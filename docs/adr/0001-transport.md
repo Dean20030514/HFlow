@@ -9,15 +9,21 @@
 ## Decision fields
 
 ```text
-preferred_transport   = acpx-dsh-acp
-production_transport  = acpx-dsh-acp      # selected; Driver implementation is the NEXT task
-live_interop          = executed (bounded, 2 top-level submissions)
-codex_invocations     = 0
+preferred_transport          = acpx-dsh-acp
+transport_selection          = acpx-dsh-acp      # decided in M0
+driver_implementation        = in_progress       # thin Driver exists; not production-certified
+basic_live_roundtrip         = passed (reported evidence from M0)
+live_cooperative_cancel      = not_tested
+owned_process_stop           = not_certified     # forced boundary teardown is proven offline only
+unattended_execution         = disabled
+production_transport         = acpx-dsh-acp      # single implementation, no runtime fallback
+codex_invocations            = 0
 ```
 
-Nothing below claims that HFlow's production Driver exists. The probe proved the
-transport works; `drivers/selected.py` still refuses to run and stays that way until the
-thin Driver is written and tested.
+"Nothing blocks further development" is true. "Nothing blocks production release" is
+**not** true: cooperative cancellation has never been exercised against the real Harness,
+and the only stop mechanism proven so far is forced teardown of the managed process
+boundary - and that proof is offline (a stubborn stub, not DSH).
 
 ## Context
 
@@ -93,12 +99,16 @@ all landed under `.probe/`; `~/.acpx` does not exist and `~/.dsh/sessions` was n
 during the probe window. One orphaned `dsh-subprocess-local` node process from an early
 crash-path run was found and killed; the later runs left no new processes behind.
 
-**Budget accounting, stated precisely:** the experiment allowed 2 top-level submissions.
-Probing the failure mode and the success mode as separate submissions, plus one attempt the
-counter correctly refused, means **3 actual submissions** were consumed (1 refused by the
-cap). That is a top-level task count, **not** an API-request count and **not** a billing
-figure: internal retries and real billed usage are not observable here, so cost stays
-`unknown`. no Codex, Reviewer, Planner or subagent calls were made.
+**Budget accounting, stated precisely** (clarified from the recorded counter, no re-run):
+three *attempted* top-level submissions, of which **two were admitted and sent** (one
+without credentials, one with) and **one was blocked before dispatch** by the persisted
+counter - it returned a `skipped` payload and left no workspace, no run directory and no
+`session/prompt` anywhere in its record. So
+`attempted=3, admitted=2, blocked_before_dispatch=1`. The M0 allowance is spent and is not
+reset by creating new probe files or directories. That is a top-level task count, **not** an
+API-request count and **not** a billing figure: internal retries and real billed usage are
+not observable here, so cost stays `unknown`. No Codex, Reviewer, Planner or subagent calls
+were made.
 
 ## Decision
 
@@ -123,14 +133,49 @@ figure: internal retries and real billed usage are not observable here, so cost 
 | start server, initialize, session/new, session/close | `probed` (live) | observed with zero prompts |
 | one prompt turn with tool use and streamed updates | `probed` (live) | nonce round trip, `end_turn`, exit 0 |
 | explicit failure when credentials are missing | `probed` (live) | fail-closed, no silent fallback |
+| launch, observe, collect through the thin Driver | `probed` (offline) | 23 contract tests against a stub process tree |
+| forced stop of the managed process boundary | `probed` (offline) | Job Object teardown of a client + stubborn descendant; **not** exercised on DSH |
 | model selection | `documented` + catalog observed | options came from the live server; never *set* one |
 | reasoning-effort selection | `documented` + catalog observed | never set |
 | `session/list`, `session/resume` | `documented` | advertised by the server; not exercised |
-| cancellation of an in-flight turn | **`not_tested`** | a hard CTRL_BREAK killed the client before any `session/cancel` reached the agent; cooperative cancel is unverified |
-| orphan-free shutdown of the managed process tree | `probed` (weak) | no leftovers seen after successful runs; this is process-scope observation, not a sandbox proof |
-| strong read-only enforcement | `unsupported` | nothing in this probe confines writes |
+| cooperative cancellation (`session/cancel`) | **`unsupported` on this launch path** | the `exec` one-shot mode has no queue owner, and `acpx cancel` resolves through one; a CTRL_BREAK killed the client before any cancel reached the agent |
+| orphan-free shutdown of the managed process tree | `probed` (weak) | no leftovers after successful runs and after forced stops; process-scope observation, not a sandbox proof |
+| strong read-only enforcement | `unsupported` | nothing in this design confines writes |
 | billed usage / quota observation | `unknown` | `usage_update` reports context usage, which is not a bill |
 | long/interrupted turns, reconnect, resume-after-crash | `not_tested` | deliberately out of scope |
+
+## Driver increment (offline)
+
+`src/hflow/drivers/acpx_dsh.py` implements the one production transport behind the neutral
+contract (`probe`, `start_handle`, `observe`, `collect`, `cancel_handle`,
+`reconcile_handle`; plus the plain `start`/`cancel`/`reconcile` forms for
+`HarnessDriver`-only callers). Facts it encodes rather than assumes:
+
+* the agent is passed as structured **argv** in a per-invocation acpx config; a raw command
+  string is rejected by acpx on win32;
+* the Windows `.CMD` launcher goes through `cmd.exe /c`, and only the launcher path and the
+  fixed profile flag appear there - task text, nonce and credentials never do;
+* the task body travels as acpx's documented stdin input (``exec -f -``) and that pipe is
+  closed once written; the ACP pipe between acpx and DSH belongs to acpx;
+* the invocation runs inside a Windows **Job Object** boundary created before the process
+  is resumed, so there is no "start it, then try to catch it" window;
+* the dispatch marker is the observed `session/prompt` send, so "no model work happened" is
+  a fact (``agent_turns=0``) when a stop lands before it;
+* output is followed by explicit byte offset (a buffered reader that latches EOF silently
+  drops everything after the first read), with a raw-log cap whose overflow marks the result
+  untrustworthy rather than successful.
+
+Stop semantics are split on purpose:
+
+| Mechanism | Meaning | Receipt |
+|---|---|---|
+| cooperative | a protocol cancel finished the work | never reported here - unsupported on this path |
+| forced | the managed process boundary was terminated | `confirmed_stopped`, `mechanism="forced"`, `local_process_stopped=true` |
+| none | nothing was stopped (already exited, or unconfirmed) | `confirmed_stopped`/`still_running`/`unknown` with `mechanism="none"` |
+
+`confirmed_stopped` with `mechanism="forced"` means **local execution stopped**. It does not
+mean the protocol cancelled cleanly, does not mean the business result is known, and does
+not mean remote billing stopped.
 
 ## Consequences
 

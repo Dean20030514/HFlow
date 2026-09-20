@@ -195,8 +195,13 @@ def test_doctor_makes_no_model_calls_and_admits_what_is_unknown(
     record = payload["capability_record"]
     assert record["live_tested"] is False
     assert record["probe_only"] is True
-    assert record["capabilities"]["cancel"] == "documented"
-    assert record["capabilities"]["readonly_enforcement"] == "unknown"
+    assert record["driver_id"] == "acpx-dsh-acp", "the M0-selected transport"
+    # Cancel is unsupported on the one-shot exec path (no queue owner to reach), and the
+    # read-only boundary is not enforced by anything here.
+    assert record["capabilities"]["cancel"] == "unsupported"
+    assert record["capabilities"]["process_boundary_teardown"] == "probed"
+    assert record["capabilities"]["readonly_enforcement"] == "unsupported"
+    assert record["capabilities"]["billing_usage"] == "unknown"
     # No credential material is read or printed.
     assert ".credentials" not in json.dumps(payload)
 
@@ -218,7 +223,9 @@ def test_status_text_marks_unknowns_instead_of_zeroing_them(
     outcome = controller.run_task(run_request)
     inspection = inspect_run(store, outcome.run_id)
     rendered = status_text(inspection)
-    assert "observed 1" in rendered
+    # The implementer's own count is labelled as a self-report, never as the run total.
+    assert "implementer self-reported 1" in rendered
+    assert "deterministic dispatch count" in rendered
     payload = report_json(inspection)
     receipt = payload["receipt"]
     assert receipt["usage"]["provider_cost"] is None

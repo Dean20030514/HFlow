@@ -58,23 +58,46 @@ actually meet today:
 
 ## Reading the counters honestly
 
-`status` prints two things that are easy to confuse:
+`status` prints three things that are easy to confuse:
 
 ```text
-turns         reserved 2/4, observed 1
-invocations   implementer=1 reviewer=1 (separate driver processes; billed model requests: unknown)
+turns         reserved 2/4, implementer self-reported 1 (a self-report, not a dispatched count and not a bill)
+invocations   implementer=1 reviewer=1 (deterministic dispatch count; billed model requests: unknown)
 candidate     workspace still matches the accepted fingerprint
 ```
 
 - `reserved 2/4` means two turns were *paid for* out of a ceiling of four: one for the
   implementer process and one for the reviewer process. Both were dispatched; a run that
   cannot afford the review turn blocks *before* the reviewer starts.
-- `observed 1` is what the driver reported for the implementer invocation. Whether a
-  Harness makes internal model requests per turn is not observable here, so billed usage
-  stays `null` and "billed model requests" stays `unknown`. Do not read `null` as `0`.
-- `candidate` compares the workspace against the fingerprint the run was accepted at. If
-  it says `DRIFTED`, the stored `ACCEPTED` describes the candidate as it was, not the
-  files on disk now; nothing has been re-verified.
+- `implementer self-reported 1` is what the worker claimed for its own turn. It is not the
+  run total and it cannot return reserved budget. The controller's own **dispatch** count is
+  the `invocations` line.
+- Whether a Harness makes internal model requests per turn is not observable here, so billed
+  usage stays `null` and "billed model requests" stays `unknown`. Do not read `null` as `0`.
+  ACP `usage_update.used/size` is context-window usage, not a bill.
+- `candidate` compares the workspace against the fingerprint the run was accepted at. If it
+  says `DRIFTED`, the stored `ACCEPTED` describes the candidate as it was, not the files on
+  disk now; nothing has been re-verified.
+
+## Stopping a run
+
+`hflow cancel <run_id>` records the intent **first**, then asks the driver, then reports what
+actually happened:
+
+| Receipt | Meaning |
+|---|---|
+| `confirmed_stopped` + `mechanism=forced` | the managed process boundary was terminated; *local execution stopped* |
+| `confirmed_stopped` + `mechanism=none` | there was nothing left to stop (already exited, or never dispatched) |
+| `still_running` / `unknown` | the stop could not be confirmed: the run stays blocked, the workspace and evidence are kept, and nothing is re-dispatched |
+
+A confirmed stop is **not** a rollback, **not** a successful protocol cancellation, and
+**not** a known business result. Cooperative cancellation (`session/cancel`) is unsupported
+on the one-shot `exec` launch path, so the only mechanism available is forced teardown of
+the boundary. Until that is verified against the real Harness, unattended production
+execution stays disabled.
+
+An accepted cancellation cannot be overwritten by a late success: acceptance refuses while a
+cancellation intent is recorded, in the same transaction that would have written the receipt.
 
 ## What is not safe yet
 

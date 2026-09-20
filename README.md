@@ -4,11 +4,22 @@ A small deterministic controller for harness-agnostic agentic development tasks.
 The controller owns admission, budget, evidence, and delivery accounting; a native
 Harness (DSH first) owns reasoning and tools.
 
-**Status: M1 offline vertical slice + M0 transport probe complete.** The only implemented
-driver is still a fake one. M0 selected `acpx -> official DSH ACP` as the first production
-transport, with a bounded live probe as evidence (`docs/adr/0001-transport.md`,
-`docs/m0-results.md`). No production Driver exists yet, so `drivers/selected.py` still
-refuses to run.
+**Status: the offline vertical slice plus one thin production Driver.**
+
+```text
+transport_selection      = acpx-dsh-acp        (decided in M0, with bounded live evidence)
+driver_implementation    = in_progress         (src/hflow/drivers/acpx_dsh.py)
+basic_live_roundtrip     = passed              (reported M0 evidence)
+live_cooperative_cancel  = not_tested          (unsupported on the one-shot exec path)
+owned_process_stop       = not_certified       (forced boundary teardown proven offline only)
+unattended_execution     = disabled
+new_live_budget          = 0                   (the M0 allowance is spent; a new one needs your approval)
+```
+
+The driver can launch, observe, force-stop and reconcile one invocation through a managed
+process boundary; the controller still owns admission, budget, attempts, evidence and the
+receipt. `docs/adr/0001-transport.md` and `docs/m0-results.md` hold the evidence, including
+what is still unverified.
 
 ## What works today
 
@@ -86,12 +97,23 @@ from it (`hflow schema`). There is no second hand-written schema to drift.
 
 ## Not implemented (do not assume otherwise)
 
-Production DSH/acpx driver — M0 selected the transport and proved the round trip, but the
-thin Driver is the next task; Git worktree isolation and snapshot; strong read-only
-sandbox; cross-process cancellation with child-process-tree proof (cooperative cancel is
-`not_tested`); repair cycle; integration/publish delivery; reuse-research automation;
-teams and native subagents; real billing observation; metrics against a direct-DSH
-baseline.
+Cooperative (protocol) cancellation on the selected launch path; a certified owned-process
+stop against the real Harness (forced teardown is proven offline only); unattended
+production execution; Git worktree isolation and snapshot; strong read-only sandbox;
+repair cycle; integration/publish delivery; reuse-research automation; teams and native
+subagents; real billing observation; metrics against a direct-DSH baseline.
+
+## Driver contract tests
+
+```sh
+python -m pytest -q tests/test_driver_acpx_dsh.py        # 23 tests, no model, no credential
+python tools/m0_probe/check_process_boundary.py          # Job Object teardown, standalone
+```
+
+The driver tests run the real launch/observe/stop code against a test-only stand-in for the
+acpx CLI plus stub agents that are **separate processes** - including one that ignores
+cancellation and holds a helper child, so a decorative process boundary would fail the test
+rather than pass it.
 
 ## M0 transport probe
 

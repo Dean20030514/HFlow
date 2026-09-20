@@ -53,6 +53,7 @@ from .ids import (
     parse_ts,
     utc_now,
 )
+from .paths import default_data_dir
 from .drivers.base import assert_driver_shape
 from .drivers.fake import ProcessGuard
 from .store import RunNotFound, Store, StoreError
@@ -167,6 +168,7 @@ class Controller:
         controller_id: str = "local-controller",
         reservation_ttl_seconds: int = RESERVATION_TTL_SECONDS,
         review_isolation: IsolationLevel = IsolationLevel.PROMPT_ONLY,
+        data_dir: Path | None = None,
     ) -> None:
         self.store = store
         self.driver = driver
@@ -174,6 +176,10 @@ class Controller:
         self.runners = runners or CheckRunners.offline_default()
         self.controller_id = controller_id
         self.reservation_ttl_seconds = reservation_ttl_seconds
+        #: Scratch root a driver may use for invocation-scoped state. Deliberately outside
+        #: the project checkout: scaffolding in the workspace would show up as a candidate
+        #: change and dirty the tree under test.
+        self.data_dir = Path(data_dir) if data_dir else default_data_dir()
         #: Recorded isolation for reviews. The driver cannot raise it by claiming so.
         self.review_isolation = review_isolation
         #: Workspace the current run targets; set by ``run_task``. Only used for the
@@ -274,24 +280,82 @@ class Controller:
         return result.outcome
 
     def cancel(self, run_id: str) -> CancellationReceipt:
+        """Request a stop: record the intent first, then ask the driver, then believe facts.
+
+        Idempotent: a recorded intent plus a recorded receipt short-circuits. No prompt is
+        sent, no budget is charged, and a confirmed stop is reported as a *local process*
+        fact - never as a successful protocol cancellation or a known business result.
+        """
+        intent_at, existing_receipt = self.store.cancel_state(run_id)
+        if existing_receipt is not None:
+            return existing_receipt
+        intent_at = self.store.record_cancel_intent(run_id)
+
         attempt = self.store.open_attempt(run_id)
         if attempt is None or not attempt["invocation_id"]:
-            self.store.set_task_state(run_id, [TaskState.DRAFT, TaskState.READY], TaskState.CANCELLED)
-            return CancellationReceipt(
-                invocation_id="", status="confirmed_stopped", detail="run cancelled before dispatch"
+            receipt = CancellationReceipt(
+                invocation_id="",
+                status="confirmed_stopped",
+                mechanism="none",
+                local_process_stopped=True,
+                detail="run cancelled before any invocation was dispatched",
             )
-        receipt = self.driver.cancel(attempt["invocation_id"])
+            self.store.record_cancel_receipt(run_id, receipt)
+            self.store.set_blocked(
+                run_id, RefusalCode.CANCELLED_BY_OPERATOR, f"cancelled before dispatch at {intent_at}"
+            )
+            return receipt
+
+        receipt = self._driver_cancel(attempt["invocation_id"], attempt["attempt_id"])
+        self.store.record_cancel_receipt(run_id, receipt)
         if receipt.status == "confirmed_stopped":
-            self.store.finish_attempt(
-                run_id=run_id,
-                attempt_id=attempt["attempt_id"],
-                state=AttemptState.CANCELLED,
-                outcome=InvocationOutcome.CANCELLED,
-                result={"cancelled": True},
-                block_code=RefusalCode.LATE_RESULT,
+            try:
+                self.store.finish_attempt(
+                    run_id=run_id,
+                    attempt_id=attempt["attempt_id"],
+                    state=AttemptState.CANCELLED,
+                    outcome=InvocationOutcome.CANCELLED,
+                    result=receipt.model_dump(mode="json"),
+                    block_code=RefusalCode.CANCELLED_BY_OPERATOR,
+                )
+            except StoreError:
+                pass  # the attempt may already be terminal; the receipt is still recorded
+            self.store.set_blocked(
+                run_id,
+                RefusalCode.CANCELLED_BY_OPERATOR,
+                f"stop confirmed ({receipt.mechanism}); local execution stopped, business result unknown",
             )
-            self.store.set_blocked(run_id, RefusalCode.LATE_RESULT, "cancelled by operator")
+        else:
+            self.store.set_blocked(
+                run_id,
+                RefusalCode.OUTCOME_UNKNOWN,
+                f"stop could not be confirmed: {receipt.status}; work may still be running",
+            )
         return receipt
+
+    def _driver_cancel(self, invocation_id: str, attempt_id: str) -> CancellationReceipt:
+        """Prefer the handle API when the driver offers it; degrade to the plain contract."""
+        handles = getattr(self.driver, "_handles", None)
+        cancel_handle = getattr(self.driver, "cancel_handle", None)
+        if isinstance(handles, dict) and callable(cancel_handle) and invocation_id in handles:
+            try:
+                return cancel_handle(handles[invocation_id])  # type: ignore[no-any-return]
+            except Exception as exc:  # noqa: BLE001 - a broken stop must not look like success
+                return CancellationReceipt(
+                    invocation_id=invocation_id,
+                    status="unknown",
+                    mechanism="none",
+                    detail=f"driver raised while stopping: {exc!r}",
+                )
+        try:
+            return self.driver.cancel(invocation_id)
+        except Exception as exc:  # noqa: BLE001
+            return CancellationReceipt(
+                invocation_id=invocation_id,
+                status="unknown",
+                mechanism="none",
+                detail=f"driver raised while stopping: {exc!r}",
+            )
 
     # -- the state machine ---------------------------------------------------
 
@@ -350,6 +414,7 @@ class Controller:
             workspace=str(project_root),
             deadline_seconds=request.deadline_seconds,
             spec_digest=spec.spec_digest(),
+            data_dir=str(self.data_dir),
         )
 
         # From here on, failures must not re-dispatch: the model may already have run.
@@ -529,6 +594,7 @@ class Controller:
             workspace=str(project_root),
             deadline_seconds=900,
             spec_digest=row["spec_digest"],
+            data_dir=str(self.data_dir),
         )
         try:
             review_invocation = self.driver.start(review_request)
@@ -585,6 +651,13 @@ class Controller:
             return self._outcome_for(
                 run_id,
                 notes=["attempt was superseded before acceptance; no receipt was written"],
+            )
+        if row["cancel_intent_at"]:
+            return self._blocked(
+                run_id,
+                RefusalCode.CANCELLED_BY_OPERATOR,
+                "a cancellation intent was recorded; a late success cannot be accepted "
+                f"(intent at {row['cancel_intent_at']})",
             )
 
         fresh_fingerprint = candidate_fingerprint(project_root, spec.scope)

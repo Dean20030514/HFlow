@@ -1,15 +1,15 @@
-"""Selection of the one production Driver, plus the M0 local capability record.
+"""Selection of the one production Driver.
 
-Status of this file, stated plainly: **no production driver is implemented yet.**
-M0 could not be executed in this environment, because
+M0 selected `acpx 0.17.1 -> official DSH ACP` with bounded live evidence
+(``docs/adr/0001-transport.md``, ``docs/m0-results.md``). This module is now the *single*
+place that maps a logical binding to a concrete driver object, so nothing else has to know
+which transport is production.
 
-* ``acpx`` is not installed (no global binary, no npm package), and
-* the local DSH home has profiles ``headless`` and ``web`` only - there is no
-  ``acp`` profile, so ``dsh --profile acp`` has nothing to boot.
+Two rules survive from the M0 round:
 
-The ADR (``docs/adr/0001-transport.md``) records the decision, and this module
-refuses loudly instead of pretending a real harness is wired up. Nothing here
-contacted a model provider or changed global DSH configuration.
+* one production transport. There is no second (headless) implementation to fall back to at
+  runtime, and no silent fallback of any kind - an unknown driver name refuses;
+* a driver that is not configured refuses loudly instead of degrading to something cheaper.
 """
 
 from __future__ import annotations
@@ -22,48 +22,61 @@ from ..contracts import (
     CapabilityReport,
     CapabilityState,
     CancellationReceipt,
-    InvocationOutcome,
     InvocationRequest,
     InvocationResult,
-    ReconcileOutcome,
     ReconcileResult,
     RefusalCode,
     RefusedError,
 )
+from .acpx_dsh import DRIVER_ID as ACPX_DSH_DRIVER_ID
+from .acpx_dsh import AcpxDshDriver
 
-SELECTED_DRIVER_ID = "m0-unselected"
-ACPX_PRESENT_IN_THIS_ENV = False
-LOCAL_DSH_PROFILES = ("headless", "web")
+SELECTED_DRIVER_ID = ACPX_DSH_DRIVER_ID
+#: Names a machine profile may use for the selected transport.
+ACPX_DSH_ALIASES = {ACPX_DSH_DRIVER_ID, "acpx-dsh", "acpx", "dsh-acp"}
 
 
-def local_probe(executable: str = "dsh", acpx_present: bool = ACPX_PRESENT_IN_THIS_ENV) -> CapabilityReport:
-    """Static, zero-model capability record for this machine.
+def default_refusal_reason() -> str:
+    """Why an unconfigured driver refuses, in one sentence a operator can act on."""
+    return (
+        f"the selected transport is {SELECTED_DRIVER_ID}; pass a real binding (or --driver fake "
+        "for offline work). No unattended production execution is approved yet: cooperative "
+        "cancellation on this launch path is unverified."
+    )
 
-    ``documented`` means upstream documentation describes it. ``unknown`` means it
-    was never executed here. Nothing in this report was live-tested.
+
+def local_probe(
+    binding: AgentBinding | None = None,
+    *,
+    driver: AcpxDshDriver | None = None,
+) -> CapabilityReport:
+    """Static capability record for this machine. Sends no task and calls no model.
+
+    With a driver instance the report is the driver's own probe (it knows its executable
+    path and launch argv); without one, this returns the deliberately conservative record
+    used before any driver is constructed.
     """
+    if driver is not None and binding is not None:
+        return driver.probe(binding)
+
     capabilities = {
-        "fresh_session": CapabilityState.DOCUMENTED,
-        "session_resume": CapabilityState.DOCUMENTED,
+        "fresh_session": CapabilityState.PROBED,
+        "session_open_close": CapabilityState.PROBED,
+        "prompt_turn": CapabilityState.PROBED,
+        "streamed_updates": CapabilityState.PROBED,
+        "structured_output": CapabilityState.PROBED,
+        "cancel": CapabilityState.UNSUPPORTED,
+        "process_boundary_teardown": CapabilityState.PROBED,
         "session_list": CapabilityState.DOCUMENTED,
-        "session_load": CapabilityState.UNSUPPORTED,
-        "cancel": CapabilityState.DOCUMENTED,
+        "session_resume": CapabilityState.DOCUMENTED,
         "model_selection": CapabilityState.DOCUMENTED,
-        "permission_requests": CapabilityState.DOCUMENTED,
-        "structured_output": CapabilityState.UNKNOWN,
-        "native_subagents": CapabilityState.UNKNOWN,
         "billing_usage": CapabilityState.UNKNOWN,
-        "readonly_enforcement": CapabilityState.UNKNOWN,
+        "readonly_enforcement": CapabilityState.UNSUPPORTED,
+        "native_subagents": CapabilityState.UNSUPPORTED,
     }
-    notes = [
-        "probe is static: no model was called and no DSH profile was booted",
-        f"local DSH profiles found: {', '.join(LOCAL_DSH_PROFILES)} (no 'acp' profile)",
-        f"acpx present: {acpx_present}",
-        "every capability stays 'documented/unknown' until a live M0 check runs",
-    ]
     return CapabilityReport(
         driver_id=SELECTED_DRIVER_ID,
-        driver_version="0.0.1",
+        driver_version="0.1.0",
         harness="dsh",
         harness_version=None,
         os=f"{platform.system()}-{platform.release()}",
@@ -71,14 +84,41 @@ def local_probe(executable: str = "dsh", acpx_present: bool = ACPX_PRESENT_IN_TH
         probe_only=True,
         live_tested=False,
         capabilities=capabilities,
-        notes=notes,
+        notes=[
+            "probe is static: no prompt, no session, no model request",
+            "transport selected by M0: acpx 0.17.1 -> official DSH ACP",
+            "cooperative cancellation is unsupported on the one-shot exec path",
+        ],
+    )
+
+
+def build_driver(
+    binding: AgentBinding,
+    *,
+    data_dir: Path,
+    dsh_home: Path | None = None,
+) -> object:
+    """Resolve a binding to the driver instance. Refuses anything not selected in M0."""
+    name = binding.driver.strip().lower()
+    if name in {"fake", "fake-offline"}:
+        from .fake import FakeDriver
+
+        root = Path(data_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        return FakeDriver(root)
+    if name in ACPX_DSH_ALIASES:
+        return AcpxDshDriver(data_dir=data_dir, dsh_home=dsh_home)
+    raise RefusedError(
+        RefusalCode.NOT_IMPLEMENTED,
+        f"driver {binding.driver!r} is not implemented. This build has exactly one production "
+        f"transport ({SELECTED_DRIVER_ID}) plus the offline fake; there is no runtime fallback.",
     )
 
 
 class UnselectedDriver:
-    """Placeholder that refuses to run. Present so misconfiguration fails loudly."""
+    """Refuses to run. Kept so a misconfiguration fails loudly rather than silently."""
 
-    driver_id = SELECTED_DRIVER_ID
+    driver_id = "unselected"
 
     def __init__(self, reason: str) -> None:
         self.reason = reason
@@ -97,30 +137,3 @@ class UnselectedDriver:
 
     def reconcile(self, invocation_id: str) -> ReconcileResult:
         self._refuse()
-
-
-def default_refusal_reason() -> str:
-    return (
-        "no production driver is selected or implemented in this build: M0 could not run "
-        "because acpx is not installed and this machine has no DSH 'acp' profile, and the "
-        "headless fallback is intentionally not implemented in the same change (one "
-        "production transport at a time). Use the offline fake driver for controller work."
-    )
-
-
-def build_driver(binding: AgentBinding, *, project_root: Path, offline: bool = False) -> object:
-    """Resolve a binding to a driver instance.
-
-    ``offline=True`` is the only path this build supports end to end.
-    """
-    from .fake import FakeDriver  # local import keeps the fake out of the real path
-
-    if binding.driver in {"fake", "fake-offline"}:
-        return FakeDriver(project_root)
-    if offline:
-        raise RefusedError(
-            RefusalCode.NOT_IMPLEMENTED,
-            f"binding {binding.driver!r} cannot run offline; there is no {binding.driver!r} driver "
-            "in this build",
-        )
-    raise RefusedError(RefusalCode.NOT_IMPLEMENTED, default_refusal_reason())

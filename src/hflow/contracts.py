@@ -415,6 +415,10 @@ class InvocationRequest(BaseModel):
     workspace: str
     deadline_seconds: int
     spec_digest: str
+    #: Where a driver may keep invocation-scoped scratch (config, raw event logs, session
+    #: state). Never the project checkout: scaffolding inside the workspace would show up in
+    #: candidate snapshots and dirty the tree under test.
+    data_dir: str = ""
 
 
 class InvocationOutcome(StrEnum):
@@ -447,7 +451,64 @@ class CancellationReceipt(BaseModel):
 
     invocation_id: str
     status: Literal["confirmed_stopped", "still_running", "unknown"]
+    #: ``cooperative`` = the protocol/graceful path finished the work; ``forced`` = the
+    #: managed process boundary was terminated; ``none`` = nothing was stopped.
+    mechanism: Literal["cooperative", "forced", "none"] = "none"
+    local_process_stopped: bool | None = None
     detail: str = ""
+
+
+class EventKind(StrEnum):
+    """Neutral event vocabulary. A Harness's internal events are never invented here."""
+
+    STARTED = "started"
+    PROGRESS = "progress"
+    USAGE = "usage"
+    PERMISSION_REQUESTED = "permission_requested"
+    DISPATCHED = "dispatched"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    OUTCOME_UNKNOWN = "outcome_unknown"
+
+
+class NormalizedEvent(BaseModel):
+    """One observed event, with the raw payload kept only as a bounded reference."""
+
+    model_config = Strict
+
+    kind: EventKind
+    sequence: int = 0
+    at: str = ""
+    message: str = ""
+    method: str = ""
+    raw_ref: str = ""
+
+
+class DriverHandle(BaseModel):
+    """Bookkeeping for one live invocation.
+
+    Start returns this instead of blocking until the end: the controller (or a test) can
+    observe events and ask for a stop while the work is still running.
+    """
+
+    model_config = Strict
+
+    invocation_id: str
+    attempt_id: str
+    run_id: str
+    role: str
+    workspace: str
+    started_at: str
+    process_identity: str
+    boundary_kind: str
+    pid: int | None = None
+    session_id: str | None = None
+    dispatched: bool = False
+    dispatched_at: str | None = None
+    event_log: str = ""
+    #: Set once the invocation reached a terminal state, so repeated calls are cheap.
+    finished: bool = False
 
 
 class ReconcileResult(BaseModel):
@@ -456,6 +517,8 @@ class ReconcileResult(BaseModel):
     invocation_id: str
     outcome: ReconcileOutcome
     detail: str = ""
+    protocol_cancel_supported: bool | None = None
+    local_process_alive: bool | None = None
 
 
 class HarnessDriver(Protocol):
@@ -470,6 +533,30 @@ class HarnessDriver(Protocol):
     def cancel(self, invocation_id: str) -> CancellationReceipt: ...
 
     def reconcile(self, invocation_id: str) -> ReconcileResult: ...
+
+
+class LifecycleDriver(Protocol):
+    """Optional extension: a driver whose invocation can be observed and stopped while live.
+
+    A driver that only implements :class:`HarnessDriver` remains valid; the controller
+    degrades to "start returns when the invocation is over", and cancellation then reports
+    what it can honestly report. The point of this protocol is that ``start`` must not be
+    the only thing that can happen to a running invocation.
+    """
+
+    driver_id: str
+
+    def probe(self, binding: AgentBinding) -> CapabilityReport: ...
+
+    def start_handle(self, request: InvocationRequest) -> DriverHandle: ...
+
+    def observe(self, handle: DriverHandle) -> Iterator[NormalizedEvent]: ...
+
+    def collect(self, handle: DriverHandle) -> InvocationResult: ...
+
+    def cancel_handle(self, handle: DriverHandle) -> CancellationReceipt: ...
+
+    def reconcile_handle(self, handle: DriverHandle) -> ReconcileResult: ...
 
 
 # --------------------------------------------------------------------------
@@ -555,6 +642,7 @@ class RefusalCode(StrEnum):
     REVIEW_REJECTED = "review_rejected"
     OUTCOME_UNKNOWN = "outcome_unknown"
     DRIVER_FAILED = "driver_failed"
+    CANCELLED_BY_OPERATOR = "cancelled_by_operator"
     NOT_IMPLEMENTED = "not_implemented"
     INTERNAL_ERROR = "internal_error"
 

@@ -28,6 +28,7 @@ from typing import Any
 from .contracts import (
     AttemptRecord,
     AttemptState,
+    CancellationReceipt,
     CheckPhase,
     DeliveryState,
     EvidenceRecord,
@@ -77,6 +78,8 @@ CREATE TABLE IF NOT EXISTS runs (
     block_code            TEXT,
     block_reason          TEXT,
     receipt_json          TEXT,
+    cancel_intent_at      TEXT,
+    cancel_receipt_json   TEXT,
     created_at            TEXT NOT NULL,
     updated_at            TEXT NOT NULL,
     CHECK (turns_reserved >= 0),
@@ -393,11 +396,14 @@ class Store:
 
         Refuses if the approved checks changed while the run was executing, which
         would mean the evidence was produced under a different command set
-        (acceptance A11).
+        (acceptance A11), and refuses if a cancellation intent was recorded after the
+        result arrived: an accepted cancellation must not be overwritten by a late
+        success (the mirror of the stale-attempt rule).
         """
         with self.transaction() as conn:
             row = conn.execute(
-                "SELECT task_state, checks_digest FROM runs WHERE run_id = ?", (run_id,)
+                "SELECT task_state, checks_digest, cancel_intent_at FROM runs WHERE run_id = ?",
+                (run_id,),
             ).fetchone()
             if row is None:
                 raise RunNotFound(run_id)
@@ -409,6 +415,11 @@ class Store:
             if row["task_state"] != TaskState.CHECKING.value:
                 raise StoreError(
                     f"run {run_id} is {row['task_state']}, not CHECKING; refusing to accept"
+                )
+            if row["cancel_intent_at"]:
+                raise StoreError(
+                    f"run {run_id} has a recorded cancellation intent at {row['cancel_intent_at']}; "
+                    "a late success cannot overwrite it"
                 )
             conn.execute(
                 "UPDATE runs SET receipt_json = ?, updated_at = ? WHERE run_id = ?",
@@ -682,6 +693,44 @@ class Store:
             )
             if cur.rowcount != 1:
                 raise StoreError(f"unknown attempt {attempt_id}")
+
+    def record_cancel_intent(self, run_id: str) -> str:
+        """Note that a stop was requested, *before* asking anything to stop.
+
+        Recorded first on purpose: if the process dies while we are stopping it, the intent
+        is already durable, so a late result cannot be accepted as if nothing happened.
+        Idempotent - the first timestamp wins.
+        """
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT cancel_intent_at FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise RunNotFound(run_id)
+            if row["cancel_intent_at"]:
+                return str(row["cancel_intent_at"])
+            now = utc_now()
+            conn.execute(
+                "UPDATE runs SET cancel_intent_at = ?, updated_at = ? WHERE run_id = ?",
+                (now, now, run_id),
+            )
+            return now
+
+    def record_cancel_receipt(self, run_id: str, receipt: CancellationReceipt) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE runs SET cancel_receipt_json = ?, updated_at = ? WHERE run_id = ?",
+                (canonical_json(receipt.model_dump(mode="json")), utc_now(), run_id),
+            )
+
+    def cancel_state(self, run_id: str) -> tuple[str | None, CancellationReceipt | None]:
+        row = self.get_run(run_id)
+        receipt = (
+            CancellationReceipt.model_validate(json.loads(row["cancel_receipt_json"]))
+            if row["cancel_receipt_json"]
+            else None
+        )
+        return (str(row["cancel_intent_at"]) if row["cancel_intent_at"] else None, receipt)
 
     def record_reconcile(self, attempt_id: str, payload: dict[str, Any]) -> None:
         """Store what an interruption check observed. Never a new dispatch."""

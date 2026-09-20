@@ -35,14 +35,15 @@ def status_text(inspection: RunInspection) -> str:
         f"delivery      {run.delivery_state.value}",
         f"claimed_by    {_unknown(run.claimed_by)}",
         f"turns         reserved {run.agent_turns_reserved}/{run.agent_turns_limit}, "
-        f"observed {_unknown(run.agent_turns_observed)}",
+        f"implementer self-reported {_unknown(run.agent_turns_observed)} "
+        "(a self-report, not a dispatched count and not a bill)",
         f"spec_digest   {run.spec_digest}",
     ]
     implementer = sum(1 for a in inspection.attempts if a.invocation_id)
     reviewer = sum(1 for a in inspection.attempts if a.review_invocation_id)
     lines.append(
         f"invocations   implementer={implementer} reviewer={reviewer} "
-        "(separate driver processes; billed model requests: unknown)"
+        "(deterministic dispatch count; billed model requests: unknown)"
     )
     lines.append(_drift_line(inspection))
     if run.block_code:
@@ -86,7 +87,7 @@ def receipt_text(receipt: ResultReceipt) -> str:
         f"delivery      {receipt.delivery_state.value}",
         "usage",
         f"  turns_reserved        {usage.controller_turns_reserved}",
-        f"  turns_observed        {_unknown(usage.controller_turns_observed)}",
+        f"  turns_observed        {_unknown(usage.controller_turns_observed)} (implementer self-report)",
         f"  provider_billed_tokens {_unknown(usage.provider_billed_tokens)}",
         f"  provider_cost          {_unknown(usage.provider_cost)}",
         f"  quota_remaining        {_unknown(usage.subscription_quota_remaining)}",

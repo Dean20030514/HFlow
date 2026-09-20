@@ -208,14 +208,15 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     store = _open_store(args)
     try:
+        data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
         if args.driver == "fake":
             driver = FakeDriver(project_root)
         else:
-            from .drivers.selected import build_driver
             from .contracts import AgentBinding
+            from .drivers.selected import build_driver
 
-            driver = build_driver(  # type: ignore[assignment]
-                AgentBinding(harness="dsh", driver=args.driver), project_root=project_root
+            driver = build_driver(
+                AgentBinding(harness="dsh", driver=args.driver), data_dir=data_dir
             )
         controller = Controller(
             store,
@@ -223,6 +224,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             controller_build=controller_build(),
             runners=CheckRunners.offline_default(),
             controller_id=args.controller_id,
+            data_dir=data_dir,
         )
         request = RunRequest(
             task=spec,
@@ -388,7 +390,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--task", required=True, help="path to task.json")
     run.add_argument("--project", default=None, help="path to .hflow/project.json")
     run.add_argument("--project-root", default=".", help="target project root (workspace)")
-    run.add_argument("--driver", default="fake", help="driver id; only 'fake' is implemented offline")
+    run.add_argument(
+        "--driver",
+        default="fake",
+        help="driver id: 'fake' (offline) or 'acpx-dsh' (the M0-selected transport)",
+    )
     run.add_argument("--controller-id", default="local-controller")
     run.add_argument("--receipt-out", default=None, help="write the result receipt to this path")
     run.add_argument("--json", action="store_true")
