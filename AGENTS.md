@@ -13,6 +13,7 @@ not restate the design; read the plan and `docs/architecture.md` when the task n
 | Admission rules (scope, reuse, budget, risk) | `src/hflow/admission.py` |
 | Approved checks and evidence | `src/hflow/verify.py` |
 | Scope containment and candidate fingerprints | `src/hflow/workspace.py` |
+| Git worktree isolation and candidate freezing | `src/hflow/gitworkspace.py` |
 | The one production driver (acpx → DSH ACP) | `src/hflow/drivers/acpx_dsh.py` |
 | Windows Job Object process boundary | `src/hflow/drivers/winjob.py` |
 | Neutral event projection from the client stream | `src/hflow/drivers/acp_events.py` |
@@ -38,8 +39,13 @@ not restate the design; read the plan and `docs/architecture.md` when the task n
 9. The agent launch argv carries only the launcher path and fixed flags. Task text, nonce,
    user content and credentials never go into a command line - they travel through stdin or
    a controlled file.
-10. No live model task runs without an explicit new budget from the user. The M0 allowance
-    is spent; a new probe file or directory does not create new allowance.
+10. No live model task runs without an explicit new budget from the user. Each live task
+    needs its own approval; a probe file, a new experiment id or an edited authorization
+    note does not create allowance.
+11. A candidate's Git identity and its content fingerprint are different things. Never
+    present one as the other, and never weaken a check to make a delivery pass.
+12. The user's checkout is never written to by an isolated run: no stash, no reset, no
+    commit of their uncommitted work.
 
 ## Working style for this repository
 

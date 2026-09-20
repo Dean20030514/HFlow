@@ -80,7 +80,17 @@ def receipt_text(receipt: ResultReceipt) -> str:
         f"plan_digest   {receipt.plan_digest}",
         f"outcome       {receipt.harness_outcome.value}",
         f"candidate     base={receipt.candidate.base_commit}",
-        f"              tree={receipt.candidate.tree_hash}",
+        *(
+            [
+                f"              git_commit={receipt.candidate.git_commit}",
+                f"              git_tree={receipt.candidate.git_tree}",
+                f"              worktree={receipt.candidate.worktree}",
+                f"              paths={', '.join(receipt.candidate_paths) or '-'}",
+            ]
+            if receipt.candidate.git_commit
+            else []
+        ),
+        f"              fingerprint={receipt.candidate.fingerprint}",
         f"verification  {receipt.verification.status} evidence={', '.join(receipt.verification.evidence_ids) or '-'}",
         f"review        {receipt.review.status} isolation={receipt.review.isolation.value}",
         f"task_state    {receipt.task_state.value}",
@@ -96,8 +106,9 @@ def receipt_text(receipt: ResultReceipt) -> str:
         lines.append("limitations")
         lines.extend(f"  - {item}" for item in receipt.limitations)
     lines.append(
-        "scope note    candidate.tree_hash is a content fingerprint over the TaskSpec's write "
-        "scope; it is not a Git tree hash and not a whole-repository verification cache key"
+        "scope note    candidate.fingerprint is a content fingerprint over the TaskSpec's write "
+        "scope; candidate.git_commit/git_tree are real Git objects when the run used a worktree. "
+        "They are different identities and neither is a whole-repository verification cache key"
     )
     return "\n".join(lines)
 

@@ -26,12 +26,24 @@ codex_invocations            = 0
 mechanism proven so far is forced teardown of the managed process boundary - proven offline,
 not against DSH.
 
-### Live forced-stop trial (2026-09-20): INCONCLUSIVE
+### Live forced-stop trial (2026-09-20): INCONCLUSIVE - client launch failed
 
 One live top-level task was authorized by the user for baseline `8335cfc` and sent. It
 **did not reach the harness**, so the trial is inconclusive and `forced_local_stop_live`
 stays `not_tested`. The authorization is consumed; there was no retry, and the M0 ledger is
 unchanged.
+
+Two levels are deliberately kept apart:
+
+| Level | Count | Meaning |
+|---|---|---|
+| authorization gate | 1 consumed | the trial's single slot, spent as designed (startup failures do not refund) |
+| real ACP `session/prompt` dispatch | 0 | the harness was never reached, so no model work was possible |
+
+The cause is **known**, not unknown: the driver launched the Node CLI with the **Python**
+interpreter (``python -u .../dist/cli.js``), which cannot parse JavaScript. That was a defect
+in this repository's driver - a class the offline tests could not catch, because the test
+stand-in client is itself a Python script.
 
 What the record shows:
 
@@ -42,21 +54,24 @@ What the record shows:
 | no model work happened | no `session/prompt` was ever observed (`dispatched=false`); no helper READY |
 | the trial's own gates behaved | no `helper_ready.json`, no extra dispatch, no late `ACCEPTED`, no orphan processes |
 
-Root cause: the driver launched the Node CLI with the **Python** interpreter
-(``python -u .../dist/cli.js``). That is a defect in this repository's driver, not an
-upstream or environment problem, and it is a class of bug the offline tests could not catch
-because the stand-in client *is* a Python script. The fix selects the interpreter from the
-entry point (Node for `.js`/`.mjs`/`.cjs`, Python for `.py`, direct execution otherwise) and
-is covered by a regression test that asserts the selected interpreter per entry-point kind.
+**Fix (`581c2ff`)**: the interpreter is selected from the entry-point kind (Node for
+`.js`/`.mjs`/`.cjs`, Python for `.py`, direct execution otherwise), covered by a regression
+test. **Real-client evidence after the fix (`tools/m0_probe/real_client_checks.py`, both
+PASS, zero model calls, no credential, no real DSH):**
 
-The mechanism itself is still only offline-proven: an earlier self-check run of the same
-probe (stand-in client, no model) reached the full stop sequence - helper started by the
-agent, `IsProcessInJob` true for *this* invocation's job, 3 processes in the boundary,
-forced stop confirmed in 2.02s, heartbeat stopped, no late acceptance. A stand-in client
-replaces DSH, so that run is INCONCLUSIVE by construction rather than a live pass.
+| Check | What it ran | Result |
+|---|---|---|
+| `version` | the installed acpx through the driver's own argv/boundary/drain code: `node .../dist/cli.js --version` | rc=0, reported `0.17.1`, process reaped, boundary empty |
+| `mock` | the real acpx client against the project's existing mock ACP agent, full one-shot `exec` (structured argv, task stdin, Job, event drain) | `stopReason` observed, nonce echoed, client gone, no unparsed lines |
 
-A second live task would need a new explicit authorization. Per the trial specification, a
-concluded inconclusive result does not return budget.
+The mechanism itself is still only offline-proven: a self-check run of the same stop probe
+(stand-in client) reached the full stop sequence - helper started by the agent,
+`IsProcessInJob` true for *this* invocation's job, 3 processes in the boundary, forced stop
+confirmed in 2.02s, heartbeat stopped, no late acceptance. A stand-in client replaces DSH, so
+that run is INCONCLUSIVE by construction rather than a live pass.
+
+A second live task would need a new explicit authorization, and only after the zero-model
+checks for the current combination hold.
 
 ## Context
 

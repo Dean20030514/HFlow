@@ -56,6 +56,7 @@ from .ids import (
 from .paths import default_data_dir
 from .drivers.base import assert_driver_shape
 from .drivers.fake import ProcessGuard
+from .gitworkspace import CandidateFreeze, GitError, GitRepo
 from .store import RunNotFound, Store, StoreError
 from .verify import CheckRunners, verify_candidate
 from .workspace import candidate_fingerprint, changed_paths, manifest, paths_outside_scope
@@ -154,7 +155,15 @@ def workspace_drift(store: Store, run_id: str, project_root: Path) -> bool | Non
         return None
     receipt = ResultReceipt.model_validate(json.loads(row["receipt_json"]))
     spec = TaskSpec.model_validate(json.loads(row["task_spec_json"]))
-    return candidate_fingerprint(Path(project_root), spec.scope) == receipt.candidate.tree_hash
+    root = Path(project_root)
+    if spec.workspace.mode == "worktree":
+        # The candidate lives in its worktree, so a change to the *user's* checkout is not
+        # drift of this candidate. The worktree is identified by the frozen path.
+        recorded = receipt.candidate.worktree
+        if not recorded or not Path(recorded).exists():
+            return None
+        root = Path(recorded)
+    return candidate_fingerprint(root, spec.scope) == receipt.candidate.fingerprint
 
 
 class Controller:
@@ -289,6 +298,23 @@ class Controller:
         intent_at, existing_receipt = self.store.cancel_state(run_id)
         if existing_receipt is not None:
             return existing_receipt
+        row = self.store.get_run(run_id)
+        if TaskState(row["task_state"]) is TaskState.ACCEPTED:
+            # History is not rewritten: a stop request after acceptance is recorded as a fact,
+            # but it cannot un-accept a delivered candidate.
+            receipt = CancellationReceipt(
+                invocation_id="",
+                status="confirmed_stopped",
+                mechanism="none",
+                local_process_stopped=True,
+                detail="the run was already ACCEPTED and its candidate frozen; nothing was stopped "
+                "and the delivery stands",
+            )
+            self.store.record_cancel_receipt(run_id, receipt)
+            self.store.record_note(
+                run_id, "a stop was requested after acceptance; the accepted candidate is unchanged"
+            )
+            return receipt
         intent_at = self.store.record_cancel_intent(run_id)
 
         attempt = self.store.open_attempt(run_id)
@@ -367,6 +393,32 @@ class Controller:
         invocation_id = new_invocation_id()
         reservation_id = new_reservation_id()
 
+        # --- workspace preparation (M2): an isolated worktree, or the project in place
+        repo: GitRepo | None = None
+        worktree: Path | None = None
+        user_tree_before = ""
+        dirty_target = False
+        if spec.workspace.mode == "worktree":
+            try:
+                repo = GitRepo.discover(project_root)
+                user_tree_before = repo.user_change_fingerprint()
+                base_commit = spec.workspace.base_commit or repo.resolve_commit("HEAD")
+                if not repo.commit_exists(base_commit):
+                    return self._blocked(
+                        run_id,
+                        RefusalCode.SCOPE_VIOLATION,
+                        f"base commit {base_commit!r} does not exist in {repo.root}",
+                    )
+                worktree = repo.create_worktree(run_id, base_commit)
+            except (GitError, RefusedError) as exc:
+                return self._blocked(run_id, RefusalCode.INTERNAL_ERROR, f"git workspace failed: {exc}")
+            if repo.is_dirty():
+                # The user has uncommitted work. That is theirs: never stashed, reset or
+                # committed. It is recorded on acceptance, where the note survives; the
+                # isolated worktree already started from the base commit regardless.
+                dirty_target = True
+        execution_root = worktree or project_root
+
         self.store.set_task_state(run_id, [TaskState.DRAFT], TaskState.READY, idempotent=True)
 
         # --- dispatch, with the budget gate and the dispatch intent in one transaction
@@ -398,8 +450,8 @@ class Controller:
             attempt_id, pid=pid, started_at=started_at, identity=identity, session_id=attempt_id
         )
 
-        pre_fingerprint = candidate_fingerprint(project_root, spec.scope)
-        pre_manifest = manifest(project_root)
+        pre_fingerprint = candidate_fingerprint(execution_root, spec.scope)
+        pre_manifest = manifest(execution_root)
         invocation = InvocationRequest(
             invocation_id=invocation_id,
             attempt_id=attempt_id,
@@ -411,7 +463,7 @@ class Controller:
             acceptance=spec.acceptance,
             write_allow=list(spec.scope.write_allow),
             write_deny=list(spec.scope.write_deny),
-            workspace=str(project_root),
+            workspace=str(execution_root),
             deadline_seconds=request.deadline_seconds,
             spec_digest=spec.spec_digest(),
             data_dir=str(self.data_dir),
@@ -470,8 +522,10 @@ class Controller:
         )
 
         # --- freeze the candidate the controller actually observed -------------
-        post_fingerprint = candidate_fingerprint(project_root, spec.scope)
-        outside = paths_outside_scope(changed_paths(pre_manifest, manifest(project_root)), spec.scope)
+        post_fingerprint = candidate_fingerprint(execution_root, spec.scope)
+        outside = paths_outside_scope(
+            changed_paths(pre_manifest, manifest(execution_root)), spec.scope
+        )
         if outside:
             return self._blocked(
                 run_id,
@@ -481,12 +535,23 @@ class Controller:
                 + (f" (+{len(outside) - 5} more)" if len(outside) > 5 else ""),
             )
 
+        # Freeze an explicit Git identity for the candidate before any check runs, so the
+        # receipt names a commit rather than only a content fingerprint.
+        freeze: CandidateFreeze | None = None
+        if repo is not None and worktree is not None:
+            try:
+                freeze = repo.freeze_candidate(
+                    worktree, list(spec.scope.write_allow), f"hflow: candidate for {spec.task_id}"
+                )
+            except GitError as exc:
+                return self._blocked(run_id, RefusalCode.INTERNAL_ERROR, f"candidate freeze failed: {exc}")
+
         self.store.advance_to_checking(run_id=run_id, attempt_id=attempt_id, phase=CheckPhase.VERIFICATION)
         verification = verify_candidate(
             store=self.store,
             spec=spec,
             project=project,
-            project_root=project_root,
+            project_root=execution_root,
             project_checks_digest=project.checks_digest(),
             candidate_fingerprint=post_fingerprint,
             attempt_id=attempt_id,
@@ -506,7 +571,7 @@ class Controller:
             )
             try:
                 review = self._review(
-                    run_id, spec, project_root, post_fingerprint, project.checks_digest()
+                    run_id, spec, execution_root, post_fingerprint, project.checks_digest()
                 )
             except RefusedError as exc:
                 return self._blocked(run_id, exc.code, exc.message)
@@ -536,12 +601,17 @@ class Controller:
             run_id=run_id,
             attempt_id=attempt_id,
             spec=spec,
-            project_root=project_root,
+            project_root=execution_root,
             verification=verification,
             review=review,
             observed_turns=result.agent_turns,
             base_ref=result.candidate.base_ref if result.candidate else "",
             limitations=list(result.limitations),
+            freeze=freeze,
+            repo=repo,
+            target_repo_root=project_root,
+            user_tree_before=user_tree_before,
+            dirty_target=dirty_target,
         )
 
     # -- steps ---------------------------------------------------------------
@@ -644,6 +714,11 @@ class Controller:
         observed_turns: int | None,
         base_ref: str,
         limitations: list[str],
+        freeze: CandidateFreeze | None = None,
+        repo: GitRepo | None = None,
+        target_repo_root: Path | None = None,
+        user_tree_before: str = "",
+        dirty_target: bool = False,
     ) -> RunOutcome:
         """Admission gate. Every field of the receipt is re-derived from stored facts."""
         row = self.store.get_run(run_id)
@@ -687,9 +762,14 @@ class Controller:
             plan_digest=row["spec_digest"],
             harness_outcome=InvocationOutcome.COMPLETED,
             candidate=CandidateSnapshot(
-                base_commit=base_ref or f"base:{row['spec_digest'][:18]}",
-                tree_hash=fresh_fingerprint,
+                base_commit=(freeze.base_commit if freeze else base_ref)
+                or f"base:{row['spec_digest'][:18]}",
+                git_commit=freeze.candidate_commit if freeze else "",
+                git_tree=freeze.tree if freeze else "",
+                worktree=str(project_root) if freeze else "",
+                fingerprint=fresh_fingerprint,
             ),
+            candidate_paths=list(freeze.paths) if freeze else [],
             verification=verification,
             review=review,
             task_state=TaskState.ACCEPTED,
@@ -702,13 +782,42 @@ class Controller:
             ),
             limitations=[
                 *limitations,
-                "candidate snapshot is a workspace fingerprint, not a Git tree hash (M2 work)",
-                "review ran in the implementer's invocation; its isolation is not independently "
-                "enforced",
+                *(
+                    [
+                        "candidate is a real Git commit in a detached worktree; nothing was "
+                        "merged, pushed or published",
+                        "the target repository's own uncommitted changes were not stashed or "
+                        "modified (they are the user's)",
+                    ]
+                    if freeze
+                    else [
+                        "candidate snapshot is a workspace fingerprint, not a Git tree hash "
+                        "(this run did not use a Git worktree)",
+                    ]
+                ),
+                "review ran in the implementer's invocations' workspace; its isolation is not "
+                "independently enforced",
             ],
         )
 
         self.store.finalize_acceptance(run_id, receipt, checks_digest=row["checks_digest"])
+
+        # Post-acceptance facts go into the note *after* the terminal transition, because the
+        # transition itself clears block_reason. The target repository's user-visible state is
+        # checked here: a run must not have touched it.
+        if repo is not None:
+            if spec.workspace.mode == "worktree" and dirty_target:
+                self.store.record_note(
+                    run_id,
+                    "target repository had uncommitted changes; they were left untouched "
+                    "(not stashed, not committed) and the candidate came from an isolated worktree",
+                )
+            if user_tree_before and repo.user_change_fingerprint() != user_tree_before:
+                self.store.record_note(
+                    run_id,
+                    "WARNING: the target repository's own state changed during the run; the "
+                    "candidate is unaffected, but the user's tree needs a look",
+                )
         return self._outcome_for(run_id)
 
     # -- helpers -------------------------------------------------------------

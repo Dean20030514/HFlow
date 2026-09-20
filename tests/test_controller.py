@@ -104,7 +104,8 @@ def test_normal_completion_produces_controller_generated_receipt(
     assert receipt.verification.status == "passed"
     assert receipt.verification.evidence_ids
     assert receipt.review.status == "accepted"
-    assert receipt.candidate.tree_hash.startswith("sha256:")
+    assert receipt.candidate.fingerprint.startswith("sha256:")
+    assert receipt.candidate.git_commit == "", "no Git worktree was used for this run"
     assert receipt.task_revision == 1
     assert receipt.runtime_build == "test-build"
 

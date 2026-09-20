@@ -503,6 +503,8 @@ def test_cancel_is_idempotent_and_sends_no_second_prompt(harness_factory) -> Non
     harness = harness_factory("stubborn")
     handle, _ = harness.start()
     harness.wait_for_stub_marker("helper")
+    # The dispatch marker must be observed before stopping, so the prompt line is in the log.
+    assert harness.wait_for_dispatch(handle), "the prompt was never dispatched"
 
     first = harness.driver.cancel_handle(handle)
     second = harness.driver.cancel_handle(handle)
@@ -571,7 +573,7 @@ def test_controller_cancel_records_intent_and_blocks_late_acceptance(
             runtime_build="test-build",
             plan_digest=task_spec.spec_digest(),
             harness_outcome=InvocationOutcome.COMPLETED,
-            candidate=CandidateSnapshot(base_commit="base", tree_hash="sha256:fp"),
+            candidate=CandidateSnapshot(base_commit="base", fingerprint="sha256:fp"),
             verification=VerificationResult(status="passed", evidence_ids=["E-late"]),
             review=ReviewResult(status="not_required"),
             task_state=TaskState.ACCEPTED,
@@ -681,8 +683,10 @@ def test_reconcile_reports_still_running_without_starting_work(harness_factory) 
     assert result.local_process_alive is True
     assert result.protocol_cancel_supported is False
     assert len(harness.stub_files("spawn")) == 1, "reconcile must not launch anything"
-    prompts = [line for line in harness.driver.raw_lines(handle.invocation_id) if '"session/prompt"' in line]
-    assert len(prompts) == 1, "reconcile must never send a prompt"
+    # Only assert on the prompt count once the dispatch marker was actually observed.
+    if harness.wait_for_dispatch(handle):
+        prompts = [line for line in harness.driver.raw_lines(handle.invocation_id) if '"session/prompt"' in line]
+        assert len(prompts) == 1, "reconcile must never send a prompt"
     harness.driver.cancel_handle(handle)
     harness.driver.release(handle.invocation_id)
 

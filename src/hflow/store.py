@@ -754,6 +754,23 @@ class Store:
         )
         return (str(row["cancel_intent_at"]) if row["cancel_intent_at"] else None, receipt)
 
+    def record_note(self, run_id: str, note: str) -> None:
+        """Append a short operator-facing note to the run.
+
+        Used for facts that must be visible without a new schema: an untouched dirty target
+        repository, or a warning that the user's tree changed during a run.
+        """
+        with self.transaction() as conn:
+            row = conn.execute("SELECT block_reason FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                raise RunNotFound(run_id)
+            existing = row["block_reason"] or ""
+            combined = f"{existing} | {note}" if existing else note
+            conn.execute(
+                "UPDATE runs SET block_reason = ?, updated_at = ? WHERE run_id = ?",
+                (combined, utc_now(), run_id),
+            )
+
     def record_reconcile(self, attempt_id: str, payload: dict[str, Any]) -> None:
         """Store what an interruption check observed. Never a new dispatch."""
         with self.transaction() as conn:

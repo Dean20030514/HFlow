@@ -4,16 +4,18 @@ A small deterministic controller for harness-agnostic agentic development tasks.
 The controller owns admission, budget, evidence, and delivery accounting; a native
 Harness (DSH first) owns reasoning and tools.
 
-**Status: the offline vertical slice plus one thin production Driver.**
+**Status: offline vertical slice, one thin production Driver, and the M2 offline delivery slice.**
 
 ```text
 transport_selection      = acpx-dsh-acp        (decided in M0, with bounded live evidence)
 driver_implementation    = in_progress         (src/hflow/drivers/acpx_dsh.py)
 basic_live_roundtrip     = passed              (reported M0 evidence)
 live_cooperative_cancel  = not_tested          (unsupported on the one-shot exec path)
-owned_process_stop       = not_certified       (forced boundary teardown proven offline only)
+forced_local_stop_offline = passed             (stubborn stub + Job Object teardown)
+forced_local_stop_live   = not_tested          (one live trial sent; client launch failed, cause known and fixed)
+m2_offline_delivery      = passed              (Git worktree -> frozen candidate -> checks -> local receipt)
 unattended_execution     = disabled
-new_live_budget          = 0                   (the M0 allowance is spent; a new one needs your approval)
+new_live_budget          = 0                   (each live task needs its own explicit approval)
 ```
 
 The driver can launch, observe, force-stop and reconcile one invocation through a managed
@@ -106,14 +108,19 @@ subagents; real billing observation; metrics against a direct-DSH baseline.
 ## Driver contract tests
 
 ```sh
-python -m pytest -q tests/test_driver_acpx_dsh.py        # 23 tests, no model, no credential
+python -m pytest -q tests/test_driver_acpx_dsh.py        # 24 tests, no model, no credential
+python -m pytest -q tests/test_concurrency.py            # 8 deterministic thread/cancel-orderings tests
+python -m pytest -q tests/test_m2_slice.py               # 5 tests: Git worktree -> frozen candidate
 python tools/m0_probe/check_process_boundary.py          # Job Object teardown, standalone
+python tools/m0_probe/real_client_checks.py all          # real acpx: version + mock-agent round trip
 ```
 
 The driver tests run the real launch/observe/stop code against a test-only stand-in for the
 acpx CLI plus stub agents that are **separate processes** - including one that ignores
 cancellation and holds a helper child, so a decorative process boundary would fail the test
-rather than pass it.
+rather than pass it. `real_client_checks.py` is the one that exercises the *installed* acpx:
+a metadata probe and a full one-shot `exec` against the project's mock agent, both with zero
+model calls.
 
 ## M0 transport probe
 

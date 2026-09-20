@@ -225,16 +225,8 @@ class AcpxDshDriver:
         JavaScript file to the Python interpreter fails immediately, which is a defect this
         driver must not have.
         """
-        suffix = self.acpx_cli.suffix.lower()
-        if suffix in {".js", ".mjs", ".cjs"}:
-            interpreter = [self.node_executable]
-        elif suffix == ".py":
-            interpreter = [self.python_executable, "-u"]
-        else:
-            # A real executable (or a shim) is launched directly.
-            interpreter = []
         return [
-            *interpreter,
+            *self._client_prefix(),
             str(self.acpx_cli),
             "--cwd",
             str(workspace),
@@ -246,6 +238,71 @@ class AcpxDshDriver:
             "-f",
             "-",
         ]
+
+    # -- read-only launch check ---------------------------------------------
+
+    def readonly_client_check(
+        self, args: list[str] | None = None, *, timeout_seconds: int = 60
+    ) -> dict[str, Any]:
+        """Run the real client with a read-only metadata argument, through this launcher.
+
+        This exists to prove that *this* code can actually start the installed client - the
+        interpreter choice, the boundary, the stream drain - without sending a task. It is
+        the same code path a real invocation uses (same argv construction, same Job Object
+        launch, same reader), with a metadata argument instead of ``exec``.
+
+        No session is created, no prompt is sent, no model is reachable from here. Callers
+        must be explicit that they are running a metadata probe, never a task.
+        """
+        argv = [*self._client_prefix(), str(self.acpx_cli), *(args or ["--version"])]
+        work_dir = self.data_dir / "readonly-check"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        stdout_path = work_dir / "stdout.txt"
+        stderr_path = work_dir / "stderr.txt"
+        boundary = ProcessBoundary().open()
+        try:
+            with stdout_path.open("wb") as stdout_handle, stderr_path.open("wb") as stderr_handle:
+                child = popen_in_boundary(
+                    argv,
+                    cwd=str(work_dir),
+                    env=self._child_env(work_dir),
+                    boundary=boundary,
+                    stdout_handle=stdout_handle,
+                    stderr_handle=stderr_handle,
+                )
+                # A metadata probe takes no stdin: close it so the client cannot wait on us.
+                if child.stdin is not None:
+                    child.stdin.close()
+                try:
+                    returncode = child.wait(timeout=timeout_seconds)
+                    timed_out = False
+                except subprocess.TimeoutExpired:
+                    boundary.terminate()
+                    returncode = child.wait(timeout=10)
+                    timed_out = True
+            emptied = boundary.wait_empty(10.0)
+            gone = process_gone(child.pid, 3.0)
+        finally:
+            boundary.close()
+        return {
+            "argv": argv,
+            "returncode": returncode,
+            "timed_out": timed_out,
+            "stdout": stdout_path.read_text(encoding="utf-8", errors="replace")[:2000],
+            "stderr": stderr_path.read_text(encoding="utf-8", errors="replace")[:2000],
+            "boundary_kind": boundary.kind,
+            "boundary_empty": emptied,
+            "process_gone": gone,
+        }
+
+    def _client_prefix(self) -> list[str]:
+        """Interpreter prefix for the client entry point, chosen by its kind."""
+        suffix = self.acpx_cli.suffix.lower()
+        if suffix in {".js", ".mjs", ".cjs"}:
+            return [self.node_executable]
+        if suffix == ".py":
+            return [self.python_executable, "-u"]
+        return []
 
     def start_handle(self, request: InvocationRequest) -> DriverHandle:
         """Launch one invocation and return immediately with an observable handle."""

@@ -256,6 +256,22 @@ class BudgetRequest(BaseModel):
     max_repair_cycles: int = 1
 
 
+class WorkspaceSpec(BaseModel):
+    """Optional Git-backed isolation for a task (M2).
+
+    When present, the controller creates a detached worktree at ``base_commit`` and does all
+    work there, so the user's own checkout is never written to. When absent, the run happens
+    in ``project_root`` directly (the M1 behaviour).
+    """
+
+    model_config = Strict
+
+    mode: Literal["worktree", "in_place"] = "in_place"
+    base_commit: str = ""
+    #: Keep the worktree after the run instead of removing it (failures keep it regardless).
+    keep: bool = False
+
+
 class TaskSpec(BaseModel):
     model_config = Strict
 
@@ -271,6 +287,7 @@ class TaskSpec(BaseModel):
     review: ReviewRequirement = Field(default_factory=ReviewRequirement)
     delivery: DeliveryRequirement = Field(default_factory=DeliveryRequirement)
     budget: BudgetRequest = Field(default_factory=BudgetRequest)
+    workspace: WorkspaceSpec = Field(default_factory=WorkspaceSpec)
 
     @model_validator(mode="after")
     def _validate_shape(self) -> TaskSpec:
@@ -565,10 +582,22 @@ class LifecycleDriver(Protocol):
 
 
 class CandidateSnapshot(BaseModel):
+    """What the controller actually froze. Two identities, never conflated.
+
+    * ``git_commit`` / ``git_tree`` are real Git objects, present when the run used a Git
+      worktree (M2).
+    * ``fingerprint`` is a content hash over the declared write scope, always present; it is
+      what detects a workspace that changed after verification.
+    """
+
     model_config = Strict
 
-    base_commit: str
-    tree_hash: str
+    base_commit: str = ""
+    git_commit: str = ""
+    git_tree: str = ""
+    worktree: str = ""
+    #: Content fingerprint over the TaskSpec's write scope. Not a Git object id.
+    fingerprint: str = ""
 
 
 class VerificationResult(BaseModel):
@@ -577,6 +606,8 @@ class VerificationResult(BaseModel):
     status: Literal["passed", "failed", "not_run"]
     evidence_ids: list[str] = Field(default_factory=list)
     detail: str = ""
+    #: Where the approved checks ran (a frozen worktree when one was used).
+    workspace: str = ""
 
 
 class ReviewResult(BaseModel):
@@ -618,6 +649,8 @@ class ResultReceipt(BaseModel):
     delivery_state: DeliveryState
     usage: UsageFacts
     limitations: list[str] = Field(default_factory=list)
+    #: Set when the candidate was frozen in a Git worktree; the paths that are part of it.
+    candidate_paths: list[str] = Field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
