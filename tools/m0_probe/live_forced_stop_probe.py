@@ -223,11 +223,24 @@ def resolve_managed_credential(ref: str) -> tuple[str | None, str]:
     """Read one named credential in memory, exactly as the M0 probe did.
 
     Reused rather than reinvented: same reference, same source, same boundaries. The value
-    is never printed, logged, or written.
+    is never printed, logged, or written. ``tools/`` is not an importable package, so the
+    module is loaded by path instead of by name.
     """
-    from tools.m0_probe.run_probe import resolve_managed_credential as resolve  # type: ignore
+    import importlib.util
 
-    return resolve(ref)
+    module_path = Path(__file__).resolve().parent / "run_probe.py"
+    spec = importlib.util.spec_from_file_location("hflow_m0_run_probe", module_path)
+    if spec is None or spec.loader is None:
+        return None, "run_probe.py could not be loaded"
+    module = importlib.util.module_from_spec(spec)
+    # Register before executing: dataclasses resolves the defining module through
+    # sys.modules while the class body runs, so an unregistered module fails to load.
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException as exc:  # noqa: BLE001 - report, never crash the probe before dispatch
+        return None, f"run_probe.py failed to load: {type(exc).__name__}"
+    return module.resolve_managed_credential(ref)  # type: ignore[no-any-return]
 
 
 # --------------------------------------------------------------------------

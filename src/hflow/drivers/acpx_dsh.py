@@ -62,6 +62,7 @@ DRIVER_ID = "acpx-dsh-acp"
 DRIVER_VERSION = "0.1.0"
 
 ENV_ACPX_CLI = "HFLOW_ACPX_CLI"
+ENV_ACPX_NODE = "HFLOW_ACPX_NODE"
 #: Resolution order for the acpx entry point, most explicit first:
 #:   1. ``$HFLOW_ACPX_CLI`` (operator intent; wins over everything);
 #:   2. ``~/.hflow/`` sibling layout used by the repo-local development install;
@@ -114,6 +115,7 @@ class AcpxDshDriver:
         self.profile = profile
         self.dsh_home = Path(dsh_home) if dsh_home else None
         self.python_executable = python_executable or shutil.which("python") or "python"
+        self.node_executable = os.environ.get(ENV_ACPX_NODE) or shutil.which("node") or "node"
         self.extra_env = dict(extra_env or {})
         self.completion_timeout_seconds = completion_timeout_seconds
         #: Test seam: the agent launch argv that goes into the acpx config. ``None`` means
@@ -215,6 +217,36 @@ class AcpxDshDriver:
 
     # -- start / observe -----------------------------------------------------
 
+    def _client_argv(self, invocation_dir: Path, workspace: Path, deadline_seconds: int) -> list[str]:
+        """The client command line, with the right interpreter for the entry point.
+
+        The published acpx CLI is a Node program (``dist/cli.js``), so it must run under
+        Node; a Python entry point (the test stand-in) runs under Python. Feeding a
+        JavaScript file to the Python interpreter fails immediately, which is a defect this
+        driver must not have.
+        """
+        suffix = self.acpx_cli.suffix.lower()
+        if suffix in {".js", ".mjs", ".cjs"}:
+            interpreter = [self.node_executable]
+        elif suffix == ".py":
+            interpreter = [self.python_executable, "-u"]
+        else:
+            # A real executable (or a shim) is launched directly.
+            interpreter = []
+        return [
+            *interpreter,
+            str(self.acpx_cli),
+            "--cwd",
+            str(workspace),
+            "--format",
+            "json",
+            "--timeout",
+            str(deadline_seconds),
+            "exec",
+            "-f",
+            "-",
+        ]
+
     def start_handle(self, request: InvocationRequest) -> DriverHandle:
         """Launch one invocation and return immediately with an observable handle."""
         if request.invocation_id in self._handles:
@@ -234,20 +266,7 @@ class AcpxDshDriver:
         config_path = self._write_config(invocation_dir)
 
         boundary = ProcessBoundary().open()
-        argv = [
-            self.python_executable,
-            "-u",
-            str(self.acpx_cli),
-            "--cwd",
-            str(workspace),
-            "--format",
-            "json",
-            "--timeout",
-            str(request.deadline_seconds),
-            "exec",
-            "-f",
-            "-",
-        ]
+        argv = self._client_argv(invocation_dir, workspace, request.deadline_seconds)
         handle = DriverHandle(
             invocation_id=request.invocation_id,
             attempt_id=request.attempt_id,

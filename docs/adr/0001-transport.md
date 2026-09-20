@@ -13,17 +13,50 @@ preferred_transport          = acpx-dsh-acp
 transport_selection          = acpx-dsh-acp      # decided in M0
 driver_implementation        = in_progress       # thin Driver exists; not production-certified
 basic_live_roundtrip         = passed (reported evidence from M0)
-live_cooperative_cancel      = not_tested
-owned_process_stop           = not_certified     # forced boundary teardown is proven offline only
+protocol_cancel_for_selected_exec = unsupported  # one-shot exec has no queue owner to reach
+forced_local_stop_offline    = passed            # stubborn stub + Job Object teardown
+forced_local_stop_live       = not_tested        # see the trial record below
 unattended_execution         = disabled
 production_transport         = acpx-dsh-acp      # single implementation, no runtime fallback
 codex_invocations            = 0
 ```
 
 "Nothing blocks further development" is true. "Nothing blocks production release" is
-**not** true: cooperative cancellation has never been exercised against the real Harness,
-and the only stop mechanism proven so far is forced teardown of the managed process
-boundary - and that proof is offline (a stubborn stub, not DSH).
+**not** true: cooperative cancellation does not exist on this launch path, and the only stop
+mechanism proven so far is forced teardown of the managed process boundary - proven offline,
+not against DSH.
+
+### Live forced-stop trial (2026-09-20): INCONCLUSIVE
+
+One live top-level task was authorized by the user for baseline `8335cfc` and sent. It
+**did not reach the harness**, so the trial is inconclusive and `forced_local_stop_live`
+stays `not_tested`. The authorization is consumed; there was no retry, and the M0 ledger is
+unchanged.
+
+What the record shows:
+
+| Fact | Evidence |
+|---|---|
+| the client never started | the invocation's stdout is 0 bytes; stderr is a Python `SyntaxError` on acpx's `dist/cli.js` |
+| the harness never booted | the probe's isolated `DSH_HOME` has no `profiles/` directory at all |
+| no model work happened | no `session/prompt` was ever observed (`dispatched=false`); no helper READY |
+| the trial's own gates behaved | no `helper_ready.json`, no extra dispatch, no late `ACCEPTED`, no orphan processes |
+
+Root cause: the driver launched the Node CLI with the **Python** interpreter
+(``python -u .../dist/cli.js``). That is a defect in this repository's driver, not an
+upstream or environment problem, and it is a class of bug the offline tests could not catch
+because the stand-in client *is* a Python script. The fix selects the interpreter from the
+entry point (Node for `.js`/`.mjs`/`.cjs`, Python for `.py`, direct execution otherwise) and
+is covered by a regression test that asserts the selected interpreter per entry-point kind.
+
+The mechanism itself is still only offline-proven: an earlier self-check run of the same
+probe (stand-in client, no model) reached the full stop sequence - helper started by the
+agent, `IsProcessInJob` true for *this* invocation's job, 3 processes in the boundary,
+forced stop confirmed in 2.02s, heartbeat stopped, no late acceptance. A stand-in client
+replaces DSH, so that run is INCONCLUSIVE by construction rather than a live pass.
+
+A second live task would need a new explicit authorization. Per the trial specification, a
+concluded inconclusive result does not return budget.
 
 ## Context
 

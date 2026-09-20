@@ -155,6 +155,32 @@ def _collect_events(driver: AcpxDshDriver, handle, limit: float = 60.0):
     return events
 
 
+def test_client_argv_uses_the_right_interpreter_for_the_entry_point(tmp_path: Path) -> None:
+    """A Node CLI entry point must not be handed to the Python interpreter.
+
+    This is a regression test for a real failure: the live trial launched acpx's
+    ``dist/cli.js`` as ``python -u cli.js``, which cannot parse JavaScript, so the client
+    died before the harness ever saw the task.
+    """
+    node_entry = AcpxDshDriver(
+        data_dir=tmp_path, acpx_cli=Path("fake/node_modules/acpx/dist/cli.js")
+    )
+    argv = node_entry._client_argv(tmp_path, tmp_path, 60)
+    assert argv[0] == node_entry.node_executable
+    assert argv[1].endswith("cli.js")
+    assert "exec" in argv and argv[-2:] == ["-f", "-"]
+
+    python_entry = AcpxDshDriver(data_dir=tmp_path, acpx_cli=FAKE_CLIENT)
+    argv = python_entry._client_argv(tmp_path, tmp_path, 60)
+    assert argv[0] == python_entry.python_executable
+    assert argv[1] == "-u"
+    assert argv[2].endswith("fake_acpx_client.py")
+
+    shim_entry = AcpxDshDriver(data_dir=tmp_path, acpx_cli=Path("C:/tools/acpx.cmd"))
+    argv = shim_entry._client_argv(tmp_path, tmp_path, 60)
+    assert argv[0].endswith("acpx.cmd"), "a real executable is launched directly"
+
+
 # --------------------------------------------------------------------------
 # group 1: normal single execution
 # --------------------------------------------------------------------------
