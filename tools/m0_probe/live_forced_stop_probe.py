@@ -149,16 +149,37 @@ def record_attempt(entry: dict) -> None:
 
 
 def authorization_present(argv: list[str]) -> tuple[bool, str]:
-    """A real trial needs the explicit flag *and* a non-empty authorization note."""
+    """A real trial needs the explicit flag, a non-empty note, and an authorization id.
+
+    The id is what makes the allowance *per approval*: an earlier gate counted every attempt
+    ever recorded, so once one entry existed no later, separately approved trial could run.
+    Counting per id keeps the cap meaningful without deleting history.
+    """
     if "--authorized" not in argv:
         return False, "no --authorized flag"
-    note = ""
-    for index, item in enumerate(argv):
-        if item == "--authorization-note" and index + 1 < len(argv):
-            note = argv[index + 1]
-    if not note.strip():
+    note = _argv_value(argv, "--authorization-note")
+    if not note or not note.strip():
         return False, "--authorized without an --authorization-note"
+    auth_id = _argv_value(argv, "--authorization-id")
+    if not auth_id or not auth_id.strip():
+        return False, "--authorized without an --authorization-id (the allowance is per approval)"
     return True, note.strip()
+
+
+def _argv_value(argv: list[str], flag: str) -> str:
+    for index, item in enumerate(argv):
+        if item == flag and index + 1 < len(argv):
+            return argv[index + 1]
+    return ""
+
+
+def attempts_for_authorization(authorization_id: str) -> list[dict]:
+    """Recorded attempts belonging to one approval, so caps never leak across approvals."""
+    return [
+        entry
+        for entry in read_attempts().get("attempts", [])
+        if entry.get("authorization_id") == authorization_id
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -577,6 +598,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--authorized", action="store_true", help="user authorization for one live task")
     parser.add_argument("--authorization-note", default="", help="the authorization text/quote")
     parser.add_argument(
+        "--authorization-id",
+        default="",
+        help="stable id of this approval; the single-trial allowance is counted per id",
+    )
+    parser.add_argument(
         "--offline-self-check",
         action="store_true",
         help="exercise the probe's own evidence chain via the test-only stand-in client",
@@ -617,22 +643,28 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     allowed, note = authorization_present(argv)
-    state = read_attempts()
-    used = len(state.get("attempts", []))
     if not allowed:
         print(f"refusing to run a live trial: {note}", file=sys.stderr)
-        print(f"attempts already recorded: {used}", file=sys.stderr)
+        print(f"attempts already recorded: {len(read_attempts().get('attempts', []))}", file=sys.stderr)
         return 4
-    if used >= 1:
-        print(f"refusing: this probe already consumed its single authorized attempt ({used})", file=sys.stderr)
+    authorization_id = _argv_value(argv, "--authorization-id").strip()
+    consumed = attempts_for_authorization(authorization_id)
+    if consumed:
+        print(
+            f"refusing: authorization {authorization_id!r} already consumed its single trial "
+            f"({len(consumed)} attempt(s) recorded)",
+            file=sys.stderr,
+        )
         return 4
+    print(f"authorization {authorization_id!r}: 1 trial available (per-approval allowance)")
 
     value, status = resolve_managed_credential(CREDENTIAL_REF)
     if not value:
         print(f"credentials unavailable: {status}", file=sys.stderr)
         print("recording the attempt as consumed; no retry will be made", file=sys.stderr)
         record_attempt({"started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                        "authorization": note, "result": "INCONCLUSIVE", "reason": status})
+                        "authorization_id": authorization_id, "authorization": note,
+                        "result": "INCONCLUSIVE", "reason": status})
         return 4
 
     evidence = TrialEvidence(
@@ -644,6 +676,7 @@ def main(argv: list[str] | None = None) -> int:
     record_attempt(
         {
             "started_at": evidence.started_at,
+            "authorization_id": authorization_id,
             "authorization": note,
             "baseline_sha": evidence.baseline_sha,
             "result": "DISPATCHED_PENDING",
@@ -663,6 +696,7 @@ def main(argv: list[str] | None = None) -> int:
     record_attempt(
         {
             "started_at": evidence.started_at,
+            "authorization_id": authorization_id,
             "authorization": note,
             "baseline_sha": evidence.baseline_sha,
             "result": evidence.result,

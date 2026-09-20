@@ -16,6 +16,7 @@ Two invariants are worth reading the code for:
 from __future__ import annotations
 
 import json
+import os
 from datetime import timedelta
 from pathlib import Path
 from typing import Protocol
@@ -487,6 +488,21 @@ class Controller:
         execution_root = worktree or project_root
 
         self.store.set_task_state(run_id, [TaskState.DRAFT], TaskState.READY, idempotent=True)
+
+        # A run that must change files needs the driver to allow it; a read-only probe does
+        # not. This is decided from the run's own mode, recorded as a fact, and never silently
+        # defaulted: an unexpected "deny" would look like an uncooperative agent.
+        if spec.workspace.mode == "worktree" and hasattr(self.driver, "non_interactive_permissions"):
+            from .drivers.acpx_dsh import ENV_ALLOW_WRITES
+
+            allow_writes = os.environ.get(ENV_ALLOW_WRITES, "").strip().lower() in {"1", "true", "yes"}
+            self.driver.non_interactive_permissions = "allow" if allow_writes else "deny"
+            self.store.record_note(
+                run_id,
+                f"driver permission mode: {self.driver.non_interactive_permissions} "
+                f"(writes {'allowed' if allow_writes else 'denied'}; set {ENV_ALLOW_WRITES}=1 to "
+                "allow them inside the disposable worktree)",
+            )
 
         # --- dispatch, with the authorized-submission claim and the budget gate
         if self.authorization is not None:

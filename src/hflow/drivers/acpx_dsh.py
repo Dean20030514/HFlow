@@ -63,6 +63,9 @@ DRIVER_VERSION = "0.1.0"
 
 ENV_ACPX_CLI = "HFLOW_ACPX_CLI"
 ENV_ACPX_NODE = "HFLOW_ACPX_NODE"
+#: Opt-in to file writes for a real invocation. Off by default; the controller sets it only
+#: for runs whose workspace is a disposable worktree created from a fixed base commit.
+ENV_ALLOW_WRITES = "HFLOW_ALLOW_WRITES"
 #: Resolution order for the acpx entry point, most explicit first:
 #:   1. ``$HFLOW_ACPX_CLI`` (operator intent; wins over everything);
 #:   2. ``~/.hflow/`` sibling layout used by the repo-local development install;
@@ -116,6 +119,9 @@ class AcpxDshDriver:
         self.dsh_home = Path(dsh_home) if dsh_home else None
         self.python_executable = python_executable or shutil.which("python") or "python"
         self.node_executable = os.environ.get(ENV_ACPX_NODE) or shutil.which("node") or "node"
+        #: "deny" for read-only work (the default), "allow" only when the caller has opted in
+        #: and the workspace is a disposable worktree.
+        self.non_interactive_permissions = "deny"
         self.extra_env = dict(extra_env or {})
         self.completion_timeout_seconds = completion_timeout_seconds
         #: Test seam: the agent launch argv that goes into the acpx config. ``None`` means
@@ -394,16 +400,28 @@ class AcpxDshDriver:
         return handle
 
     def _write_config(self, invocation_dir: Path) -> Path:
-        """Per-invocation acpx config: structured argv, explicit agent name, no defaults."""
+        """Per-invocation acpx config: structured argv, explicit agent name, explicit policy.
+
+        Permission policy is a **parameter**, not a constant. A read-only probe can safely deny
+        everything, but a task that must change files cannot: a silent ``deny`` would look like
+        "the agent refused to work" while the real cause was our configuration. There is
+        deliberately no approve-all value here: writes are allowed only in the mode whose whole
+        point is a scoped, isolated worktree.
+        """
         config = {
             "defaultAgent": DRIVER_ID,
             "authPolicy": "skip",
             "permissionPolicy": {"defaultAction": "deny"},
-            "nonInteractivePermissions": "deny",
+            "nonInteractivePermissions": self.non_interactive_permissions,
             "ttl": 30,
             "format": "json",
             "agents": {DRIVER_ID: {"argv": self._agent_argv()}},
         }
+        if self.non_interactive_permissions == "allow":
+            # Worktree mode: the invocation is confined to a disposable worktree created from
+            # the base commit, and the controller freezes whatever it produced afterwards.
+            config["approveAll"] = False
+            config["permissionPolicy"] = {"defaultAction": "allow"}
         path = invocation_dir / "acpx-config.json"
         path.write_text(json.dumps(config, indent=2), encoding="utf-8")
         return path
