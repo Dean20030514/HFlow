@@ -116,12 +116,14 @@ subagents; real billing observation; metrics against a direct-DSH baseline.
 ## Driver contract tests
 
 ```sh
+python -m pytest -q tests/test_authorization.py          # 10 tests: the authorized real-run gate
 python -m pytest -q tests/test_driver_acpx_dsh.py        # 24 tests, no model, no credential
 python -m pytest -q tests/test_concurrency.py            # 8 deterministic thread/cancel-orderings tests
 python -m pytest -q tests/test_m2_slice.py               # 5 tests: Git worktree -> frozen candidate
 python -m pytest -q tests/test_cli_m2_cleanup.py         # 15 tests: the same flow through the CLI + guarded clean
 python tools/m0_probe/check_process_boundary.py          # Job Object teardown, standalone
 python tools/m0_probe/real_client_checks.py all          # real acpx: version + mock-agent round trip
+python tools/m2_live/prepare_m2_live.py                  # build the real M2 task package (dispatches nothing)
 ```
 
 The driver tests run the real launch/observe/stop code against a test-only stand-in for the

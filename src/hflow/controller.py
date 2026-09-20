@@ -18,8 +18,10 @@ from __future__ import annotations
 import json
 from datetime import timedelta
 from pathlib import Path
+from typing import Protocol
 
 from .admission import validate_task_spec
+from .authorization import AuthorizationRecord
 from .contracts import (
     AttemptState,
     CancellationReceipt,
@@ -166,6 +168,17 @@ def workspace_drift(store: Store, run_id: str, project_root: Path) -> bool | Non
     return candidate_fingerprint(root, spec.scope) == receipt.candidate.fingerprint
 
 
+class PreflightCheck(Protocol):
+    """A zero-model check that must hold before any real Harness call.
+
+    Ordering is the point: this runs *before* an authorization is consumed, before any
+    credential is read and before a workspace is created. A stale or broken launch binding is
+    a reason to stop, not a reason to spend a submission finding out.
+    """
+
+    def __call__(self) -> tuple[bool, str]: ...
+
+
 class Controller:
     def __init__(
         self,
@@ -178,6 +191,8 @@ class Controller:
         reservation_ttl_seconds: int = RESERVATION_TTL_SECONDS,
         review_isolation: IsolationLevel = IsolationLevel.PROMPT_ONLY,
         data_dir: Path | None = None,
+        authorization: AuthorizationRecord | None = None,
+        preflight: PreflightCheck | None = None,
     ) -> None:
         self.store = store
         self.driver = driver
@@ -185,6 +200,12 @@ class Controller:
         self.runners = runners or CheckRunners.offline_default()
         self.controller_id = controller_id
         self.reservation_ttl_seconds = reservation_ttl_seconds
+        #: Set only for a real Harness run, and only from a user-provenance artifact. Its
+        #: allowance is consumed transactionally immediately before each dispatch.
+        self.authorization = authorization
+        #: Obligatory when an authorization is present: proves the launch binding still works
+        #: without spending a submission.
+        self.preflight = preflight
         #: Scratch root a driver may use for invocation-scoped state. Deliberately outside
         #: the project checkout: scaffolding in the workspace would show up as a candidate
         #: change and dirty the tree under test.
@@ -210,6 +231,24 @@ class Controller:
 
         self.project_root = project_root
         spec_digest = spec.spec_digest()
+
+        # --- real-run gate: the artifact is recorded first, then the zero-model preflight.
+        # Nothing expensive happens for an unauthorized real run - no credential read, no
+        # workspace, no budget reservation, no process. The artifact is registered *before*
+        # the preflight so that even a refused attempt leaves an auditable record of what was
+        # authorized and that nothing was spent. Its allowance is claimed later, at the moment
+        # a dispatch is actually certain, so a duplicate submission (which correctly dispatches
+        # nothing) cannot consume it.
+        if self.authorization is not None:
+            self.store.register_authorization(self.authorization.as_store_record())
+            report = self._preflight_report()
+            if not report[0]:
+                raise RefusedError(
+                    RefusalCode.NOT_IMPLEMENTED,
+                    f"zero-model preflight failed for this execution binding: {report[1]}. "
+                    "No authorization allowance was consumed and nothing was dispatched.",
+                )
+
         existing = self.store.find_run_by_spec_digest(project.project_id, spec_digest)
 
         if existing is not None:
@@ -385,6 +424,33 @@ class Controller:
 
     # -- the state machine ---------------------------------------------------
 
+    def _preflight_report(self) -> tuple[bool, str]:
+        if self.preflight is None:
+            return False, "no zero-model preflight is wired for this execution binding"
+        try:
+            return self.preflight()
+        except Exception as exc:  # noqa: BLE001 - a broken preflight is a refusal, not a crash
+            return False, f"preflight raised {exc!r}"
+
+    def _claim_submission(self, run_id: str, purpose: str) -> int:
+        """Consume one authorized top-level submission, or refuse to dispatch.
+
+        Called immediately before a real dispatch (implementer, or the separate reviewer
+        invocation). The store's UPDATE is the gate, so a restart or a resubmission cannot
+        restore allowance.
+        """
+        assert self.authorization is not None
+        try:
+            used = self.store.claim_authorized_submission(self.authorization.authorization_id)
+        except StoreError as exc:
+            raise RefusedError(RefusalCode.BUDGET_EXHAUSTED, str(exc)) from exc
+        self.store.record_note(
+            run_id,
+            f"authorization {self.authorization.authorization_id}: consumed top-level submission "
+            f"{used}/{self.authorization.max_top_level_submissions} for {purpose}",
+        )
+        return used
+
     def _drive(self, run_id: str, request: RunRequest) -> RunOutcome:
         spec = request.task
         project = request.project
@@ -421,6 +487,10 @@ class Controller:
         execution_root = worktree or project_root
 
         self.store.set_task_state(run_id, [TaskState.DRAFT], TaskState.READY, idempotent=True)
+
+        # --- dispatch, with the authorized-submission claim and the budget gate
+        if self.authorization is not None:
+            self._claim_submission(run_id, "implementer invocation")
 
         # --- dispatch, with the budget gate and the dispatch intent in one transaction
         expires_at = (
@@ -646,6 +716,9 @@ class Controller:
         """
         attempt = self.store.open_attempt(run_id)
         attempt_id = attempt["attempt_id"] if attempt else ""
+        if self.authorization is not None:
+            # The reviewer is its own invocation and its own top-level submission.
+            self._claim_submission(run_id, "reviewer invocation")
         try:
             self.store.reserve_review_turn(run_id, self.controller_id)
         except StoreError as exc:

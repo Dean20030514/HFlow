@@ -188,7 +188,46 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _zero_model_preflight(driver: object, args: argparse.Namespace):
+    """A cheap, model-free check that the launch binding works, run before any dispatch.
+
+    For the selected transport this launches the installed client with a metadata argument -
+    no session, no prompt, no credential - which is exactly the failure mode that cost a
+    submission in an earlier round. It runs once per real invocation, and its result is
+    returned rather than logged, so a failure refuses the run instead of warning about it.
+    """
+
+    def check() -> tuple[bool, str]:
+        readonly = getattr(driver, "readonly_client_check", None)
+        if not callable(readonly):
+            return False, f"driver {getattr(driver, 'driver_id', '?')!r} has no zero-model probe"
+        result = readonly(["--version"], timeout_seconds=90)
+        reported = str(result.get("stdout", "")).strip()
+        if result.get("returncode") != 0 or not reported:
+            return False, (
+                f"the client did not report a version (rc={result.get('returncode')}, "
+                f"stderr={str(result.get('stderr', ''))[:160]!r})"
+            )
+        if not result.get("process_gone") or not result.get("boundary_empty"):
+            return False, "the client process or its boundary did not settle after the probe"
+        return True, f"client reports {reported}"
+
+    return check
+
+
 def cmd_run(args: argparse.Namespace) -> int:
+    # The authorization question is settled before the task is even read: refusing here means a
+    # missing approval cannot be confused with a malformed task, and no file is touched first.
+    if args.driver != "fake" and not args.authorization_file:
+        message = (
+            f"driver {args.driver!r} is a real Harness driver and needs an explicit, bound user "
+            "authorization file (--authorization-file). There is no flag that substitutes for "
+            "one and no fallback to the fake driver."
+        )
+        _write_out({"refused": True, "reason": "live_authorization_missing", "detail": message}, args.json)
+        print(f"refused: {message}", file=sys.stderr)
+        return EXIT_REFUSED
+
     task_path = Path(args.task)
     spec = TaskSpec.model_validate(_load_json(task_path))
     project_root = Path(args.project_root).resolve()
@@ -220,18 +259,33 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
         return EXIT_REFUSED
 
-    # Real drivers need an explicit, current authorization. The check happens before any
-    # credential is read, before any workspace is created and before any budget is reserved,
-    # and it refuses rather than silently falling back to the fake driver.
-    if args.driver != "fake" and not args.live_authorized:
-        message = (
-            f"driver {args.driver!r} is a real Harness driver and no live authorization is "
-            "recorded for this invocation. Pass --live-authorized only with an explicit, "
-            "current user authorization; there is no fallback to the fake driver."
+    # A real Harness run needs an explicit, bound, single-use authorization artifact. This is
+    # checked before any credential is read, any workspace is created and any budget or
+    # submission allowance is consumed, and it refuses rather than falling back to the fake
+    # driver. A bare flag is deliberately not accepted: the same process that would run the
+    # task must not be able to authorize itself with a word.
+    authorization = None
+    authorization_binding = None
+    if args.driver != "fake":
+        from .authorization import (
+            current_binding,
+            load_authorization,
+            verify_authorization,
         )
-        _write_out({"refused": True, "reason": "live_authorization_missing", "detail": message}, args.json)
-        print(f"refused: {message}", file=sys.stderr)
-        return EXIT_REFUSED
+
+        authorization = load_authorization(Path(args.authorization_file))
+        authorization_binding = current_binding(
+            mode=args.authorization_mode,
+            driver=args.driver,
+            project=project,
+            request=RunRequest(
+                task=spec, project=project, project_root=project_root, workspace_root=project_root
+            ),
+            spec_path=task_path,
+        )
+        # Refuses with a specific mismatch list when the artifact covers a different task,
+        # project, base commit, driver or execution mode.
+        verify_authorization(authorization, expected=authorization_binding)
 
     store = _open_store(args)
     try:
@@ -270,6 +324,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             ),
             controller_id=args.controller_id,
             data_dir=data_dir,
+            authorization=authorization,
+            preflight=_zero_model_preflight(driver, args) if authorization is not None else None,
         )
         request = RunRequest(
             task=spec,
@@ -526,9 +582,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="JSON object of {relative path: file text} the fake driver should write",
     )
     run.add_argument(
-        "--live-authorized",
-        action="store_true",
-        help="assert an explicit, current user authorization for a real Harness driver",
+        "--authorization-file",
+        default=None,
+        help=(
+            "JSON authorization artifact (user text + binding) required by any real Harness "
+            "driver; there is no flag substitute"
+        ),
+    )
+    run.add_argument(
+        "--authorization-mode",
+        choices=["stop-trial", "m2-live-change"],
+        default="m2-live-change",
+        help="which authorized activity this run belongs to; modes are not interchangeable",
     )
     run.add_argument("--json", action="store_true")
     run.add_argument("--force", action="store_true", help="continue past admission issues (unsafe)")

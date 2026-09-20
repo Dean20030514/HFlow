@@ -44,7 +44,7 @@ from .contracts import (
     digest_of,
     json_schema,
 )
-from .ids import utc_now
+from .ids import new_evidence_id, utc_now
 
 SCHEMA_VERSION = 1
 
@@ -143,6 +143,29 @@ CREATE TABLE IF NOT EXISTS evidence (
 );
 
 CREATE INDEX IF NOT EXISTS ix_evidence_run ON evidence (run_id, kind, check_id);
+
+CREATE TABLE IF NOT EXISTS run_notes (
+    note_id     TEXT PRIMARY KEY,
+    run_id      TEXT NOT NULL REFERENCES runs(run_id),
+    note        TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_run_notes_run ON run_notes (run_id, created_at);
+
+CREATE TABLE IF NOT EXISTS authorizations (
+    authorization_id   TEXT PRIMARY KEY,
+    mode               TEXT NOT NULL,
+    binding_digest     TEXT NOT NULL,
+    user_text          TEXT NOT NULL,
+    provided_by        TEXT NOT NULL,
+    authorized_at      TEXT NOT NULL,
+    max_top_level_submissions INTEGER NOT NULL,
+    used_top_level_submissions INTEGER NOT NULL DEFAULT 0,
+    created_at         TEXT NOT NULL,
+    CHECK (used_top_level_submissions >= 0),
+    CHECK (used_top_level_submissions <= max_top_level_submissions)
+);
 """
 
 
@@ -760,21 +783,25 @@ class Store:
         return (str(row["cancel_intent_at"]) if row["cancel_intent_at"] else None, receipt)
 
     def record_note(self, run_id: str, note: str) -> None:
-        """Append a short operator-facing note to the run.
+        """Append an operator-facing note to the run's own audit trail.
 
-        Used for facts that must be visible without a new schema: an untouched dirty target
-        repository, or a warning that the user's tree changed during a run.
+        Notes live in their own table rather than in ``block_reason``, because a terminal
+        transition clears that column and an audit fact (an authorization being consumed, a
+        dirty target being left alone) must survive the run reaching a final state.
         """
         with self.transaction() as conn:
-            row = conn.execute("SELECT block_reason FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            row = conn.execute("SELECT run_id FROM runs WHERE run_id = ?", (run_id,)).fetchone()
             if row is None:
                 raise RunNotFound(run_id)
-            existing = row["block_reason"] or ""
-            combined = f"{existing} | {note}" if existing else note
             conn.execute(
-                "UPDATE runs SET block_reason = ?, updated_at = ? WHERE run_id = ?",
-                (combined, utc_now(), run_id),
+                "INSERT INTO run_notes (note_id, run_id, note, created_at) VALUES (?, ?, ?, ?)",
+                (new_evidence_id(), run_id, note[:1000], utc_now()),
             )
+
+    def notes_for(self, run_id: str) -> list[str]:
+        return [row["note"] for row in self._fetchall(
+            "SELECT note FROM run_notes WHERE run_id = ? ORDER BY created_at, rowid", (run_id,)
+        )]
 
     def record_worktree(self, run_id: str, path: Path) -> None:
         """Record the workspace this run was given. Written before any work happens in it."""
@@ -849,6 +876,87 @@ class Store:
             "cleanup_done_at": row["cleanup_done_at"],
             "cleanup_error": row["cleanup_error"],
         }
+
+    # -- authorizations -------------------------------------------------------
+
+    def register_authorization(self, record: dict[str, Any]) -> sqlite3.Row:
+        """Record a one-shot user authorization, or return the existing identical record."""
+        with self.transaction() as conn:
+            existing = conn.execute(
+                "SELECT * FROM authorizations WHERE authorization_id = ?",
+                (record["authorization_id"],),
+            ).fetchone()
+            if existing is not None:
+                if existing["binding_digest"] != record["binding_digest"]:
+                    raise StoreError(
+                        f"authorization {record['authorization_id']} already exists bound to a "
+                        "different target; refusing to reuse it"
+                    )
+                return existing
+            conn.execute(
+                """
+                INSERT INTO authorizations (
+                    authorization_id, mode, binding_digest, user_text, provided_by,
+                    authorized_at, max_top_level_submissions, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record["authorization_id"],
+                    record["mode"],
+                    record["binding_digest"],
+                    record["user_text"],
+                    record["provided_by"],
+                    record["authorized_at"],
+                    int(record["max_top_level_submissions"]),
+                    utc_now(),
+                ),
+            )
+            return conn.execute(
+                "SELECT * FROM authorizations WHERE authorization_id = ?",
+                (record["authorization_id"],),
+            ).fetchone()
+
+    def claim_authorized_submission(self, authorization_id: str) -> int:
+        """Consume one top-level submission from an authorization, atomically.
+
+        The UPDATE is the gate and the CHECK constraint is the backstop, mirroring budget
+        reservation: a restart, a new run id or a resubmitted identical spec cannot restore
+        allowance. A refusal means "do not dispatch", not "dispatch and hope".
+        """
+        with self.transaction() as conn:
+            cur = conn.execute(
+                """
+                UPDATE authorizations
+                   SET used_top_level_submissions = used_top_level_submissions + 1
+                 WHERE authorization_id = ?
+                   AND used_top_level_submissions + 1 <= max_top_level_submissions
+                """,
+                (authorization_id,),
+            )
+            if cur.rowcount != 1:
+                row = conn.execute(
+                    "SELECT used_top_level_submissions, max_top_level_submissions FROM authorizations "
+                    "WHERE authorization_id = ?",
+                    (authorization_id,),
+                ).fetchone()
+                if row is None:
+                    raise StoreError(f"unknown authorization {authorization_id}")
+                raise StoreError(
+                    f"authorization {authorization_id} is exhausted: "
+                    f"{row['used_top_level_submissions']}/{row['max_top_level_submissions']} "
+                    "top-level submissions used"
+                )
+            row = conn.execute(
+                "SELECT used_top_level_submissions FROM authorizations WHERE authorization_id = ?",
+                (authorization_id,),
+            ).fetchone()
+            return int(row["used_top_level_submissions"])
+
+    def authorization_state(self, authorization_id: str) -> dict[str, Any] | None:
+        row = self._fetchone(
+            "SELECT * FROM authorizations WHERE authorization_id = ?", (authorization_id,)
+        )
+        return dict(row) if row is not None else None
 
     def record_reconcile(self, attempt_id: str, payload: dict[str, Any]) -> None:
         """Store what an interruption check observed. Never a new dispatch."""

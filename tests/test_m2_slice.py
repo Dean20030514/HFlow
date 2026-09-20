@@ -399,8 +399,9 @@ def test_dirty_target_repository_is_left_alone(sample_repo: Path, tmp_path: Path
         assert after == before, "the user's uncommitted changes must be exactly as they were"
         assert _git(sample_repo, "stash", "list").strip() == stashes_before
         assert "user work in progress" in dirty_file.read_text(encoding="utf-8")
-        # The controller recorded that the target was dirty instead of hiding it.
-        assert "uncommitted changes" in (store.get_run(outcome.run_id)["block_reason"] or "")
+        # The controller recorded that the target was dirty instead of hiding it. Notes live
+        # in the run's own audit table so they survive a terminal transition.
+        assert any("uncommitted changes" in note for note in store.notes_for(outcome.run_id))
         # Exactly one commit exists: the controller did not commit the user's work.
         assert _git(sample_repo, "rev-list", "--count", "HEAD").strip() == "1"
     finally:

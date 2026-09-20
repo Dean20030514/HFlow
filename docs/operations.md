@@ -134,6 +134,68 @@ record is reported `MISSING`, never as a success.
 - Worktrees are not garbage-collected automatically, and `clean` deliberately never runs
   `git gc`, `git clean`, `worktree prune`, or `rmtree`.
 
+## Running a real Harness task (authorized only)
+
+A real driver needs an **authorization artifact**: a JSON file holding the user's own approval
+text, bound to one execution, with a hard cap on how many top-level submissions it covers.
+
+```json
+{
+  "schema_version": 1,
+  "authorization_id": "AUTH-m2-live-1",
+  "provided_by": "user",
+  "user_text": "<the user's approval, verbatim>",
+  "authorized_at": "<when the user said it>",
+  "max_top_level_submissions": 2,
+  "binding": {
+    "mode": "m2-live-change",
+    "driver": "acpx-dsh",
+    "project_id": "m2-live-reportkit",
+    "repo_path": "<abs path>",
+    "base_commit": "<40-hex>",
+    "spec_digest": "sha256:<the task as admitted>",
+    "spec_path": "<abs path to task.json>"
+  }
+}
+```
+
+```sh
+hflow run --task task.json --project .hflow/project.json --project-root <repo> \
+          --driver acpx-dsh --authorization-file auth.json \
+          --authorization-mode m2-live-change --data-dir <data> --json
+```
+
+Why an artifact instead of a flag: a flag would be written by the same process that runs the
+task, so an agent could authorize itself. The artifact is refused unless
+
+- `provided_by` is exactly `user` (a model-written note is rejected by the schema);
+- the binding matches the run about to happen - mode, driver, project, repository path, base
+  commit, task digest and task path. Any mismatch lists the offending fields;
+- allowance remains. Consumption is a single SQL UPDATE guarded by a CHECK constraint, so a
+  restart, a new run id or a resubmitted identical spec cannot restore it.
+
+`mode` keeps activities apart: a `stop-trial` approval does not cover a `m2-live-change` task.
+
+Before any dispatch, a **zero-model preflight** runs: the driver launches the installed client
+with a metadata argument (`--version`), so a broken launch binding is found without spending a
+submission. Preflight failure refuses the run and consumes nothing. A duplicate submission
+(which correctly dispatches nothing) also consumes nothing.
+
+`implementer` and `reviewer` are separate invocations and separate top-level submissions; both
+are claimed from the same artifact.
+
+## Preparing a real M2 task
+
+```sh
+python tools/m2_live/prepare_m2_live.py --out .probe/m2-live
+```
+
+Builds a synthetic Git project with two genuine input-handling defects, the project contract,
+the TaskSpec, and the authorization template (`user_text` deliberately empty). It asserts the
+base commit really fails both defect tests and that nothing fails for import or collection
+reasons - so a later live run is never the first time the package is exercised. It contains no
+fixed patch and no fake-write plan.
+
 ## Reading the counters honestly
 
 `status` prints three things that are easy to confuse:
