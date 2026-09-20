@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -149,12 +150,22 @@ class RunNotFound(StoreError):
 
 
 class Store:
-    """Thin, explicit SQLite wrapper. No ORM, no implicit commits."""
+    """Thin, explicit SQLite wrapper. No ORM, no implicit commits.
+
+    Connections are shared across threads (the controller can be cancelling while a
+    background thread drives a run), so every statement and transaction is serialized by a
+    re-entrant lock. That is stronger than relying on SQLite's own serialized threading mode:
+    it also makes multi-statement transactions atomic with respect to sibling threads
+    instead of interleaving with them.
+    """
 
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.path), isolation_level=None)
+        self._lock = threading.RLock()
+        self.conn = sqlite3.connect(
+            str(self.path), isolation_level=None, check_same_thread=False
+        )
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         if str(self.path) != ":memory:":
@@ -194,27 +205,38 @@ class Store:
         ``autocommit=True`` is used only for schema bootstrap, because
         ``executescript`` would itself commit a surrounding explicit transaction.
         """
-        if autocommit:
-            before = self.conn.in_transaction
+        with self._lock:
+            if autocommit:
+                before = self.conn.in_transaction
+                try:
+                    yield self.conn
+                except BaseException:
+                    if self.conn.in_transaction:
+                        self.conn.execute("ROLLBACK")
+                    raise
+                if self.conn.in_transaction and not before:
+                    self.conn.execute("COMMIT")
+                return
+            self.conn.execute("BEGIN IMMEDIATE")
             try:
                 yield self.conn
             except BaseException:
-                if self.conn.in_transaction:
-                    self.conn.execute("ROLLBACK")
+                self.conn.execute("ROLLBACK")
                 raise
-            if self.conn.in_transaction and not before:
-                self.conn.execute("COMMIT")
-            return
-        self.conn.execute("BEGIN IMMEDIATE")
-        try:
-            yield self.conn
-        except BaseException:
-            self.conn.execute("ROLLBACK")
-            raise
-        self.conn.execute("COMMIT")
+            self.conn.execute("COMMIT")
 
     def close(self) -> None:
-        self.conn.close()
+        with self._lock:
+            self.conn.close()
+
+    def _fetchone(self, sql: str, params: Sequence[Any] = ()) -> sqlite3.Row | None:
+        """Locked single-row read. Every query goes through a locked helper."""
+        with self._lock:
+            return self.conn.execute(sql, params).fetchone()
+
+    def _fetchall(self, sql: str, params: Sequence[Any] = ()) -> list[sqlite3.Row]:
+        with self._lock:
+            return list(self.conn.execute(sql, params))
 
     def __enter__(self) -> Store:
         return self
@@ -225,10 +247,10 @@ class Store:
     # -- runs ----------------------------------------------------------------
 
     def find_run_by_spec_digest(self, project_id: str, spec_digest: str) -> sqlite3.Row | None:
-        return self.conn.execute(
+        return self._fetchone(
             "SELECT * FROM runs WHERE project_id = ? AND spec_digest = ?",
             (project_id, spec_digest),
-        ).fetchone()
+        )
 
     def create_run(
         self,
@@ -280,7 +302,7 @@ class Store:
             return conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
 
     def get_run(self, run_id: str) -> sqlite3.Row:
-        row = self.conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        row = self._fetchone("SELECT * FROM runs WHERE run_id = ?", (run_id,))
         if row is None:
             raise RunNotFound(run_id)
         return row
@@ -516,15 +538,15 @@ class Store:
 
     def open_attempt(self, run_id: str) -> sqlite3.Row | None:
         """The newest attempt, whatever its state (used for recovery decisions)."""
-        return self.conn.execute(
+        return self._fetchone(
             "SELECT * FROM attempts WHERE run_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
             (run_id,),
-        ).fetchone()
+        )
 
     def attempt_by_invocation(self, invocation_id: str) -> sqlite3.Row | None:
-        return self.conn.execute(
+        return self._fetchone(
             "SELECT * FROM attempts WHERE invocation_id = ?", (invocation_id,)
-        ).fetchone()
+        )
 
     def dispatch_attempt(
         self,
@@ -907,32 +929,24 @@ class Store:
 
     def evidence_for(self, run_id: str, kind: str | None = None) -> list[sqlite3.Row]:
         if kind is None:
-            return list(
-                self.conn.execute(
-                    "SELECT * FROM evidence WHERE run_id = ? ORDER BY created_at, rowid", (run_id,)
-                )
+            return self._fetchall(
+                "SELECT * FROM evidence WHERE run_id = ? ORDER BY created_at, rowid", (run_id,)
             )
-        return list(
-            self.conn.execute(
-                "SELECT * FROM evidence WHERE run_id = ? AND kind = ? ORDER BY created_at, rowid",
-                (run_id, kind),
-            )
+        return self._fetchall(
+            "SELECT * FROM evidence WHERE run_id = ? AND kind = ? ORDER BY created_at, rowid",
+            (run_id, kind),
         )
 
     # -- read model ----------------------------------------------------------
 
     def list_runs(self, limit: int = 20) -> list[sqlite3.Row]:
-        return list(
-            self.conn.execute(
-                "SELECT * FROM runs ORDER BY created_at DESC, rowid DESC LIMIT ?", (limit,)
-            )
+        return self._fetchall(
+            "SELECT * FROM runs ORDER BY created_at DESC, rowid DESC LIMIT ?", (limit,)
         )
 
     def attempts_for(self, run_id: str) -> list[sqlite3.Row]:
-        return list(
-            self.conn.execute(
-                "SELECT * FROM attempts WHERE run_id = ? ORDER BY created_at, rowid", (run_id,)
-            )
+        return self._fetchall(
+            "SELECT * FROM attempts WHERE run_id = ? ORDER BY created_at, rowid", (run_id,)
         )
 
     def invocation_counts(self, run_id: str) -> tuple[int, int]:
@@ -942,7 +956,7 @@ class Store:
         reserved turn, so collapsing both into one "invocations" number would either
         understate what was dispatched or overstate what the implementer did.
         """
-        row = self.conn.execute(
+        row = self._fetchone(
             """
             SELECT
                 COALESCE(SUM(CASE WHEN invocation_id IS NOT NULL THEN 1 ELSE 0 END), 0) AS implementer,
@@ -951,5 +965,6 @@ class Store:
              WHERE run_id = ?
             """,
             (run_id,),
-        ).fetchone()
+        )
+        assert row is not None
         return int(row["implementer"]), int(row["reviewer"])

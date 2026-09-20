@@ -200,6 +200,35 @@ class ProcessBoundary:
         )
         return int(info.ActiveProcesses) if ok else None
 
+    def contains(self, pid: int) -> bool | None:
+        """Is this exact process inside *this* boundary?
+
+        ``IsProcessInJob`` with a concrete job handle answers that question. Passing NULL
+        would only answer "is it in *some* job", which is not the same claim, so the handle
+        is always supplied here. Returns ``None`` on platforms without job objects or when
+        the query cannot be answered.
+        """
+        if self.handle is None or self._api is None:
+            return None
+        api = self._api
+        api.OpenProcess.restype = wintypes.HANDLE
+        process = api.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not process:
+            return None
+        try:
+            result = wintypes.BOOL()
+            api.IsProcessInJob.restype = wintypes.BOOL
+            api.IsProcessInJob.argtypes = [
+                wintypes.HANDLE,
+                wintypes.HANDLE,
+                ctypes.POINTER(wintypes.BOOL),
+            ]
+            if not api.IsProcessInJob(process, self.handle, ctypes.byref(result)):
+                return None
+            return bool(result.value)
+        finally:
+            api.CloseHandle(process)
+
     def terminate(self, exit_code: int = 1) -> bool:
         """Ask the kernel to kill every process in the boundary."""
         if self.handle is None or self._api is None:
@@ -322,6 +351,48 @@ def popen_in_boundary(
         child.kill()
         raise
     return child
+
+
+def parent_pid(pid: int) -> int | None:
+    """Parent process id, or ``None`` when it cannot be read.
+
+    Used only to attribute a helper process to the managed boundary by walking up from the
+    process the harness actually started. Process-scope evidence, not a security claim.
+    """
+    if not IS_WINDOWS:
+        return None
+    api = _kernel32()
+    TH32CS_SNAPPROCESS = 0x00000002
+
+    class _ProcessEntry32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.CHAR * 260),
+        ]
+
+    snapshot = api.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snapshot == wintypes.HANDLE(-1).value:
+        return None
+    entry = _ProcessEntry32()
+    entry.dwSize = ctypes.sizeof(_ProcessEntry32)
+    try:
+        if not api.Process32First(snapshot, ctypes.byref(entry)):
+            return None
+        while True:
+            if entry.th32ProcessID == pid:
+                return int(entry.th32ParentProcessID)
+            if not api.Process32Next(snapshot, ctypes.byref(entry)):
+                return None
+    finally:
+        api.CloseHandle(snapshot)
 
 
 def process_gone(pid: int, wait_seconds: float = 0.0) -> bool:
