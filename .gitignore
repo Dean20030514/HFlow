@@ -5,6 +5,11 @@
 *.sqlite-shm
 artifacts/
 
+# --- M0 probe scratch: local acpx dependency tree, isolated homes, wire logs ---
+# Reproducible via tools/m0_probe/run_probe.py; never committed (it is a dependency
+# directory plus probe-private home/session/log data, not source).
+.probe/
+
 # --- test / tool temp ---
 .pytest_cache/
 .tmp/

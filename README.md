@@ -4,9 +4,11 @@ A small deterministic controller for harness-agnostic agentic development tasks.
 The controller owns admission, budget, evidence, and delivery accounting; a native
 Harness (DSH first) owns reasoning and tools.
 
-**Status: M1 offline vertical slice.** The only implemented driver is a fake one. No
-real Harness has been connected, no model has been called, and no compatibility claim
-is made. See `docs/adr/0001-transport.md`.
+**Status: M1 offline vertical slice + M0 transport probe complete.** The only implemented
+driver is still a fake one. M0 selected `acpx -> official DSH ACP` as the first production
+transport, with a bounded live probe as evidence (`docs/adr/0001-transport.md`,
+`docs/m0-results.md`). No production Driver exists yet, so `drivers/selected.py` still
+refuses to run.
 
 ## What works today
 
@@ -84,7 +86,24 @@ from it (`hflow schema`). There is no second hand-written schema to drift.
 
 ## Not implemented (do not assume otherwise)
 
-Production DSH/acpx driver (M0 experiment not run), Git worktree isolation and snapshot,
-strong read-only sandbox, cross-process cancellation with child-process-tree proof,
-repair cycle, integration/publish delivery, reuse-research automation, teams and native
-subagents, real billing observation, metrics against a direct-DSH baseline.
+Production DSH/acpx driver — M0 selected the transport and proved the round trip, but the
+thin Driver is the next task; Git worktree isolation and snapshot; strong read-only
+sandbox; cross-process cancellation with child-process-tree proof (cooperative cancel is
+`not_tested`); repair cycle; integration/publish delivery; reuse-research automation;
+teams and native subagents; real billing observation; metrics against a direct-DSH
+baseline.
+
+## M0 transport probe
+
+```sh
+cd .probe/acpx && npm install --no-fund --no-audit acpx@0.17.1   # project-local, once
+python tools/m0_probe/run_probe.py --phase a --phase b           # zero real model calls
+python tools/m0_probe/run_probe.py --phase c --live \
+    --live-max-submissions 2 --live-credential-ref DEEPSEEK_API_KEY   # explicit opt-in
+python tools/m0_probe/write_results_doc.py                       # regenerate docs/m0-results.md
+```
+
+The probe never touches `~/.dsh`, `~/.acpx`, PATH, or any global install: each child gets a
+probe-private `USERPROFILE`/`HOME`/`DSH_HOME` under the gitignored `.probe/` directory. The
+live phase is bounded by a persisted submission counter, and `--live-credential-ref` is the
+only path that reads a credential (one named reference, in memory, never written or logged).

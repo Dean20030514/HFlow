@@ -1,0 +1,448 @@
+{
+  "started_at": "2026-09-20T07:22:10Z",
+  "repo": "C:\\Users\\16097\\Desktop\\HFlow",
+  "phases": [
+    "a",
+    "b"
+  ],
+  "live_enabled": false,
+  "a_local_prechecks": {
+    "phase": "a",
+    "model_calls": 0,
+    "acpx": {
+      "cli": "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\acpx\\node_modules\\acpx\\dist\\cli.js",
+      "version": "0.17.1",
+      "lockfile": "True",
+      "installed_package_json": "0.17.1"
+    },
+    "acpx_help_excerpt": "Usage: acpx [options] [command] [prompt...]\n\nHeadless CLI client for the Agent Client Protocol\n\nArguments:\n  prompt                                  Prompt text\n\nOptions:",
+    "acpx_config_paths": "{\n  \"defaultAgent\": \"codex\",\n  \"defaultPermissions\": \"approve-reads\",\n  \"nonInteractivePermissions\": \"deny\",\n  \"authPolicy\": \"skip\",\n  \"ttl\": 300,\n  \"timeout\": null,\n  \"queueMaxDepth\": 16,\n  \"format\": \"text\",\n  \"agents\": {},\n  \"authMethods\": [],\n  \"disableExec\": false,\n  \"paths\": {\n    \"global\": \"C:\\\\Users\\\\16097\\\\Desktop\\\\HFlow\\\\.probe\\\\home\\\\a\\\\.acpx\\\\config.json\",\n    \"project\": \"C:\\\\Users\\\\16097\\\\Desktop\\\\HFlow\\\\.probe\\\\a\\\\.acpxrc.json\"\n  },\n  \"loaded\": {\n    \"global\": false,\n    \"project\": false\n  }\n}\n",
+    "dsh": {
+      "path": "C:\\Users\\16097\\AppData\\Roaming\\npm\\dsh.CMD",
+      "version": "0.1.5-rc.1"
+    },
+    "dsh_launcher_help": "Usage: dsh [options] [command] [args...]\n\ndsh: boot a DeepSeek Harness profile \u2014 an ordered stack of plugin-bundle patch\nlayers under your own overrides.\n\nArguments:\n  args                           arguments for the booted profile's app (see:\n                                 dsh --profile <name> --help)\n\nOptions:\n  -V, --version                  output the version number\n  --profile <name>               the profile under $DSH_HOME/profiles to boot\n  --from-default-profile <name>  initialize a new custom profile from a shipped\n                                 profile template\n  --patch <path>                 extra patch-list overlay applied after the\n                                 profile layer (repeatable)\n  --dump-config                  print the composed profile tree and exit\n  --dump-default-config          print the profile tree without its user layer\n                                 or --patch overlays and exit\n\nCommands:\n  web [options] [args...]        boot the web profile (alias of --profile web);\n                                 the web app's own flags follow\n  plugin [options] [args...]     manage a profile's plugins by forwarding the\n                                 remaining arguments to pnpm in the profile\n                                 directory\n\nExamples:\n  dsh --profile web                          boot the web profile (same as: dsh web)\n  dsh --profile rescue --from-default-profile web\n                                             create rescue from the shipped web template, then boot it\n  dsh --profile headless \"run the tests\"     answer one task, print the result, and exit\n  dsh --profile tui --patch ./extra.yml      boot a custom profile with one extra overlay\n  dsh --profile tui --resume <session>       arguments after the launcher flags reach the app\n  dsh --profile web --help                   the web app's own flags and help\n  dsh plugin --profile tui add <package>     install a plugin into the tui profile\n\n",
+    "dsh_home_override": {
+      "dsh_home": "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\home\\dsh-template",
+      "returncode": 0,
+      "timed_out": false,
+      "profiles_created": [
+        "acp"
+      ],
+      "stdout_head": "# == @deepseek-ai/dsh-base\n- id: timer\n  name: '@deepseek-ai/cordis-plugin-timer'\n- id: hmr\n  name: '@deepseek-ai/cordis-plugin-hmr'\n  disabled: true\n  config:\n    root:\n      - .\n- id: llm\n  name: '@deepseek-ai/dsh-llm'\n- id: deepseek-llm-api-extensions\n  name: '@deepseek-ai/dsh-deepseek-llm-api-extensions'\n- id: session\n  name: '@deepseek-ai/dsh-session'\n- id: session-log-deepseek\n  name: '@deepseek-ai/dsh-session-log-deepseek'\n- id: typert\n  name: '@deepseek-ai/dsh-typert-registry'\n- id: typert-loader\n  name: '@deepseek-ai/dsh-typert-loader'\n- id: typert-gateway\n  name: '@deepseek-ai/dsh-api-gateway'\n- id: session-title\n  name: '@deepseek-ai/dsh-session-title'",
+      "stderr_tail": "",
+      "stdout_path": "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\a\\_stdout.txt",
+      "stderr_path": "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\a\\_stderr.txt"
+    }
+  },
+  "b_mock": {
+    "phase": "b",
+    "real_model_calls": 0,
+    "scenarios": {
+      "normal": {
+        "argv": [
+          "C:\\Program Files\\nodejs\\node.EXE",
+          "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\acpx\\node_modules\\acpx\\dist\\cli.js",
+          "--cwd",
+          "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\b\\normal\\ws",
+          "--format",
+          "json",
+          "exec",
+          "probe prompt"
+        ],
+        "config": "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\b\\normal\\home\\.acpx\\config.json",
+        "returncode": 0,
+        "timed_out": false,
+        "seconds": 0.28,
+        "stdout": "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\"clientCapabilities\":{\"fs\":{\"readTextFile\":true,\"writeTextFile\":true},\"terminal\":true},\"clientInfo\":{\"name\":\"acpx\",\"version\":\"0.17.1\"}}}\n{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":false,\"promptCapabilities\":{\"image\":false,\"audio\":false,\"embeddedContext\":false},\"mcpCapabilities\":{\"http\":false,\"sse\":false,\"acp\":false},\"sessionCapabilities\":{},\"auth\":{}},\"agentInfo\":{\"name\":\"hflow-mock-acp\",\"version\":\"0.1.0\"}}}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/new\",\"params\":{\"cwd\":\"C:\\\\Users\\\\16097\\\\Desktop\\\\HFlow\\\\.probe\\\\b\\\\normal\\\\ws\",\"mcpServers\":[]}}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"mock-session-1\",\"modes\":null,\"configOptions\":null}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/prompt\",\"params\":{\"sessionId\":\"mock-session-1\",\"prompt\":[{\"type\":\"text\",\"text\":\"probe prompt\"}]}}\n{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"mock-session-1\",\"update\":{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"mock thought\"}}}}\n{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"mock-session-1\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"mock answer to: probe prompt\"}}}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"stopReason\":\"end_turn\"}}\n",
+        "stderr_tail": "",
+        "wire_log": "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\b\\normal\\wire.jsonl",
+        "wire": {
+          "present": true,
+          "incoming_methods": [
+            "initialize",
+            "session/new",
+            "session/prompt"
+          ],
+          "outgoing": [
+            "result",
+            "result",
+            "session/update",
+            "session/update",
+            "result"
+          ],
+          "notes": [
+            {
+              "prompts_seen": 1,
+              "exiting": true
+            }
+          ]
+        }
+      },
+      "echo-nonce": {
+        "argv": [
+          "C:\\Program Files\\nodejs\\node.EXE",
+          "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\acpx\\node_modules\\acpx\\dist\\cli.js",
+          "--cwd",
+          "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\b\\echo-nonce\\ws",
+          "--format",
+          "json",
+          "exec",
+          "please reply with NONCE=abc123"
+        ],
+        "config": "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\b\\echo-nonce\\home\\.acpx\\config.json",
+        "returncode": 0,
+        "timed_out": false,
+        "seconds": 0.28,
+        "stdout": "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\"clientCapabilities\":{\"fs\":{\"readTextFile\":true,\"writeTextFile\":true},\"terminal\":true},\"clientInfo\":{\"name\":\"acpx\",\"version\":\"0.17.1\"}}}\n{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":false,\"promptCapabilities\":{\"image\":false,\"audio\":false,\"embeddedContext\":false},\"mcpCapabilities\":{\"http\":false,\"sse\":false,\"acp\":false},\"sessionCapabilities\":{},\"auth\":{}},\"agentInfo\":{\"name\":\"hflow-mock-acp\",\"version\":\"0.1.0\"}}}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/new\",\"params\":{\"cwd\":\"C:\\\\Users\\\\16097\\\\Desktop\\\\HFlow\\\\.probe\\\\b\\\\echo-nonce\\\\ws\",\"mcpServers\":[]}}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"mock-session-1\",\"modes\":null,\"configOptions\":null}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/prompt\",\"params\":{\"sessionId\":\"mock-session-1\",\"prompt\":[{\"type\":\"text\",\"text\":\"please reply with NONCE=abc123\"}]}}\n{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"mock-session-1\",\"update\":{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"mock thought\"}}}}\n{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"mock-session-1\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"MOCK_NONCE=abc123\"}}}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"stopReason\":\"end_turn\"}}\n",
+        "stderr_tail": "",
+        "wire_log": "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\b\\echo-nonce\\wire.jsonl",
+        "wire": {
+          "present": true,
+          "incoming_methods": [
+            "initialize",
+            "session/new",
+            "session/prompt"
+          ],
+          "outgoing": [
+            "result",
+            "result",
+            "session/update",
+            "session/update",
+            "result"
+          ],
+          "notes": [
+            {
+              "prompts_seen": 1,
+              "exiting": true
+            }
+          ]
+        }
+      },
+      "unknown-method": {
+        "argv": [
+          "C:\\Program Files\\nodejs\\node.EXE",
+          "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\acpx\\node_modules\\acpx\\dist\\cli.js",
+          "--cwd",
+          "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\b\\unknown-method\\ws",
+          "--format",
+          "json",
+          "exec",
+          "probe prompt"
+        ],
+        "config": "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\b\\unknown-method\\home\\.acpx\\config.json",
+        "returncode": 1,
+        "timed_out": false,
+        "seconds": 0.26,
+        "stdout": "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\"clientCapabilities\":{\"fs\":{\"readTextFile\":true,\"writeTextFile\":true},\"terminal\":true},\"clientInfo\":{\"name\":\"acpx\",\"version\":\"0.17.1\"}}}\n{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":false,\"promptCapabilities\":{\"image\":false,\"audio\":false,\"embeddedContext\":false},\"mcpCapabilities\":{\"http\":false,\"sse\":false,\"acp\":false},\"sessionCapabilities\":{},\"auth\":{}},\"agentInfo\":{\"name\":\"hflow-mock-acp\",\"version\":\"0.1.0\"}}}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/new\",\"params\":{\"cwd\":\"C:\\\\Users\\\\16097\\\\Desktop\\\\HFlow\\\\.probe\\\\b\\\\unknown-method\\\\ws\",\"mcpServers\":[]}}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"Method not found: session/new (probe scenario)\"}}\n",
+        "stderr_tail": "",
+        "wire_log": "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\b\\unknown-method\\wire.jsonl",
+        "wire": {
+          "present": true,
+          "incoming_methods": [
+            "initialize",
+            "session/new"
+          ],
+          "outgoing": [
+            "result",
+            "error"
+          ],
+          "notes": [
+            {
+              "prompts_seen": 0,
+              "exiting": true
+            }
+          ]
+        }
+      },
+      "garbage-line": {
+        "argv": [
+          "C:\\Program Files\\nodejs\\node.EXE",
+          "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\acpx\\node_modules\\acpx\\dist\\cli.js",
+          "--cwd",
+          "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\b\\garbage-line\\ws",
+          "--format",
+          "json",
+          "exec",
+          "probe prompt"
+        ],
+        "config": "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\b\\garbage-line\\home\\.acpx\\config.json",
+        "returncode": 0,
+        "timed_out": false,
+        "seconds": 0.27,
+        "stdout": "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\"clientCapabilities\":{\"fs\":{\"readTextFile\":true,\"writeTextFile\":true},\"terminal\":true},\"clientInfo\":{\"name\":\"acpx\",\"version\":\"0.17.1\"}}}\n{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":false,\"promptCapabilities\":{\"image\":false,\"audio\":false,\"embeddedContext\":false},\"mcpCapabilities\":{\"http\":false,\"sse\":false,\"acp\":false},\"sessionCapabilities\":{},\"auth\":{}},\"agentInfo\":{\"name\":\"hflow-mock-acp\",\"version\":\"0.1.0\"}}}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/new\",\"params\":{\"cwd\":\"C:\\\\Users\\\\16097\\\\Desktop\\\\HFlow\\\\.probe\\\\b\\\\garbage-line\\\\ws\",\"mcpServers\":[]}}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"mock-session-1\",\"modes\":null,\"configOptions\":null}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/prompt\",\"params\":{\"sessionId\":\"mock-session-1\",\"prompt\":[{\"type\":\"text\",\"text\":\"probe prompt\"}]}}\n{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"mock-session-1\",\"update\":{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"mock thought\"}}}}\n{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"mock-session-1\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"mock answer to: probe prompt\"}}}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"stopReason\":\"end_turn\"}}\n",
+        "stderr_tail": "    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)\nFailed to parse JSON message: this-is-not-json SyntaxError: Unexpected token 'h', \"this-is-not-json\" is not valid JSON\n    at JSON.parse (<anonymous>)\n    at parseAcpJsonMessageLine (file:///C:/Users/16097/Desktop/HFlow/.probe/acpx/node_modules/acpx/dist/queue-owner-runtime-Dgv3e2Tp.js:1483:23)\n    at enqueueNdJsonLine (file:///C:/Users/16097/Desktop/HFlow/.probe/acpx/node_modules/acpx/dist/queue-owner-runtime-Dgv3e2Tp.js:1490:19)\n    at enqueueNdJsonLines (file:///C:/Users/16097/Desktop/HFlow/.probe/acpx/node_modules/acpx/dist/queue-owner-runtime-Dgv3e2Tp.js:1497:28)\n    at Object.start (file:///C:/Users/16097/Desktop/HFlow/.probe/acpx/node_modules/acpx/dist/queue-owner-runtime-Dgv3e2Tp.js:1515:6)\n    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)",
+        "wire_log": "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\b\\garbage-line\\wire.jsonl",
+        "wire": {
+          "present": true,
+          "incoming_methods": [
+            "initialize",
+            "session/new",
+            "session/prompt"
+          ],
+          "outgoing": [
+            "result",
+            "result",
+            "session/update",
+            "session/update",
+            "result"
+          ],
+          "notes": [
+            {
+              "injecting_garbage": true
+            },
+            {
+              "injecting_garbage": true
+            },
+            {
+              "injecting_garbage": true
+            },
+            {
+              "prompts_seen": 1,
+              "exiting": true
+            }
+          ]
+        }
+      },
+      "bad-init": {
+        "argv": [
+          "C:\\Program Files\\nodejs\\node.EXE",
+          "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\acpx\\node_modules\\acpx\\dist\\cli.js",
+          "--cwd",
+          "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\b\\bad-init\\ws",
+          "--format",
+          "json",
+          "exec",
+          "probe prompt"
+        ],
+        "config": "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\b\\bad-init\\home\\.acpx\\config.json",
+        "returncode": 0,
+        "timed_out": false,
+        "seconds": 0.29,
+        "stdout": "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\"clientCapabilities\":{\"fs\":{\"readTextFile\":true,\"writeTextFile\":true},\"terminal\":true},\"clientInfo\":{\"name\":\"acpx\",\"version\":\"0.17.1\"}}}\n{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"unexpected\":true}}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/new\",\"params\":{\"cwd\":\"C:\\\\Users\\\\16097\\\\Desktop\\\\HFlow\\\\.probe\\\\b\\\\bad-init\\\\ws\",\"mcpServers\":[]}}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"mock-session-1\",\"modes\":null,\"configOptions\":null}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/prompt\",\"params\":{\"sessionId\":\"mock-session-1\",\"prompt\":[{\"type\":\"text\",\"text\":\"probe prompt\"}]}}\n{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"mock-session-1\",\"update\":{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"mock thought\"}}}}\n{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"mock-session-1\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"mock answer to: probe prompt\"}}}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"stopReason\":\"end_turn\"}}\n",
+        "stderr_tail": "",
+        "wire_log": "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\b\\bad-init\\wire.jsonl",
+        "wire": {
+          "present": true,
+          "incoming_methods": [
+            "initialize",
+            "session/new",
+            "session/prompt"
+          ],
+          "outgoing": [
+            "result",
+            "result",
+            "session/update",
+            "session/update",
+            "result"
+          ],
+          "notes": [
+            {
+              "prompts_seen": 1,
+              "exiting": true
+            }
+          ]
+        }
+      },
+      "exit-after-init": {
+        "argv": [
+          "C:\\Program Files\\nodejs\\node.EXE",
+          "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\acpx\\node_modules\\acpx\\dist\\cli.js",
+          "--cwd",
+          "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\b\\exit-after-init\\ws",
+          "--format",
+          "json",
+          "exec",
+          "probe prompt"
+        ],
+        "config": "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\b\\exit-after-init\\home\\.acpx\\config.json",
+        "returncode": 1,
+        "timed_out": false,
+        "seconds": 0.26,
+        "stdout": "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\"clientCapabilities\":{\"fs\":{\"readTextFile\":true,\"writeTextFile\":true},\"terminal\":true},\"clientInfo\":{\"name\":\"acpx\",\"version\":\"0.17.1\"}}}\n{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":false,\"promptCapabilities\":{\"image\":false,\"audio\":false,\"embeddedContext\":false},\"mcpCapabilities\":{\"http\":false,\"sse\":false,\"acp\":false},\"sessionCapabilities\":{},\"auth\":{}},\"agentInfo\":{\"name\":\"hflow-mock-acp\",\"version\":\"0.1.0\"}}}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/new\",\"params\":{\"cwd\":\"C:\\\\Users\\\\16097\\\\Desktop\\\\HFlow\\\\.probe\\\\b\\\\exit-after-init\\\\ws\",\"mcpServers\":[]}}\n{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"ACP agent disconnected during request (connection_close, exit=null, signal=null)\",\"data\":{\"acpxCode\":\"RUNTIME\",\"detailCode\":\"AGENT_DISCONNECTED\",\"origin\":\"acp\",\"sessionId\":\"unknown\"}}}\n",
+        "stderr_tail": "",
+        "wire_log": "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\b\\exit-after-init\\wire.jsonl",
+        "wire": {
+          "present": true,
+          "incoming_methods": [
+            "initialize"
+          ],
+          "outgoing": [
+            "result"
+          ],
+          "notes": [
+            {
+              "exiting_after_init": true
+            },
+            {
+              "prompts_seen": 0,
+              "exiting": true
+            }
+          ]
+        }
+      },
+      "slow-prompt": {
+        "argv": [
+          "C:\\Program Files\\nodejs\\node.EXE",
+          "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\acpx\\node_modules\\acpx\\dist\\cli.js",
+          "--cwd",
+          "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\b\\slow-prompt\\ws",
+          "--format",
+          "json",
+          "--timeout",
+          "5",
+          "exec",
+          "probe prompt"
+        ],
+        "config": "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\b\\slow-prompt\\home\\.acpx\\config.json",
+        "returncode": 3,
+        "timed_out": false,
+        "seconds": 5.38,
+        "stdout": "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\"clientCapabilities\":{\"fs\":{\"readTextFile\":true,\"writeTextFile\":true},\"terminal\":true},\"clientInfo\":{\"name\":\"acpx\",\"version\":\"0.17.1\"}}}\n{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":false,\"promptCapabilities\":{\"image\":false,\"audio\":false,\"embeddedContext\":false},\"mcpCapabilities\":{\"http\":false,\"sse\":false,\"acp\":false},\"sessionCapabilities\":{},\"auth\":{}},\"agentInfo\":{\"name\":\"hflow-mock-acp\",\"version\":\"0.1.0\"}}}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/new\",\"params\":{\"cwd\":\"C:\\\\Users\\\\16097\\\\Desktop\\\\HFlow\\\\.probe\\\\b\\\\slow-prompt\\\\ws\",\"mcpServers\":[]}}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"mock-session-1\",\"modes\":null,\"configOptions\":null}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/prompt\",\"params\":{\"sessionId\":\"mock-session-1\",\"prompt\":[{\"type\":\"text\",\"text\":\"probe prompt\"}]}}\n{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32070,\"message\":\"Timed out after 5000ms\",\"data\":{\"acpxCode\":\"TIMEOUT\",\"origin\":\"cli\",\"sessionId\":\"unknown\"}}}\n",
+        "stderr_tail": "",
+        "wire_log": "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\b\\slow-prompt\\wire.jsonl",
+        "wire": {
+          "present": true,
+          "incoming_methods": [
+            "initialize",
+            "session/new",
+            "session/prompt"
+          ],
+          "outgoing": [
+            "result",
+            "result"
+          ],
+          "notes": []
+        }
+      },
+      "cancel-prompt": {
+        "argv": [
+          "C:\\Program Files\\nodejs\\node.EXE",
+          "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\acpx\\node_modules\\acpx\\dist\\cli.js",
+          "--cwd",
+          "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\b\\cancel-prompt\\ws",
+          "--format",
+          "json",
+          "exec",
+          "probe prompt"
+        ],
+        "config": "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\b\\cancel-prompt\\home\\.acpx\\config.json",
+        "still_running_before_signal": true,
+        "interrupt_sent": true,
+        "interrupt_kind": "CTRL_BREAK",
+        "client_exited_without_force_kill": true,
+        "returncode": 3221225786,
+        "stdout": "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\"clientCapabilities\":{\"fs\":{\"readTextFile\":true,\"writeTextFile\":true},\"terminal\":true},\"clientInfo\":{\"name\":\"acpx\",\"version\":\"0.17.1\"}}}\n{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":false,\"promptCapabilities\":{\"image\":false,\"audio\":false,\"embeddedContext\":false},\"mcpCapabilities\":{\"http\":false,\"sse\":false,\"acp\":false},\"sessionCapabilities\":{},\"auth\":{}},\"agentInfo\":{\"name\":\"hflow-mock-acp\",\"version\":\"0.1.0\"}}}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/new\",\"params\":{\"cwd\":\"C:\\\\Users\\\\16097\\\\Desktop\\\\HFlow\\\\.probe\\\\b\\\\cancel-prompt\\\\ws\",\"mcpServers\":[]}}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"mock-session-1\",\"modes\":null,\"configOptions\":null}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/prompt\",\"params\":{\"sessionId\":\"mock-session-1\",\"prompt\":[{\"type\":\"text\",\"text\":\"probe prompt\"}]}}\n",
+        "stderr_tail": "",
+        "wire_log": "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\b\\cancel-prompt\\wire.jsonl",
+        "wire": {
+          "present": true,
+          "incoming_methods": [
+            "initialize",
+            "session/new",
+            "session/prompt"
+          ],
+          "outgoing": [
+            "result",
+            "result"
+          ],
+          "notes": []
+        }
+      }
+    }
+  },
+  "capability_table": [
+    {
+      "capability": "launcher boot of acp profile in probe-private home",
+      "documented": "`dsh --profile acp` starts the shipped stdio server",
+      "local_observation": "profiles created: ['acp'], dump-config exit=0",
+      "mock": "not applicable",
+      "live": "see live rows below",
+      "conclusion": "the launcher initializes the shipped template into a probe-private DSH_HOME; no prompt sent, so no inference",
+      "evidence": [
+        "C:\\Users\\16097\\Desktop\\HFlow\\.probe\\a\\_stdout.txt"
+      ]
+    },
+    {
+      "capability": "acpx custom agent via structured argv on Windows",
+      "documented": "custom agent registry; raw command strings rejected on win32",
+      "local_observation": "`--agent \"<command string>\"` rejected on win32 with an explicit argv-array error; `agents.<name>.argv` config path also probed by the acpx CLI",
+      "mock": "argv agent launched and handshaked",
+      "live": "argv agent launched the real DSH (see live rows)",
+      "conclusion": "the structured argv boundary works on Windows; the one-string form does not",
+      "evidence": []
+    },
+    {
+      "capability": "initialize handshake",
+      "documented": "ACP initialize negotiates version and capabilities",
+      "local_observation": "ACP probe client sent protocolVersion=1",
+      "mock": "exit=0",
+      "live": "see live rows below",
+      "conclusion": "verified against both mock and real DSH",
+      "evidence": []
+    },
+    {
+      "capability": "session create + one prompt turn",
+      "documented": "session/new then session/prompt returns a stopReason",
+      "local_observation": "not checked",
+      "mock": "exit=0",
+      "live": "see live rows below",
+      "conclusion": "mock and real DSH both produce a stopReason",
+      "evidence": []
+    },
+    {
+      "capability": "streamed session/update delivery",
+      "documented": "agent_message_chunk / agent_thought_chunk updates",
+      "local_observation": "not checked",
+      "mock": "exit=0",
+      "live": "see live rows below",
+      "conclusion": "update kinds observed live: see the prompt-turn row",
+      "evidence": []
+    },
+    {
+      "capability": "normal termination and exit code",
+      "documented": "exit code 0 when the task completed, 1 when it aborted or errored",
+      "local_observation": "not checked",
+      "mock": "exit=0 on success; exit=1 on error",
+      "live": "see live rows below",
+      "conclusion": "exit status distinguishes success from failure in both layers",
+      "evidence": []
+    },
+    {
+      "capability": "deterministic protocol error handling",
+      "documented": "JSON-RPC error surface",
+      "local_observation": "not checked",
+      "mock": "unknown-method exit=1; garbage-line exit=0; bad-init exit=0",
+      "live": "not tested",
+      "conclusion": "an explicit JSON-RPC error fails the run; a malformed initialize *response* was accepted and the turn continued, so this client does not validate that handshake shape",
+      "evidence": []
+    },
+    {
+      "capability": "server death without a reply",
+      "documented": "client must report failure rather than hang",
+      "local_observation": "not checked",
+      "mock": "exit=1",
+      "live": "not tested",
+      "conclusion": "client reports a failure instead of blocking",
+      "evidence": []
+    },
+    {
+      "capability": "client timeout",
+      "documented": "--timeout bounds the wait",
+      "local_observation": "not checked",
+      "mock": "exit=3 (distinct exit code, acpxCode=TIMEOUT)",
+      "live": "not tested",
+      "conclusion": "bounded wait with an explicit timeout error",
+      "evidence": []
+    },
+    {
+      "capability": "cancellation of an in-flight turn",
+      "documented": "cooperative session/cancel; acpx cancel / prompt-owned cancellation",
+      "local_observation": "not checked",
+      "mock": "not observed: sending CTRL_BREAK to the client killed it (exit 0xC000013A) before any session/cancel reached the agent",
+      "live": "not tested",
+      "conclusion": "NOT VERIFIED - the cooperative cancel path was never exercised; a hard client stop is not evidence of cancellation capability",
+      "evidence": []
+    }
+  ]
+}
