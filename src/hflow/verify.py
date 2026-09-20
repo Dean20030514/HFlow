@@ -16,6 +16,7 @@ with a timeout; that limits blast radius but is not a security boundary.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 import time
@@ -101,15 +102,21 @@ class CommandCheckRunner:
     Output is captured through temporary files rather than pipes: it is portable,
     avoids deadlocks on large output, and keeps the controller free of a reader
     thread. Only digests and a short excerpt reach the database.
+
+    ``extra_env`` is merged over the ambient environment. The controller uses it to keep a
+    check from scattering caches into the workspace under test - a check should produce
+    evidence, not untracked files that later look like unfrozen changes.
     """
 
-    def __init__(self, excerpt_limit: int = 2000) -> None:
+    def __init__(self, excerpt_limit: int = 2000, extra_env: dict[str, str] | None = None) -> None:
         self.excerpt_limit = excerpt_limit
+        self.extra_env = dict(extra_env or {})
 
     def run(self, check: CheckDef, cwd: Path, timeout_seconds: int) -> CheckOutcome:
         if not check.argv:
             return CheckOutcome(EvidenceStatus.ERROR, detail=f"check {check.id}: empty argv")
         started = time.monotonic()
+        env = {**os.environ, **self.extra_env}
         with tempfile.TemporaryDirectory(prefix="hflow-check-") as tmp:
             out_path = Path(tmp) / "stdout.txt"
             err_path = Path(tmp) / "stderr.txt"
@@ -118,6 +125,7 @@ class CommandCheckRunner:
                     completed = subprocess.run(  # noqa: S603 - argv comes from the project contract
                         list(check.argv),
                         cwd=str(cwd),
+                        env=env,
                         stdout=out,
                         stderr=err,
                         timeout=timeout_seconds,
@@ -173,8 +181,8 @@ class CheckRunners:
         self.runners: dict[str, CheckRunner] = dict(runners or {})
 
     @classmethod
-    def offline_default(cls) -> CheckRunners:
-        return cls({"fake": FakeCheckRunner(), "command": CommandCheckRunner()})
+    def offline_default(cls, extra_env: dict[str, str] | None = None) -> CheckRunners:
+        return cls({"fake": FakeCheckRunner(), "command": CommandCheckRunner(extra_env=extra_env)})
 
     def for_kind(self, kind: str) -> CheckRunner:
         return self.runners.get(kind, DenyCheckRunner())

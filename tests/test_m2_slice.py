@@ -41,9 +41,10 @@ from hflow.contracts import (
 )
 from hflow.controller import Controller, inspect_run
 from hflow.drivers.fake import FakeDriver, FakeScript
-from hflow.gitworkspace import GitRepo
+from hflow.gitworkspace import IGNORED_ARTIFACT_ALLOWLIST, GitRepo
 from hflow.store import Store
 from hflow.verify import CheckRunners
+from hflow.workspace import matches_pattern
 
 SCRIPT_SOURCE = '''"""Tiny text utilities used as the M2 sample project."""
 
@@ -255,7 +256,8 @@ def test_m2_slice_produces_a_frozen_git_candidate_and_a_receipt(
         # (bytecode caches); those are not candidate drift, and they are listed separately.
         assert _git(worktree, "status", "--porcelain", "--untracked-files=no").strip() == ""
         ignored = GitRepo.discover(worktree).ignored_artifacts(worktree)
-        assert all(entry.rstrip("/") in {"__pycache__", "src/textkit/__pycache__", "tests/__pycache__", ".pytest_cache"} or "__pycache__" in entry for entry in ignored), (
+        assert ignored, "the check did leave a cache; the policy must still name every entry"
+        assert all(matches_pattern(entry, list(IGNORED_ARTIFACT_ALLOWLIST)) for entry in ignored), (
             f"unexpected ignored artifacts in the candidate worktree: {ignored}"
         )
         assert "?" not in _git(worktree, "status", "--porcelain", "--untracked-files=no")

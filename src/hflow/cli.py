@@ -17,6 +17,7 @@ from pathlib import Path
 
 from .admission import validate_task_spec
 from .contracts import (
+    InvocationOutcome,
     ProjectConfig,
     RefusalCode,
     RefusedError,
@@ -28,7 +29,7 @@ from .contracts import (
     json_schema,
 )
 from .controller import Controller, RunOutcome, inspect_run
-from .drivers.fake import FakeDriver
+from .drivers.fake import FakeDriver, FakeScript
 from .drivers.selected import default_refusal_reason, local_probe
 from .paths import database_path, default_data_dir
 from .report import report_json, report_text
@@ -194,6 +195,19 @@ def cmd_run(args: argparse.Namespace) -> int:
     project_path = Path(args.project) if args.project else project_root / ".hflow" / "project.json"
     project = ProjectConfig.model_validate(_load_json(project_path))
 
+    # Command-line overrides become part of the *effective* TaskSpec before admission, so the
+    # stored spec, its digest and the run's identity all describe the same thing.
+    overrides: dict[str, object] = {}
+    if args.base_commit or args.workspace:
+        mode = args.workspace or spec.workspace.mode
+        overrides["workspace"] = {
+            "mode": mode,
+            "base_commit": args.base_commit or spec.workspace.base_commit,
+            "keep": True if mode == "worktree" else spec.workspace.keep,
+        }
+    if overrides:
+        spec = TaskSpec.model_validate({**spec.model_dump(mode="json"), **overrides})
+
     validation = validate_task_spec(spec, project, project_root)
     if not validation.ok and not args.force:
         _write_out(
@@ -206,11 +220,37 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
         return EXIT_REFUSED
 
+    # Real drivers need an explicit, current authorization. The check happens before any
+    # credential is read, before any workspace is created and before any budget is reserved,
+    # and it refuses rather than silently falling back to the fake driver.
+    if args.driver != "fake" and not args.live_authorized:
+        message = (
+            f"driver {args.driver!r} is a real Harness driver and no live authorization is "
+            "recorded for this invocation. Pass --live-authorized only with an explicit, "
+            "current user authorization; there is no fallback to the fake driver."
+        )
+        _write_out({"refused": True, "reason": "live_authorization_missing", "detail": message}, args.json)
+        print(f"refused: {message}", file=sys.stderr)
+        return EXIT_REFUSED
+
     store = _open_store(args)
     try:
         data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
         if args.driver == "fake":
-            driver = FakeDriver(project_root)
+            # The fake driver is a scripted stand-in for tests and examples. Its change comes
+            # from a plan file so an offline run is reproducible from the CLI alone, without a
+            # test harness. It is explicitly the test driver: `--driver fake` never pretends
+            # to be a real Harness delivery.
+            script = FakeScript(outcome=InvocationOutcome.COMPLETED, agent_turns=1)
+            if args.fake_write_plan:
+                plan = _load_json(Path(args.fake_write_plan))
+                if not isinstance(plan, dict):
+                    raise RefusedError(
+                        RefusalCode.INVALID_SPEC, "--fake-write-plan must be a JSON object of path -> text"
+                    )
+                script.write_plan = {str(key): str(value) for key, value in plan.items()}
+                script.limitations = ["fake driver: no model was invoked; change came from a plan file"]
+            driver = FakeDriver(project_root, script)
         else:
             from .contracts import AgentBinding
             from .drivers.selected import build_driver
@@ -222,7 +262,12 @@ def cmd_run(args: argparse.Namespace) -> int:
             store,
             driver,  # type: ignore[arg-type]
             controller_build=controller_build(),
-            runners=CheckRunners.offline_default(),
+            # Keep approved checks from scattering caches into the workspace under test: a
+            # check should leave evidence, not untracked files that later look like unfrozen
+            # changes. This does not weaken any check.
+            runners=CheckRunners.offline_default(
+                extra_env={"PYTHONDONTWRITEBYTECODE": "1", "PYTEST_ADDOPTS": "-p no:cacheprovider"}
+            ),
             controller_id=args.controller_id,
             data_dir=data_dir,
         )
@@ -345,6 +390,73 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return _outcome_exit_code(outcome)
 
 
+def cmd_clean(args: argparse.Namespace) -> int:
+    """Release a run's workspace: preview by default, remove only with --apply."""
+    if args.apply and args.dry_run:
+        print("refusing: --apply and --dry-run are contradictory", file=sys.stderr)
+        return EXIT_USAGE
+    from .cleanup import apply_cleanup, plan_cleanup, reconcile_cleanup
+
+    store = _open_store(args)
+    try:
+        if args.reconcile:
+            result = reconcile_cleanup(store, args.run_id)
+            _write_out(result if args.json else f"{result['status']}: {result['detail']}", args.json)
+            return EXIT_OK
+        if args.apply:
+            result = apply_cleanup(store, args.run_id, operator=args.controller_id)
+            if args.json:
+                print(canonical_json(result))
+            else:
+                detail = result.get("detail", "")
+                print(f"{result['status']}: {detail}")
+                if result.get("candidate_ref"):
+                    print(f"kept          candidate ref {result['candidate_ref']}")
+            # Idempotent success: "this workspace is not there" is the requested end state,
+            # whether we removed it just now or a previous run did. Refusals, failures and
+            # partial removals stay non-zero because the workspace is still present.
+            if result.get("applied") or result.get("status") == "REMOVED":
+                return EXIT_OK
+            return EXIT_BLOCKED
+        plan = plan_cleanup(store, args.run_id)
+    except RunNotFound:
+        print(f"unknown run {args.run_id}", file=sys.stderr)
+        return EXIT_USAGE
+    finally:
+        store.close()
+
+    if args.json:
+        print(canonical_json(plan.as_dict()))
+    else:
+        print(f"run           {plan.run_id}")
+        print(f"workspace     {plan.path or '(none)'}")
+        print(f"state         {plan.workspace_state} (task {plan.task_state})")
+        if plan.common_dir:
+            print(f"git common    {plan.common_dir}")
+            print(f"registered    {plan.registered}")
+        if plan.head:
+            print(f"head          {plan.head}")
+            print(f"candidate     {plan.expected_candidate or '(no receipt)'}")
+        if plan.candidate_ref:
+            print(f"candidate ref {plan.candidate_ref} -> {plan.candidate_ref_target or '(missing)'}")
+        if plan.tracked_changes:
+            print(f"tracked       {', '.join(plan.tracked_changes[:5])}")
+        if plan.ignored_paths:
+            print(f"ignored       {', '.join(plan.ignored_paths[:5])}")
+        if plan.unsupported:
+            print(f"unsupported   {'; '.join(plan.unsupported[:3])}")
+        print(f"decision      {'ALLOWED' if plan.allowed else 'REFUSED'}")
+        for item in plan.refusals:
+            print(f"  refuse      {item['reason']}: {item['detail']}")
+        for reason in plan.reasons:
+            print(f"  note        {reason}")
+        for keep in plan.keeps:
+            print(f"  keeps       {keep}")
+        if plan.allowed:
+            print("apply with:   hflow clean " + plan.run_id + " --apply")
+    return EXIT_OK
+
+
 def cmd_schema(args: argparse.Namespace) -> int:
     """Print the generated JSON Schema. Generated, never a second hand-written copy."""
     models = {
@@ -397,6 +509,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--controller-id", default="local-controller")
     run.add_argument("--receipt-out", default=None, help="write the result receipt to this path")
+    run.add_argument(
+        "--base-commit",
+        default=None,
+        help="fix the base commit for a Git-worktree run (overrides the TaskSpec before admission)",
+    )
+    run.add_argument(
+        "--workspace",
+        choices=["worktree", "in_place"],
+        default=None,
+        help="override workspace.mode before admission (worktree = isolated Git worktree)",
+    )
+    run.add_argument(
+        "--fake-write-plan",
+        default=None,
+        help="JSON object of {relative path: file text} the fake driver should write",
+    )
+    run.add_argument(
+        "--live-authorized",
+        action="store_true",
+        help="assert an explicit, current user authorization for a real Harness driver",
+    )
     run.add_argument("--json", action="store_true")
     run.add_argument("--force", action="store_true", help="continue past admission issues (unsafe)")
     _add_store_args(run)
@@ -434,6 +567,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     schema = sub.add_parser("schema", help="print generated JSON Schema for the data contracts")
     schema.set_defaults(func=cmd_schema)
+
+    clean = sub.add_parser(
+        "clean", help="release a run's workspace: preview by default, remove with --apply"
+    )
+    clean.add_argument("run_id")
+    clean.add_argument("--apply", action="store_true", help="actually remove the run's worktree")
+    clean.add_argument(
+        "--dry-run", action="store_true", help="explicit synonym for the default preview"
+    )
+    clean.add_argument(
+        "--reconcile",
+        action="store_true",
+        help="after an interruption, decide this run's workspace state from recorded facts",
+    )
+    clean.add_argument("--controller-id", default="local-controller")
+    clean.add_argument("--json", action="store_true")
+    _add_store_args(clean)
+    clean.set_defaults(func=cmd_clean)
 
     return parser
 

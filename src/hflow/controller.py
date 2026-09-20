@@ -56,7 +56,7 @@ from .ids import (
 from .paths import default_data_dir
 from .drivers.base import assert_driver_shape
 from .drivers.fake import ProcessGuard
-from .gitworkspace import CandidateFreeze, GitError, GitRepo
+from .gitworkspace import IGNORED_ARTIFACT_ALLOWLIST, CandidateFreeze, GitError, GitRepo, GitStatusParseError
 from .store import RunNotFound, Store, StoreError
 from .verify import CheckRunners, verify_candidate
 from .workspace import candidate_fingerprint, changed_paths, manifest, paths_outside_scope
@@ -410,6 +410,7 @@ class Controller:
                         f"base commit {base_commit!r} does not exist in {repo.root}",
                     )
                 worktree = repo.create_worktree(run_id, base_commit)
+                self.store.record_worktree(run_id, worktree)
             except (GitError, RefusedError) as exc:
                 return self._blocked(run_id, RefusalCode.INTERNAL_ERROR, f"git workspace failed: {exc}")
             if repo.is_dirty():
@@ -541,10 +542,20 @@ class Controller:
         if repo is not None and worktree is not None:
             try:
                 freeze = repo.freeze_candidate(
-                    worktree, list(spec.scope.write_allow), f"hflow: candidate for {spec.task_id}"
+                    worktree,
+                    list(spec.scope.write_allow),
+                    f"hflow: candidate for {spec.task_id}",
+                    allow_ignored=IGNORED_ARTIFACT_ALLOWLIST,
                 )
+                # Keep the candidate reachable independently of its worktree: a bare commit
+                # SHA is an identifier, not a retention policy.
+                ref = repo.candidate_ref(run_id, attempt_id)
+                ref_status = repo.ensure_candidate_ref(ref, freeze.candidate_commit)
+                self.store.record_note(run_id, f"candidate ref {ref} ({ref_status})")
             except GitError as exc:
                 return self._blocked(run_id, RefusalCode.INTERNAL_ERROR, f"candidate freeze failed: {exc}")
+            except GitStatusParseError as exc:
+                return self._blocked(run_id, RefusalCode.SCOPE_VIOLATION, f"candidate freeze refused: {exc}")
 
         self.store.advance_to_checking(run_id=run_id, attempt_id=attempt_id, phase=CheckPhase.VERIFICATION)
         verification = verify_candidate(

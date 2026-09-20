@@ -81,6 +81,11 @@ CREATE TABLE IF NOT EXISTS runs (
     receipt_json          TEXT,
     cancel_intent_at      TEXT,
     cancel_receipt_json   TEXT,
+    worktree_path         TEXT,
+    worktree_state        TEXT NOT NULL DEFAULT 'NONE',
+    cleanup_intent_at     TEXT,
+    cleanup_done_at       TEXT,
+    cleanup_error         TEXT,
     created_at            TEXT NOT NULL,
     updated_at            TEXT NOT NULL,
     CHECK (turns_reserved >= 0),
@@ -770,6 +775,80 @@ class Store:
                 "UPDATE runs SET block_reason = ?, updated_at = ? WHERE run_id = ?",
                 (combined, utc_now(), run_id),
             )
+
+    def record_worktree(self, run_id: str, path: Path) -> None:
+        """Record the workspace this run was given. Written before any work happens in it."""
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE runs SET worktree_path = ?, worktree_state = ?, updated_at = ? WHERE run_id = ?",
+                (str(path), "READY", utc_now(), run_id),
+            )
+
+    def record_cleanup_intent(self, run_id: str, operator: str) -> str:
+        """Claim the right to remove this run's workspace, transactionally (CAS-style).
+
+        Refuses while another cleanup is in flight, so two operators cannot both decide to
+        delete the same directory. The intent is durable before any git command runs, which
+        is what makes an interrupted cleanup reconcilable afterwards. Idempotent: the first
+        intent timestamp wins.
+        """
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT cleanup_intent_at, cleanup_done_at, worktree_state FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise RunNotFound(run_id)
+            if row["cleanup_done_at"]:
+                return "already_removed"
+            if row["worktree_state"] == "REMOVING" and row["cleanup_intent_at"]:
+                return "in_progress"
+            now = utc_now()
+            conn.execute(
+                """
+                UPDATE runs SET cleanup_intent_at = ?, worktree_state = ?, updated_at = ?
+                 WHERE run_id = ?
+                """,
+                (now, "REMOVING", now, run_id),
+            )
+            return f"claimed by {operator} at {now}"
+
+    def finish_cleanup(self, run_id: str, *, error: str = "") -> None:
+        """Record the outcome of a cleanup attempt without touching business state.
+
+        A failed or refused attempt releases the claim: the workspace is still there, so the
+        run must be cleanable again once the operator fixes what blocked it. Leaving the claim
+        set would wedge the run in REMOVING forever.
+        """
+        with self.transaction() as conn:
+            if error:
+                conn.execute(
+                    """
+                    UPDATE runs SET worktree_state = ?, cleanup_intent_at = NULL,
+                                    cleanup_error = ?, updated_at = ?
+                     WHERE run_id = ?
+                    """,
+                    ("PRESENT", error[:500], utc_now(), run_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE runs SET worktree_state = ?, cleanup_done_at = ?, cleanup_error = NULL,
+                                    updated_at = ?
+                     WHERE run_id = ?
+                    """,
+                    ("REMOVED", utc_now(), utc_now(), run_id),
+                )
+
+    def workspace_state(self, run_id: str) -> dict[str, Any]:
+        row = self.get_run(run_id)
+        return {
+            "worktree_path": row["worktree_path"],
+            "worktree_state": row["worktree_state"],
+            "cleanup_intent_at": row["cleanup_intent_at"],
+            "cleanup_done_at": row["cleanup_done_at"],
+            "cleanup_error": row["cleanup_error"],
+        }
 
     def record_reconcile(self, attempt_id: str, payload: dict[str, Any]) -> None:
         """Store what an interruption check observed. Never a new dispatch."""

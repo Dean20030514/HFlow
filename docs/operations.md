@@ -56,6 +56,84 @@ actually meet today:
   asks the driver and records `confirmed_stopped` / `still_running` / `unknown`
   honestly. Cross-process child-tree termination is **not** implemented.
 
+## M2 runs through the CLI
+
+An offline candidate needs three files: the target repository (a real Git repo), a project
+contract, and a task. The change itself comes from a plan file, because the fake driver is a
+scripted stand-in:
+
+```sh
+hflow run --task task.json --project .hflow/project.json --project-root <repo> \
+          --driver fake --fake-write-plan plan.json --json
+hflow status <run-id> --project-root <repo>
+hflow report <run-id> --json --project-root <repo>
+```
+
+The TaskSpec selects isolation with `"workspace": {"mode": "worktree", "base_commit": "<sha>"}`.
+`--base-commit` / `--workspace` override it *before* admission, so the stored spec and its
+digest describe what actually ran.
+
+What the receipt gives you, and how to read it:
+
+| Field | Meaning |
+|---|---|
+| `candidate.base_commit` | the fixed commit the worktree started from |
+| `candidate.git_commit` / `git_tree` | real Git objects for the frozen candidate |
+| `candidate.fingerprint` | content hash over the write scope; **not** a Git id |
+| `candidate.worktree` | where the candidate lived (until you clean it) |
+| `candidate_paths` | the paths that are part of the candidate |
+| `verification.status` / `evidence_ids` | the approved check's result on that candidate |
+
+`--driver acpx-dsh` needs `--live-authorized` plus a current, explicit user authorization. It
+refuses before reading credentials, creating a workspace or reserving budget, and it never
+falls back to the fake driver.
+
+## Releasing a workspace (`clean`)
+
+`clean` deletes the run's **working directory**. It never deletes the delivery.
+
+```sh
+hflow clean <run-id>              # preview only; changes nothing, not even git metadata
+hflow clean <run-id> --apply      # remove this run's worktree
+hflow clean <run-id> --reconcile  # after an interruption, decide from recorded facts
+```
+
+The preview prints the resolved path, the Git common directory, the registration, HEAD, the
+candidate ref and its target, the tracked/ignored/unsupported status, and every reason for
+the decision. It creates no ref and removes no file. `--dry-run` is the same preview;
+combining it with `--apply` is refused.
+
+`--apply` re-checks everything (an earlier preview is not a standing permission), claims the
+run's cleanup intent in a short transaction, and calls `git worktree remove` **without
+`--force`**. It refuses when:
+
+| Refusal | Why |
+|---|---|
+| `no_managed_workspace` | the run did not use a worktree |
+| `not_a_worktree`, `not_registered` | the path is not the linked worktree git has for this run |
+| `is_source_repository` | the path is the repository's main worktree |
+| `execution_active`, `run_in_flight` | an attempt or the run is still live |
+| `stop_unconfirmed` | a cancellation was requested but never confirmed |
+| `unfrozen_changes`, `head_drift` | the worktree holds changes that were never frozen |
+| `unknown_ignored_files` | ignored files that are not known build artifacts (an `.env`, local data) |
+| `unsupported_status` | unmerged or submodule records that cannot be interpreted |
+
+A refusal keeps everything and releases the cleanup claim, so the same command works once
+you fix what blocked it. What survives a successful `clean`: the candidate commit (reachable
+through `refs/hflow/candidates/<run-id>/<attempt-id>`), its tree, the receipt, the evidence,
+and the run's history. Repeat `--apply` is idempotent; a path that vanished without a cleanup
+record is reported `MISSING`, never as a success.
+
+## Known limits of `clean`
+
+- It protects against HFlow's own concurrent operations, not against another process running
+  as the same user that deliberately holds files open.
+- Windows can keep a directory undeletable for a moment after a check's child exits. HFlow
+  retries once after a short settle; if git still refuses, it reports the failure and does
+  not force anything.
+- Worktrees are not garbage-collected automatically, and `clean` deliberately never runs
+  `git gc`, `git clean`, `worktree prune`, or `rmtree`.
+
 ## Reading the counters honestly
 
 `status` prints three things that are easy to confuse:

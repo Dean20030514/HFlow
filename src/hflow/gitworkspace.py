@@ -24,6 +24,96 @@ from pathlib import Path
 from .contracts import RefusalCode, RefusedError, digest_of
 from .workspace import matches_pattern
 
+#: Porcelain v1 status codes that this module refuses to interpret. Anything unmerged, or a
+#: submodule change, changes what "the paths in this worktree" even means, so the caller gets
+#: an explicit refusal instead of a guessed path.
+UNSUPPORTED_STATUS_CODES = frozenset({"U", "DD", "AU", "UD", "UA", "DU", "AA", "UU"})
+
+
+class GitStatusParseError(RuntimeError):
+    """A porcelain record this module will not guess about."""
+
+
+@dataclass(frozen=True)
+class StatusReport:
+    """Parsed ``git status --porcelain=v1 -z --untracked-files=all --ignored`` output."""
+
+    #: Paths tracked-and-changed, or untracked (rename/copy contributes BOTH paths).
+    changed: tuple[str, ...]
+    #: Paths git ignores. Ignored is not the same as disposable.
+    ignored: tuple[str, ...]
+    #: Untracked paths that git also ignores (a check's leftover cache, for example).
+    #: Kept apart from ``changed`` so a caller can apply an artifact policy to them.
+    untracked_ignored: tuple[str, ...]
+    #: Records that could not be interpreted (unmerged conflicts, submodule changes, ...).
+    unsupported: tuple[str, ...]
+
+    @property
+    def blocking_changes(self) -> tuple[str, ...]:
+        """Changed paths that are *not* explainable by the ignored-artifact policy."""
+        return self.changed
+
+
+def parse_status_z(raw: str) -> StatusReport:
+    """Parse ``-z`` porcelain output.
+
+    Why ``-z``: the ordinary text form quotes and escapes unusual paths (C-style quoting for
+    non-ASCII and for spaces with ``core.quotePath``), which forces a second parsing problem.
+    ``-z`` emits raw bytes, NUL-terminated, so paths arrive exactly as git sees them.
+
+    Offset note, because this was misdescribed once already: in porcelain v1 an ordinary
+    record is ``XY<space><path>``, so ``record[3:]`` is the path. What corrupts it is
+    *trimming the record first* - ``" M src/a.py".strip()`` loses the leading space and makes
+    ``[3:]`` cut into the path. This function therefore never trims a record; it only splits
+    on NUL.
+
+    Renames and copies are a single record with **two** NUL-separated paths (new, then old);
+    both are reported, so a scope check cannot miss the old path.
+
+    ``??`` vs ``!!``: with ``--ignored``, git reports a path that is both untracked and
+    ignored as ``!!``, so it lands in ``ignored`` rather than ``changed``. That distinction
+    matters for cleanup: a bytecode cache must not look like an unfrozen source change.
+    """
+    changed: list[str] = []
+    ignored: list[str] = []
+    untracked_ignored: list[str] = []
+    unsupported: list[str] = []
+
+    records = [record for record in raw.split("\0") if record]
+    index = 0
+    while index < len(records):
+        record = records[index]
+        index += 1
+        if len(record) < 4:
+            unsupported.append(record[:40])
+            continue
+        code = record[:2]
+        path = record[3:]
+        if code == "!!":
+            ignored.append(path)
+            continue
+        if code in UNSUPPORTED_STATUS_CODES or "U" in code:
+            unsupported.append(f"{code} {path}"[:80])
+            continue
+        if code[0] in {"R", "C"}:  # rename/copy: the old path is the next record
+            changed.append(path)
+            if index < len(records):
+                old = records[index]
+                index += 1
+                changed.append(old)
+                if "S" in code or "N" in code:
+                    unsupported.append(f"{code} {path} (submodule)")
+            else:
+                unsupported.append(f"{code} {path} (missing rename source)")
+            continue
+        if "S" in code:
+            unsupported.append(f"{code} {path} (submodule)")
+            continue
+        changed.append(path)
+
+    return StatusReport(tuple(changed), tuple(ignored), tuple(untracked_ignored), tuple(unsupported))
+
+
 #: Identity used for controller-created candidate commits. Fixed on purpose: the commit
 #: records the controller, not the person, and must not depend on ambient git config.
 CANDIDATE_AUTHOR_NAME = "HFlow Controller"
@@ -32,6 +122,18 @@ CANDIDATE_AUTHOR_EMAIL = "hflow@localhost"
 
 class GitError(RuntimeError):
     """A git command failed. The message keeps git's own words."""
+
+
+#: Ignored paths a *check* may legitimately leave behind in a run worktree. Naming them is
+#: the point: "ignored" alone never authorizes deletion, and anything not on this list makes
+#: a freeze or a cleanup refuse. Deliberately narrow - a bytecode cache and a test runner's
+#: cache. User-owned ignored files (``.env``, local data, notes) are not on it.
+IGNORED_ARTIFACT_ALLOWLIST = (
+    "**/__pycache__/**",
+    "**/*.pyc",
+    ".pytest_cache/**",
+    "**/.pytest_cache/**",
+)
 
 
 @dataclass(frozen=True)
@@ -121,30 +223,26 @@ class GitRepo:
             raise GitError(f"git {' '.join(args)} failed: {completed.stderr.strip()[:300]}")
         return completed.stdout
 
-    def status_porcelain(self, cwd: Path | None = None, *, include_ignored: bool = False) -> list[str]:
-        """Changed paths, with git's ``XY <path>`` prefix removed.
+    def status_report(self, cwd: Path | None = None) -> StatusReport:
+        """Raw, machine-parsed status. Raises rather than guessing on odd records."""
+        raw = self.run(
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored",
+            cwd=cwd,
+        )
+        return parse_status_z(raw)
 
-        Porcelain v1 pads the two status characters and then a space, so the path starts at
-        index 3. Ignored entries (``!!``) are excluded unless asked for: a check that runs a
-        test suite legitimately produces ignored artifacts, and those are not candidate drift.
-        """
-        out = self.run("status", "--porcelain", *(["--ignored"] if include_ignored else []), cwd=cwd)
-        paths: list[str] = []
-        for line in out.splitlines():
-            if len(line) < 4 or not line.strip():
-                continue
-            if line.startswith("!!") and not include_ignored:
-                continue
-            path = line[3:]
-            if " -> " in path:  # renames are reported as "old -> new"
-                path = path.split(" -> ", 1)[1]
-            paths.append(path.strip().strip('"'))
-        return paths
+    def status_porcelain(self, cwd: Path | None = None) -> list[str]:
+        """Changed paths (never ignored, never unsupported)."""
+        return list(self.status_report(cwd).changed)
 
     def ignored_artifacts(self, cwd: Path) -> list[str]:
-        """Paths git ignores in this worktree (a check's own byproducts, not the candidate)."""
-        out = self.run("status", "--porcelain", "--ignored", cwd=cwd)
-        return [line[3:].strip() for line in out.splitlines() if line.startswith("!!")]
+        """Paths git ignores here. Ignored does not mean disposable - see the clean policy."""
+        return list(self.status_report(cwd).ignored)
 
     def ignored_artifact_fingerprint(self, cwd: Path) -> str:
         """Content hash of ignored artifacts, so a change in them is still detectable."""
@@ -226,20 +324,56 @@ class GitRepo:
         return self.run("rev-parse", "HEAD^{tree}", cwd=worktree).strip()
 
     def worktree_changes(self, worktree: Path, allow: list[str]) -> list[str]:
-        """Changed paths in the worktree that the TaskSpec did not authorize."""
-        return [path for path in self.status_porcelain(cwd=worktree) if not matches_pattern(path, allow)]
+        """Changed paths in the worktree that the TaskSpec did not authorize.
+
+        Raises :class:`GitStatusParseError` when the status cannot be interpreted safely: an
+        unreadable status must fail the run, not silently shrink the change set.
+        """
+        report = self.status_report(worktree)
+        if report.unsupported:
+            raise GitStatusParseError(
+                "unsupported git status records: " + "; ".join(report.unsupported[:3])
+            )
+        return [path for path in report.changed if not matches_pattern(path, allow)]
 
     def freeze_candidate(
-        self, worktree: Path, allow: list[str], message: str = "hflow: candidate"
+        self,
+        worktree: Path,
+        allow: list[str],
+        message: str = "hflow: candidate",
+        *,
+        allow_ignored: list[str] | None = None,
     ) -> CandidateFreeze:
         """Commit the declared paths and return the candidate's explicit identity.
 
         Only the authorized paths are added, one by one - never ``git add -A``, so a stray
         log, credential file or runtime artifact in the worktree cannot be collected into the
         candidate by accident.
+
+        ``allow_ignored`` lets a caller name ignored byproducts it accepts as check-generated
+        noise (for example a bytecode cache). Anything ignored that is not named there makes
+        the freeze refuse: ignored is not the same as disposable.
         """
         base_commit = self.worktree_commit(worktree)
-        changed = self.worktree_changes(worktree, allow)
+        report = self.status_report(worktree)
+        if report.unsupported:
+            raise GitStatusParseError(
+                "unsupported git status records: " + "; ".join(report.unsupported[:3])
+            )
+        permitted = list(allow_ignored or [])
+        unexpected_ignored = [
+            path for path in report.ignored if not matches_pattern(path, permitted)
+        ]
+        if unexpected_ignored:
+            raise GitStatusParseError(
+                "refusing to freeze with unrecognised ignored paths: "
+                + ", ".join(unexpected_ignored[:5])
+            )
+        outside = [path for path in report.changed if not matches_pattern(path, allow)]
+        if outside:
+            raise GitStatusParseError(
+                "worker changed unauthorised paths: " + ", ".join(outside[:5])
+            )
         added: list[str] = []
         for entry in allow:
             target = worktree / entry
@@ -280,3 +414,98 @@ class GitRepo:
 
     def worktree_list(self) -> list[str]:
         return [line for line in self.run("worktree", "list", "--porcelain").splitlines() if line.strip()]
+
+    # -- refs -----------------------------------------------------------------
+
+    def candidate_ref(self, run_id: str, attempt_id: str) -> str:
+        """The HFlow-owned ref that keeps a candidate reachable after its worktree is gone.
+
+        The name is built from controller-validated identifiers, never from model text. It is
+        *not* an acceptance mark: failed candidates are kept too.
+        """
+        for label, value in (("run id", run_id), ("attempt id", attempt_id)):
+            if not value or not value.replace("-", "").replace("_", "").isalnum():
+                raise GitError(f"refusing to build a ref from an invalid {label}: {value!r}")
+        return f"refs/hflow/candidates/{run_id}/{attempt_id}"
+
+    def ref_target(self, ref: str) -> str | None:
+        completed = subprocess.run(  # noqa: S603,S607 - read-only query
+            ["git", "rev-parse", "--verify", "--quiet", ref],
+            cwd=str(self.root),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env=_base_env(),
+        )
+        return completed.stdout.strip() or None
+
+    def ensure_candidate_ref(self, ref: str, commit: str) -> str:
+        """Create the ref only if absent; reuse it if it already points at the candidate.
+
+        ``git update-ref`` with the empty old value is a create-if-absent operation, so an
+        existing ref - including a user's - is never overwritten. A conflicting value is
+        refused instead.
+        """
+        existing = self.ref_target(ref)
+        if existing is not None:
+            if existing == commit:
+                return "reused"
+            raise GitError(f"ref {ref} already exists at {existing} and is not {commit}")
+        try:
+            self.run("update-ref", ref, commit, "")
+        except GitError as exc:
+            # Lost a race, or the ref appeared: re-read and treat a match as success.
+            current = self.ref_target(ref)
+            if current == commit:
+                return "reused"
+            raise GitError(f"could not create {ref}: {exc}") from exc
+        return "created"
+
+    # -- cleanup helpers ------------------------------------------------------
+
+    def worktree_blocks(self) -> list[dict[str, str]]:
+        """All worktree registrations, in git's order (the main worktree comes first)."""
+        blocks: list[dict[str, str]] = []
+        current: dict[str, str] = {}
+        for line in self.run("worktree", "list", "--porcelain").splitlines():
+            if not line.strip():
+                if current:
+                    blocks.append(current)
+                    current = {}
+                continue
+            key, _, value = line.partition(" ")
+            current[key] = value
+        if current:
+            blocks.append(current)
+        return blocks
+
+    def main_worktree(self) -> Path | None:
+        """The repository's main worktree.
+
+        This is the only reliable way to identify the source checkout: inside a linked
+        worktree, ``git rev-parse --show-toplevel`` returns *that worktree*, so comparing it
+        to the resolved path would misidentify every worktree as the source.
+        """
+        blocks = self.worktree_blocks()
+        if not blocks:
+            return None
+        recorded = blocks[0].get("worktree")
+        return Path(recorded).resolve() if recorded else None
+
+    def is_main_worktree(self, candidate: Path) -> bool:
+        main = self.main_worktree()
+        return main is not None and Path(candidate).resolve() == main
+
+    def worktree_registration(self, worktree: Path) -> dict[str, str] | None:
+        """The registration git actually holds for this path, or ``None`` when absent."""
+        target = Path(worktree).resolve()
+        for block in self.worktree_blocks():
+            recorded = block.get("worktree")
+            if recorded and Path(recorded).resolve() == target:
+                return block
+        return None
+
+    def remove_worktree_checked(self, worktree: Path) -> None:
+        """``git worktree remove`` with no force and no fallback deletion."""
+        self.run("worktree", "remove", str(worktree))

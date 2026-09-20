@@ -56,7 +56,15 @@ hflow status   R-xxxxxxxxxx               # pure SQLite read, zero model calls
 hflow report   R-xxxxxxxxxx --json        # receipt + evidence, zero model calls
 hflow resume   R-xxxxxxxxxx               # reconcile an interrupted attempt; never re-dispatches
 hflow cancel   R-xxxxxxxxxx
+hflow clean    R-xxxxxxxxxx               # preview releasing the run's worktree
+hflow clean    R-xxxxxxxxxx --apply       # remove it; the candidate and receipt are kept
 hflow schema                              # generated JSON Schema for every contract
+```
+
+An offline M2 candidate end to end, including cleanup, is runnable as a demo:
+
+```sh
+python examples/m2_cli_demo.py
 ```
 
 Runtime data (SQLite, evidence) goes to `%LOCALAPPDATA%\HFlow` on Windows or
@@ -111,6 +119,7 @@ subagents; real billing observation; metrics against a direct-DSH baseline.
 python -m pytest -q tests/test_driver_acpx_dsh.py        # 24 tests, no model, no credential
 python -m pytest -q tests/test_concurrency.py            # 8 deterministic thread/cancel-orderings tests
 python -m pytest -q tests/test_m2_slice.py               # 5 tests: Git worktree -> frozen candidate
+python -m pytest -q tests/test_cli_m2_cleanup.py         # 15 tests: the same flow through the CLI + guarded clean
 python tools/m0_probe/check_process_boundary.py          # Job Object teardown, standalone
 python tools/m0_probe/real_client_checks.py all          # real acpx: version + mock-agent round trip
 ```

@@ -47,6 +47,8 @@ and carries a limitation saying so, instead of presenting a fingerprint as a Git
 
 ```sh
 python -m pytest -q tests/test_m2_slice.py        # 5 tests, real Git repos in temp dirs
+python -m pytest -q tests/test_cli_m2_cleanup.py  # 15 tests: the same flow through `hflow`
+python examples/m2_cli_demo.py                    # the whole flow, printed
 ```
 
 Covered: the sample really fails at the base commit; the slice produces a frozen candidate
@@ -55,14 +57,49 @@ delivery while keeping the candidate; editing the worktree after acceptance show
 drift; and a dirty target repository is left untouched (same porcelain output, same stash
 list, same commit count).
 
+Through the CLI, additionally: `status`/`report` read the same facts with no process started,
+`--driver acpx-dsh` refuses before any credential or workspace, preview changes nothing (no
+ref created, no file removed), `--apply` removes only that run's worktree while the candidate
+ref and receipt survive, repeated apply is idempotent, and a `MISSING` path is never reported
+as success. The dangerous cases - active execution, unfrozen changes, HEAD drift, an ignored
+`.env`, a foreign path - are all refused with the scene preserved.
+
+## Candidate retention
+
+A commit SHA in a report is an identifier, not a retention policy: a detached worktree's HEAD
+alone does not keep an object alive. Freezing therefore also creates
+
+```text
+refs/hflow/candidates/<run-id>/<attempt-id>
+```
+
+via `git update-ref` with an empty old value (create-if-absent). An existing ref pointing at
+the same candidate is reused; anything else is refused, so a user's ref is never overwritten.
+`clean` uses that ref as its "the delivery outlives the workspace" check, and never creates
+one during a preview. The ref is not an acceptance mark - failed candidates are kept too.
+
 ## Known gaps
 
-- Worktrees are created beside the repository and **not** garbage-collected automatically;
-  a failed candidate is intentionally kept, so an operator (or a later `hflow clean`) must
-  remove them.
+- Worktrees are created beside the repository and are **not** garbage-collected
+  automatically. `clean` releases one run's workspace on request; a kept failed candidate
+  stays until an operator releases it deliberately.
 - Integration and publishing are not implemented: `LOCAL_CANDIDATE` is the only delivery
   state this path can reach.
 - The check runner still executes in the worktree with the current process user's rights.
   Git isolation is a *workspace* boundary, not a sandbox.
+- A linked worktree does write shared Git metadata in the source repository (objects and
+  `worktrees/` administration). The guarantee is about the user's HEAD, index, working files,
+  stash and branches - not "the `.git` directory is never written".
 - No real Harness has run this path end to end; the Fake Driver proves the controller, not
   DSH. A live M2 task needs its own authorization and budget.
+
+## Porcelain parsing note
+
+`parse_status_z` reads `git status --porcelain=v1 -z --untracked-files=all --ignored` and
+never trims a record. An earlier report described a "`line[3:]` off-by-one" bug; that
+description was wrong - `record[3:]` is correct for an untrimmed `XY<space><path>` record.
+What actually corrupted paths was trimming the record first (`.strip()` eats the leading space
+of an unstaged ` M` record) and then slicing at a fixed offset. The parser now uses `-z`
+records, keeps rename/copy's two paths together, refuses unmerged and submodule records
+instead of guessing, and is covered by a test that exercises those states against a real
+repository rather than fixed strings.
