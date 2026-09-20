@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "project_id": "hflow-self",
+  "checks": [
+    {
+      "id": "unit",
+      "kind": "command",
+      "argv": ["python", "-m", "pytest", "-q", "tests"],
+      "timeout_seconds": 600,
+      "cacheable": true
+    },
+    {
+      "id": "docs-check",
+      "kind": "fake",
+      "timeout_seconds": 60,
+      "cacheable": true
+    }
+  ],
+  "write_deny": [".hflow/**", ".github/**", ".git/**"],
+  "limits": {
+    "max_agent_turns": 4,
+    "max_repair_cycles": 1,
+    "max_parallel_workers": 1,
+    "max_native_children": 0
+  },
+  "min_risk_for_review": "standard",
+  "review_required": true
+}

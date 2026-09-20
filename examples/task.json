@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "task_id": "T-demo-001",
+  "revision": 1,
+  "goal": "Return an empty result for empty input instead of raising, without changing non-empty behaviour",
+  "acceptance": [
+    {
+      "id": "AC-1",
+      "statement": "An empty input returns the agreed empty result instead of raising",
+      "check_ids": ["unit"]
+    },
+    {
+      "id": "AC-2",
+      "statement": "Existing behaviour for non-empty input is unchanged",
+      "check_ids": ["unit", "docs-check"]
+    }
+  ],
+  "scope": {
+    "write_allow": ["src/hflow/contracts.py", "tests/test_contracts.py"],
+    "write_deny": [".hflow/**", ".github/**"]
+  },
+  "risk": "standard",
+  "dependencies": [],
+  "reuse": {
+    "status": "existing_decision",
+    "reference": "docs/adr/0001-transport.md",
+    "reason": "Reuses the standard library and the already-recorded transport decision; no new component is introduced."
+  },
+  "review": {
+    "required": true
+  },
+  "delivery": {
+    "mode": "local_candidate"
+  },
+  "budget": {
+    "max_agent_turns": 4,
+    "max_repair_cycles": 1
+  }
+}

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hflow"
+version = "0.0.1"
+description = "HFlow: a small deterministic controller for harness-agnostic agentic development tasks."
+requires-python = ">=3.12"
+# Deliberately tiny. Everything else comes from the standard library.
+# Upper bounds are compatibility guards, not claims that newer versions were tested.
+dependencies = [
+  "pydantic>=2.12,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=9.0,<10",
+]
+
+[project.scripts]
+hflow = "hflow.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+# Lets `pytest` resolve the package without an editable install.
+pythonpath = ["src"]
+testpaths = ["tests"]

@@ -1,0 +1,20 @@
+# --- runtime data (never committed) ---
+.run/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+artifacts/
+
+# --- test / tool temp ---
+.pytest_cache/
+.tmp/
+tmp/
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
