@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -191,9 +192,67 @@ def check_mock(node: str, *, deadline_seconds: int = 60) -> dict:
     }
 
 
+def check_config(node: str, *, allow_writes: bool) -> dict:
+    """C: the client must accept the config the driver writes, before any live dispatch.
+
+    This is the check that would have prevented a wasted live submission: a client that rejects
+    a config key exits during startup, so an invented key looks exactly like "the agent did
+    nothing". Both permission modes are validated against the installed client, with no session
+    and no prompt.
+    """
+    if not INSTALLED_ACPX.exists():
+        return {"check": "config", "status": "BLOCKED", "reason": f"acpx not installed at {INSTALLED_ACPX}"}
+    run_dir = PROBE_ROOT / f"config-{'writes' if allow_writes else 'reads'}"
+    if run_dir.exists():
+        shutil.rmtree(run_dir, ignore_errors=True)
+    home = (run_dir / "home").resolve()
+    home.mkdir(parents=True, exist_ok=True)
+    driver = AcpxDshDriver(
+        data_dir=run_dir / "data",
+        acpx_cli=INSTALLED_ACPX,
+        python_executable=sys.executable,
+    )
+    driver.allow_writes = allow_writes
+    config_path = driver._write_config(run_dir)
+    acpx_home = home / ".acpx"
+    acpx_home.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(config_path, acpx_home / "config.json")
+
+    env = {**os.environ, "USERPROFILE": str(home), "HOME": str(home)}
+    completed = subprocess.run(  # noqa: S603 - argv is built here
+        [node, str(INSTALLED_ACPX), "config", "show"],
+        cwd=str(run_dir),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+    )
+    accepted = completed.returncode == 0
+    detail = ""
+    if accepted:
+        try:
+            shown = json.loads(completed.stdout)
+            detail = f"defaultPermissions={shown.get('defaultPermissions')}"
+        except json.JSONDecodeError:
+            accepted = False
+            detail = "config show did not print JSON"
+    else:
+        detail = (completed.stderr or completed.stdout).strip().splitlines()[-1][:200]
+    return {
+        "check": f"config({'writes' if allow_writes else 'reads'})",
+        "status": "PASS" if accepted else "FAIL",
+        "allow_writes": allow_writes,
+        "config_keys": sorted(json.loads(config_path.read_text(encoding="utf-8")).keys()),
+        "returncode": completed.returncode,
+        "detail": detail,
+        "config_path": str(config_path),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("check", choices=["version", "mock", "all"], nargs="?", default="all")
+    parser.add_argument("check", choices=["version", "mock", "config", "all"], nargs="?", default="all")
     parser.add_argument("--out", default=str(PROBE_ROOT / "results.json"))
     args = parser.parse_args(argv)
 
@@ -201,29 +260,38 @@ def main(argv: list[str] | None = None) -> int:
     results: dict = {"node": node, "installed_acpx": str(INSTALLED_ACPX)}
     if args.check in {"version", "all"}:
         results["version"] = check_version(node)
+    if args.check in {"config", "all"}:
+        results["config_reads"] = check_config(node, allow_writes=False)
+        results["config_writes"] = check_config(node, allow_writes=True)
     if args.check in {"mock", "all"}:
         results["mock"] = check_mock(node)
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
-    print(json.dumps({k: v for k, v in results.items() if k not in {"version", "mock"}}, indent=2))
-    for name in ("version", "mock"):
+    print(json.dumps({k: v for k, v in results.items() if not isinstance(v, dict)}, indent=2))
+    for name in ("version", "config_reads", "config_writes", "mock"):
         if name in results:
             entry = results[name]
-            print(f"\n{name}: {entry.get('status')} ({entry.get('reason', '')})")
+            print(f"\n{name}: {entry.get('status')} ({entry.get('reason', entry.get('detail', ''))})")
             if name == "version":
                 print(f"  argv: {entry.get('argv')}")
                 print(f"  rc={entry.get('returncode')} reported={entry.get('reported_version')!r} "
                       f"gone={entry.get('process_gone')} boundary_empty={entry.get('boundary_empty')}")
                 print(f"  syntax check: rc={entry.get('node_syntax_check', {}).get('returncode')}")
+            elif name.startswith("config"):
+                print(f"  keys: {entry.get('config_keys')} | rc={entry.get('returncode')}")
             else:
                 print(f"  argv: {entry.get('client_argv')}")
                 print(f"  outcome={entry.get('outcome')} kinds={entry.get('event_kinds')} "
                       f"nonce_echoed={entry.get('nonce_echoed')} agent_launched={entry.get('mock_agent_launched')} "
                       f"gone={entry.get('client_process_gone')}")
     print(f"\nreport: {out_path}")
-    failed = [name for name in ("version", "mock") if results.get(name, {}).get("status") not in {"PASS"}]
+    failed = [
+        name
+        for name in ("version", "config_reads", "config_writes", "mock")
+        if results.get(name, {}).get("status") not in {"PASS"}
+    ]
     return 0 if not failed else 1
 
 

@@ -119,9 +119,9 @@ class AcpxDshDriver:
         self.dsh_home = Path(dsh_home) if dsh_home else None
         self.python_executable = python_executable or shutil.which("python") or "python"
         self.node_executable = os.environ.get(ENV_ACPX_NODE) or shutil.which("node") or "node"
-        #: "deny" for read-only work (the default), "allow" only when the caller has opted in
-        #: and the workspace is a disposable worktree.
-        self.non_interactive_permissions = "deny"
+        #: Whether this invocation may change files. Off unless the caller opts in, and only
+        #: meaningful for a run whose workspace is a disposable worktree.
+        self.allow_writes = False
         self.extra_env = dict(extra_env or {})
         self.completion_timeout_seconds = completion_timeout_seconds
         #: Test seam: the agent launch argv that goes into the acpx config. ``None`` means
@@ -403,25 +403,26 @@ class AcpxDshDriver:
         """Per-invocation acpx config: structured argv, explicit agent name, explicit policy.
 
         Permission policy is a **parameter**, not a constant. A read-only probe can safely deny
-        everything, but a task that must change files cannot: a silent ``deny`` would look like
-        "the agent refused to work" while the real cause was our configuration. There is
-        deliberately no approve-all value here: writes are allowed only in the mode whose whole
-        point is a scoped, isolated worktree.
+        writes, but a task that must change files cannot: a silent denial would look like "the
+        agent refused to work" while the real cause was our configuration.
+
+        The keys are taken from the installed client, not invented: ``nonInteractivePermissions``
+        accepts only ``deny`` or ``fail``, and the read/write decision is ``defaultPermissions``
+        with the modes ``approve-all`` / ``approve-reads`` / ``deny-all``. An unknown key or
+        value makes the client exit on startup (which is exactly how an invented key was caught),
+        so the configuration is verified against the real client in the tests.
         """
+        mode = "approve-all" if self.allow_writes else "approve-reads"
         config = {
             "defaultAgent": DRIVER_ID,
             "authPolicy": "skip",
-            "permissionPolicy": {"defaultAction": "deny"},
-            "nonInteractivePermissions": self.non_interactive_permissions,
+            # Only ever "deny": there is no approved "allow" value in this client.
+            "nonInteractivePermissions": "deny",
+            "defaultPermissions": mode,
             "ttl": 30,
             "format": "json",
             "agents": {DRIVER_ID: {"argv": self._agent_argv()}},
         }
-        if self.non_interactive_permissions == "allow":
-            # Worktree mode: the invocation is confined to a disposable worktree created from
-            # the base commit, and the controller freezes whatever it produced afterwards.
-            config["approveAll"] = False
-            config["permissionPolicy"] = {"defaultAction": "allow"}
         path = invocation_dir / "acpx-config.json"
         path.write_text(json.dumps(config, indent=2), encoding="utf-8")
         return path

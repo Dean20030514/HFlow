@@ -179,10 +179,28 @@ task, so an agent could authorize itself. The artifact is refused unless
 Before any dispatch, a **zero-model preflight** runs: the driver launches the installed client
 with a metadata argument (`--version`), so a broken launch binding is found without spending a
 submission. Preflight failure refuses the run and consumes nothing. A duplicate submission
-(which correctly dispatches nothing) also consumes nothing.
+(which correctly dispatches none) also consumes nothing.
 
 `implementer` and `reviewer` are separate invocations and separate top-level submissions; both
 are claimed from the same artifact.
+
+### Validate the client config offline (do this before a live run)
+
+```sh
+python tools/m0_probe/real_client_checks.py all
+```
+
+Four model-free checks: the installed client reports its version through the production
+launcher; the client **accepts the config the driver writes** in both permission modes
+(`config show` must parse it); and a full one-shot `exec` round trip runs against the project's
+mock agent. The config check exists because an invented key makes the client exit during
+startup, which is indistinguishable from "the agent did nothing" - it cost one live submission
+once, and never will again: `defaultPermissions` takes `approve-all` / `approve-reads` /
+`deny-all`, and `nonInteractivePermissions` accepts only `deny` or `fail`.
+
+Writes are off unless `HFLOW_ALLOW_WRITES=1`, which the controller honors only for a run whose
+workspace is a disposable worktree created from a fixed base commit; the effective mode is
+recorded in the run's notes.
 
 ## Preparing a real M2 task
 
