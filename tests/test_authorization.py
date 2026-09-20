@@ -202,10 +202,16 @@ def test_reviewer_is_a_separate_consumed_submission(
 # --------------------------------------------------------------------------
 
 
-def test_an_agent_written_note_cannot_authorize_a_real_run(
+def test_schema_rejects_any_provenance_other_than_user(
     tmp_path: Path, project, task_spec, project_root: Path, real_request: RunRequest
 ) -> None:
-    """The failure mode this gate exists for: the runner authorizing itself."""
+    """``provided_by`` is a **value constraint**, not proof of authorship.
+
+    It stops an artifact that *labels itself* as agent-authored. It cannot stop the executing
+    agent from writing the bytes ``provided_by: "user"`` - nothing in this codebase can, because
+    there is no issuer or protected store outside the executor's reach. The declared trust model
+    is trusted-local, user-attested operation; see ``docs/m2-live-acceptance-result.md``.
+    """
     path = tmp_path / "auth.json"
     document = _record(real_request, project, tmp_path / "task.json").model_dump(mode="json")
     document["provided_by"] = "agent"
@@ -216,6 +222,50 @@ def test_an_agent_written_note_cannot_authorize_a_real_run(
         load_authorization(path)
     # pydantic rejects the provenance outright: only "user" is a legal value.
     assert "provided_by" in str(excinfo.value) or "agent" in str(excinfo.value)
+
+
+def test_a_forged_user_provenance_is_accepted_which_is_the_stated_trust_limit(
+    tmp_path: Path, project, task_spec, project_root: Path, real_request: RunRequest
+) -> None:
+    """The limit, asserted rather than implied: same-user forgery is not prevented.
+
+    If this test ever starts failing because a real issuer exists, the trust model changed and
+    the documentation must say so. Until then it documents exactly what is *not* protected.
+    """
+    path = tmp_path / "forged.json"
+    document = _record(real_request, project, tmp_path / "task.json").model_dump(mode="json")
+    document["user_text"] = "written by the executor, claiming to be the user"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    record = load_authorization(path)  # accepted: provenance is only a field value
+    binding = current_binding(
+        mode="m2-live-change",
+        driver="acpx-dsh",
+        project=project,
+        request=real_request,
+        spec_path=tmp_path / "task.json",
+    )
+    verify_authorization(record, expected=binding)
+
+
+def test_a_fresh_authorization_id_resets_allowance_which_is_also_a_trust_limit(
+    tmp_path: Path, project, task_spec, project_root: Path, real_request: RunRequest
+) -> None:
+    """Recorded so the cap is not over-read: it bounds one id, it does not bound a person."""
+    store = Store(tmp_path / "hflow.sqlite")
+    try:
+        first = _record(real_request, project, tmp_path / "task.json", max_submissions=1)
+        store.register_authorization(first.as_store_record())
+        store.claim_authorized_submission(first.authorization_id)
+        with pytest.raises(StoreError):
+            store.claim_authorized_submission(first.authorization_id)
+
+        # A different id - same user, same task, same everything else - has fresh allowance.
+        second = first.model_copy(update={"authorization_id": "AUTH-test-2"})
+        store.register_authorization(second.as_store_record())
+        assert store.claim_authorized_submission("AUTH-test-2") == 1
+    finally:
+        store.close()
 
 
 def test_authorization_for_a_different_task_is_refused(

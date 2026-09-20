@@ -119,9 +119,6 @@ class AcpxDshDriver:
         self.dsh_home = Path(dsh_home) if dsh_home else None
         self.python_executable = python_executable or shutil.which("python") or "python"
         self.node_executable = os.environ.get(ENV_ACPX_NODE) or shutil.which("node") or "node"
-        #: Whether this invocation may change files. Off unless the caller opts in, and only
-        #: meaningful for a run whose workspace is a disposable worktree.
-        self.allow_writes = False
         self.extra_env = dict(extra_env or {})
         self.completion_timeout_seconds = completion_timeout_seconds
         #: Test seam: the agent launch argv that goes into the acpx config. ``None`` means
@@ -326,7 +323,7 @@ class AcpxDshDriver:
         workspace = Path(request.workspace)
         # Task body travels as a file, not as a command-line string.
         task_file.write_text(request.goal, encoding="utf-8")
-        config_path = self._write_config(invocation_dir)
+        config_path = self._write_config(invocation_dir, writes_allowed=request.writes_allowed)
 
         boundary = ProcessBoundary().open()
         argv = self._client_argv(invocation_dir, workspace, request.deadline_seconds)
@@ -399,24 +396,28 @@ class AcpxDshDriver:
         thread.start()
         return handle
 
-    def _write_config(self, invocation_dir: Path) -> Path:
+    def _write_config(self, invocation_dir: Path, *, writes_allowed: bool) -> Path:
         """Per-invocation acpx config: structured argv, explicit agent name, explicit policy.
 
-        Permission policy is a **parameter**, not a constant. A read-only probe can safely deny
-        writes, but a task that must change files cannot: a silent denial would look like "the
-        agent refused to work" while the real cause was our configuration.
+        Permission policy is derived from the **request** (role + approved mode), not from a
+        driver default and not from an ambient environment variable, so a reviewer cannot
+        inherit an implementer's write permission.
 
-        The keys are taken from the installed client, not invented: ``nonInteractivePermissions``
-        accepts only ``deny`` or ``fail``, and the read/write decision is ``defaultPermissions``
-        with the modes ``approve-all`` / ``approve-reads`` / ``deny-all``. An unknown key or
-        value makes the client exit on startup (which is exactly how an invented key was caught),
-        so the configuration is verified against the real client in the tests.
+        The keys are taken from the installed client, not invented. ``nonInteractivePermissions``
+        accepts only ``deny`` or ``fail``; the read/write decision is ``defaultPermissions`` with
+        ``approve-all`` / ``approve-reads`` / ``deny-all``. ``approve-all`` means *all* tool
+        permission requests are auto-approved - not only file writes - which is why it is
+        disclosed and limited to a write-capable implementer inside a disposable worktree.
+
+        Unknown keys are not harmless: the client ignored an invented ``permissionPolicy`` key
+        silently (so a run proceeded at the client default). The generated key set is therefore
+        asserted against a strict allowlist in the offline checks.
         """
-        mode = "approve-all" if self.allow_writes else "approve-reads"
+        mode = "approve-all" if writes_allowed else "approve-reads"
         config = {
             "defaultAgent": DRIVER_ID,
             "authPolicy": "skip",
-            # Only ever "deny": there is no approved "allow" value in this client.
+            # Only ever "deny": this client has no approved "allow" value here.
             "nonInteractivePermissions": "deny",
             "defaultPermissions": mode,
             "ttl": 30,

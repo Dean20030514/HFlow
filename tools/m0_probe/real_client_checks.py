@@ -192,13 +192,28 @@ def check_mock(node: str, *, deadline_seconds: int = 60) -> dict:
     }
 
 
-def check_config(node: str, *, allow_writes: bool) -> dict:
-    """C: the client must accept the config the driver writes, before any live dispatch.
+#: The complete key set the driver is allowed to write. Unknown keys are not harmless: this
+#: client silently ignored an invented ``permissionPolicy`` key, so a run proceeded at the
+#: client default while the config looked deliberate.
+ALLOWED_CONFIG_KEYS = frozenset(
+    {
+        "defaultAgent",
+        "authPolicy",
+        "nonInteractivePermissions",
+        "defaultPermissions",
+        "ttl",
+        "format",
+        "agents",
+    }
+)
 
-    This is the check that would have prevented a wasted live submission: a client that rejects
-    a config key exits during startup, so an invented key looks exactly like "the agent did
-    nothing". Both permission modes are validated against the installed client, with no session
-    and no prompt.
+
+def check_config(node: str, *, allow_writes: bool) -> dict:
+    """The client must accept the config the driver writes, and the key set must be exact.
+
+    Both permission modes are validated against the installed client, with no session and no
+    prompt. A client that rejects a key exits during startup, which looks exactly like "the
+    agent did nothing" - this check exists because that cost a live submission once.
     """
     if not INSTALLED_ACPX.exists():
         return {"check": "config", "status": "BLOCKED", "reason": f"acpx not installed at {INSTALLED_ACPX}"}
@@ -212,8 +227,10 @@ def check_config(node: str, *, allow_writes: bool) -> dict:
         acpx_cli=INSTALLED_ACPX,
         python_executable=sys.executable,
     )
-    driver.allow_writes = allow_writes
-    config_path = driver._write_config(run_dir)
+    config_path = driver._write_config(run_dir, writes_allowed=allow_writes)
+    generated = json.loads(config_path.read_text(encoding="utf-8"))
+    extra_keys = sorted(set(generated) - ALLOWED_CONFIG_KEYS)
+
     acpx_home = home / ".acpx"
     acpx_home.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(config_path, acpx_home / "config.json")
@@ -229,30 +246,124 @@ def check_config(node: str, *, allow_writes: bool) -> dict:
         check=False,
     )
     accepted = completed.returncode == 0
-    detail = ""
+    expected_mode = "approve-all" if allow_writes else "approve-reads"
+    reported_mode = ""
     if accepted:
         try:
             shown = json.loads(completed.stdout)
-            detail = f"defaultPermissions={shown.get('defaultPermissions')}"
+            reported_mode = str(shown.get("defaultPermissions", ""))
         except json.JSONDecodeError:
             accepted = False
-            detail = "config show did not print JSON"
-    else:
-        detail = (completed.stderr or completed.stdout).strip().splitlines()[-1][:200]
+    if accepted and reported_mode != expected_mode:
+        accepted = False
     return {
         "check": f"config({'writes' if allow_writes else 'reads'})",
-        "status": "PASS" if accepted else "FAIL",
+        "status": "PASS" if accepted and not extra_keys else "FAIL",
         "allow_writes": allow_writes,
-        "config_keys": sorted(json.loads(config_path.read_text(encoding="utf-8")).keys()),
+        "config_keys": sorted(generated),
+        "unsupported_keys": extra_keys,
+        "expected_mode": expected_mode,
+        "effective_mode": reported_mode,
         "returncode": completed.returncode,
-        "detail": detail,
+        "detail": (
+            f"defaultPermissions={reported_mode}"
+            if accepted
+            else (completed.stderr or completed.stdout).strip().splitlines()[-1][:200]
+        ),
         "config_path": str(config_path),
+    }
+
+
+def check_permission(node: str, *, allow_writes: bool) -> dict:
+    """Observe the client's own permission decision for one policy.
+
+    The mock agent asks ``session/request_permission`` and never answers it itself, so the reply
+    that comes back was decided by acpx from its configuration. This proves the **client's policy
+    mapping**; it is not evidence about DSH's native tool enforcement, which is a separate layer.
+    """
+    if not INSTALLED_ACPX.exists():
+        return {"check": "permission", "status": "BLOCKED", "reason": f"acpx not installed at {INSTALLED_ACPX}"}
+    run_dir = PROBE_ROOT / f"permission-{'writes' if allow_writes else 'reads'}"
+    if run_dir.exists():
+        shutil.rmtree(run_dir, ignore_errors=True)
+    workspace = run_dir / "ws"
+    workspace.mkdir(parents=True, exist_ok=True)
+    wire_log = run_dir / "mock-wire.jsonl"
+    agent_argv = [
+        sys.executable,
+        "-u",
+        str(MOCK_AGENT),
+        "--scenario",
+        "normal",
+        "--wire-log",
+        str(wire_log),
+        "--ready-file",
+        str(run_dir / "mock-ready.txt"),
+    ]
+    home = (run_dir / "home").resolve()
+    home.mkdir(parents=True, exist_ok=True)
+    driver = AcpxDshDriver(
+        data_dir=run_dir / "data",
+        acpx_cli=INSTALLED_ACPX,
+        python_executable=sys.executable,
+        agent_argv_override=agent_argv,
+        completion_timeout_seconds=90,
+    )
+    driver.extra_env["USERPROFILE"] = str(home)
+    driver.extra_env["HOME"] = str(home)
+
+    request = InvocationRequest(
+        invocation_id=f"I-perm-{'writes' if allow_writes else 'reads'}",
+        attempt_id="A-perm",
+        run_id="R-perm",
+        role="implementer" if allow_writes else "reviewer",
+        task_id="T-perm",
+        task_revision=1,
+        goal="ask for a permission and report what the client decided",
+        acceptance=[],
+        write_allow=[],
+        write_deny=[],
+        workspace=str(workspace),
+        deadline_seconds=60,
+        spec_digest="sha256:permission-check",
+        writes_allowed=allow_writes,
+        data_dir=str(run_dir / "data"),
+    )
+    handle = driver.start_handle(request)
+    for _ in driver.observe(handle):
+        pass
+    result = driver.collect(handle)
+    driver.release(handle.invocation_id)
+
+    decision: dict | None = None
+    if wire_log.exists():
+        for line in wire_log.read_text(encoding="utf-8").splitlines():
+            record = json.loads(line)
+            payload = record.get("payload") or {}
+            if record.get("dir") == "note" and "permission_decision" in payload:
+                decision = payload["permission_decision"]
+    outcome = (decision or {}).get("outcome")
+    option = outcome.get("optionId") if isinstance(outcome, dict) else outcome
+    expected_option = "allow-once" if allow_writes else None
+    approved = option == "allow-once"
+    rejected = isinstance(outcome, dict) and outcome.get("optionId") == "reject-once"
+    ok = result.outcome.value == "completed" and (approved if allow_writes else rejected)
+    return {
+        "check": f"permission({'writes' if allow_writes else 'reads'})",
+        "status": "PASS" if ok else "FAIL",
+        "allow_writes": allow_writes,
+        "client_decision": option,
+        "decision_raw": decision,
+        "turn_outcome": result.outcome.value,
+        "note": "client-side policy mapping only; not DSH native tool enforcement",
     }
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("check", choices=["version", "mock", "config", "all"], nargs="?", default="all")
+    parser.add_argument(
+        "check", choices=["version", "mock", "config", "permission", "all"], nargs="?", default="all"
+    )
     parser.add_argument("--out", default=str(PROBE_ROOT / "results.json"))
     args = parser.parse_args(argv)
 
@@ -263,6 +374,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.check in {"config", "all"}:
         results["config_reads"] = check_config(node, allow_writes=False)
         results["config_writes"] = check_config(node, allow_writes=True)
+    if args.check in {"permission", "all"}:
+        results["permission_reads"] = check_permission(node, allow_writes=False)
+        results["permission_writes"] = check_permission(node, allow_writes=True)
     if args.check in {"mock", "all"}:
         results["mock"] = check_mock(node)
 
@@ -270,28 +384,31 @@ def main(argv: list[str] | None = None) -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
     print(json.dumps({k: v for k, v in results.items() if not isinstance(v, dict)}, indent=2))
-    for name in ("version", "config_reads", "config_writes", "mock"):
-        if name in results:
-            entry = results[name]
-            print(f"\n{name}: {entry.get('status')} ({entry.get('reason', entry.get('detail', ''))})")
-            if name == "version":
-                print(f"  argv: {entry.get('argv')}")
-                print(f"  rc={entry.get('returncode')} reported={entry.get('reported_version')!r} "
-                      f"gone={entry.get('process_gone')} boundary_empty={entry.get('boundary_empty')}")
-                print(f"  syntax check: rc={entry.get('node_syntax_check', {}).get('returncode')}")
-            elif name.startswith("config"):
-                print(f"  keys: {entry.get('config_keys')} | rc={entry.get('returncode')}")
-            else:
-                print(f"  argv: {entry.get('client_argv')}")
-                print(f"  outcome={entry.get('outcome')} kinds={entry.get('event_kinds')} "
-                      f"nonce_echoed={entry.get('nonce_echoed')} agent_launched={entry.get('mock_agent_launched')} "
-                      f"gone={entry.get('client_process_gone')}")
+    order = ("version", "config_reads", "config_writes", "permission_reads", "permission_writes", "mock")
+    for name in order:
+        if name not in results:
+            continue
+        entry = results[name]
+        print(f"\n{name}: {entry.get('status')} ({entry.get('reason', entry.get('detail', ''))})")
+        if name == "version":
+            print(f"  argv: {entry.get('argv')}")
+            print(f"  rc={entry.get('returncode')} reported={entry.get('reported_version')!r} "
+                  f"gone={entry.get('process_gone')} boundary_empty={entry.get('boundary_empty')}")
+            print(f"  syntax check: rc={entry.get('node_syntax_check', {}).get('returncode')}")
+        elif name.startswith("config"):
+            print(f"  keys: {entry.get('config_keys')}")
+            print(f"  unsupported: {entry.get('unsupported_keys')} | "
+                  f"effective={entry.get('effective_mode')} expected={entry.get('expected_mode')}")
+        elif name.startswith("permission"):
+            print(f"  client decision={entry.get('client_decision')} "
+                  f"turn={entry.get('turn_outcome')} ({entry.get('note')})")
+        else:
+            print(f"  argv: {entry.get('client_argv')}")
+            print(f"  outcome={entry.get('outcome')} kinds={entry.get('event_kinds')} "
+                  f"nonce_echoed={entry.get('nonce_echoed')} agent_launched={entry.get('mock_agent_launched')} "
+                  f"gone={entry.get('client_process_gone')}")
     print(f"\nreport: {out_path}")
-    failed = [
-        name
-        for name in ("version", "config_reads", "config_writes", "mock")
-        if results.get(name, {}).get("status") not in {"PASS"}
-    ]
+    failed = [name for name in order if results.get(name, {}).get("status") not in {"PASS", None}]
     return 0 if not failed else 1
 
 

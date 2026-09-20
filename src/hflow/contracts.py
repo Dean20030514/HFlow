@@ -432,6 +432,10 @@ class InvocationRequest(BaseModel):
     workspace: str
     deadline_seconds: int
     spec_digest: str
+    #: May this invocation change files? Decided by the controller from the *role* and the
+    #: run's approved mode - never by the driver's own default, and never by an ambient
+    #: switch. A reviewer is read-only even when the implementer was allowed to write.
+    writes_allowed: bool = False
     #: Where a driver may keep invocation-scoped scratch (config, raw event logs, session
     #: state). Never the project checkout: scaffolding inside the workspace would show up in
     #: candidate snapshots and dirty the tree under test.

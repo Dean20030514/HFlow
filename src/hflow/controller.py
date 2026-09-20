@@ -58,6 +58,7 @@ from .ids import (
 )
 from .paths import default_data_dir
 from .drivers.base import assert_driver_shape
+from .drivers.acpx_dsh import ENV_ALLOW_WRITES
 from .drivers.fake import ProcessGuard
 from .gitworkspace import IGNORED_ARTIFACT_ALLOWLIST, CandidateFreeze, GitError, GitRepo, GitStatusParseError
 from .store import RunNotFound, Store, StoreError
@@ -492,16 +493,24 @@ class Controller:
         # A run that must change files needs the driver to allow it; a read-only probe does
         # not. This is decided from the run's own mode, recorded as a fact, and never silently
         # defaulted: an unexpected "deny" would look like an uncooperative agent.
-        if spec.workspace.mode == "worktree" and hasattr(self.driver, "allow_writes"):
-            from .drivers.acpx_dsh import ENV_ALLOW_WRITES
-
-            allow_writes = os.environ.get(ENV_ALLOW_WRITES, "").strip().lower() in {"1", "true", "yes"}
-            self.driver.allow_writes = allow_writes
+        # Permission is decided per role, from the run's own mode plus an explicit local
+        # opt-in, and recorded before dispatch. A reviewer never inherits an implementer's
+        # write permission: `_review` passes writes_allowed=False unconditionally.
+        allow_writes = os.environ.get(ENV_ALLOW_WRITES, "").strip().lower() in {"1", "true", "yes"}
+        implementer_writes = allow_writes and spec.workspace.mode == "worktree"
+        self.store.record_note(
+            run_id,
+            "effective permissions - implementer: "
+            f"{'approve-all (all tool requests auto-approved)' if implementer_writes else 'approve-reads'}"
+            " | reviewer: approve-reads",
+        )
+        if not implementer_writes:
             self.store.record_note(
                 run_id,
-                f"driver permission mode: {'approve-all' if allow_writes else 'approve-reads'} "
-                f"(writes {'allowed' if allow_writes else 'denied'} inside a disposable worktree; "
-                f"set {ENV_ALLOW_WRITES}=1 to allow them)",
+                f"writes are off for this run (workspace.mode={spec.workspace.mode}, "
+                f"{ENV_ALLOW_WRITES}='{os.environ.get(ENV_ALLOW_WRITES, '')}'); a task that needs "
+                "to change files will block at verification instead of being granted permission "
+                "implicitly",
             )
 
         # --- dispatch, with the authorized-submission claim and the budget gate
@@ -553,6 +562,7 @@ class Controller:
             workspace=str(execution_root),
             deadline_seconds=request.deadline_seconds,
             spec_digest=spec.spec_digest(),
+            writes_allowed=implementer_writes,
             data_dir=str(self.data_dir),
         )
 
@@ -764,6 +774,9 @@ class Controller:
             workspace=str(project_root),
             deadline_seconds=900,
             spec_digest=row["spec_digest"],
+            # A reviewer is read-only, always: it checks what the implementer produced, and an
+            # approval for the implementer to write never extends to the review invocation.
+            writes_allowed=False,
             data_dir=str(self.data_dir),
         )
         try:

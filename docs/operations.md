@@ -214,6 +214,49 @@ base commit really fails both defect tests and that nothing fails for import or 
 reasons - so a later live run is never the first time the package is exercised. It contains no
 fixed patch and no fake-write plan.
 
+### What the authorization does and does not prove
+
+**Trust model: trusted-local, user-attested operation.** A human creates the artifact through the
+manual procedure below; the artifact records that decision and bounds its consumption. The
+executor is trusted not to forge approvals and not to modify the controller or its database.
+
+What is actually enforced:
+
+- the **binding** must match the run about to happen (mode, driver, project, repository path,
+  base commit, task digest, task path), so an approval for one task cannot authorize another;
+- **consumption is bounded per authorization id** by a single guarded UPDATE plus a CHECK
+  constraint, so a restart, a new run id or a resubmitted identical spec cannot restore
+  allowance for that id;
+- `provided_by` must be the literal value `user` - a value constraint that rejects an artifact
+  *labelling itself* agent-authored.
+
+What is **not** enforced, and must not be claimed:
+
+- provenance is **not authenticated**. Nothing distinguishes bytes a user typed from the same
+  bytes written by the executing agent, because there is no approval issuer and no protected
+  store outside the executor's reach. `tests/test_authorization.py` asserts this limit
+  explicitly, so it is a recorded fact rather than an unstated assumption;
+- a **fresh authorization id resets the allowance** - the cap bounds one id, not a person or a
+  day. Raising this to real anti-forgery would need a separate issuer or store and is a
+  deliberate design decision, not something to solve with another string field.
+
+### Effective permissions per role
+
+Before a live run, the controller records the effective modes in the run's notes, and they are
+enforced per role:
+
+| Role | `defaultPermissions` | Rationale |
+|---|---|---|
+| implementer (write-capable, disposable worktree, `HFLOW_ALLOW_WRITES=1`) | `approve-all` | the task must change a file; **all** tool permission requests are auto-approved, which is broader than file writes |
+| implementer (default) | `approve-reads` | reads proceed, writes are refused |
+| reviewer | `approve-reads` | never inherits the implementer's write approval |
+
+`HFLOW_ALLOW_WRITES` is a local request, not authority: it is honored only for a run whose
+workspace is a disposable worktree created from a fixed base, it is disclosed in the notes, and
+it never applies to the review invocation. acpx permission mediation is also **not** a sandbox:
+its filesystem checks do not confine arbitrary shell commands, and a disposable worktree does
+not confine anything by itself.
+
 ## Reading the counters honestly
 
 `status` prints three things that are easy to confuse:
