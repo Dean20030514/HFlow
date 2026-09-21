@@ -8,6 +8,9 @@ production decision path.
 **No new live authorization was used.** New real model submissions: **0**. `AUTH-m2-live-2`
 still reads `used 2/2`.
 
+Repair commit: **`51596cd`** (`fix(review): propagate validated reviewer verdicts`), on top of
+the recorded runner `3dbfeae` and its evidence commit `e6a303e`.
+
 ## 1. The missing wire, confirmed in source
 
 | Location | Before |
@@ -98,7 +101,7 @@ is unchanged.
 | Check | Result |
 |---|---|
 | source run / state | `R-gkb3ld97x8`, `BLOCKED` / `review_rejected`, `delivery NONE`, no receipt, `controller_build hflow/0.0.1+3dbfeae` |
-| parser build | `hflow/0.0.1+e6a303e` |
+| parser build | `hflow/0.0.1+51596cd` |
 | reviewer stream | `…/invocations/I-vc5pcccfog/events.ndjson`, 403397 bytes, `sha256:041201c1…49df6`, 203 lines, 0 unparseable |
 | prompt binding | request id `2` = terminal response id `2`; single session `c8fa7994…b178` |
 | answer | final message `eb6ade90…d89b`, 6723 chars, `sha256:6c7cb3c9…7fa2c` |
