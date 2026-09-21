@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterator
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal, Protocol, TypeVar
@@ -655,6 +656,12 @@ class ResultReceipt(BaseModel):
     limitations: list[str] = Field(default_factory=list)
     #: Set when the candidate was frozen in a Git worktree; the paths that are part of it.
     candidate_paths: list[str] = Field(default_factory=list)
+    #: Present only when this receipt records a *later* decision about an execution that had
+    #: already ended another way - today, an offline reprocessing of recorded evidence after
+    #: an adapter failure. The original decision is never overwritten: it stays in the run's
+    #: notes and in this record, so "accepted by later offline reprocessing on build X" can
+    #: never be read as "the original run succeeded".
+    provenance: dict[str, Any] = Field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------

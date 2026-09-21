@@ -39,17 +39,30 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from hflow.contracts import (  # noqa: E402
+    CandidateSnapshot,
     CheckPhase,
+    DeliveryState,
     EvidenceStatus,
+    InvocationOutcome,
+    ResultReceipt,
     ReviewOutput,
     ReviewResult,
     TaskSpec,
+    TaskState,
+    UsageFacts,
+    VerificationResult,
     canonical_json,
     digest_of,
 )
 from hflow.review import AnswerTranscript, decode_review, review_input_error  # noqa: E402
+from hflow.ids import new_evidence_id  # noqa: E402
 from hflow.runtime import PACKAGE_VERSION as _PACKAGE_VERSION  # noqa: E402
-from hflow.store import Store  # noqa: E402
+from hflow.store import (  # noqa: E402
+    OFFLINE_REPROCESSING_KIND,
+    Store,
+    StoreError,
+    _same_offline_reprocessing,
+)
 from hflow.workspace import candidate_fingerprint  # noqa: E402
 
 PROBE_ROOT = REPO_ROOT / ".probe" / "m2-live"
@@ -146,6 +159,82 @@ def extract_reviewer_answer(messages: list[dict[str, Any]], session_id: str | No
 # --------------------------------------------------------------------------
 
 
+def review_result_status(review: ReviewOutput) -> str:
+    """The controller's review status for a validated verdict. One definition, two callers."""
+    return "accepted" if review.verdict == "accepted" else "changes_requested"
+
+
+def build_receipt(
+    *,
+    spec: TaskSpec,
+    run_row: dict[str, Any],
+    attempt_row: dict[str, Any],
+    verification_evidence: dict[str, Any],
+    review: ReviewOutput,
+    review_evidence_id: str,
+    fingerprint: str,
+    target: Path,
+    candidate_commit: str,
+    runtime_build: str,
+    provenance: dict[str, Any],
+    isolated: bool,
+) -> ResultReceipt:
+    """One receipt constructor, used by the isolated evaluation and the production write.
+
+    Every value comes from the record; nothing is derived from a model's prose or from the
+    temporary evaluation. ``runtime_build`` is the build that is *processing now*, which is
+    what distinguishes this decision from the original execution.
+    """
+    return ResultReceipt(
+        run_id=run_row["run_id"],
+        task_id=spec.task_id,
+        attempt_id=verification_evidence["attempt_id"],
+        task_revision=int(run_row["task_revision"]),
+        runtime_build=runtime_build,
+        plan_digest=run_row["spec_digest"],
+        harness_outcome=InvocationOutcome.COMPLETED,
+        candidate=CandidateSnapshot(
+            base_commit=spec.workspace.base_commit or (run_row.get("worktree_path") and ""),
+            git_commit=candidate_commit,
+            worktree=str(target),
+            fingerprint=fingerprint,
+        ),
+        verification=VerificationResult(
+            status="passed",
+            evidence_ids=[verification_evidence["evidence_id"]],
+            detail=verification_evidence["detail"],
+            workspace=str(target),
+        ),
+        review=ReviewResult(
+            status=review_result_status(review),
+            evidence_ids=[review_evidence_id],
+            checked_fingerprint=fingerprint,
+        ),
+        task_state=TaskState.ACCEPTED,
+        delivery_state=DeliveryState.LOCAL_CANDIDATE,
+        usage=UsageFacts(
+            controller_turns_reserved=int(run_row["turns_reserved"]),
+            controller_turns_observed=run_row["turns_observed"],
+        ),
+        candidate_paths=[str(path) for path in (spec.scope.write_allow or [])],
+        provenance=provenance,
+        limitations=[
+            "this receipt records a LATER decision about an execution that ended "
+            f"{provenance.get('original_block_code', 'another way')} on build "
+            f"{provenance.get('original_runtime_build', 'unknown')}; it is not an uninterrupted "
+            "success of that execution",
+            "delivery comes from recorded evidence re-validated offline; the approved check was "
+            "re-associated (candidate fingerprint, checks digest, command) but not re-executed",
+            "no model was called for this decision; no authorization allowance was consumed",
+            *(
+                ["evaluated in an isolated temporary store: a test artifact, not a delivery"]
+                if isolated
+                else []
+            ),
+        ],
+    )
+
+
 def evaluate_acceptance(
     *,
     spec: TaskSpec,
@@ -156,6 +245,7 @@ def evaluate_acceptance(
     reviewed_fingerprint: str,
     target: Path,
     candidate_commit: str,
+    provenance: dict[str, Any],
 ) -> dict[str, Any]:
     """Apply the controller's acceptance predicates to the recorded evidence.
 
@@ -202,18 +292,8 @@ def evaluate_acceptance(
         result["accepted"] = False
         return result
 
-    # Build the receipt in a temporary store: the same transaction the controller runs, from
-    # copied rows, with nothing of the original touched.
-    from hflow.contracts import (
-        CandidateSnapshot,
-        DeliveryState,
-        InvocationOutcome,
-        ResultReceipt,
-        TaskState,
-        UsageFacts,
-        VerificationResult,
-    )
-
+    # Build the receipt in a temporary store: the same construction the production
+    # finalization uses, from copied rows, with nothing of the original touched.
     with tempfile.TemporaryDirectory(prefix="hflow-replay-") as tmp:
         store = Store(Path(tmp) / "isolated.sqlite")
         try:
@@ -278,57 +358,33 @@ def evaluate_acceptance(
                 attempt_id=verification_evidence["attempt_id"],
                 phase=CheckPhase.REVIEW,
             )
-            review_result = ReviewResult(
-                status="accepted" if review.verdict == "accepted" else "changes_requested",
-                evidence_ids=[review_evidence.evidence_id],
-                checked_fingerprint=fresh_fingerprint,
-            )
-            receipt = ResultReceipt(
-                run_id=row["run_id"],
-                task_id=spec.task_id,
-                attempt_id=verification_evidence["attempt_id"],
-                task_revision=int(run_row["task_revision"]),
+            receipt = build_receipt(
+                spec=spec,
+                run_row=run_row,
+                attempt_row=attempt_row,
+                verification_evidence=verification_evidence,
+                review=review,
+                review_evidence_id=review_evidence.evidence_id,
+                fingerprint=fresh_fingerprint,
+                target=target,
+                candidate_commit=candidate_commit,
                 runtime_build=run_row["controller_build"],
-                plan_digest=run_row["spec_digest"],
-                harness_outcome=InvocationOutcome.COMPLETED,
-                candidate=CandidateSnapshot(
-                    base_commit=spec.workspace.base_commit,
-                    git_commit=candidate_commit,
-                    worktree=str(target),
-                    fingerprint=fresh_fingerprint,
-                ),
-                verification=VerificationResult(
-                    status="passed",
-                    evidence_ids=[verification_evidence["evidence_id"]],
-                    detail=verification_evidence["detail"],
-                    workspace=str(target),
-                ),
-                review=review_result,
-                task_state=TaskState.ACCEPTED,
-                delivery_state=DeliveryState.LOCAL_CANDIDATE,
-                usage=UsageFacts(
-                    controller_turns_reserved=int(run_row["turns_reserved"]),
-                    controller_turns_observed=run_row["turns_observed"],
-                ),
-                limitations=[
-                    "isolated offline replay of recorded evidence; not a live execution",
-                    "the frozen candidate was re-checked by content fingerprint, not by re-running "
-                    "the approved check",
-                ],
+                provenance=provenance,
+                isolated=True,
             )
             # The real transaction, with its own CAS and cancellation-intent guards.
             store.finalize_acceptance(
                 row["run_id"], receipt, checks_digest=run_row["checks_digest"]
             )
             result["isolated_review_evidence_id"] = review_evidence.evidence_id
-            result["isolated_review_status"] = review_result.status
+            result["isolated_review_status"] = review_result_status(review)
             result["isolated_task_state"] = store.get_run(row["run_id"])["task_state"]
             result["isolated_receipt_written"] = bool(store.get_run(row["run_id"])["receipt_json"])
             result["receipt_artifact"] = (
                 "written in an isolated temporary store; a receipt created there is a test "
                 "artifact, not this run's delivery receipt"
             )
-            result["accepted"] = review_result.status == "accepted"
+            result["accepted"] = review_result_status(review) == "accepted"
         finally:
             store.close()
     return result
@@ -346,8 +402,15 @@ def replay(
     project_dir: Path = DEFAULT_PROJECT,
     parser_build: str | None = None,
     work_root: Path | None = None,
+    finalize: bool = False,
+    processing_build: str | None = None,
 ) -> dict[str, Any]:
-    """Produce the derived diagnostic for one recorded run. Read-only by construction."""
+    """Produce the derived diagnostic for one recorded run.
+
+    Read-only unless ``finalize`` is set, which is the explicit local finalization action: the
+    same checks run first, and only an evaluation that passes may write the decision - through
+    the Store's guarded transaction, never by patching rows here.
+    """
     store_path = Path(store_path)
     project_dir = Path(project_dir)
     diagnostic: dict[str, Any] = {
@@ -426,9 +489,41 @@ def replay(
         }
         diagnostic["parser_build"] = parser_build
         if run_row["receipt_json"]:
+            existing = ResultReceipt.model_validate(json.loads(run_row["receipt_json"]))
+            if existing.provenance.get("kind") == OFFLINE_REPROCESSING_KIND:
+                # Already finalized: report the recorded decision instead of re-deriving it, so
+                # repeating the command cannot issue a second delivery.
+                diagnostic["already_finalized"] = {
+                    "runtime_build": existing.runtime_build,
+                    "review_status": existing.review.status,
+                    "review_evidence_ids": existing.review.evidence_ids,
+                    "candidate_fingerprint": existing.candidate.fingerprint,
+                    "git_commit": existing.candidate.git_commit,
+                    "original_block_code": existing.provenance.get("original_block_code"),
+                    "original_runtime_build": existing.provenance.get("original_runtime_build"),
+                    "source_evidence_id": existing.provenance.get("source_evidence_id"),
+                }
+                if finalize:
+                    diagnostic["finalization"] = {
+                        "written": False,
+                        "written_evidence_id": existing.review.evidence_ids[0]
+                        if existing.review.evidence_ids
+                        else "",
+                        "task_state": run_row["task_state"],
+                        "delivery_state": run_row["delivery_state"],
+                        "receipt_present": True,
+                        "runtime_build": existing.runtime_build,
+                        "store": str(store_path),
+                        "detail": "the same offline reprocessing decision is already recorded",
+                    }
+                diagnostic["store_sha256_after"] = sha256_file(store_path)
+                diagnostic["store_mutated"] = (
+                    diagnostic["store_sha256_after"] != diagnostic["store_sha256"]
+                )
+                return diagnostic
             diagnostic["blockers"].append(
-                "this run already has a receipt; the replay reports the record instead of "
-                "re-deriving it"
+                "this run already carries a receipt that is not an offline reprocessing decision; "
+                "the replay reports the record instead of re-deriving it"
             )
             return diagnostic
 
@@ -439,11 +534,30 @@ def replay(
             _evaluate(diagnostic, run_row, attempt_row, evidence_rows, review)
         diagnostic["authorizations"] = authorizations
         diagnostic["recorded_notes"] = [note["note"] for note in notes]
+
+        if finalize and not diagnostic["blockers"] and review is not None:
+            # The write happens only after every predicate above passed, and it goes through the
+            # Store's transaction. The evaluation receipt above stays a test artifact.
+            diagnostic["finalization"] = finalize_in_store(
+                store_path=store_path,
+                run_row=run_row,
+                attempt_row=attempt_row,
+                diagnostic=diagnostic,
+                provenance=diagnostic["provenance"],
+                processing_build=processing_build or parser_build,
+                review=review,
+            )
+        elif finalize:
+            diagnostic["finalization"] = {
+                "written": False,
+                "detail": "refused: the pre-write checks did not pass, so nothing was recorded",
+            }
+
         diagnostic["store_sha256_after"] = sha256_file(store_path)
         diagnostic["store_mutated"] = (
             diagnostic["store_sha256_after"] != diagnostic["store_sha256"]
         )
-        if diagnostic["store_mutated"]:
+        if diagnostic["store_mutated"] and not (finalize and not diagnostic["blockers"]):
             diagnostic["blockers"].append("the original store changed during the replay")
         return diagnostic
     finally:
@@ -748,6 +862,8 @@ def _evaluate(
         )
         return
     spec = TaskSpec.model_validate(json.loads(run_row["task_spec_json"]))
+    provenance = reprocessing_provenance(diagnostic, run_row, verification)
+    diagnostic["provenance"] = provenance
     diagnostic["acceptance"] = evaluate_acceptance(
         spec=spec,
         run_row=run_row,
@@ -757,12 +873,154 @@ def _evaluate(
         reviewed_fingerprint=verification["candidate_fingerprint"],
         target=worktree,
         candidate_commit=str(diagnostic.get("candidate", {}).get("candidate_ref_sha") or ""),
+        provenance=provenance,
     )
     if not diagnostic["acceptance"]["accepted"]:
         diagnostic["blockers"].append(
             "the isolated acceptance evaluation did not pass: "
             + "; ".join(diagnostic["acceptance"]["blockers"])
         )
+
+
+def reprocessing_provenance(
+    diagnostic: dict[str, Any], run_row: dict[str, Any], verification: dict[str, Any]
+) -> dict[str, Any]:
+    """The record that makes this receipt a *later* decision, not the execution's own outcome.
+
+    It names what ended the execution, on which build, and which evidence the new decision was
+    derived from - so the original failure stays readable next to the delivery.
+    """
+    review = diagnostic.get("review", {})
+    return {
+        "kind": OFFLINE_REPROCESSING_KIND,
+        "original_decision": "BLOCKED",
+        "original_block_code": run_row.get("block_code") or "",
+        "original_block_reason": run_row.get("block_reason") or "",
+        "original_runtime_build": run_row.get("controller_build") or "",
+        "original_attempt_id": run_row.get("current_attempt_id") or "",
+        "source_evidence_id": verification["evidence_id"],
+        "source_candidate_fingerprint": verification["candidate_fingerprint"],
+        "source_checks_digest": run_row["checks_digest"],
+        "reviewer_invocation_id": diagnostic.get("recorded", {}).get("reviewer_invocation") or "",
+        "review_answer_sha256": review.get("answer_sha256") or "",
+        "review_verdict_digest": review.get("verdict_digest") or "",
+        "model_calls": 0,
+        "authorization_consumed": 0,
+    }
+
+
+def finalize_in_store(
+    *,
+    store_path: Path,
+    run_row: dict[str, Any],
+    attempt_row: dict[str, Any],
+    diagnostic: dict[str, Any],
+    provenance: dict[str, Any],
+    processing_build: str,
+    review: ReviewOutput,
+) -> dict[str, Any]:
+    """Record the decision in the ledger, through the Store's guarded transaction.
+
+    The review evidence and the receipt are written in one transaction: a crash cannot leave a
+    receipt whose review evidence is missing. Idempotent by construction - an identical
+    decision already recorded returns ``written: false`` instead of a second delivery.
+    """
+    store = Store(store_path)
+    try:
+        row = store.get_run(run_row["run_id"])
+        if row["receipt_json"]:
+            existing = ResultReceipt.model_validate(json.loads(row["receipt_json"]))
+            if _same_offline_reprocessing(
+                existing,
+                source_evidence_id=provenance["source_evidence_id"],
+                candidate_fingerprint=provenance["source_candidate_fingerprint"],
+            ):
+                return {
+                    "written": False,
+                    "written_evidence_id": existing.review.evidence_ids[0]
+                    if existing.review.evidence_ids
+                    else "",
+                    "task_state": row["task_state"],
+                    "delivery_state": row["delivery_state"],
+                    "receipt_present": True,
+                    "runtime_build": existing.runtime_build,
+                    "store": str(store_path),
+                    "detail": "the same offline reprocessing decision is already recorded",
+                }
+            raise StoreError(
+                f"run {run_row['run_id']} already carries a receipt for a different decision; "
+                "refusing to overwrite it"
+            )
+
+        spec = TaskSpec.model_validate(json.loads(run_row["task_spec_json"]))
+        worktree = Path(run_row["worktree_path"])
+        verification = next(
+            row
+            for row in _load_evidence(store_path, run_row["run_id"])
+            if row["kind"] == "verification"
+        )
+        review_evidence_id = new_evidence_id()
+        receipt = build_receipt(
+            spec=spec,
+            run_row=run_row,
+            attempt_row=attempt_row,
+            verification_evidence=verification,
+            review=review,
+            review_evidence_id=review_evidence_id,
+            fingerprint=provenance["source_candidate_fingerprint"],
+            target=worktree,
+            candidate_commit=str(diagnostic.get("candidate", {}).get("candidate_ref_sha") or ""),
+            runtime_build=processing_build,
+            provenance=provenance,
+            isolated=False,
+        )
+        written = store.finalize_offline_reprocessing(
+            run_row["run_id"],
+            receipt,
+            checks_digest=run_row["checks_digest"],
+            source_evidence_id=provenance["source_evidence_id"],
+            candidate_fingerprint=provenance["source_candidate_fingerprint"],
+            review_evidence={
+                "status": EvidenceStatus.PASSED
+                if review.verdict == "accepted"
+                else EvidenceStatus.FAILED,
+                "detail": canonical_json(review.model_dump(mode="json")),
+                "verdict": review.verdict,
+            },
+        )
+        row = store.get_run(run_row["run_id"])
+        return {
+            "written": written,
+            "written_evidence_id": review_evidence_id,
+            "task_state": row["task_state"],
+            "delivery_state": row["delivery_state"],
+            "receipt_present": bool(row["receipt_json"]),
+            "store": str(store_path),
+            "detail": (
+                "recorded: a later offline reprocessing decision now carries the delivery; the "
+                "original blocked decision and its runtime are preserved in the run's notes and "
+                "in the receipt provenance"
+                if written
+                else "the same offline reprocessing decision is already recorded"
+            ),
+        }
+    finally:
+        store.close()
+
+
+def _load_evidence(store_path: Path, run_id: str) -> list[dict[str, Any]]:
+    """Read the run's evidence rows through a read-only connection (no writes, no migration)."""
+    connection = sqlite3.connect(f"file:{Path(store_path).as_posix()}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        return [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM evidence WHERE run_id = ? ORDER BY created_at, rowid", (run_id,)
+            )
+        ]
+    finally:
+        connection.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -772,10 +1030,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project-dir", default=str(DEFAULT_PROJECT))
     parser.add_argument("--out", default="")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--finalize",
+        action="store_true",
+        help=(
+            "record the decision in the ledger after the pre-write checks pass; without it this "
+            "tool only reads and evaluates"
+        ),
+    )
     args = parser.parse_args(argv)
 
     diagnostic = replay(
-        args.run_id, store_path=Path(args.store), project_dir=Path(args.project_dir)
+        args.run_id,
+        store_path=Path(args.store),
+        project_dir=Path(args.project_dir),
+        finalize=args.finalize,
     )
     text = json.dumps(diagnostic, indent=2, ensure_ascii=False)
     if args.out:
@@ -784,14 +1053,22 @@ def main(argv: list[str] | None = None) -> int:
         print(text)
     review = diagnostic.get("review", {})
     acceptance = diagnostic.get("acceptance", {})
+    finalization = diagnostic.get("finalization", {})
+    already = diagnostic.get("already_finalized", {})
     print(
         f"\nrun={args.run_id} verdict={review.get('verdict')} "
         f"isolated_acceptance={acceptance.get('accepted')} "
         f"blockers={len(diagnostic.get('blockers', []))} "
-        f"store_mutated={diagnostic.get('store_mutated')}",
+        f"store_mutated={diagnostic.get('store_mutated')} "
+        f"written={finalization.get('written')} "
+        f"already_finalized={bool(already)}",
         file=sys.stderr,
     )
-    return 0 if not diagnostic.get("blockers") else 1
+    if diagnostic.get("blockers"):
+        return 1
+    if args.finalize and not finalization.get("written") and not already:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

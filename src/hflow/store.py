@@ -48,6 +48,27 @@ from .ids import new_evidence_id, utc_now
 
 SCHEMA_VERSION = 1
 
+#: Marks a receipt that records an offline reprocessing decision rather than the outcome of
+#: the execution it belongs to. The string lives here because both the store guard and the
+#: local finalization entry point must agree on it.
+OFFLINE_REPROCESSING_KIND = "offline_reprocessing"
+
+
+def _same_offline_reprocessing(
+    receipt: ResultReceipt, *, source_evidence_id: str, candidate_fingerprint: str
+) -> bool:
+    """Is this receipt the same offline-reprocessing decision, from the same evidence?
+
+    Used for idempotency: the same source evidence and candidate must return the same
+    decision instead of issuing a second delivery.
+    """
+    provenance = receipt.provenance
+    return (
+        provenance.get("kind") == OFFLINE_REPROCESSING_KIND
+        and provenance.get("source_evidence_id") == source_evidence_id
+        and receipt.candidate.fingerprint == candidate_fingerprint
+    )
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_meta (
     key   TEXT PRIMARY KEY,
@@ -493,6 +514,144 @@ class Store:
             if cur.rowcount != 1:
                 raise StoreError(f"run {run_id} left CHECKING during acceptance; no receipt written")
 
+    def finalize_offline_reprocessing(
+        self,
+        run_id: str,
+        receipt: ResultReceipt,
+        *,
+        checks_digest: str,
+        source_evidence_id: str,
+        candidate_fingerprint: str,
+        review_evidence: dict[str, Any],
+    ) -> bool:
+        """Record a *later* decision about an execution that already ended, in one transaction.
+
+        This exists for one narrow case: a run whose execution and checks completed but whose
+        delivery was lost to an adapter failure, where the recorded evidence still supports
+        acceptance under the fixed build. It is deliberately not a general recovery path, and
+        it never fabricates an execution:
+
+        * it refuses anything but the original terminal state - a run that is not ``BLOCKED``
+          with a recorded reason, or that has a cancellation intent, is never reopened;
+        * it refuses to overwrite a receipt that records a *different* decision, so two
+          conflicting finalizations cannot both be delivered;
+        * if the same decision is already recorded it changes nothing and reports ``False``,
+          which makes the operation idempotent instead of duplicating a delivery;
+        * the review evidence and the receipt are written together, so no receipt can name
+          evidence that was never stored;
+        * it never touches authorization rows or budget counters: a local decision is not a
+          model submission, and no allowance is consumed or restored here.
+
+        The caller is responsible for having re-checked the evidence bindings (candidate
+        fingerprint, checks digest, verification evidence, review binding) against the
+        current bytes; this method enforces the state-machine and receipt-level guards.
+        """
+        with self.transaction() as conn:
+            row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                raise RunNotFound(run_id)
+            if row["checks_digest"] != checks_digest:
+                raise StoreError(
+                    f"run {run_id} was admitted under checks digest {row['checks_digest']} but the "
+                    f"project contract now provides {checks_digest}; recorded evidence would be stale"
+                )
+            if row["cancel_intent_at"]:
+                raise StoreError(
+                    f"run {run_id} has a recorded cancellation intent at {row['cancel_intent_at']}; "
+                    "an accepted cancellation is never overwritten by a later decision"
+                )
+            existing_json = row["receipt_json"]
+            if existing_json:
+                existing = ResultReceipt.model_validate(json.loads(existing_json))
+                if _same_offline_reprocessing(
+                    existing,
+                    source_evidence_id=source_evidence_id,
+                    candidate_fingerprint=candidate_fingerprint,
+                ):
+                    return False  # the same decision is already recorded: nothing to do
+                raise StoreError(
+                    f"run {run_id} already carries a delivery receipt for a different decision; "
+                    "refusing to overwrite it"
+                )
+            if row["task_state"] != TaskState.BLOCKED.value or not row["block_reason"]:
+                raise StoreError(
+                    f"run {run_id} is {row['task_state']} without a recorded failure; offline "
+                    "reprocessing only applies to an execution that ended blocked"
+                )
+            if receipt.provenance.get("kind") != OFFLINE_REPROCESSING_KIND:
+                raise StoreError(
+                    f"run {run_id}: an offline-reprocessing receipt must declare its provenance"
+                )
+            if receipt.run_id != run_id:
+                raise StoreError(f"receipt is for {receipt.run_id}, not {run_id}")
+            if receipt.candidate.fingerprint != candidate_fingerprint:
+                raise StoreError(
+                    "the receipt's candidate fingerprint is not the evidence the decision was "
+                    "derived from"
+                )
+            attempt_id = receipt.attempt_id
+            if not attempt_id:
+                raise StoreError("an offline-reprocessing receipt must name the attempt it replays")
+            if not receipt.review.evidence_ids:
+                raise StoreError("an offline-reprocessing receipt must reference its review evidence")
+            review_status = EvidenceStatus(review_evidence["status"])
+            cur = conn.execute(
+                """
+                INSERT INTO evidence (
+                    evidence_id, run_id, attempt_id, kind, status, check_id,
+                    candidate_fingerprint, checks_digest, command_json, exit_code,
+                    stdout_digest, stderr_digest, detail, created_at
+                ) VALUES (?, ?, ?, 'review', ?, 'review', ?, ?, '[]', NULL, '', '', ?, ?)
+                """,
+                (
+                    receipt.review.evidence_ids[0],
+                    run_id,
+                    attempt_id,
+                    review_status.value,
+                    candidate_fingerprint,
+                    checks_digest,
+                    str(review_evidence.get("detail", ""))[:2000],
+                    utc_now(),
+                ),
+            )
+            if cur.rowcount != 1:
+                raise StoreError(f"run {run_id}: the review evidence could not be recorded")
+            now = utc_now()
+            cur = conn.execute(
+                """
+                UPDATE runs
+                   SET receipt_json = ?, task_state = ?, phase = NULL, delivery_state = ?,
+                       block_code = NULL, block_reason = NULL, updated_at = ?
+                 WHERE run_id = ? AND task_state = ? AND receipt_json IS NULL
+                """,
+                (
+                    canonical_json(receipt.model_dump(mode="json")),
+                    TaskState.ACCEPTED.value,
+                    DeliveryState.LOCAL_CANDIDATE.value,
+                    now,
+                    run_id,
+                    TaskState.BLOCKED.value,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise StoreError(
+                    f"run {run_id} changed while the offline decision was being recorded; nothing "
+                    "was written"
+                )
+            self._record_note_locked(
+                conn,
+                run_id,
+                "offline reprocessing decision: this run was BLOCKED/"
+                f"{receipt.provenance.get('original_block_code', 'unknown')} on build "
+                f"{receipt.provenance.get('original_runtime_build', 'unknown')}"
+                f" ({receipt.provenance.get('original_block_reason', 'no detail')}); delivery was "
+                "recorded later from the same recorded evidence by build "
+                f"{receipt.runtime_build} through {OFFLINE_REPROCESSING_KIND} "
+                f"(source evidence {source_evidence_id}). The original failure is preserved here "
+                "and is not a success of that execution. No model submission was made.",
+            )
+            return True
+
     # -- budget --------------------------------------------------------------
 
     def reserve_turn(
@@ -790,13 +949,17 @@ class Store:
         dirty target being left alone) must survive the run reaching a final state.
         """
         with self.transaction() as conn:
-            row = conn.execute("SELECT run_id FROM runs WHERE run_id = ?", (run_id,)).fetchone()
-            if row is None:
-                raise RunNotFound(run_id)
-            conn.execute(
-                "INSERT INTO run_notes (note_id, run_id, note, created_at) VALUES (?, ?, ?, ?)",
-                (new_evidence_id(), run_id, note[:1000], utc_now()),
-            )
+            self._record_note_locked(conn, run_id, note)
+
+    def _record_note_locked(self, conn: sqlite3.Connection, run_id: str, note: str) -> None:
+        """The note insert, for callers that already hold a transaction."""
+        row = conn.execute("SELECT run_id FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        if row is None:
+            raise RunNotFound(run_id)
+        conn.execute(
+            "INSERT INTO run_notes (note_id, run_id, note, created_at) VALUES (?, ?, ?, ?)",
+            (new_evidence_id(), run_id, note[:1000], utc_now()),
+        )
 
     def notes_for(self, run_id: str) -> list[str]:
         return [row["note"] for row in self._fetchall(
