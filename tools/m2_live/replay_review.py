@@ -565,11 +565,13 @@ def replay(
 
 
 def _detect_parser_build() -> str:
-    """The build identity of *this* checkout, read from Git metadata without running git.
+    """The full build identity of *this* checkout, read from Git metadata without running git.
 
-    Reading ``.git/HEAD`` (and the ref it points at) is a pure file read, so the replay tool
-    launches no child process at all - which is also what makes "no model was launched here"
-    checkable rather than asserted.
+    The full commit SHA is recorded rather than an abbreviation: this value names the build a
+    delivery decision came from, and an abbreviated hash is not an identity. Reading
+    ``.git/HEAD`` (and the ref it points at) is a pure file read, so the replay tool launches
+    no child process at all - which is also what makes "no model was launched here" checkable
+    rather than asserted.
     """
     git_dir = REPO_ROOT / ".git"
     if git_dir.is_file():
@@ -582,16 +584,17 @@ def _detect_parser_build() -> str:
         return "unknown (no .git/HEAD)"
     head = head_path.read_text(encoding="utf-8", errors="replace").strip()
     if head.startswith("ref:"):
-        ref_path = git_dir / head.split("ref:", 1)[1].strip()
+        ref_name = head.split("ref:", 1)[1].strip()
+        ref_path = git_dir / ref_name
         if not ref_path.is_file():
             packed = git_dir / "packed-refs"
             if packed.is_file():
                 for line in packed.read_text(encoding="utf-8", errors="replace").splitlines():
-                    if line.endswith(" " + head.split("ref:", 1)[1].strip()):
-                        return f"hflow/{_PACKAGE_VERSION}+{line.split(' ', 1)[0][:7]}"
+                    if line.endswith(" " + ref_name):
+                        return f"hflow/{_PACKAGE_VERSION}+{line.split(' ', 1)[0]}"
             return "unknown (ref not resolved)"
         head = ref_path.read_text(encoding="utf-8", errors="replace").strip()
-    return f"hflow/{_PACKAGE_VERSION}+{head[:7]}" if head else "unknown (empty HEAD)"
+    return f"hflow/{_PACKAGE_VERSION}+{head}" if head else "unknown (empty HEAD)"
 
 
 def _check_task_and_project(
