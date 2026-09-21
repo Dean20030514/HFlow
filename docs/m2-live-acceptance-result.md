@@ -89,6 +89,52 @@ mock:              PASS  (full one-shot exec against the mock agent)
 The two `permission_*` checks prove the **client's** policy mapping, not DSH native tool
 enforcement.
 
+## B — second attempt (`3dbfeae`, authorization `AUTH-m2-live-2`): candidate valid, delivery blocked by a driver gap
+
+Both allocated invocations were used, in order: implementer `I-xf3sez1lho`, then reviewer
+`I-vc5pcccfog` (fresh session, `approve-reads`). The pipeline ran **end to end for the first
+time**:
+
+| Stage | Result |
+|---|---|
+| implementer invocation | `completed` (`stopReason=end_turn`), `approve-all` |
+| its own work | ran the failing tests, edited `src/reportkit/__init__.py`, re-ran them |
+| frozen candidate | `refs/hflow/candidates/R-gkb3ld97x8/A-7f2pbp4teu` → `499ece7043fe3267b4ff89f9a5b5bc1d70c42481`, 4 insertions, in scope, worktree clean |
+| fixed program checks | `unit` passed, exit 0 (evidence `E-zgamyka8s3`) |
+| reviewer invocation | `completed`, separate session, `approve-reads` |
+| **reviewer verdict** | **`accepted`** — AC-1, AC-2, AC-3 all `pass` |
+| controller outcome | **`BLOCKED` / `review_rejected`; no receipt** |
+| allowance | `AUTH-m2-live-2` used 2/2 |
+
+The candidate is a genuine, correct fix: `summarise(None)` raises `TypeError` mentioning a
+sequence of strings, `average([])` raises `ValueError`, valid-input behaviour unchanged, tests
+and configuration untouched.
+
+**Why it was not accepted** — the reviewer found the cause itself, and it is in HFlow, not in the
+candidate:
+
+```text
+AcpxDshDriver.collect() always sets review=None;
+_review() therefore always returns changes_requested.
+No real reviewer verdict can reach acceptance.
+```
+
+The reviewer *did* return the contract's structured object (a `verdict: "accepted"` block with
+five findings) inside its final message, but the driver never extracts it: prose arrives as
+event text, the driver reports `review=None`, and the controller correctly treats a missing
+verdict as `changes_requested`. So a real reviewer turn deterministically blocks delivery —
+exactly the "production reviewer result wiring not yet implemented" gap, and it should have been
+closed and validated offline before a live reviewer was dispatched.
+
+Per the authorization this stops the attempt: both allocations are consumed, there is no refund
+or retry, and the candidate, the workspace `R-gkb3ld97x8`, the old failed run `R-0mh0gtrz9r` and
+its workspace are all preserved for inspection.
+
+**Next minimal task (bounded, offline):** implement the reviewer-result extraction required by
+the existing contract — parse the reviewer's structured object from its final message, attach it
+to the review evidence, and validate it against the mock (structured, malformed, and absent
+shapes). Until that exists, no real review can produce `ACCEPTED / LOCAL_CANDIDATE`.
+
 ## Authorization trust model — stated honestly
 
 **Trusted-local, user-attested operation.** A human creates the approval; the artifact records
@@ -124,9 +170,12 @@ arbitrary shell commands — and a disposable worktree does not confine anything
 
 | Item | State |
 |---|---|
-| `forced_local_stop_live` | passed for this binding (A) |
+| `forced_local_stop_live` | passed for the A binding |
 | `protocol_cancel` | `unsupported_for_selected_exec` (unchanged) |
 | reviewer isolation | `prompt_only` / audit-only — not a sandbox |
-| M2 real change delivered by DSH | **not achieved**: the implementer never started |
+| real DSH implementer produced a valid, in-scope candidate | **achieved** (attempt 2) |
+| fixed program checks on that candidate | **passed** |
+| independent real review | **ran and returned `accepted`** |
+| controller-owned `ACCEPTED / LOCAL_CANDIDATE` | **not achieved** — the driver discards the reviewer's structured verdict |
 | billed usage / remote termination | unknown |
 | unattended execution | disabled |

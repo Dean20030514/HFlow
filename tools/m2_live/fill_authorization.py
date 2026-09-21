@@ -32,6 +32,19 @@ from hflow.contracts import ProjectConfig, RunRequest, TaskSpec  # noqa: E402
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--package", default=str(REPO_ROOT / ".probe" / "m2-live"))
+    parser.add_argument(
+        "--task",
+        default="",
+        help="actual TaskSpec path to bind (defaults to <package>/task.json)",
+    )
+    parser.add_argument(
+        "--project",
+        default="",
+        help="actual project contract path to bind (defaults to <package>/project.json)",
+    )
+    parser.add_argument(
+        "--repo", default="", help="repository root of the project under test (defaults to <package>/project)"
+    )
     parser.add_argument("--text-file", required=True, help="file containing the user's verbatim approval")
     parser.add_argument("--authorization-id", required=True)
     parser.add_argument("--authorized-at", default="")
@@ -40,9 +53,14 @@ def main() -> int:
     args = parser.parse_args()
 
     package = Path(args.package).resolve()
-    task_path = package / "task.json"
-    project_path = package / "project.json"
-    repo = package / "project"
+    # Bind the *actual* files the run will use. Defaulting silently to the package root would
+    # bind a different revision than the one being dispatched.
+    task_path = Path(args.task).resolve() if args.task else package / "task.json"
+    project_path = Path(args.project).resolve() if args.project else package / "project.json"
+    repo = Path(args.repo).resolve() if args.repo else package / "project"
+    for label, path in (("task", task_path), ("project", project_path), ("repo", repo)):
+        if not path.exists():
+            raise SystemExit(f"{label} path does not exist: {path}")
 
     user_text = Path(args.text_file).read_text(encoding="utf-8").strip()
     if not user_text:
@@ -76,10 +94,12 @@ def main() -> int:
     print(f"provided_by     {reloaded.provided_by}")
     print(f"max submissions {reloaded.max_top_level_submissions}")
     print(f"binding digest  {reloaded.binding_digest()}")
+    print(f"task bound      {reloaded.binding.spec_path}")
+    print(f"task digest     {reloaded.binding.spec_digest}")
+    print(f"repo bound      {reloaded.binding.repo_path}")
     print(f"base commit     {reloaded.binding.base_commit}")
-    print(f"spec digest     {reloaded.binding.spec_digest}")
     print(f"user text       {reloaded.user_text[:120]}...")
-    print("verified against the prepared task: OK")
+    print("verified against the actual task: OK")
     return 0
 
 

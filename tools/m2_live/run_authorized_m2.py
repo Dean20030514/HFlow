@@ -43,6 +43,19 @@ def resolve_credential(ref: str) -> tuple[str | None, str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--package", default=str(REPO_ROOT / ".probe" / "m2-live"))
+    parser.add_argument("--task", default="", help="TaskSpec path (defaults to <package>/task.json)")
+    parser.add_argument(
+        "--project", default="", help="project contract path (defaults to <package>/project.json)"
+    )
+    parser.add_argument(
+        "--repo",
+        default="",
+        help=(
+            "repository of the project under test (defaults to <package>/project). This must be "
+            "the same path the authorization was bound to, so it is stated explicitly rather "
+            "than guessed from the package layout."
+        ),
+    )
     parser.add_argument("--authorization-file", required=True)
     parser.add_argument("--authorization-mode", default="m2-live-change")
     parser.add_argument("--data-dir", default="")
@@ -52,6 +65,13 @@ def main() -> int:
 
     package = Path(args.package).resolve()
     data_dir = Path(args.data_dir) if args.data_dir else package / "data"
+    task_path = Path(args.task).resolve() if args.task else package / "task.json"
+    project_path = Path(args.project).resolve() if args.project else package / "project.json"
+    repo = Path(args.repo).resolve() if args.repo else package / "project"
+    for label, path in (("task", task_path), ("project", project_path), ("repo", repo)):
+        if not path.exists():
+            print(f"{label} path does not exist: {path}", file=sys.stderr)
+            return 4
 
     value, status = resolve_credential(CREDENTIAL_REF)
     if not value:
@@ -61,11 +81,11 @@ def main() -> int:
     argv = [
         "run",
         "--task",
-        str(package / "task.json"),
+        str(task_path),
         "--project",
-        str(package / "project.json"),
+        str(project_path),
         "--project-root",
-        str(package / "project"),
+        str(repo),
         "--driver",
         "acpx-dsh",
         "--authorization-file",
