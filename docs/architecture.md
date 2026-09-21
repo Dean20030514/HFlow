@@ -69,6 +69,15 @@ oversight; the corresponding plan item is listed in the README as future work.
   `isolation=prompt_only` is recorded for exactly that reason.
 - **`review_isolation` is recorded from enforcement, not from claims.** A reviewer that
   says it was read-only does not change the recorded level (A08).
+- **A reviewer's verdict travels as text, not as a protocol field.** ACP's terminal prompt
+  response carries a stop reason, not HFlow's `ReviewOutput`; the verdict is an assistant
+  message. The production driver therefore reassembles the reviewer's *final* message from
+  eligible `agent_message_chunk` updates of that invocation's own session and decodes one
+  canonical `ReviewOutput` from it (`src/hflow/review.py`). Missing, malformed, ambiguous or
+  unbound output blocks as `review_protocol_error` and is recorded as failed review evidence -
+  it is never described as the reviewer requesting changes, and a verdict can never be filled
+  in on the model's behalf. Only the review invocation may produce it: an implementer whose
+  output happens to contain a verdict-shaped object still reports `review=None`.
 - **No repair cycle yet.** A rejected review or failed verification blocks the run; the
   bounded repair cycle in the plan is not implemented.
 - **Billing is unknown.** `provider_billed_tokens`, `provider_cost` and

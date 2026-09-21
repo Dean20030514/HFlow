@@ -33,6 +33,7 @@ from .contracts import (
     HarnessDriver,
     InvocationOutcome,
     InvocationRequest,
+    InvocationResult,
     IsolationLevel,
     RefusalCode,
     RefusedError,
@@ -57,6 +58,7 @@ from .ids import (
     utc_now,
 )
 from .paths import default_data_dir
+from .review import REVIEW_MISSING, review_input_error
 from .drivers.base import assert_driver_shape
 from .drivers.acpx_dsh import ENV_ALLOW_WRITES
 from .drivers.fake import ProcessGuard
@@ -785,15 +787,31 @@ class Controller:
             self.store.attach_review_result(
                 attempt_id, {"error": repr(exc), "invocation_id": invocation_id}
             )
-            return ReviewResult(status="changes_requested", isolation=self.review_isolation)
+            raise RefusedError(
+                RefusalCode.REVIEW_PROTOCOL_ERROR,
+                "the review invocation could not be started, so no verdict exists: " f"{exc!r}",
+            ) from exc
 
         self.store.attach_review_result(attempt_id, review_invocation.model_dump(mode="json"))
         if review_invocation.outcome is not InvocationOutcome.COMPLETED:
-            return ReviewResult(status="changes_requested", isolation=self.review_isolation)
+            # An unfinished turn is a transport failure, not the reviewer's judgment. It is
+            # reported as such; a genuine rejection requires a validated `changes_requested`.
+            raise RefusedError(
+                RefusalCode.REVIEW_PROTOCOL_ERROR,
+                "the review invocation did not complete "
+                f"({review_invocation.outcome.value}: "
+                f"{review_invocation.error_message or 'no detail'}), so it produced no verdict",
+            )
 
         review_output = review_invocation.review
         if review_output is None:
-            return ReviewResult(status="changes_requested", isolation=self.review_isolation)
+            return self._unusable_review(
+                run_id=run_id,
+                attempt_id=attempt_id,
+                invocation=review_invocation,
+                candidate_fp=candidate_fp,
+                checks_digest=checks_digest,
+            )
 
         evidence = self.store.record_evidence(
             evidence_id=self._new_evidence_id(),
@@ -813,6 +831,59 @@ class Controller:
             isolation=self.review_isolation,
             evidence_ids=[evidence.evidence_id],
             checked_fingerprint=candidate_fp,
+        )
+
+    def _unusable_review(
+        self,
+        *,
+        run_id: str,
+        attempt_id: str,
+        invocation: InvocationResult,
+        candidate_fp: str,
+        checks_digest: str,
+    ) -> ReviewResult:
+        """A completed reviewer turn whose verdict never arrived. Refuse, and say why.
+
+        The run stays BLOCKED and still gets no receipt, exactly as before - what changes is
+        the record: a missing/invalid/ambiguous verdict is a *wire* failure, so it is
+        recorded as failed review evidence with a protocol reason instead of being described
+        as the reviewer requesting changes. Nothing here can accept a candidate.
+        """
+        limitations = list(invocation.limitations)
+        wire_error = review_input_error(limitations)
+        if wire_error is None:
+            kind, detail = (
+                REVIEW_MISSING,
+                "the driver reported a completed reviewer turn with no structured verdict and "
+                "no explanation for its absence",
+            )
+        else:
+            kind, detail = wire_error
+        if kind == "unbound":
+            # A turn whose completion is not bound to its own prompt is not a usable result:
+            # it must be reconciled, never treated as an answer from this invocation.
+            raise RefusedError(
+                RefusalCode.OUTCOME_UNKNOWN,
+                f"the reviewer's completion is not bound to its prompt ({detail}); "
+                "no verdict can be trusted and nothing is re-dispatched",
+            )
+        self.store.record_evidence(
+            evidence_id=self._new_evidence_id(),
+            run_id=run_id,
+            attempt_id=attempt_id,
+            kind="review",
+            status=EvidenceStatus.ERROR,
+            candidate_fingerprint=candidate_fp,
+            checks_digest=checks_digest,
+            check_id="review",
+            detail=(
+                f"no usable structured verdict from the review invocation: {kind}: {detail}"
+            ),
+        )
+        raise RefusedError(
+            RefusalCode.REVIEW_PROTOCOL_ERROR,
+            f"the reviewer produced no usable structured verdict ({kind}: {detail}); "
+            "acceptance refuses, and this is not a substantive review rejection",
         )
 
     def _accept(

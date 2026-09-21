@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import sys
 import threading
@@ -37,6 +38,7 @@ AGENT_VERSION = "0.1.0"
 SCENARIOS = (
     "normal",  # initialize, session/new, prompt with two chunks, end_turn
     "echo-nonce",  # like normal, but the prompt text is echoed back inside a marker
+    "role-answer",  # answers by role: an implementer edit, or a reviewer's fenced verdict
     "unknown-method",  # replies -32601 to the first session/new
     "garbage-line",  # writes one non-JSON line, then keeps working
     "slow-prompt",  # prompt sleeps past the client timeout before answering
@@ -44,6 +46,14 @@ SCENARIOS = (
     "bad-init",  # initialize returns an unrelated shape
     "exit-after-init",  # exits immediately after initialize succeeds
 )
+
+#: ``role-answer`` settings, taken from the environment so the mock stays a fixed program:
+#: where the "implementer" writes (relative to the session cwd), and how the "reviewer"
+#: states its verdict (``fenced``/``bare``/``prose``). No credentials and no model are
+#: involved in either case - this scenario exists to exercise result *plumbing*.
+IMPLEMENTER_PATH_ENV = "MOCK_IMPLEMENTER_PATH"
+REVIEW_MODE_ENV = "MOCK_REVIEW_MODE"
+REVIEWER_PROMPT_MARKER = "Review the frozen candidate"
 
 
 class Wire:
@@ -185,6 +195,8 @@ class MockAgent:
             if self.scenario == "echo-nonce"
             else f"mock answer to: {prompt_text[:120]}"
         )
+        if self.scenario == "role-answer":
+            answer = role_answer(prompt_text)
         self.wire.notify(
             "session/update",
             {
@@ -280,6 +292,41 @@ class MockAgent:
         worker.start()
 
 
+def role_answer(prompt_text: str) -> str:
+    """What the mock says, depending on which role's prompt it received.
+
+    The "implementer" edits the file named by ``MOCK_IMPLEMENTER_PATH`` and reports it; the
+    "reviewer" states the canonical ``{"verdict", "findings"}`` object inside one fenced JSON
+    block, the way the recorded DSH reviewer did. Nothing here calls a model.
+    """
+    if REVIEWER_PROMPT_MARKER not in prompt_text:
+        relative = os.environ.get(IMPLEMENTER_PATH_ENV, "")
+        if relative:
+            target = Path.cwd() / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                "def parse(text):\n    if not text:\n        return None\n    return text\n",
+                encoding="utf-8",
+            )
+        return f"Imported the scoped change into {relative or '(no path configured)'}."
+
+    mode = os.environ.get(REVIEW_MODE_ENV, "fenced")
+    verdict = {
+        "verdict": "accepted",
+        "findings": [{"id": "AC-1", "status": "pass", "detail": "empty input returns the agreed result"}],
+    }
+    if mode == "bare":
+        return json.dumps(verdict)
+    if mode == "prose":
+        return "I reviewed the candidate and I approve it. No structured verdict is attached."
+    payload = json.dumps(verdict, indent=2)
+    return (
+        "I reviewed the frozen candidate.\n\n"
+        "```python\nassert parse('') is None\n```\n\n"
+        f"## Verdict\n\n```json\n{payload}\n```\n"
+    )
+
+
 def _prompt_text(params: dict[str, Any]) -> str:
     blocks = params.get("prompt") or []
     parts: list[str] = []
@@ -334,7 +381,7 @@ def main(argv: list[str] | None = None) -> int:
             "mock": AGENT_NAME,
             "version": AGENT_VERSION,
             "scenario": args.scenario,
-            "pid": __import__("os").getpid(),
+            "pid": os.getpid(),
             "cwd": str(Path.cwd()),
         },
     )

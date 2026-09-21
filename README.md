@@ -38,7 +38,7 @@ Python 3.12+ (developed on 3.14.7). Runtime dependency: `pydantic>=2.12,<3`.
 Development dependency: `pytest>=9.0,<10`.
 
 ```sh
-python -m pytest -q            # 49 passed, 1 skipped (see below)
+python -m pytest -q            # 183 passed, 1 skipped (see below)
 python -m pip install -e .     # optional: installs the `hflow` console script
 ```
 
@@ -101,6 +101,11 @@ from it (`hflow schema`). There is no second hand-written schema to drift.
 - Implementer and reviewer are separate driver processes with separate reserved turns;
   `run` reports `implementer_invocations` and `reviewer_invocations` separately. Neither
   number is a model-request count, and no field claims to know billed usage.
+- A reviewer's verdict is decoded from that reviewer invocation's own final message and
+  validated against the canonical `ReviewOutput`; nothing else can supply it. A turn that
+  produced no usable verdict blocks as `review_protocol_error` (a wire failure) instead of
+  being reported as the reviewer requesting changes, and a validated `changes_requested`
+  stays a review rejection.
 - An unknown outcome blocks and never auto-retries.
 - Verification is bound to a candidate fingerprint and a checks digest.
 - `status`, `report` and `doctor` make no model calls.
@@ -109,21 +114,28 @@ from it (`hflow schema`). There is no second hand-written schema to drift.
 
 Cooperative (protocol) cancellation on the selected launch path; a certified owned-process
 stop against the real Harness (forced teardown is proven offline only); unattended
-production execution; Git worktree isolation and snapshot; strong read-only sandbox;
-repair cycle; integration/publish delivery; reuse-research automation; teams and native
-subagents; real billing observation; metrics against a direct-DSH baseline.
+production execution; strong read-only sandbox; repair cycle; integration/publish delivery;
+reuse-research automation; teams and native subagents; real billing observation; metrics
+against a direct-DSH baseline. A reviewer's answer is read as text and decoded against the
+contract - the harness is not asked for structured output, and no model is ever asked to
+repair a malformed verdict.
 
 ## Driver contract tests
 
 ```sh
-python -m pytest -q tests/test_authorization.py          # 10 tests: the authorized real-run gate
+python -m pytest -q tests/test_authorization.py          # 12 tests: the authorized real-run gate
 python -m pytest -q tests/test_driver_acpx_dsh.py        # 24 tests, no model, no credential
+python -m pytest -q tests/test_review.py                 # 37 tests: the review output grammar
+python -m pytest -q tests/test_review_wire.py            # 20 tests: reviewer verdict -> receipt
+python -m pytest -q tests/test_real_client_review.py     # installed acpx + mock agent, no model
+python -m pytest -q tests/test_saved_review_replay.py    # the recorded live review, replayed offline
 python -m pytest -q tests/test_concurrency.py            # 8 deterministic thread/cancel-orderings tests
 python -m pytest -q tests/test_m2_slice.py               # 5 tests: Git worktree -> frozen candidate
 python -m pytest -q tests/test_cli_m2_cleanup.py         # 15 tests: the same flow through the CLI + guarded clean
 python tools/m0_probe/check_process_boundary.py          # Job Object teardown, standalone
 python tools/m0_probe/real_client_checks.py all          # real acpx: version + mock-agent round trip
 python tools/m2_live/prepare_m2_live.py                  # build the real M2 task package (dispatches nothing)
+python tools/m2_live/replay_review.py R-gkb3ld97x8       # replay a recorded review; no model, no writes
 ```
 
 The driver tests run the real launch/observe/stop code against a test-only stand-in for the

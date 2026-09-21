@@ -53,8 +53,17 @@ from ..contracts import (
     NormalizedEvent,
     ReconcileOutcome,
     ReconcileResult,
+    ReviewOutput,
 )
 from ..ids import utc_now
+from ..review import (
+    MAX_ANSWER_BYTES,
+    REVIEW_INVALID,
+    REVIEW_MISSING,
+    AnswerTranscript,
+    ReviewDecodeError,
+    decode_review,
+)
 from .acp_events import project_line, summarize
 from .winjob import ProcessBoundary, popen_in_boundary, process_gone
 
@@ -132,6 +141,11 @@ class AcpxDshDriver:
         self._stream_drained: dict[str, bool] = {}
         self._receipts: dict[str, CancellationReceipt] = {}
         self._events: dict[str, list[NormalizedEvent]] = {}
+        #: Assistant messages of each invocation, kept so a reviewer's final answer can be
+        #: reassembled from the chunks that were actually observed (see ``collect``).
+        self._transcripts: dict[str, AnswerTranscript] = {}
+        self._prompt_request_ids: dict[str, set[Any]] = {}
+        self._terminal_prompt_ids: dict[str, list[Any]] = {}
         self._lines: dict[str, list[str]] = {}
         self._unparsed: dict[str, int] = {}
         self._overflow: dict[str, bool] = {}
@@ -372,6 +386,9 @@ class AcpxDshDriver:
         self._boundaries[request.invocation_id] = boundary
         # Bounded: the raw log file is the full record, memory only needs recent context.
         self._events[request.invocation_id] = []
+        self._transcripts[request.invocation_id] = AnswerTranscript(role=request.role)
+        self._prompt_request_ids[request.invocation_id] = set()
+        self._terminal_prompt_ids[request.invocation_id] = []
         self._lines[request.invocation_id] = deque(maxlen=MAX_BUFFERED_LINES)
         self._unparsed[request.invocation_id] = 0
         self._overflow[request.invocation_id] = False
@@ -443,6 +460,7 @@ class AcpxDshDriver:
         offset = 0
         pending = b""
         written = 0
+        line_index = 0
         with log_path.open("a", encoding="utf-8") as log:
             while True:
                 chunk = b""
@@ -465,11 +483,14 @@ class AcpxDshDriver:
                             self._overflow[invocation_id] = True
                         self._lines[invocation_id].append(text)
                         observed = project_line(text, len(self._events[invocation_id]), utc_now())
+                        line_index += 1
                         if not observed.parsed:
                             self._unparsed[invocation_id] += 1
                             continue
                         if observed.message is not None:
-                            self._note_message(invocation_id, observed.message)
+                            self._note_message(
+                                invocation_id, observed.message, line_index=line_index - 1
+                            )
                         if observed.event is not None:
                             self._events[invocation_id].append(observed.event)
                     continue
@@ -495,14 +516,42 @@ class AcpxDshDriver:
                 flush=True,
             )
 
-    def _note_message(self, invocation_id: str, message: dict[str, Any]) -> None:
+    def _note_message(
+        self, invocation_id: str, message: dict[str, Any], *, line_index: int = -1
+    ) -> None:
+        """Record what one wire message means for this invocation.
+
+        Three neutral facts, no policy: the dispatch marker, the session identity, and the
+        assistant text of the turn (which is where a reviewer's verdict actually travels).
+        """
         handle = self._handles[invocation_id]
         if message.get("method") == "session/prompt":
             handle.dispatched = True
             handle.dispatched_at = handle.dispatched_at or utc_now()
+            request_id = message.get("id")
+            if request_id is not None:
+                self._prompt_request_ids.setdefault(invocation_id, set()).add(request_id)
+        if message.get("method") == "session/update":
+            params = message.get("params") if isinstance(message.get("params"), dict) else {}
+            update = params.get("update") if isinstance(params.get("update"), dict) else {}
+            transcript = self._transcripts.get(invocation_id)
+            if transcript is not None:
+                # A shape this build cannot read must not kill the reader thread: it is
+                # recorded as unusable answer text, so the review stays absent (fail closed).
+                try:
+                    transcript.observe_update(
+                        update,
+                        params=params,
+                        sequence=len(self._events.get(invocation_id, [])),
+                        line_index=line_index,
+                    )
+                except ReviewDecodeError as exc:
+                    transcript.reject(exc.detail)
         result = message.get("result")
         if isinstance(result, dict) and isinstance(result.get("sessionId"), str):
             handle.session_id = result["sessionId"]
+        if isinstance(result, dict) and "stopReason" in result:
+            self._terminal_prompt_ids.setdefault(invocation_id, []).append(message.get("id"))
 
     def observe(self, handle: DriverHandle, *, poll_seconds: float = 0.1) -> Iterator[NormalizedEvent]:
         """Yield events as they arrive, until the invocation reaches a terminal state."""
@@ -613,11 +662,19 @@ class AcpxDshDriver:
         ]
         if not handle.dispatched:
             limitations.append("no session/prompt was observed; the harness never received the task")
+        if self._terminal_response_matches_prompt(invocation_id) is False:
+            limitations.append(
+                "review_unbound: the terminal response does not answer the observed session/prompt "
+                "request; the turn's completion is not bound to this invocation's prompt"
+            )
+        review, note = self._review_output(handle, outcome)
+        if note:
+            limitations.append(note)
         result = InvocationResult(
             invocation_id=invocation_id,
             outcome=outcome,
             candidate=None,
-            review=None,
+            review=review,
             agent_turns=1 if handle.dispatched else 0,
             provider_billed_tokens=None,
             reported_cost=None,
@@ -629,6 +686,76 @@ class AcpxDshDriver:
         handle.finished = True
         self._results[invocation_id] = result
         return result
+
+    def _terminal_response_matches_prompt(self, invocation_id: str) -> bool:
+        """Does the terminal prompt response answer a ``session/prompt`` we observed?
+
+        A JSON-RPC response is not task completion by itself; it is completion of one
+        request. The recorded runtime answers the prompt with the same id, and this keeps
+        that association rather than trusting "the stream ended".
+
+        ``None`` means no prompt was observed at all, so there is nothing to bind a
+        completion to and no mismatch to report.
+        """
+        prompt_ids = self._prompt_request_ids.get(invocation_id)
+        if not prompt_ids:
+            return None
+        terminal_ids = self._terminal_prompt_ids.get(invocation_id) or []
+        return any(request_id in prompt_ids for request_id in terminal_ids)
+
+    def _review_output(
+        self, handle: DriverHandle, outcome: InvocationOutcome
+    ) -> tuple[ReviewOutput | None, str]:
+        """Decode a verdict from a reviewer's *final answer*, or explain why there is none.
+
+        This is the role-specific adaptation boundary, and the only place a review can come
+        from. It grants no authority: a decoded verdict is validated against the canonical
+        model and handed to the controller, which decides what it means. Anything else -
+        wrong role, unfinished turn, unreadable answer - yields ``None`` plus a machine
+        readable reason, so the controller never has to read a model's prose to find out
+        whether the wire was intact.
+        """
+        transcript = self._transcripts.get(handle.invocation_id)
+        if transcript is None:
+            return None, ""
+        if handle.role != "reviewer":
+            # A verdict-shaped object in an implementer's output is not a review: only the
+            # review invocation may produce review evidence. Nothing to explain here - the
+            # absent review is the expected result for this role.
+            return None, ""
+        if transcript.truncated:
+            return None, (
+                f"review_{REVIEW_MISSING}: the reviewer's assistant output exceeded "
+                f"{MAX_ANSWER_BYTES} bytes and was not retained"
+            )
+        if transcript.rejected:
+            return None, f"review_{REVIEW_INVALID}: {transcript.rejected}"
+        answer = transcript.final_answer()
+        if answer is None:
+            return None, (
+                f"review_{REVIEW_MISSING}: no agent_message_chunk was observed for this "
+                "invocation, so there is no reviewer answer to decode"
+            )
+
+        # Transport validity is judged first and separately: accepted-looking text in an
+        # unfinished, cancelled or truncated turn can never authorize acceptance.
+        if outcome is not InvocationOutcome.COMPLETED:
+            return None, (
+                f"review_{REVIEW_MISSING}: the reviewer turn did not complete "
+                f"({outcome.value}); its text is not a verdict"
+            )
+        if self._terminal_response_matches_prompt(handle.invocation_id) is False:
+            # True means matched; None means no prompt was observed, which the limitation
+            # above already states. Only a real mismatch is called out here.
+            return None, (
+                f"review_{REVIEW_MISSING}: the terminal response was not matched to an observed "
+                "session/prompt request for this invocation"
+            )
+        try:
+            review = decode_review(answer.text)
+        except ReviewDecodeError as exc:
+            return None, f"review_{exc.kind}: {exc.detail} (answer {len(answer.text)} chars)"
+        return review, f"review_decoded: {review.verdict} from the final agent message"
 
     # -- stop ----------------------------------------------------------------
 

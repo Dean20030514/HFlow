@@ -270,9 +270,15 @@ def test_controller_runs_the_driver_through_its_normal_contract(
     assert outcome.task_state is TaskState.BLOCKED
     # The stub client is harness scaffolding and writes its own log into the session cwd,
     # which the controller correctly flags as a change outside the TaskSpec's write scope.
-    # Either refusal is a fail-closed result; what matters is that the driver was reached and
+    # When the run does get past that, the stub's reviewer answers in prose with no
+    # structured verdict, which the controller correctly refuses as a review protocol
+    # problem. Each refusal is fail-closed; what matters is that the driver was reached and
     # that no receipt was produced.
-    assert outcome.block_code in {RefusalCode.SCOPE_VIOLATION, RefusalCode.VERIFICATION_FAILED}
+    assert outcome.block_code in {
+        RefusalCode.SCOPE_VIOLATION,
+        RefusalCode.VERIFICATION_FAILED,
+        RefusalCode.REVIEW_PROTOCOL_ERROR,
+    }
     assert outcome.receipt is None
     # The implementer really ran; the driver was reached, not replaced by a fake.
     assert len(harness.driver._handles) == 1

@@ -135,6 +135,13 @@ the existing contract — parse the reviewer's structured object from its final 
 to the review evidence, and validate it against the mock (structured, malformed, and absent
 shapes). Until that exists, no real review can produce `ACCEPTED / LOCAL_CANDIDATE`.
 
+**Done offline, with no new model call:** see `docs/m2-review-wire-repair.md` — the verdict is
+now decoded from the reviewer's own final message, verified/cancelled/unbound turns cannot
+supply one, an unusable verdict blocks as `review_protocol_error` instead of being described as
+a substantive rejection, and the recorded reviewer bytes replay through the acceptance
+predicates in an isolated evaluation. The record above is unchanged: this run stays `BLOCKED` /
+`review_rejected` with no receipt.
+
 ## Authorization trust model — stated honestly
 
 **Trusted-local, user-attested operation.** A human creates the approval; the artifact records

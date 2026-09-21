@@ -50,6 +50,19 @@ def out(message: dict) -> None:
     sys.stdout.flush()
 
 
+def spawn_log_path(workdir: Path) -> Path:
+    """Where the client records which agent it launched.
+
+    The default is the session cwd, which for a real run is the tree under test. A test that
+    drives the *controller* points ``STUB_SPAWN_LOG`` at its own scratch directory instead,
+    so harness bookkeeping cannot be mistaken for a worker changing files outside its scope.
+    """
+    override = os.environ.get("STUB_SPAWN_LOG")
+    path = Path(override) if override else workdir / SPAWN_LOG
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cwd", default=".")
@@ -68,7 +81,7 @@ def main(argv: list[str] | None = None) -> int:
 
     workdir = Path(args.cwd)
     workdir.mkdir(parents=True, exist_ok=True)
-    with (workdir / SPAWN_LOG).open("a", encoding="utf-8") as handle:
+    with spawn_log_path(workdir).open("a", encoding="utf-8") as handle:
         handle.write(json.dumps({"scenario": scenario, "task": task[:200]}) + "\n")
 
     out(

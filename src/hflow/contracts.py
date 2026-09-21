@@ -677,6 +677,11 @@ class RefusalCode(StrEnum):
     VERIFICATION_FAILED = "verification_failed"
     EVIDENCE_STALE = "evidence_stale"
     REVIEW_REJECTED = "review_rejected"
+    #: The reviewer turn produced no usable structured verdict (missing, malformed, ambiguous
+    #: or unbound to its prompt). Distinct from ``REVIEW_REJECTED`` on purpose: refusing
+    #: acceptance because the *wire* failed is not the reviewer's substantive judgment, and
+    #: reporting it as one would be a false statement about the review.
+    REVIEW_PROTOCOL_ERROR = "review_protocol_error"
     OUTCOME_UNKNOWN = "outcome_unknown"
     DRIVER_FAILED = "driver_failed"
     CANCELLED_BY_OPERATOR = "cancelled_by_operator"
