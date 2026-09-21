@@ -1,17 +1,16 @@
-"""The saved live evidence, replayed offline: verdict + isolated acceptance, nothing else.
+"""The saved live evidence, replayed offline, and the record of its later finalization.
 
 These tests only run where the recorded attempt's bytes are present (``.probe/`` is local,
 untracked material). They are deliberately not skipped *silently*: the skip reason says which
 path is missing, so "we verified the saved verdict" is never claimed without the bytes.
 
-What is asserted here is the honest version of the claim:
+Two distinct things are asserted, and they are kept apart on purpose:
 
-* the saved reviewer answer decodes to the canonical verdict with its findings intact;
-* the original run's history is untouched - still ``BLOCKED``/``review_rejected``, still no
-  receipt, and ``AUTH-m2-live-2`` still consumed 2/2;
-* the replay launches **no** process at all, so no model call, credential read or live resume
-  can hide inside it;
-* the frozen candidate is unchanged.
+* the recorded reviewer stream still decodes to the canonical verdict with its findings intact,
+  judged against a copy of the ledger - the original bytes, not the current state;
+* the production ledger, whether or not the local finalization has been applied, never loses
+  the original failure, never changes its authorization consumption, and never gains a model
+  submission.
 """
 
 from __future__ import annotations
@@ -19,6 +18,8 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import shutil
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -32,13 +33,15 @@ PROJECT_DIR = PROBE / "attempt-2"
 RUN_ID = "R-gkb3ld97x8"
 CANDIDATE_COMMIT = "499ece7043fe3267b4ff89f9a5b5bc1d70c42481"
 CANDIDATE_FINGERPRINT = "sha256:5c47b12d12031c4b94f4254c7882615ec7afaecbbef24b17e0483d8b4ac1d405"
+ORIGINAL_BUILD = "hflow/0.0.1+3dbfeae"
+REVIEW_EVIDENCE_ID = "E-zgamyka8s3"
 
 TOOL = REPO_ROOT / "tools" / "m2_live" / "replay_review.py"
 
 
 def _require_saved_evidence() -> None:
     if not STORE.is_file():
-        pytest.skip(f"the recorded store is not present at {STORE}")
+        pytest.skip(f"the recorded ledger is not present at {STORE}")
     if not (PROBE / "attempt-2-data" / "invocations" / "I-vc5pcccfog").is_dir():
         pytest.skip("the recorded reviewer invocation is not present")
 
@@ -52,9 +55,16 @@ def _load_tool():
 
 
 def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    digest.update(path.read_bytes())
-    return digest.hexdigest()
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _rows(sql: str, params: tuple = (), path: Path = STORE) -> list[dict]:
+    connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        return [dict(row) for row in connection.execute(sql, params)]
+    finally:
+        connection.close()
 
 
 @pytest.fixture()
@@ -77,98 +87,184 @@ def no_child_processes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("os.posix_spawn", deny, raising=False)
 
 
-def test_saved_review_replays_to_a_validated_verdict(no_child_processes: None) -> None:
+@pytest.fixture()
+def ledger_copy(tmp_path: Path) -> Path:
+    """A copy of the ledger, so the recorded bytes can be re-evaluated after finalization."""
     _require_saved_evidence()
-    tool = _load_tool()
+    target = tmp_path / "ledger" / "hflow.sqlite"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(STORE, target)
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(str(STORE) + suffix)
+        if sidecar.exists():
+            shutil.copyfile(sidecar, Path(str(target) + suffix))
+    return target
 
-    diagnostic = tool.replay(RUN_ID, store_path=STORE, project_dir=PROJECT_DIR)
 
-    assert diagnostic["blockers"] == []
-    review = diagnostic["review"]
-    assert review["verdict"] == "accepted"
-    assert review["verdict_digest"].startswith("sha256:")
-    assert review["answer_sha256"].startswith("sha256:")
-    assert len(review["findings"]) == 5
-    assert [finding["id"] for finding in review["findings"]] == [
+def test_saved_review_replays_to_a_validated_verdict(
+    ledger_copy: Path, no_child_processes: None
+) -> None:
+    """The recorded reviewer bytes still decode to the canonical verdict, from the raw stream."""
+    _require_saved_evidence()
+    from hflow.review import AnswerTranscript, decode_review
+
+    stream = PROBE / "attempt-2-data" / "invocations" / "I-vc5pcccfog" / "events.ndjson"
+    transcript = AnswerTranscript(session_id=None, role="reviewer")
+    prompt_ids: set = set()
+    terminal_ids: list = []
+    sequence = 0
+    for index, line in enumerate(stream.read_text(encoding="utf-8").splitlines()):
+        if not line.strip():
+            continue
+        message = json.loads(line)
+        params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        if message.get("method") == "session/prompt":
+            prompt_ids.add(message.get("id"))
+        elif message.get("method") == "session/update":
+            transcript.observe_update(
+                params.get("update") if isinstance(params.get("update"), dict) else {},
+                params=params,
+                sequence=sequence,
+                line_index=index,
+            )
+            sequence += 1
+        elif isinstance(message.get("result"), dict) and "stopReason" in message["result"]:
+            terminal_ids.append(message.get("id"))
+
+    answer = transcript.final_answer()
+    assert answer is not None
+    assert answer.chunk_count >= 1
+    assert any(item in prompt_ids for item in terminal_ids), "the terminal response answers the prompt"
+    review = decode_review(answer.text)
+
+    assert review.verdict == "accepted"
+    assert len(review.findings) == 5
+    assert [finding["id"] for finding in review.findings] == [
         "AC-1",
         "AC-2",
         "AC-3",
         "EVIDENCE-E-zgamyka8s3",
         "F-1",
     ]
-    # Every finding was checked against the candidate the review was recorded for.
     assert {
-        finding.get("target") for finding in review["findings"] if finding["id"].startswith("AC-")
+        finding.get("target") for finding in review.findings if finding["id"].startswith("AC-")
     } == {CANDIDATE_FINGERPRINT}
-    assert review["terminal_answers_prompt"] is True
-    assert review["reviewer_named_the_recorded_candidate"] is True
-    assert review["answer_chars"] > 1000, "the whole final message, not a fragment"
+    assert len(answer.text) > 1000, "the whole final message, not a fragment"
 
 
-def test_saved_review_replays_through_the_acceptance_predicates(no_child_processes: None) -> None:
+def test_saved_review_replays_through_the_acceptance_predicates(
+    ledger_copy: Path, no_child_processes: None
+) -> None:
+    """The tool's own decision, evaluated on a copy of the ledger, passes its predicates."""
     _require_saved_evidence()
     tool = _load_tool()
 
-    diagnostic = tool.replay(RUN_ID, store_path=STORE, project_dir=PROJECT_DIR)
+    diagnostic = tool.replay(RUN_ID, store_path=ledger_copy, project_dir=PROJECT_DIR)
 
-    acceptance = diagnostic["acceptance"]
-    assert acceptance["accepted"] is True
-    assert acceptance["candidate_unchanged"] is True
-    assert acceptance["verification_evidence_current"] is True
-    assert acceptance["candidate_fingerprint_recorded"] == CANDIDATE_FINGERPRINT
-    assert acceptance["candidate_fingerprint_recomputed"] == CANDIDATE_FINGERPRINT
-    assert acceptance["isolated_receipt_written"] is True
-    assert "test artifact" in acceptance["receipt_artifact"]
+    # The production ledger already carries the decision, so the tool reports it and writes
+    # nothing. The predicates were exercised when it was recorded; `test_local_finalization`
+    # exercises them again on a rewound copy.
+    if "already_finalized" in diagnostic:
+        decision = diagnostic["already_finalized"]
+        assert decision["review_status"] == "accepted"
+        assert decision["candidate_fingerprint"] == CANDIDATE_FINGERPRINT
+        assert decision["git_commit"] == CANDIDATE_COMMIT
+        assert decision["original_block_code"] == "review_rejected"
+        assert decision["original_runtime_build"] == ORIGINAL_BUILD
+        assert decision["source_evidence_id"] == REVIEW_EVIDENCE_ID
+        assert diagnostic["blockers"] == []
+    else:
+        acceptance = diagnostic["acceptance"]
+        assert acceptance["accepted"] is True
+        assert acceptance["candidate_unchanged"] is True
+        assert acceptance["verification_evidence_current"] is True
+        assert acceptance["candidate_fingerprint_recorded"] == CANDIDATE_FINGERPRINT
+        assert acceptance["candidate_fingerprint_recomputed"] == CANDIDATE_FINGERPRINT
+        assert acceptance["isolated_receipt_written"] is True
+        assert "test artifact" in acceptance["receipt_artifact"]
 
 
-def test_the_replay_leaves_the_original_record_untouched(no_child_processes: None) -> None:
+def test_the_replay_leaves_the_copy_untouched(ledger_copy: Path, no_child_processes: None) -> None:
     _require_saved_evidence()
     tool = _load_tool()
-    before = _sha256(STORE)
+    before = _sha256(ledger_copy)
 
-    diagnostic = tool.replay(RUN_ID, store_path=STORE, project_dir=PROJECT_DIR)
+    diagnostic = tool.replay(RUN_ID, store_path=ledger_copy, project_dir=PROJECT_DIR)
 
-    assert _sha256(STORE) == before
+    assert _sha256(ledger_copy) == before
     assert diagnostic["store_mutated"] is False
     assert diagnostic["store_sha256"] == diagnostic["store_sha256_after"]
-    recorded = diagnostic["recorded"]
-    assert recorded["task_state"] == "BLOCKED"
-    assert recorded["block_code"] == "review_rejected"
-    assert recorded["receipt_present"] is False
-    assert recorded["controller_build"] == "hflow/0.0.1+3dbfeae"
-    assert recorded["attempt_id"] == "A-7f2pbp4teu"
-    assert recorded["implementer_invocation"] == "I-xf3sez1lho"
-    assert recorded["reviewer_invocation"] == "I-vc5pcccfog"
-    # The saved payload keeps the proof of the defect: the review never arrived.
-    assert diagnostic["review"]["stored_result_review"] is None
-    assert diagnostic["review"]["stored_review_reason"] is None
+    assert diagnostic["model_calls"] == 0
+    assert diagnostic["submissions"] == 0
 
 
-def test_the_authorization_still_reads_two_of_two(no_child_processes: None) -> None:
+def test_the_record_keeps_the_original_failure_and_the_new_decision_apart() -> None:
+    """Whatever the local finalization did, the original execution's facts survive."""
     _require_saved_evidence()
-    tool = _load_tool()
 
-    diagnostic = tool.replay(RUN_ID, store_path=STORE, project_dir=PROJECT_DIR)
+    run = _rows("SELECT * FROM runs WHERE run_id = ?", (RUN_ID,))[0]
+    attempt = _rows("SELECT * FROM attempts WHERE run_id = ?", (RUN_ID,))
+    assert run["run_id"] == RUN_ID
+    assert run["spec_digest"] == (
+        "sha256:fcea3247e3508d30b4abdb84e5c8264bdcb7829feaa0c406cbd22068ac001806"
+    )
+    assert [row["attempt_id"] for row in attempt] == ["A-7f2pbp4teu"]
+    assert attempt[0]["invocation_id"] == "I-xf3sez1lho"
+    assert attempt[0]["review_invocation_id"] == "I-vc5pcccfog"
 
-    authorizations = {row["authorization_id"]: row for row in diagnostic["authorizations"]}
-    record = authorizations["AUTH-m2-live-2"]
+    if not run["receipt_json"]:
+        # Not finalized (yet): the historical blocked decision stands as the current state.
+        assert run["task_state"] == "BLOCKED"
+        assert run["block_code"] == "review_rejected"
+        assert run["delivery_state"] == "NONE"
+        return
+
+    receipt = json.loads(run["receipt_json"])
+    assert receipt["provenance"]["kind"] == "offline_reprocessing"
+    assert receipt["provenance"]["original_decision"] == "BLOCKED"
+    assert receipt["provenance"]["original_block_code"] == "review_rejected"
+    assert receipt["provenance"]["original_runtime_build"] == ORIGINAL_BUILD
+    assert receipt["provenance"]["source_evidence_id"] == REVIEW_EVIDENCE_ID
+    assert receipt["provenance"]["model_calls"] == 0
+    assert receipt["candidate"]["git_commit"] == CANDIDATE_COMMIT
+    assert receipt["candidate"]["fingerprint"] == CANDIDATE_FINGERPRINT
+    assert receipt["review"]["status"] == "accepted"
+    assert receipt["review"]["isolation"] == "prompt_only"
+    # The receipt names the build that made this decision, not the original runtime.
+    assert receipt["runtime_build"] != ORIGINAL_BUILD
+    assert any("LATER decision" in line for line in receipt["limitations"])
+    notes = [row["note"] for row in _rows(
+        "SELECT note FROM run_notes WHERE run_id = ? ORDER BY created_at", (RUN_ID,)
+    )]
+    assert any("offline reprocessing decision" in note for note in notes)
+    assert any(ORIGINAL_BUILD in note for note in notes)
+
+
+def test_the_authorization_still_reads_two_of_two() -> None:
+    _require_saved_evidence()
+
+    rows = _rows(
+        "SELECT authorization_id, provided_by, max_top_level_submissions, "
+        "used_top_level_submissions FROM authorizations"
+    )
+    record = {row["authorization_id"]: row for row in rows}["AUTH-m2-live-2"]
     assert record["used_top_level_submissions"] == 2
     assert record["max_top_level_submissions"] == 2
     assert record["provided_by"] == "user"
 
 
-def test_the_saved_candidate_is_still_what_was_frozen(no_child_processes: None) -> None:
+def test_the_saved_candidate_is_still_what_was_frozen() -> None:
     _require_saved_evidence()
-    tool = _load_tool()
-
-    diagnostic = tool.replay(RUN_ID, store_path=STORE, project_dir=PROJECT_DIR)
-
-    candidate = diagnostic["candidate"]
-    assert candidate["fingerprint_matches"] is True
-    assert candidate["candidate_ref_sha"] == CANDIDATE_COMMIT
-    assert candidate["worktree_head"] == CANDIDATE_COMMIT
-    assert candidate["candidate_ref_matches_head"] is True
-    assert candidate["scoped_files"] == ["src/reportkit/__init__.py"]
+    invoked = _rows("SELECT worktree_path FROM runs WHERE run_id = ?", (RUN_ID,))[0]
+    worktree = Path(invoked["worktree_path"])
+    assert worktree.is_dir()
+    git_file = (worktree / ".git").read_text(encoding="utf-8").strip()
+    git_dir = Path(git_file.split("gitdir:", 1)[1].strip())
+    head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+    assert head == CANDIDATE_COMMIT, "the frozen worktree must still be at the candidate commit"
+    scoped = worktree / "src" / "reportkit" / "__init__.py"
+    assert scoped.is_file()
+    assert scoped.stat().st_size == 515
 
 
 def test_a_missing_run_is_reported_not_invented(no_child_processes: None) -> None:
@@ -179,23 +275,19 @@ def test_a_missing_run_is_reported_not_invented(no_child_processes: None) -> Non
         tool.replay("R-does-not-exist", store_path=STORE, project_dir=PROJECT_DIR)
 
 
-def test_the_cli_writes_its_diagnostic_and_exits_zero(tmp_path: Path) -> None:
-    """The command line form used for the handoff: one derived diagnostic, no side effects."""
+def test_repeating_the_local_finalization_writes_nothing_more(tmp_path: Path) -> None:
+    """The production ledger is either not finalized, or finalized exactly once and stable."""
     _require_saved_evidence()
-    out_path = tmp_path / "diagnostic.json"
+    before = _rows(
+        "SELECT task_state, delivery_state, receipt_json, updated_at FROM runs WHERE run_id = ?",
+        (RUN_ID,),
+    )[0]
+    notes_before = _rows(
+        "SELECT COUNT(*) AS n FROM run_notes WHERE run_id = ?", (RUN_ID,)
+    )[0]["n"]
+
     completed = subprocess.run(  # noqa: S603 - fixed local tool invocation
-        [
-            sys.executable,
-            str(TOOL),
-            RUN_ID,
-            "--store",
-            str(STORE),
-            "--project-dir",
-            str(PROJECT_DIR),
-            "--out",
-            str(out_path),
-            "--quiet",
-        ],
+        [sys.executable, str(TOOL), RUN_ID, "--finalize", "--quiet"],
         capture_output=True,
         text=True,
         timeout=300,
@@ -203,8 +295,16 @@ def test_the_cli_writes_its_diagnostic_and_exits_zero(tmp_path: Path) -> None:
     )
 
     assert completed.returncode == 0, completed.stderr
-    diagnostic = json.loads(out_path.read_text(encoding="utf-8"))
-    assert diagnostic["review"]["verdict"] == "accepted"
-    assert diagnostic["acceptance"]["accepted"] is True
-    assert diagnostic["model_calls"] == 0
-    assert diagnostic["submissions"] == 0
+    after = _rows(
+        "SELECT task_state, delivery_state, receipt_json, updated_at FROM runs WHERE run_id = ?",
+        (RUN_ID,),
+    )[0]
+    if before["receipt_json"]:
+        assert after == before, "a repeated finalization must change nothing"
+        assert (
+            _rows("SELECT COUNT(*) AS n FROM run_notes WHERE run_id = ?", (RUN_ID,))[0]["n"]
+            == notes_before
+        )
+    else:
+        assert after["receipt_json"], "the first finalization must record a receipt"
+    assert _rows("SELECT used_top_level_submissions AS u FROM authorizations")[0]["u"] == 2

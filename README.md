@@ -14,6 +14,7 @@ live_cooperative_cancel  = not_tested          (unsupported on the one-shot exec
 forced_local_stop_offline = passed             (stubborn stub + Job Object teardown)
 forced_local_stop_live   = not_tested          (one live trial sent; client launch failed, cause known and fixed)
 m2_offline_delivery      = passed              (Git worktree -> frozen candidate -> checks -> local receipt)
+m2_live_candidate        = delivered_after_offline_recovery  (recorded evidence; original run stays BLOCKED on 3dbfeae)
 unattended_execution     = disabled
 new_live_budget          = 0                   (each live task needs its own explicit approval)
 ```
@@ -38,7 +39,7 @@ Python 3.12+ (developed on 3.14.7). Runtime dependency: `pydantic>=2.12,<3`.
 Development dependency: `pytest>=9.0,<10`.
 
 ```sh
-python -m pytest -q            # 183 passed, 1 skipped (see below)
+python -m pytest -q            # 197 passed, 1 skipped (see below)
 python -m pip install -e .     # optional: installs the `hflow` console script
 ```
 
@@ -108,6 +109,12 @@ from it (`hflow schema`). There is no second hand-written schema to drift.
   stays a review rejection.
 - An unknown outcome blocks and never auto-retries.
 - Verification is bound to a candidate fingerprint and a checks digest.
+- A delivery can be recorded as a **later decision** about an execution that already ended (an
+  offline reprocessing of recorded evidence). Such a receipt carries `provenance` naming the
+  original decision, its build and the evidence it came from, and `report` prints that next to
+  the delivery - so a recovered delivery never reads as the original run's own success. The
+  write only ever moves a blocked run forward, never over a cancellation intent or a different
+  decision, is idempotent for the same evidence, and consumes no allowance.
 - `status`, `report` and `doctor` make no model calls.
 
 ## Not implemented (do not assume otherwise)
@@ -126,9 +133,10 @@ repair a malformed verdict.
 python -m pytest -q tests/test_authorization.py          # 12 tests: the authorized real-run gate
 python -m pytest -q tests/test_driver_acpx_dsh.py        # 24 tests, no model, no credential
 python -m pytest -q tests/test_review.py                 # 37 tests: the review output grammar
-python -m pytest -q tests/test_review_wire.py            # 20 tests: reviewer verdict -> receipt
-python -m pytest -q tests/test_real_client_review.py     # installed acpx + mock agent, no model
-python -m pytest -q tests/test_saved_review_replay.py    # the recorded live review, replayed offline
+python -m pytest -q tests/test_review_wire.py            # 21 tests: reviewer verdict -> receipt
+python -m pytest -q tests/test_real_client_review.py     # 3 tests: installed acpx + mock agent, no model
+python -m pytest -q tests/test_saved_review_replay.py    # 8 tests: the recorded live review, replayed offline
+python -m pytest -q tests/test_local_finalization.py     # 13 tests: one later decision, recorded through the Store
 python -m pytest -q tests/test_concurrency.py            # 8 deterministic thread/cancel-orderings tests
 python -m pytest -q tests/test_m2_slice.py               # 5 tests: Git worktree -> frozen candidate
 python -m pytest -q tests/test_cli_m2_cleanup.py         # 15 tests: the same flow through the CLI + guarded clean
@@ -136,6 +144,7 @@ python tools/m0_probe/check_process_boundary.py          # Job Object teardown, 
 python tools/m0_probe/real_client_checks.py all          # real acpx: version + mock-agent round trip
 python tools/m2_live/prepare_m2_live.py                  # build the real M2 task package (dispatches nothing)
 python tools/m2_live/replay_review.py R-gkb3ld97x8       # replay a recorded review; no model, no writes
+python tools/m2_live/replay_review.py R-xxxxxxxxxx --finalize  # record one later decision (needs explicit approval)
 ```
 
 The driver tests run the real launch/observe/stop code against a test-only stand-in for the

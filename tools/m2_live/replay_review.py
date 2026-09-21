@@ -44,6 +44,7 @@ from hflow.contracts import (  # noqa: E402
     DeliveryState,
     EvidenceStatus,
     InvocationOutcome,
+    IsolationLevel,
     ResultReceipt,
     ReviewOutput,
     ReviewResult,
@@ -69,6 +70,11 @@ PROBE_ROOT = REPO_ROOT / ".probe" / "m2-live"
 DEFAULT_STORE = PROBE_ROOT / "attempt-2-data" / "hflow.sqlite"
 DEFAULT_PROJECT = PROBE_ROOT / "attempt-2"
 REVIEWER_PROMPT_MARKER = "Review the frozen candidate"
+
+#: The isolation level the controller records for a review on this driver. It is a fact about
+#: what the driver enforces (a read-only launch mode), never the reviewer's own claim, and it
+#: is what the original run's controller would have recorded too.
+RECORDED_REVIEW_ISOLATION = IsolationLevel.PROMPT_ONLY
 
 
 class ReplayError(RuntimeError):
@@ -207,6 +213,7 @@ def build_receipt(
         ),
         review=ReviewResult(
             status=review_result_status(review),
+            isolation=RECORDED_REVIEW_ISOLATION,
             evidence_ids=[review_evidence_id],
             checked_fingerprint=fingerprint,
         ),

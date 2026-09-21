@@ -84,6 +84,35 @@ def ledger_copy(tmp_path: Path) -> Path:
     return target
 
 
+@pytest.fixture()
+def blocked_ledger_copy(ledger_copy: Path) -> Path:
+    """The same copy, rewound to the recorded pre-finalization state.
+
+    The production ledger may already carry the offline decision. Rewinding only this copy's
+    *decision columns* - never its evidence, notes or authorization rows - is what lets the
+    finalization itself be exercised again without touching the record.
+    """
+    connection = sqlite3.connect(ledger_copy)
+    try:
+        with connection:
+            connection.execute(
+                "DELETE FROM evidence WHERE evidence_id <> ?", (REVIEW_EVIDENCE_ID,)
+            )
+            connection.execute(
+                "DELETE FROM run_notes WHERE note LIKE 'offline reprocessing decision%'"
+            )
+            connection.execute(
+                "UPDATE runs SET task_state = 'BLOCKED', phase = NULL, delivery_state = 'NONE', "
+                "receipt_json = NULL, block_code = 'review_rejected', "
+                "block_reason = 'independent review requested changes; automatic repair is "
+                "deferred to M3' WHERE run_id = ?",
+                (RUN_ID,),
+            )
+    finally:
+        connection.close()
+    return ledger_copy
+
+
 def _rows(path: Path, sql: str, params: tuple = ()) -> list[dict]:
     connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
@@ -99,10 +128,11 @@ def _rows(path: Path, sql: str, params: tuple = ()) -> list[dict]:
 
 
 def test_the_recorded_evidence_finalizes_in_a_ledger_copy(
-    ledger_copy: Path, no_child_processes: None
+    blocked_ledger_copy: Path, no_child_processes: None
 ) -> None:
     _require_recorded_ledger()
     tool = _load_tool()
+    ledger_copy = blocked_ledger_copy
 
     diagnostic = tool.replay(
         RUN_ID,
@@ -193,10 +223,11 @@ def test_the_finalization_consumes_no_allowance_and_adds_no_submission(
     assert after_run["turns_observed"] == before_run["turns_observed"]
 
 
-def test_a_second_finalization_changes_nothing(ledger_copy: Path, no_child_processes: None) -> None:
+def test_a_second_finalization_changes_nothing(blocked_ledger_copy: Path, no_child_processes: None) -> None:
     """Idempotent: the same evidence and candidate must not issue a second delivery."""
     _require_recorded_ledger()
     tool = _load_tool()
+    ledger_copy = blocked_ledger_copy
     first = tool.replay(
         RUN_ID,
         store_path=ledger_copy,
@@ -242,6 +273,33 @@ def test_the_read_only_replay_never_writes(ledger_copy: Path, no_child_processes
     assert diagnostic["store_mutated"] is False
     assert "finalization" not in diagnostic
     assert ledger_copy.read_bytes() == before
+
+
+def test_the_report_keeps_the_original_failure_next_to_the_delivery(
+    blocked_ledger_copy: Path, no_child_processes: None
+) -> None:
+    """A receipt that records a later decision must never read as the execution's own success."""
+    _require_recorded_ledger()
+    from hflow.report import receipt_text
+
+    tool = _load_tool()
+    diagnostic = tool.replay(
+        RUN_ID,
+        store_path=blocked_ledger_copy,
+        project_dir=PROJECT_DIR,
+        finalize=True,
+        processing_build=CHECK_BUILD,
+    )
+    assert diagnostic["finalization"]["written"] is True
+    run = _rows(blocked_ledger_copy, "SELECT receipt_json FROM runs WHERE run_id = ?", (RUN_ID,))[0]
+    text = receipt_text(ResultReceipt.model_validate(json.loads(run["receipt_json"])))
+
+    assert "provenance" in text
+    assert "original_decision     BLOCKED / review_rejected" in text
+    assert "original_runtime      hflow/0.0.1+3dbfeae" in text
+    assert "offline_reprocessing" in text
+    assert CHECK_BUILD in text
+    assert "not the execution's own outcome" in text
 
 
 # --------------------------------------------------------------------------
@@ -506,26 +564,22 @@ def test_a_verdict_that_is_not_an_acceptance_still_records_a_failed_review(tmp_p
 
 
 def test_the_tool_refuses_to_finalize_when_the_candidate_moved(
-    ledger_copy: Path, tmp_path: Path, no_child_processes: None
+    blocked_ledger_copy: Path, tmp_path: Path, no_child_processes: None
 ) -> None:
     """Changed evidence fails closed: the ledger keeps its original decision."""
     _require_recorded_ledger()
     tool = _load_tool()
-    # Point the recorded spec at a path whose content cannot match the recorded fingerprint.
+    ledger_copy = blocked_ledger_copy
+    # Point the recorded run at a tree whose *content* cannot match the recorded fingerprint:
+    # the same scoped path in the target project, which is at the base commit, not the candidate.
     altered = tmp_path / "spec-drift.sqlite"
     shutil.copyfile(ledger_copy, altered)
     connection = sqlite3.connect(altered)
     try:
-        spec = json.loads(
-            _rows(altered, "SELECT task_spec_json FROM runs WHERE run_id = ?", (RUN_ID,))[0][
-                "task_spec_json"
-            ]
-        )
-        spec["scope"]["write_allow"] = ["src/reportkit/other_file.py"]
         with connection:
             connection.execute(
-                "UPDATE runs SET task_spec_json = ? WHERE run_id = ?",
-                (json.dumps(spec), RUN_ID),
+                "UPDATE runs SET worktree_path = ? WHERE run_id = ?",
+                (str(PROBE / "project"), RUN_ID),
             )
     finally:
         connection.close()

@@ -95,13 +95,32 @@ def receipt_text(receipt: ResultReceipt) -> str:
         f"review        {receipt.review.status} isolation={receipt.review.isolation.value}",
         f"task_state    {receipt.task_state.value}",
         f"delivery      {receipt.delivery_state.value}",
-        "usage",
-        f"  turns_reserved        {usage.controller_turns_reserved}",
-        f"  turns_observed        {_unknown(usage.controller_turns_observed)} (implementer self-report)",
-        f"  provider_billed_tokens {_unknown(usage.provider_billed_tokens)}",
-        f"  provider_cost          {_unknown(usage.provider_cost)}",
-        f"  quota_remaining        {_unknown(usage.subscription_quota_remaining)}",
     ]
+    # A later decision must show what the execution itself ended as, right next to the delivery.
+    if receipt.provenance.get("kind"):
+        lines.extend(
+            [
+                "provenance    this receipt is a later decision, not the execution's own outcome",
+                f"  kind                  {receipt.provenance.get('kind')}",
+                f"  original_decision     {receipt.provenance.get('original_decision', '-')}"
+                f" / {receipt.provenance.get('original_block_code', '-')}",
+                f"  original_runtime      {receipt.provenance.get('original_runtime_build', '-')}",
+                f"  original_reason       {receipt.provenance.get('original_block_reason', '-')}",
+                f"  source_evidence       {receipt.provenance.get('source_evidence_id', '-')}",
+                f"  model_calls           {receipt.provenance.get('model_calls', '-')}"
+                f" (authorization consumed: {receipt.provenance.get('authorization_consumed', '-')})",
+            ]
+        )
+    lines.extend(
+        [
+            "usage",
+            f"  turns_reserved        {usage.controller_turns_reserved}",
+            f"  turns_observed        {_unknown(usage.controller_turns_observed)} (implementer self-report)",
+            f"  provider_billed_tokens {_unknown(usage.provider_billed_tokens)}",
+            f"  provider_cost          {_unknown(usage.provider_cost)}",
+            f"  quota_remaining        {_unknown(usage.subscription_quota_remaining)}",
+        ]
+    )
     if receipt.limitations:
         lines.append("limitations")
         lines.extend(f"  - {item}" for item in receipt.limitations)

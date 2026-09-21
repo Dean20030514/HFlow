@@ -1,15 +1,18 @@
 # Reviewer result wire — repair and offline replay of the recorded B attempt
 
-The live implementation and review both completed; delivery was blocked by **adapter result
-loss**, not by the candidate and not by the reviewer's judgment. This note records the repair,
-the regression that proves it, and the replay of the recorded reviewer bytes through the
-production decision path.
+**Outcome: M2 candidate delivered after evidence-based offline recovery.** The live
+implementation and review both completed; delivery was originally blocked by **adapter result
+loss**, not by the candidate and not by the reviewer's judgment. The verdict was then recovered
+from the reviewer's own recorded bytes and the candidate's delivery was recorded locally as a
+*later* decision on the fixed build. That is not an uninterrupted M2 run: the original execution
+stays `BLOCKED` / `review_rejected` on `3dbfeae`, and the receipt says so itself.
 
 **No new live authorization was used.** New real model submissions: **0**. `AUTH-m2-live-2`
 still reads `used 2/2`.
 
-Repair commit: **`51596cd`** (`fix(review): propagate validated reviewer verdicts`), on top of
-the recorded runner `3dbfeae` and its evidence commit `e6a303e`.
+Repair commits: `51596cd` (`fix(review): propagate validated reviewer verdicts`) and
+`1ca5e95` + `f1c68c2` (the local finalization path and its full-SHA processing identity), on top
+of the recorded runner `3dbfeae` and its evidence commit `e6a303e`.
 
 ## 1. The missing wire, confirmed in source
 
@@ -120,18 +123,55 @@ prove the bytes were not edited earlier, and the approved check was re-associate
 fingerprint + checks digest + command) but **not** re-executed to manufacture a fresh
 timestamp.
 
-## 5. What this does and does not establish
+## 5. The local finalization action (recorded)
+
+After the repair, one local, zero-model finalization was explicitly requested and executed for
+this candidate. It is a **later decision about the same recorded evidence**, not a rerun:
+
+```sh
+python tools/m2_live/replay_review.py R-gkb3ld97x8 --finalize
+```
+
+| Item | Value |
+|---|---|
+| processing build (`receipt.runtime_build`) | `hflow/0.0.1+f1c68c2237f56e81558e75d364c1ade7de26dfac` |
+| decision | `offline_reprocessing`, `ACCEPTED` / `LOCAL_CANDIDATE` |
+| receipt attempt / revision | `A-7f2pbp4teu` / 2 |
+| candidate | `git_commit 499ece7043fe3267b4ff89f9a5b5bc1d70c42481`, fingerprint `sha256:5c47b12d…d405`, path `src/reportkit/__init__.py` |
+| verification evidence | `E-zgamyka8s3` (`unit`, passed, exit 0) - re-associated, not re-run |
+| review evidence | `E-wln314qoor` (`review`, passed, `isolation=prompt_only`), verdict `accepted`, digest `sha256:bbe60014…025e9` |
+| source of the decision | `E-zgamyka8s3`, checks digest `sha256:42216b79…ba80`, reviewer answer `sha256:6c7cb3c9…7fa2c` |
+| original execution, preserved | `BLOCKED` / `review_rejected` on `hflow/0.0.1+3dbfeae`, reason recorded verbatim, still in the run's notes and in the receipt's provenance |
+| `AUTH-m2-live-2` | still 2/2, `provided_by user`, unchanged by the decision |
+| new model submissions | **0** (no dispatch, no credential read, no allowance consumed) |
+| ledger | `1b4040a2…` after the write and `7a3409ed…` after the isolation correction; a repeated `--finalize` changed no byte |
+
+Requested wording, recorded as the authority for this action: *"one local, zero-model
+finalization of candidate `499ece7043fe…` for original run `R-gkb3ld97x8`, using the recorded
+implementation, verification and review evidence and the validated reviewer fix `51596cd`"* —
+performed through the controller/Store path, with no temporary receipt copied and no SQL hand
+edit.
+
+The transaction (`Store.finalize_offline_reprocessing`) writes the review evidence and the
+receipt together, only from the original terminal state, never over a cancellation intent,
+never over a different decision, and idempotently for the same evidence and candidate. A
+deliberate defect in the first recorded receipt - `review.isolation` came out `unknown` instead
+of the recorded `prompt_only` - was corrected through `Store.save_receipt`, the repair path for
+an already-terminal run; state, provenance and the decision itself were unchanged.
+
+## 6. What this does and does not establish
 
 * Established: the saved reviewer verdict is a valid canonical `ReviewOutput`; the production
-  path now carries such a verdict through `collect()` and `_review()` to the unchanged
-  acceptance checks; the recorded candidate and its verification evidence still bind; and the
-  acceptance predicates pass on the recorded material in an isolated evaluation.
-* **Not** established: an uninterrupted successful M2 run. The original run is still
-  historically `BLOCKED` / `review_rejected` with no receipt; nothing was rewritten, and the
-  runner commit `3dbfeae` is not stamped as passed.
+  path carries such a verdict through `collect()` and `_review()` to the unchanged acceptance
+  checks; the recorded candidate and its verification evidence still bind; and this candidate's
+  delivery is now recorded as **`ACCEPTED` / `LOCAL_CANDIDATE`** through the Store's guarded
+  transaction, with the original failure preserved next to it (`status`/`report` print the
+  provenance of the later decision).
+* **Not** established: an uninterrupted successful M2 run. The original execution is still
+  `BLOCKED` / `review_rejected` on `3dbfeae`, that runtime is not stamped as passed, and the
+  receipt says so in its own limitations.
 * Not done: no new live model call, no A retest, no format-repair call, no new dependency, no
-  automatic historical finalization, no new readiness platform.
+  new B trial, no unattended execution.
 
-Post-hoc finalization of the original run, if it is ever wanted, is a separate explicit local
-action through the controller checks and CAS with the original failure and a new processing
-version/time recorded - not a hand-edited SQLite state and not a forged verdict.
+A future clean run can demonstrate the fixed path during a separately authorized task; this
+already completed candidate is not re-purchased for presentation.
