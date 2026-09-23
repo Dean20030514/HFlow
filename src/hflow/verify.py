@@ -16,11 +16,12 @@ with a timeout; that limits blast radius but is not a security boundary.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import tempfile
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Protocol
 
@@ -34,8 +35,24 @@ from .contracts import (
     VerificationResult,
     digest_of,
 )
+from .drivers.winjob import (
+    JobBoundaryError,
+    ProcessBoundary,
+    popen_in_boundary,
+    process_gone,
+)
 from .ids import new_evidence_id
 from .store import Store
+
+#: How long a finished check's boundary is given to settle before its remaining processes
+#: are treated as a lifecycle defect rather than a clean pass. Bounded, and taken from the
+#: check's own deadline, so a check never overruns because of this wait.
+DESCENDANT_SETTLE_SECONDS = 2.0
+#: How long a boundary tear-down is given to report itself empty before it is called
+#: unconfirmed. A tear-down that cannot confirm must not be reported as a success.
+BOUNDARY_EMPTY_SECONDS = 5.0
+#: How long the direct child is given to die after the boundary killed it.
+CHILD_REAP_SECONDS = 5.0
 
 
 class CheckOutcome:
@@ -97,67 +114,332 @@ class FakeCheckRunner:
 
 
 class CommandCheckRunner:
-    """Runs an approved argv as a subprocess.
+    """Runs an approved argv as a subprocess inside an owned process boundary.
 
     Output is captured through temporary files rather than pipes: it is portable,
     avoids deadlocks on large output, and keeps the controller free of a reader
     thread. Only digests and a short excerpt reach the database.
 
-    ``extra_env`` is merged over the ambient environment. The controller uses it to keep a
-    check from scattering caches into the workspace under test - a check should produce
-    evidence, not untracked files that later look like unfrozen changes.
+    The process itself is owned rather than merely started. On Windows the check is
+    launched *inside* a Job Object (``drivers/winjob.py``), so a check that leaves
+    descendants behind can be settled as one unit; the child is created suspended and
+    assigned before it runs, so there is no window in which it is unowned. If that
+    boundary cannot be established, nothing is executed at all: falling back to an
+    unmanaged launch would mean the runner could no longer stop what it started.
+
+    Three outcomes are deliberately *not* passes: a check whose deadline expired, a check
+    whose direct child exited 0 while its descendants had to be terminated, and a check that
+    could not be run inside a boundary at all. Each is an ``ERROR`` carrying the lifecycle
+    observation in its detail text, so an unsettled process tree stays visible in the stored
+    evidence instead of being rounded up to success. Where the platform's boundary covers only
+    the direct child, the detail says so rather than implying whole-tree termination.
+
+    What the linger check cannot see: a process that enters the job *after* the boundary was
+    last polled. The boundary is sampled when the direct child has finished, and again after
+    the settle window, so a descendant started later than that is reported by nothing. Closing
+    the boundary at the end of every call terminates whatever is still in the job at that
+    moment, but that termination is not itself observed and does not change an outcome that was
+    already computed, so this remains a gap rather than a guarantee. A process that was never
+    in the job at all - work delegated outside the owned boundary - is outside this slice
+    entirely and is not reclaimed by ``close()``.
+
+    An observation that could not be made is not a clean boundary either. ``None`` from the
+    boundary means "unknown" - a failed query behind a Windows Job Object looks exactly like a
+    boundary that does not exist - so the two are told apart by ``ProcessBoundary.kind`` and
+    only a boundary that is *known* not to own a tree ("direct_child_only") may pass without a
+    settlement observation.
+
+    Output-size limits and environment minimization are not part of this slice:
+    ``extra_env`` is still merged over the ambient environment.
     """
 
-    def __init__(self, excerpt_limit: int = 2000, extra_env: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        excerpt_limit: int = 2000,
+        extra_env: dict[str, str] | None = None,
+        *,
+        _observation_override: Callable[[ProcessBoundary], int | None] | None = None,
+    ) -> None:
         self.excerpt_limit = excerpt_limit
         self.extra_env = dict(extra_env or {})
+        # Test-only: supplies the boundary observation instead of querying it, so a lifecycle
+        # test can reproduce a query that failed on a real Windows Job Object (the helper returns
+        # ``None`` for that, exactly as it does where no job exists). Production code never
+        # passes it.
+        self._observation_override = _observation_override
 
     def run(self, check: CheckDef, cwd: Path, timeout_seconds: int) -> CheckOutcome:
         if not check.argv:
             return CheckOutcome(EvidenceStatus.ERROR, detail=f"check {check.id}: empty argv")
         started = time.monotonic()
+        deadline = started + max(0.0, float(timeout_seconds))
         env = {**os.environ, **self.extra_env}
-        with tempfile.TemporaryDirectory(prefix="hflow-check-") as tmp:
-            out_path = Path(tmp) / "stdout.txt"
-            err_path = Path(tmp) / "stderr.txt"
-            try:
-                with out_path.open("wb") as out, err_path.open("wb") as err:
-                    completed = subprocess.run(  # noqa: S603 - argv comes from the project contract
-                        list(check.argv),
-                        cwd=str(cwd),
-                        env=env,
-                        stdout=out,
-                        stderr=err,
-                        timeout=timeout_seconds,
-                        check=False,
-                    )
-                returncode: int | None = completed.returncode
-                timed_out = False
-            except subprocess.TimeoutExpired:
-                returncode, timed_out = None, True
-            except OSError as exc:
-                return CheckOutcome(
-                    EvidenceStatus.ERROR,
-                    detail=f"check {check.id} could not start: {exc}",
-                    command=list(check.argv),
-                )
+        argv = list(check.argv)
+        # Deliberately not ``TemporaryDirectory``: on Windows a process that still holds the
+        # captured file open makes deleting it fail, and failing to delete a log file must not
+        # turn a check's real result into an exception. Removal is explicit, best effort and
+        # bounded, and a file that stays behind is reported as a fact in the detail text.
+        try:
+            scratch = Path(tempfile.mkdtemp(prefix="hflow-check-"))
+            out_path = scratch / "stdout.txt"
+            err_path = scratch / "stderr.txt"
+        except OSError as exc:
+            # Refusing to run without somewhere to capture output is the honest answer: the
+            # alternative is a check whose evidence cannot be recorded.
+            return CheckOutcome(
+                EvidenceStatus.ERROR,
+                detail=f"check {check.id}: no writable scratch directory for its output ({exc})",
+                command=argv,
+            )
+        kept = 0
+        try:
+            result = self._execute(argv, check, cwd, env, out_path, err_path, deadline)
             stdout = out_path.read_bytes() if out_path.exists() else b""
             stderr = err_path.read_bytes() if err_path.exists() else b""
+        finally:
+            kept = self._discard_output_files(scratch, (out_path, err_path))
         elapsed = round(time.monotonic() - started, 3)
-        detail = f"check {check.id}: exit={returncode} elapsed={elapsed}s"
-        if timed_out:
-            detail += f" (timeout after {timeout_seconds}s)"
+        if kept:
+            result["details"] = [*(result.get("details") or []), "output_files_kept=1"]
+        return self._outcome(check, argv, result, stdout, stderr, elapsed)
+
+    @staticmethod
+    def _discard_output_files(directory: Path, paths: tuple[Path, ...]) -> int:
+        """Remove this call's scratch files; report how many could not be removed."""
+        for _ in range(10):
+            try:
+                for path in paths:
+                    path.unlink(missing_ok=True)
+                directory.rmdir()
+                return 0
+            except OSError:
+                time.sleep(0.02)
+        try:
+            directory.rmdir()
+            return 0
+        except OSError:
+            return 1
+
+    # -- one execution, fully owned ------------------------------------------
+
+    def _execute(
+        self,
+        argv: list[str],
+        check: CheckDef,
+        cwd: Path,
+        env: dict[str, str],
+        out_path: Path,
+        err_path: Path,
+        deadline: float,
+    ) -> dict[str, object]:
+        """Launch, observe and settle one check. Never raises for a check-level failure."""
+        try:
+            boundary = ProcessBoundary().open()
+        except (JobBoundaryError, OSError) as exc:
+            # No boundary, no execution: an unmanaged launch could not be stopped afterwards.
+            return {
+                "phase": "boundary",
+                "error": f"the check process boundary could not be established ({exc})",
+            }
+
+        child: subprocess.Popen | None = None
+        details: list[str] = [f"boundary={boundary.kind}"]
+        try:
+            try:
+                with out_path.open("wb") as out, err_path.open("wb") as err:
+                    child = popen_in_boundary(
+                        argv,
+                        cwd=str(cwd),
+                        env=env,
+                        boundary=boundary,
+                        stdout_handle=out,
+                        stderr_handle=err,
+                    )
+            except (JobBoundaryError, OSError, ValueError) as exc:
+                # Covers "could not start" and "started but could not be assigned/resumed".
+                # Nothing here ran unmanaged, so there is nothing to tear down.
+                return {"phase": "startup", "error": f"the check could not be started ({exc})"}
+            # A check receives no interactive input. The helper creates a stdin pipe, so it is
+            # closed here: a check that waits for EOF would otherwise hang until its deadline.
+            self._close_stdin(child)
+
+            timed_out = False
+            try:
+                returncode: int | None = child.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                returncode = None
+                # Deadline reached: stop what this runner owns, before asking whether the
+                # boundary is quiet. Reaping the direct child is left to the finally block.
+                terminated = boundary.terminate()
+                details.append(
+                    "timeout: the owned boundary was terminated "
+                    f"({'the OS accepted it' if terminated else 'the request was refused'})"
+                )
+
+            settled = self._settle_descendants(boundary, details, deadline)
+            if timed_out:
+                # Reap first, then ask whether the direct child is really gone: the question
+                # is answerable only once nothing is holding the process object open.
+                self._reap_direct_child(child)
+                details.append(f"direct_child_gone={process_gone(child.pid, 0.0)}")
+            return {
+                "phase": "completed",
+                "returncode": returncode,
+                "timed_out": timed_out,
+                # ``settled`` is "settled", "forced" or "unknown"; only "settled" may pass.
+                "settled": settled,
+                "details": details,
+            }
+        finally:
+            # Both steps happen before the caller reads the captured output: on Windows a
+            # process that is still inside the boundary holds its stdout/stderr handles open,
+            # and reading or deleting those files while it does is a sharing violation. The
+            # boundary is therefore released here - kill-on-close settles whatever is left -
+            # and this also guarantees the handle never outlives the call.
+            if child is not None:
+                self._reap_direct_child(child)
+            with contextlib.suppress(Exception):
+                boundary.close()
+
+    def _reap_direct_child(self, child: subprocess.Popen) -> None:
+        """Wait a bounded time for the direct child, then make sure it is gone.
+
+        Called on every path, including the ones that already failed: a launched child must
+        not be left behind because an earlier step went wrong.
+        """
+        try:
+            child.wait(timeout=CHILD_REAP_SECONDS)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        with contextlib.suppress(Exception):
+            child.kill()
+        with contextlib.suppress(Exception):
+            child.wait(timeout=CHILD_REAP_SECONDS)
+
+    def _settle_descendants(
+        self, boundary: ProcessBoundary, details: list[str], deadline: float
+    ) -> str:
+        """Let a finished check's boundary go quiet.
+
+        Returns ``"settled"`` only when the boundary was *observed* to own no process, which is
+        the one state a pass is allowed to rest on. ``"forced"`` means processes were seen and
+        had to be terminated; ``"unknown"`` means the observation itself failed - a query that
+        did not answer on a boundary that owns a tree, which must not be read as an empty tree.
+
+        A direct child exiting is not by itself completion: a check that spawned helpers can
+        leave them running. A boundary that is *known* not to own a tree (``direct_child_only``,
+        i.e. no Job Object was created) keeps its documented weaker behaviour: nothing about the
+        process tree is claimed there, including by a pass.
+        """
+        active = self._observation(boundary)
+        if active is None:
+            if boundary.kind == "direct_child_only":
+                details.append("boundary_ownership=single_process_only_on_this_platform")
+                return "settled"
+            # The query did not answer although a boundary exists. Unknown is not empty.
+            details.append("boundary_observation=unknown")
+            return "unknown"
+
+        settle_budget = min(DESCENDANT_SETTLE_SECONDS, max(0.0, deadline - time.monotonic()))
+        if active > 0 and settle_budget > 0:
+            boundary.wait_empty(settle_budget)
+            active = self._observation(boundary)
+            if active is None:
+                details.append("boundary_observation=unknown")
+                return "unknown"
+        if active == 0:
+            details.append("boundary_empty=True")
+            return "settled"
+
+        # Descendants outlived the check and the settle window: settle them by force, and say
+        # so. The caller reports this as a lifecycle error, never as a clean pass.
+        details.append(f"descendants_alive_after_settle={active}")
+        boundary.terminate()
+        emptied = boundary.wait_empty(
+            min(BOUNDARY_EMPTY_SECONDS, max(0.0, deadline - time.monotonic()))
+        )
+        # An unconfirmed tear-down stays visible: it is never rounded up to "terminated".
+        details.append(f"boundary_terminated_by_this_runner=True boundary_empty={emptied}")
+        return "forced"
+
+    def _observation(self, boundary: ProcessBoundary) -> int | None:
+        """How many processes the boundary owns right now, or ``None`` when that is unknown."""
+        if self._observation_override is not None:
+            return self._observation_override(boundary)
+        return boundary.active_processes()
+
+    @staticmethod
+    def _close_stdin(child: subprocess.Popen) -> None:
+        if child.stdin is not None and not child.stdin.closed:
+            with contextlib.suppress(OSError):
+                child.stdin.close()
+
+    # -- result mapping ------------------------------------------------------
+
+    def _outcome(
+        self,
+        check: CheckDef,
+        argv: list[str],
+        result: dict[str, object],
+        stdout: bytes,
+        stderr: bytes,
+        elapsed: float,
+    ) -> CheckOutcome:
+        """Map one execution to a CheckOutcome. Only this method decides PASSED."""
+        status = EvidenceStatus.ERROR
+        returncode: int | None = None
+        detail = ""
+
+        if result["phase"] in {"boundary", "startup"}:
+            # Nothing ran, or nothing ran unmanaged. The reason is the whole detail.
+            detail = f"check {check.id}: {result['error']}"
+        else:
+            returncode = result["returncode"]  # type: ignore[assignment]
+            timed_out = bool(result["timed_out"])
+            settled = str(result["settled"])
+            segments = [str(segment) for segment in result["details"] or []]  # type: ignore[union-attr]
+            if timed_out:
+                # A timeout stays an error whatever a process does afterwards: the check did
+                # not finish inside its deadline, so nothing about its result is trustworthy.
+                detail = (
+                    f"check {check.id}: exit={returncode} elapsed={elapsed}s "
+                    f"(timeout after {check.timeout_seconds}s)"
+                )
+            else:
+                detail = f"check {check.id}: exit={returncode} elapsed={elapsed}s"
+                if returncode == 0 and settled == "settled":
+                    status = EvidenceStatus.PASSED
+                elif returncode != 0:
+                    status = EvidenceStatus.FAILED
+            if settled == "forced":
+                # A zero exit is not completion if the check left processes behind.
+                segments.insert(
+                    0,
+                    "the check left processes running after it finished; its owned boundary was "
+                    "terminated, so this is a lifecycle error, not a clean result",
+                )
+            elif settled == "unknown":
+                # Distinct from the case above on purpose: no lingering process was observed
+                # here, the observation itself failed. Saying "processes were left running"
+                # would report a fact this run does not have.
+                segments.insert(
+                    0,
+                    "the owned boundary could not be observed, so settlement is unconfirmed; an "
+                    "unanswered query is not an empty process tree and this is not a clean result",
+                )
+            detail += " " + " ".join(segments)
+
         if stderr:
             detail += " stderr=" + stderr[: self.excerpt_limit].decode("utf-8", "replace")
         return CheckOutcome(
-            EvidenceStatus.ERROR if timed_out else (
-                EvidenceStatus.PASSED if returncode == 0 else EvidenceStatus.FAILED
-            ),
+            status,
             exit_code=returncode,
             stdout_digest=digest_of(stdout.decode("utf-8", "replace")),
             stderr_digest=digest_of(stderr.decode("utf-8", "replace")),
             detail=detail,
-            command=list(check.argv),
+            command=argv,
         )
 
 
