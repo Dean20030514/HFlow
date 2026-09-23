@@ -16,6 +16,7 @@ from hflow.contracts import (
     AcceptanceCriterion,
     BudgetRequest,
     CheckDef,
+    DeliveryRequirement,
     ProjectConfig,
     ProjectLimits,
     RefusalCode,
@@ -94,6 +95,144 @@ def test_reuse_gate_blocks_unproven_reuse(
         }
     )
     assert RefusalCode.REUSE_NOT_APPROVED in _codes(spec, project, project_root)
+
+
+def _decided(**kwargs: object) -> ReuseDecision:
+    """A decided reuse record with a stated need, plus whatever the case under test varies."""
+    base: dict[str, object] = {
+        "status": ReuseStatus.DECIDED,
+        "need": "structured automation transport",
+        "reason": "reuses the existing transport instead of writing a second client",
+    }
+    return ReuseDecision(**{**base, **kwargs})
+
+
+#: choice / fit_test_status / reason -> is this combination admissible? (plan 9.3)
+REUSE_FIT_CASES: list[tuple[str, str, str, bool]] = [
+    # An unanswered or failed compatibility question is not a decision to adopt the component.
+    ("reuse", "pending", "", False),
+    ("adapt", "pending", "", False),
+    ("reuse", "failed", "", False),
+    # The same failure on `adapt` was previously admissible: adapting is still adoption.
+    ("adapt", "failed", "", False),
+    # An answered question, either way, is what the gate asks for.
+    ("reuse", "passed", "", True),
+    ("adapt", "passed", "", True),
+    # Claiming no test is needed is a claim, so it needs its short argument.
+    ("reuse", "not_required", "identical API, already used by this module", True),
+    ("adapt", "not_required", "same library, only the call signature is adapted", True),
+    ("reuse", "not_required", "", False),
+    ("adapt", "not_required", "", False),
+    # Choosing something other than reuse/adapt is not gated on being right about reuse:
+    # `build`/`defer` may legitimately follow a failed fit test (plan 9.3).
+    ("build", "failed", "", True),
+    ("build", "pending", "", True),
+    ("defer", "pending", "", True),
+]
+
+
+@pytest.mark.parametrize(
+    ("choice", "fit_test_status", "reason", "admissible"), REUSE_FIT_CASES, ids=str
+)
+def test_reuse_fit_test_combination_decides_admission(
+    task_spec: TaskSpec,
+    project: ProjectConfig,
+    project_root: Path,
+    choice: str,
+    fit_test_status: str,
+    reason: str,
+    admissible: bool,
+) -> None:
+    spec = task_spec.model_copy(
+        update={
+            "reuse": _decided(
+                choice=choice,
+                required_fit_test="DSH ACP single-task interop",
+                fit_test_status=fit_test_status,
+                reason=reason,
+            )
+        }
+    )
+    report = validate_task_spec(spec, project, project_root)
+    assert report.ok is admissible
+    if admissible:
+        assert report.issues == []
+        return
+    # A refusal has to say which field is wrong, not only that something is.
+    expected_location = (
+        "reuse.fit_test_status"
+        if fit_test_status in {"pending", "failed"}
+        else "reuse.reason"
+    )
+    assert [(issue.code, issue.location) for issue in report.issues] == [
+        (RefusalCode.REUSE_NOT_APPROVED, expected_location)
+    ]
+
+
+@pytest.mark.parametrize(
+    "reuse",
+    [
+        ReuseDecision(status=ReuseStatus.NOT_REQUIRED),
+        ReuseDecision(status=ReuseStatus.EXEMPT, reason="wording only, no component choice"),
+        ReuseDecision(
+            status=ReuseStatus.EXISTING_DECISION,
+            reference="project:parser-library-choice",
+            reason="the recorded decision still covers this use",
+        ),
+        ReuseDecision(
+            status=ReuseStatus.EXISTING_DECISION,
+            reference="project:transport-choice",
+            choice="reuse",
+            required_fit_test="acpx one-shot round trip",
+            fit_test_status="passed",
+        ),
+    ],
+)
+def test_legal_reuse_records_stay_admissible(
+    task_spec: TaskSpec, project: ProjectConfig, project_root: Path, reuse: ReuseDecision
+) -> None:
+    """The new gate must not turn already-legal records into refusals (plan 9.3)."""
+    spec = task_spec.model_copy(update={"reuse": reuse})
+    report = validate_task_spec(spec, project, project_root)
+    assert report.ok, [issue.detail for issue in report.issues]
+
+
+@pytest.mark.parametrize(
+    "reuse",
+    [
+        ReuseDecision(status=ReuseStatus.EXISTING_DECISION),
+        ReuseDecision(status=ReuseStatus.EXISTING_DECISION, reference="   "),
+        ReuseDecision(status=ReuseStatus.DECIDED, need="a transport", choice="none"),
+        ReuseDecision(status=ReuseStatus.DECIDED, need="   ", choice="build", reason="r"),
+    ],
+)
+def test_reuse_records_that_were_already_refused_still_are(
+    task_spec: TaskSpec, project: ProjectConfig, project_root: Path, reuse: ReuseDecision
+) -> None:
+    spec = task_spec.model_copy(update={"reuse": reuse})
+    assert RefusalCode.REUSE_NOT_APPROVED in _codes(spec, project, project_root)
+
+
+@pytest.mark.parametrize("mode", ["integrated", "published"])
+def test_unsupported_delivery_level_is_refused_not_warned(
+    task_spec: TaskSpec, project: ProjectConfig, project_root: Path, mode: str
+) -> None:
+    """A lower delivery than requested must not be reported as the requested one (plan 2.4 E)."""
+    spec = task_spec.model_copy(update={"delivery": DeliveryRequirement(mode=mode)})
+    report = validate_task_spec(spec, project, project_root)
+    assert not report.ok
+    assert RefusalCode.NOT_IMPLEMENTED in {issue.code for issue in report.issues}
+    assert not report.warnings, "an unmet delivery requirement is a refusal, not a note"
+    assert [issue.location for issue in report.issues] == ["delivery.mode"]
+
+
+def test_local_candidate_delivery_is_admitted_without_comment(
+    task_spec: TaskSpec, project: ProjectConfig, project_root: Path
+) -> None:
+    spec = task_spec.model_copy(update={"delivery": DeliveryRequirement(mode="local_candidate")})
+    report = validate_task_spec(spec, project, project_root)
+    assert report.ok
+    assert report.warnings == []
 
 
 def test_reuse_gate_allows_explicit_exemption(

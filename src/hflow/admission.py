@@ -24,6 +24,10 @@ from .workspace import check_scope
 # Ordered from least to most demanding; a task may not lower the project's floor.
 _RISK_ORDER = {"low": 0, "standard": 1, "strict": 2}
 
+#: The one delivery level this build implements. Everything else is refused up front rather
+#: than silently delivered at this level.
+_IMPLEMENTED_DELIVERY = "local_candidate"
+
 
 def validate_task_spec(
     spec: TaskSpec, project: ProjectConfig, project_root: Path
@@ -92,15 +96,37 @@ def validate_task_spec(
                     location="reuse.need",
                 )
             )
-        if reuse.choice == "reuse" and reuse.fit_test_status == "pending":
+        # Reusing or adapting a component is only decided once its compatibility question is
+        # answered (plan 9.3). A *failed* fit test is a decision to change component or build,
+        # never a reason to keep choice=reuse and dispatch anyway - reporting it as a pass
+        # would be a false statement about an experiment that already ran.
+        if reuse.choice in {"reuse", "adapt"} and reuse.fit_test_status in {"pending", "failed"}:
             issues.append(
                 ValidationIssue(
                     code=RefusalCode.REUSE_NOT_APPROVED,
                     detail=(
-                        "reuse.choice=reuse with an unrun required_fit_test cannot dispatch: "
-                        "the compatibility question must be answered first"
+                        f"reuse.choice={reuse.choice} with required_fit_test "
+                        f"{reuse.fit_test_status!r} cannot dispatch: the compatibility question "
+                        "must be answered by a recorded result before the component is adopted"
                     ),
                     location="reuse.fit_test_status",
+                )
+            )
+        # Claiming no fit test is needed is a claim, so it carries its own short argument
+        # (plan 9.3). Without one, "not_required" is indistinguishable from a forgotten test.
+        if (
+            reuse.choice in {"reuse", "adapt"}
+            and reuse.fit_test_status == "not_required"
+            and not reuse.reason.strip()
+        ):
+            issues.append(
+                ValidationIssue(
+                    code=RefusalCode.REUSE_NOT_APPROVED,
+                    detail=(
+                        f"reuse.choice={reuse.choice} without a required_fit_test must state, in "
+                        "reuse.reason, why the component is already proven to fit this use"
+                    ),
+                    location="reuse.reason",
                 )
             )
     elif reuse.status == ReuseStatus.EXISTING_DECISION and not reuse.reference.strip():
@@ -157,10 +183,24 @@ def validate_task_spec(
             )
         )
 
-    if spec.delivery.mode != "local_candidate":
-        warnings.append(
-            "delivery.mode requests integration/publish, which M1 does not implement; "
-            "the run will stop at LOCAL_CANDIDATE"
+    # --- delivery level ---------------------------------------------------
+    # This build can only deliver a local candidate. Asking for integrated/published used to
+    # be a warning, which meant a run "succeeded" while the requested delivery level was never
+    # reached - a success exit masking an unmet requirement. It is a refusal now: reaching a
+    # lower level than requested needs an explicit operator decision, and there is no
+    # auto-downgrade in this build (the run row keeps the requested mode, so a later decision
+    # can still be recorded against what was actually asked for).
+    if spec.delivery.mode != _IMPLEMENTED_DELIVERY:
+        issues.append(
+            ValidationIssue(
+                code=RefusalCode.NOT_IMPLEMENTED,
+                detail=(
+                    f"delivery.mode={spec.delivery.mode!r} is not implemented by this build; only "
+                    f"{_IMPLEMENTED_DELIVERY!r} is. Nothing was dispatched, so no lower delivery "
+                    "level will be presented as the requested one."
+                ),
+                location="delivery.mode",
+            )
         )
 
     return ValidationReport(
