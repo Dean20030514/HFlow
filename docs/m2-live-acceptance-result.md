@@ -1,5 +1,15 @@
 # M2 controlled live acceptance — result
 
+> **Status note (added during the T01 documentation pass; the record below is unchanged).**
+> This file is the record of the live executions as they happened. Two of its statements are
+> **snapshots**, not current state: the reviewer-verdict gap was repaired afterwards and the
+> candidate's delivery was then recorded as a later offline decision — see
+> `docs/m2-review-wire-repair.md` §5 — and the last table's `not achieved` row predates that
+> decision. The original execution outcome in this file still stands exactly as written:
+> `R-gkb3ld97x8` stays `BLOCKED` / `review_rejected` on build `3dbfeae`, with no receipt of its
+> own. Nothing here was an uninterrupted successful live run, and no live execution has been
+> re-run since.
+
 Approved starting baseline: `2603a1e`. Each tested execution is a **different fact** from that
 baseline, and the task's base commit is different again:
 
@@ -175,6 +185,11 @@ arbitrary shell commands — and a disposable worktree does not confine anything
 
 ## What is still unknown
 
+This table is the state **as recorded at the end of the live trials**, before the offline
+repair. Read the last two marked rows together with `docs/m2-review-wire-repair.md`: the
+verdict is now decoded, and the delivery that this execution did not reach was later recorded
+as a *separate, offline* decision about the same evidence.
+
 | Item | State |
 |---|---|
 | `forced_local_stop_live` | passed for the A binding |
@@ -183,6 +198,6 @@ arbitrary shell commands — and a disposable worktree does not confine anything
 | real DSH implementer produced a valid, in-scope candidate | **achieved** (attempt 2) |
 | fixed program checks on that candidate | **passed** |
 | independent real review | **ran and returned `accepted`** |
-| controller-owned `ACCEPTED / LOCAL_CANDIDATE` | **not achieved** — the driver discards the reviewer's structured verdict |
+| controller-owned `ACCEPTED / LOCAL_CANDIDATE` | **not achieved by this execution** — the driver discarded the reviewer's structured verdict; recorded later as a separate offline decision on the repaired build |
 | billed usage / remote termination | unknown |
 | unattended execution | disabled |

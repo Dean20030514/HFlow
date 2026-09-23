@@ -10,6 +10,14 @@ stays `BLOCKED` / `review_rejected` on `3dbfeae`, and the receipt says so itself
 **No new live authorization was used.** New real model submissions: **0**. `AUTH-m2-live-2`
 still reads `used 2/2`.
 
+> **What this file does not replace (note added during the T01 documentation pass).**
+> `docs/m2-live-acceptance-result.md` remains the record of the live executions, and its
+> `controller-owned ACCEPTED / LOCAL_CANDIDATE = not achieved by this execution` row is still
+> true of that execution. The two facts are different events about the same run and are kept
+> apart everywhere: the execution ended `BLOCKED` / `review_rejected` on `3dbfeae` with no
+> receipt of its own, and the delivery recorded here is a later, offline decision on the
+> repaired build. Neither this file nor the README may be read as "M2 completed live".
+
 Repair commits: `51596cd` (`fix(review): propagate validated reviewer verdicts`) and
 `1ca5e95` + `f1c68c2` (the local finalization path and its full-SHA processing identity), on top
 of the recorded runner `3dbfeae` and its evidence commit `e6a303e`.
@@ -85,10 +93,11 @@ With `src/hflow` reverted to the committed state both fail with
 `BLOCKED` run; with the patch they pass and the run reaches
 `ACCEPTED / LOCAL_CANDIDATE` with review evidence `status=passed`.
 
-The whole suite: **183 passed, 1 skipped** (the pre-existing directory-link skip), including
-`test_real_client_review.py`, which runs the *installed* acpx under Node against the project's
-mock ACP agent - once with a fenced verdict (⇒ receipt) and once with prose only (⇒
-`review_protocol_error`, no receipt).
+The whole suite at that commit: **183 passed, 1 skipped** (the pre-existing directory-link
+skip), including `test_real_client_review.py`, which runs the *installed* acpx under Node
+against the project's mock ACP agent - once with a fenced verdict (⇒ receipt) and once with
+prose only (⇒ `review_protocol_error`, no receipt). That count is a snapshot of the repair
+tree, not of today's working tree; the README records the counts measured since.
 
 ## 4. The recorded reviewer bytes, replayed offline
 

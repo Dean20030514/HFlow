@@ -1,6 +1,9 @@
 # Operations
 
-Practical notes for running HFlow as it exists today (M1, offline).
+Practical notes for running HFlow as it exists today. The commands below are the ones the
+installed CLI actually accepts; when this file and `hflow <command> --help` disagree, `--help`
+is right. `python -m pytest -q` and `python -m pytest -q --collect-only` are the two ways this
+file's test numbers were checked.
 
 ## Daily commands
 
@@ -42,7 +45,20 @@ actually meet today:
 | `review_rejected` | the reviewer returned `changes_requested` | read the finding, then submit a new revision |
 | `outcome_unknown` | the invocation was interrupted and its result is unknown | `hflow resume` to reconcile; submit a new revision to proceed |
 | `driver_failed` | the driver reported a failure before/without a result | read `block_reason`; fix the environment, do not blindly retry |
-| `not_implemented` | the requested driver does not exist in this build | use `--driver fake`, or wait for M0/M2 |
+| `not_implemented` | the requested driver does not exist in this build, or the TaskSpec asked for a delivery level this build cannot reach | use `--driver fake`, request `local_candidate`, or wait for the implementation |
+
+Refusals that happen *before* a run exists (exit `2`) are listed in `issues`, not in a block
+code. Two of them are easy to meet by accident:
+
+| Admission issue | Meaning | Next action |
+|---|---|---|
+| `reuse_not_approved` | `choice` is `reuse`/`adapt` while `fit_test_status` is `pending` or `failed`, or `not_required` was claimed without a reason | answer the compatibility question (or record the choice as `build`/`defer`) and submit again |
+| `not_implemented` at `delivery.mode` | the task asked for `integrated`/`published` | this build delivers `local_candidate` only; a lower level than requested is not delivered silently - change the request deliberately |
+
+These are **refusals**, not blocks: no run row, no workspace, no reservation, no invocation and
+no allowance exists afterwards, and `status` has nothing to show you. A block (`exit 3`) is the
+opposite kind of event - the run exists, work happened, and its evidence is kept. Reading a
+refusal as "the run failed" and a block as "nothing happened" are both wrong.
 
 ## Guarantees you can rely on
 
@@ -54,7 +70,10 @@ actually meet today:
 - A refused admission (`exit 2`) creates no run state at all.
 - `cancel` on a run that never dispatched is local and instant; on a dispatched run it
   asks the driver and records `confirmed_stopped` / `still_running` / `unknown`
-  honestly. Cross-process child-tree termination is **not** implemented.
+  honestly. What can be stopped is what the process boundary owns: a Windows Job Object, which
+  covers the tree it was given. On other platforms the boundary degrades to
+  `direct_child_only` and says so (`ProcessBoundary.kind`), so there is no descendant control
+  to claim there, and nothing here reaches a remote model request or a remote bill.
 
 ## M2 runs through the CLI
 
@@ -84,9 +103,11 @@ What the receipt gives you, and how to read it:
 | `candidate_paths` | the paths that are part of the candidate |
 | `verification.status` / `evidence_ids` | the approved check's result on that candidate |
 
-`--driver acpx-dsh` needs `--live-authorized` plus a current, explicit user authorization. It
-refuses before reading credentials, creating a workspace or reserving budget, and it never
-falls back to the fake driver.
+`--driver acpx-dsh` needs `--authorization-file <auth.json>` plus `--authorization-mode`, and
+the artifact must cover exactly this run. It refuses before reading credentials, creating a
+workspace or reserving budget, and it never falls back to the fake driver. `--live-authorized`
+is not a flag in this build and never was one that worked: a bare flag could be typed by the
+same process that runs the task, which is the thing the artifact exists to prevent.
 
 ## Releasing a workspace (`clean`)
 
@@ -294,21 +315,39 @@ actually happened:
 A confirmed stop is **not** a rollback, **not** a successful protocol cancellation, and
 **not** a known business result. Cooperative cancellation (`session/cancel`) is unsupported
 on the one-shot `exec` launch path, so the only mechanism available is forced teardown of
-the boundary. Until that is verified against the real Harness, unattended production
-execution stays disabled.
+the boundary. That teardown has been recorded as passing once, for one machine, one acpx/DSH
+version and one binding (M2 trial A, with the client in `approve-reads` mode); it does not
+extend to another platform, to a process that leaves the boundary, or to remote billing.
+Unattended production execution therefore stays disabled.
 
 An accepted cancellation cannot be overwritten by a late success: acceptance refuses while a
 cancellation intent is recorded, in the same transaction that would have written the receipt.
 
 ## What is not safe yet
 
-- **No sandbox.** A worker (once a real driver exists) and `command` checks run as
-  ordinary child processes with your user's rights. Scope is detected after the fact and
-  the candidate is refused, but the write already happened.
-- **No isolated workspace.** M1 edits the project root directly. Keep a clean checkout
-  or a copy until M2 adds managed worktrees.
+- **No sandbox.** A worker and `command` checks run as ordinary child processes with your
+  user's rights. Scope is detected after the fact and the candidate is refused, but the write
+  already happened. Nothing confines credentials either: an approved check inherits the
+  process environment, so keep project checks free of anything that needs a secret.
+- **The managed worktree is a workspace boundary, not a permission boundary.** With
+  `"workspace": {"mode": "worktree", "base_commit": "<sha>"}` a run works in a detached
+  worktree beside the repository, your HEAD/index/working files/stash/branches are left alone,
+  and the frozen candidate is kept under `refs/hflow/candidates/...`. It still shares the
+  source repository's Git objects and admin files, and a process running as this user can read
+  and write outside it. With `mode: in_place` a run edits the project root directly.
+- **The reviewer is not sandboxed.** It is a separate process, session and invocation and it
+  never inherits the implementer's write permission, but it reviews the same checkout with
+  `isolation=prompt_only` recorded. A prompt-level instruction is not an enforced boundary.
+- **A stop is local.** Closing the managed process boundary ends the processes it owns; it is
+  not a cooperative protocol cancellation (unsupported on the selected one-shot `exec` path),
+  it does not follow a descendant that leaves that boundary, it exists on Windows only, and it
+  says nothing about a remote model request or remote billing having stopped.
 - **No repair cycle.** Failed verification or a rejected review stops the run.
 - **No billing observation.** Cost and token fields are `null`; do not read `null` as 0.
+- **Authorization is trusted-local.** The artifact records a human decision and bounds its
+  consumption, but its provenance is not authenticated and a fresh authorization id resets the
+  allowance; the executor is trusted not to forge approvals or edit the ledger. Until that
+  changes, unattended execution stays disabled.
 
 ## Recovering from a controller crash
 
