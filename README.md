@@ -109,6 +109,7 @@ being tested, so they are recorded rather than asserted:
 | `9483a84` with the uncommitted T02 admission patch and its new tests | `python -m pytest -q` | `225 passed, 1 skipped in 131.85s` (exit 0) |
 | the batch A/B/C working tree (uncommitted) | `python -m pytest -q` | `298 passed, 1 skipped in 190.18s` (exit 0) |
 | current working tree with the batch D configuration wiring and its corrections (uncommitted) | `python -m pytest -q` | `353 passed, 1 skipped in 192.25s` (exit 0) |
+| the same tree plus the reviewer-cancel-routing fix, its race regressions and the coordinated spawn gate (uncommitted) | `python -m pytest -q` | `377 passed, 1 skipped in 190.05s` (exit 0) |
 
 The last row is this working tree, not a commit; the committed HEAD (`5382470`) was not
 re-measured on its own. Before this batch's tests were added the same tree measured
@@ -116,7 +117,18 @@ re-measured on its own. Before this batch's tests were added the same tree measu
 zero-model `prepare` preview, per-role dispatch through two configured drivers, the
 effective-configuration and resolved-launch halves of the authorization binding, the dispatch
 preconditions `prepare` shares with the run's own gate, and the two checks that the child
-process really receives the launch that was bound.
+process really receives the launch that was bound. The reviewer-cancel-routing change adds the
+24 tests in `tests/test_cancel_routing.py` (378 collected in the tree, 1 skipped): a stop
+reaching the reviewer's own invocation through its own driver, an unconfirmed stop staying
+`unknown`, a late `accepted` verdict or a late failure not overriding either stop state, no
+reviewer started or bought after a stop (including the windows inside the packet render, the
+turn reservation and the check step), the same windows decided by thread interleaving rather
+than by ordering, reconciliation following the same routing, and - against the **production
+`AcpxDshDriver` over the offline client stand-in and a stub agent** - that a stop which wins the
+spawn gate creates **no child process at all**, that a stop inside the spawn critical section
+**waits for publication and then terminates the child it finds**, and that a stop which loses
+the race terminates the published one. Four of those regressions came from external
+counterexamples; they were kept in the repository rather than in someone's scratch directory.
 
 Four tests skip themselves when their precondition is absent rather than pretending to pass:
 the directory-link test in `test_contracts.py` (the skip seen above), the installed-acpx test in
@@ -256,10 +268,29 @@ Not built around configuration either:
 - **No `hflow init`.** A project contract is still hand-written, and no `--format markdown`
   handoff renderer or `hflow repair` / `hflow integrate` command exists. `resume` still only
   reconciles.
-- **The reviewer's live invocation cannot be stopped separately.** `cancel` targets the
-  attempt's implementer invocation; a reviewer bound to the same driver is covered by the same
-  process boundary, but a stop that arrives while the review is running is not yet routed to the
-  reviewer's own invocation.
+- **A stop targets the role that is running, and the two sides of a handoff are coordinated, not
+  merely ordered.** The controller resolves the live invocation from the run's recorded `phase`
+  and routes the stop through that role's own driver, so a reviewer bound to its own driver is
+  stopped through it and the `cancel_target` note records which role, driver and invocation
+  were asked. Two writes carry the stop decision rather than following a read: registering a
+  role's invocation is one statement with `WHERE cancel_intent_at IS NULL`, and every block is
+  one statement with the same condition. The spawn is coordinated the same way and closer to the
+  metal: a driver publishes the invocation's handle and creates the child **inside one gate**,
+  and *both* stop entry points - `cancel_handle` and `cancel(invocation_id)` - take that same
+  gate to record their request. "No handle yet" is therefore never an answer while a child is
+  being created: a stop that takes the gate waits for that critical section to end - normally by
+  waiting to acquire the gate, which the spawn releases only after publishing - and then
+  terminates the process it finds, reported as `mechanism=forced`. A stop that takes the gate
+  first means **no process is created at all** (`start_cancelled`, reported as a cancelled
+  invocation with no child). `InvocationRequest.stop_requested` is the question the driver asks
+  inside that gate, so the answer is taken at the instant of the spawn rather than when the
+  request was built. That wait is bounded by the spawn and not by the invocation: the gate is
+  released before the model answer is awaited, so a stop may wait for a process to be created but
+  never for the call it is stopping to finish. A stop that is not confirmed never re-dispatches,
+  and no later failure (`review_protocol_error`, a transport error, a rejected review) relabels
+  either stop state. Two limits stay stated: the command-line `cancel` cannot reach a child
+  started by another controller process, and this covers the one driver that creates processes
+  here (`AcpxDshDriver`); another driver must coordinate its own spawn the same way.
 - **An offline profile is all-or-nothing.** A profile may bind every role to the offline fake
   (for development) or every role to a real transport; mixing the two is refused rather than
   half-scripted.
@@ -286,8 +317,9 @@ Not verified, even where something works on one binding:
 ## Driver contract tests
 
 ```sh
-python -m pytest -q tests/test_authorization.py          # 12 tests: the authorized real-run gate
-python -m pytest -q tests/test_driver_acpx_dsh.py        # 27 tests, no model, no credential
+python -m pytest -q tests/test_cancel_routing.py         # 24 tests: a stop reaches the live role, wins the handoff, and is never undone
+python -m pytest -q tests/test_authorization.py          # 15 tests: the authorized real-run gate
+python -m pytest -q tests/test_driver_acpx_dsh.py        # 30 tests, no model, no credential
 python -m pytest -q tests/test_review.py                 # 37 tests: the review output grammar
 python -m pytest -q tests/test_review_wire.py            # 21 tests: reviewer verdict -> receipt
 python -m pytest -q tests/test_real_client_review.py     # 3 tests: installed acpx + mock agent, no model

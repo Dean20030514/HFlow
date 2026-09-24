@@ -187,6 +187,13 @@ def _stream_reference(detail: str, name: str) -> dict[str, object]:
 #: an operator grepping a run), so they are constants rather than inline strings.
 NOTE_PACKET = "role_input_packet"
 NOTE_PROMPT_DIGEST = "prompt_digest"
+#: Which role's invocation a stop was routed to, and what it reported. Recorded as a fact
+#: because "which process was asked to stop" is the first question an operator has afterwards.
+NOTE_CANCEL_TARGET = "cancel_target"
+#: A result that arrived for an attempt the run had already stopped. It cannot change the
+#: outcome, so the fact is recorded in the note table where a terminal transition cannot
+#: erase it - instead of the controller raising on a state that is already correct.
+NOTE_LATE_RESULT = "late_result"
 
 
 class RunOutcome:
@@ -560,11 +567,19 @@ class Controller:
         )
 
     def reconcile(self, run_id: str) -> ReconcileOutcome:
-        """Observe an interrupted attempt. Must not start new model work."""
+        """Observe an interrupted attempt. Must not start new model work.
+
+        The observation goes to the invocation the run was actually on - the reviewer's own
+        driver during ``phase=review`` - because a process the other driver never started
+        cannot be reported on. Nothing is re-dispatched either way.
+        """
         attempt = self.store.open_attempt(run_id)
-        if attempt is None or not attempt["invocation_id"]:
+        if attempt is None:
             return ReconcileOutcome.NOT_STARTED
-        result = self.driver.reconcile(attempt["invocation_id"])
+        _role, driver, invocation_id = self._active_invocation(self.store.get_run(run_id), attempt)
+        if not invocation_id:
+            return ReconcileOutcome.NOT_STARTED
+        result = driver.reconcile(invocation_id)
         self.store.record_reconcile(attempt["attempt_id"], result.model_dump(mode="json"))
         return result.outcome
 
@@ -574,6 +589,11 @@ class Controller:
         Idempotent: a recorded intent plus a recorded receipt short-circuits. No prompt is
         sent, no budget is charged, and a confirmed stop is reported as a *local process*
         fact - never as a successful protocol cancellation or a known business result.
+
+        The stop is routed to the role that is actually running. Both roles are separate
+        invocations, and a machine profile may bind them to separate driver objects, so the
+        invocation id and the driver are resolved together from stored facts rather than
+        assumed to be the implementer's.
         """
         intent_at, existing_receipt = self.store.cancel_state(run_id)
         if existing_receipt is not None:
@@ -598,7 +618,8 @@ class Controller:
         intent_at = self.store.record_cancel_intent(run_id)
 
         attempt = self.store.open_attempt(run_id)
-        if attempt is None or not attempt["invocation_id"]:
+        role, driver, active_invocation = self._active_invocation(row, attempt)
+        if not active_invocation:
             receipt = CancellationReceipt(
                 invocation_id="",
                 status="confirmed_stopped",
@@ -612,8 +633,13 @@ class Controller:
             )
             return receipt
 
-        receipt = self._driver_cancel(attempt["invocation_id"], attempt["attempt_id"])
+        receipt = self._driver_cancel(driver, active_invocation)
         self.store.record_cancel_receipt(run_id, receipt)
+        self.store.record_note(
+            run_id,
+            f"{NOTE_CANCEL_TARGET}: role={role} invocation={active_invocation} "
+            f"reported={receipt.status} mechanism={receipt.mechanism}",
+        )
         if receipt.status == "confirmed_stopped":
             try:
                 self.store.finish_attempt(
@@ -629,20 +655,60 @@ class Controller:
             self.store.set_blocked(
                 run_id,
                 RefusalCode.CANCELLED_BY_OPERATOR,
-                f"stop confirmed ({receipt.mechanism}); local execution stopped, business result unknown",
+                f"stop confirmed ({receipt.mechanism}) for the {role} invocation "
+                f"{active_invocation} ({self._driver_label(driver, role)}); local execution "
+                "stopped, business result unknown",
             )
         else:
             self.store.set_blocked(
                 run_id,
                 RefusalCode.OUTCOME_UNKNOWN,
-                f"stop could not be confirmed: {receipt.status}; work may still be running",
+                f"stop could not be confirmed for the {role} invocation {active_invocation} "
+                f"({self._driver_label(driver, role)}): {receipt.status}; work may still be running",
             )
         return receipt
 
-    def _driver_cancel(self, invocation_id: str, attempt_id: str) -> CancellationReceipt:
-        """Prefer the handle API when the driver offers it; degrade to the plain contract."""
-        handles = getattr(self.driver, "_handles", None)
-        cancel_handle = getattr(self.driver, "cancel_handle", None)
+    def _active_invocation(
+        self, row: object, attempt: object
+    ) -> tuple[str, HarnessDriver, str]:
+        """``(role, driver, invocation_id)`` for the invocation a stop should reach.
+
+        The run's recorded ``phase`` decides, not the order of the ids and not an assumption
+        that the driver is the implementer's:
+
+        * ``phase=review`` and a recorded review invocation -> that invocation, through
+          ``reviewer_driver``. The reviewer is its own process, session and allowance, so a
+          stop that named the implementer's (already finished) invocation would report a fact
+          about the wrong process;
+        * otherwise -> the implementer's invocation through ``driver``.
+
+        Only durable facts are read (the run row and the attempt row), so this is the same
+        decision a second controller process would make. ``""`` means no invocation was
+        dispatched for this attempt and there is nothing to ask to stop.
+        """
+        data = dict(row)  # type: ignore[arg-type]
+        attempt_data = dict(attempt) if attempt is not None else {}
+        review_invocation = str(attempt_data.get("review_invocation_id") or "")
+        if data.get("phase") == CheckPhase.REVIEW.value and review_invocation:
+            return "reviewer", self.reviewer_driver, review_invocation
+        return "implementer", self.driver, str(attempt_data.get("invocation_id") or "")
+
+    def _driver_label(self, driver: HarnessDriver, role: str) -> str:
+        """How the stop's record names the driver that was asked, without guessing."""
+        driver_id = getattr(driver, "driver_id", "") or type(driver).__name__
+        bound = self.effective_config.role(role) if self.effective_config is not None else None
+        agent = f", agent={bound.agent}" if bound is not None else ""
+        return f"driver={driver_id}{agent}"
+
+    def _driver_cancel(self, driver: HarnessDriver, invocation_id: str) -> CancellationReceipt:
+        """Prefer the handle API when the driver offers it; degrade to the plain contract.
+
+        Takes the driver explicitly: with per-role bindings the invocation is owned by one
+        role's driver, and asking the other one would report "nothing was stopped" for a
+        process that is still running.
+        """
+        handles = getattr(driver, "_handles", None)
+        cancel_handle = getattr(driver, "cancel_handle", None)
         if isinstance(handles, dict) and callable(cancel_handle) and invocation_id in handles:
             try:
                 return cancel_handle(handles[invocation_id])  # type: ignore[no-any-return]
@@ -654,7 +720,7 @@ class Controller:
                     detail=f"driver raised while stopping: {exc!r}",
                 )
         try:
-            return self.driver.cancel(invocation_id)
+            return driver.cancel(invocation_id)
         except Exception as exc:  # noqa: BLE001
             return CancellationReceipt(
                 invocation_id=invocation_id,
@@ -1004,33 +1070,31 @@ class Controller:
             packet=prepared.packet.text,
             writes_allowed=implementer_writes,
             data_dir=str(self.data_dir),
+            # Asked by the driver at the instant it creates the process, not answered here: a
+            # snapshot taken now would be stale by the time the child is spawned.
+            stop_requested=lambda: self._stop_recorded(run_id),
         )
 
         # From here on, failures must not re-dispatch: the model may already have run.
         try:
             result = self.driver.start(invocation)
         except RefusedError as exc:
-            self._block_attempt(run_id, attempt_id, exc.code, str(exc))
-            return self._outcome_for(run_id)
+            return self._block_attempt(run_id, attempt_id, exc.code, str(exc))
         except Exception as exc:  # noqa: BLE001 - controller must not hot-fix a driver
-            self._block_attempt(run_id, attempt_id, RefusalCode.INTERNAL_ERROR, repr(exc))
-            return self._outcome_for(run_id)
+            return self._block_attempt(run_id, attempt_id, RefusalCode.INTERNAL_ERROR, repr(exc))
 
         if result.outcome is InvocationOutcome.OUTCOME_UNKNOWN:
-            self.store.finish_attempt(
+            self._apply_result_or_stay_stopped(
                 run_id=run_id,
                 attempt_id=attempt_id,
                 state=AttemptState.OUTCOME_UNKNOWN,
                 outcome=InvocationOutcome.OUTCOME_UNKNOWN,
-                result=result.model_dump(mode="json"),
+                result=result,
                 block_code=RefusalCode.OUTCOME_UNKNOWN,
-            )
-            return self._blocked(
-                run_id,
-                RefusalCode.OUTCOME_UNKNOWN,
-                "the worker's result is unknown; no re-dispatch until an operator reconciles "
+                reason="the worker's result is unknown; no re-dispatch until an operator reconciles "
                 "(plan 9.3)",
             )
+            return self._outcome_for(run_id)
 
         if result.agent_turns is not None:
             self.store.set_turns_observed(run_id, result.agent_turns)
@@ -1061,27 +1125,30 @@ class Controller:
             )
 
         if result.outcome is not InvocationOutcome.COMPLETED:
-            self.store.finish_attempt(
+            self._apply_result_or_stay_stopped(
                 run_id=run_id,
                 attempt_id=attempt_id,
                 state=AttemptState.FAILED,
                 outcome=result.outcome,
-                result=result.model_dump(mode="json"),
+                result=result,
                 block_code=RefusalCode.DRIVER_FAILED,
+                reason=f"driver reported {result.outcome.value}: "
+                f"{result.error_message or 'no detail'}",
             )
-            return self._blocked(
-                run_id,
-                RefusalCode.DRIVER_FAILED,
-                f"driver reported {result.outcome.value}: {result.error_message or 'no detail'}",
-            )
+            # Applied or already finalized by a stop: the run's own recorded state is the answer.
+            return self._outcome_for(run_id)
 
-        self.store.finish_attempt(
+        if not self._apply_result_or_stay_stopped(
             run_id=run_id,
             attempt_id=attempt_id,
             state=AttemptState.SUCCEEDED,
             outcome=result.outcome,
-            result=result.model_dump(mode="json"),
-        )
+            result=result,
+        ):
+            # The run was stopped while this invocation was running. Its result is recorded on
+            # the attempt row and the run keeps the decision the operator made; nothing here
+            # resumes the loop.
+            return self._outcome_for(run_id)
 
         # --- freeze the candidate the controller actually observed -------------
         post_fingerprint = candidate_fingerprint(execution_root, spec.scope)
@@ -1139,12 +1206,12 @@ class Controller:
         if verification.status != "passed":
             review = ReviewResult(status="not_run", isolation=self.review_isolation)
         elif spec.needs_review(project):
-            self.store.set_task_state(
-                run_id,
-                [TaskState.CHECKING],
-                TaskState.CHECKING,
-                phase=CheckPhase.REVIEW,
-            )
+            # A stop recorded while the implementer or its checks were running is read here,
+            # before any state transition or handoff to the reviewer. The transition itself is
+            # stop-aware, because the cancel can land between reading this and asking for it.
+            stopped = self._advance_to_review(run_id)
+            if stopped is not None:
+                return stopped
             try:
                 review = self._review(
                     run_id,
@@ -1224,11 +1291,24 @@ class Controller:
           is whatever the driver could actually enforce, recorded by the controller;
         * it does not spend a review turn when budget cannot cover it (A03): the
           reservation refuses and the run blocks with no reviewer process started.
+
+        It also does not *start* a reviewer for a run whose stop was already requested: the
+        intent is recorded before anything is asked to stop, and buying a turn after that
+        would spend allowance and dispatch a process for a decision a human already ended.
         """
         attempt = self.store.open_attempt(run_id)
         attempt_id = attempt["attempt_id"] if attempt else ""
         row = self.store.get_run(run_id)
         invocation_id = new_invocation_id()
+
+        # Read as late as possible - after the checks, after the worktree - so a stop recorded
+        # while the implementer or its checks were running is seen here.
+        if self.store.get_run(run_id)["cancel_intent_at"]:
+            raise RefusedError(
+                RefusalCode.CANCELLED_BY_OPERATOR,
+                "a cancellation intent is recorded, so no review turn was bought and no reviewer "
+                "was started; the run stays stopped instead of re-dispatching",
+            )
 
         # The packet is rendered *before* the submission is claimed: an input that cannot be
         # built must not consume an allowance or a budget turn.
@@ -1303,6 +1383,11 @@ class Controller:
             f"digest={reviewer_packet.digest}",
         )
 
+        # A stop can be recorded while the packet is being built or the checks are running. It is
+        # re-read here, after the rendering and before anything is bought: buying an allowance or
+        # a review turn for a run a human already stopped is exactly the spend a stop prevents.
+        self._refuse_if_stopped(run_id, where="the review turn was bought")
+
         if self.authorization is not None:
             # The reviewer is its own invocation and its own top-level submission.
             self._claim_submission(run_id, "reviewer invocation")
@@ -1311,11 +1396,16 @@ class Controller:
         except StoreError as exc:
             raise RefusedError(RefusalCode.BUDGET_EXHAUSTED, str(exc)) from exc
 
-        self.store.record_review_invocation(attempt_id, invocation_id)
-        pid, started_at, identity = ProcessGuard(self.controller_id).identity()
-        self.store.record_process_identity(
-            attempt_id, pid=pid, started_at=started_at, identity=identity, session_id=attempt_id
-        )
+        # The last handoff, and the one a read cannot protect: registering the reviewer's
+        # invocation and the stop's decision are a single conditional write, so exactly one of
+        # them wins. If the stop won, nothing is registered and the reviewer is never started.
+        #
+        # Registration is *not* enough on its own, which is why the handoff does not end here: a
+        # stop can still commit between this write and the driver creating a child. The request
+        # therefore carries the stop question, and the driver decides it inside the gate it also
+        # uses to publish that invocation's handle - so either the stop is seen and no process is
+        # created, or the process exists and the stop finds a published handle to act on.
+        self._register_reviewer(run_id, attempt_id, invocation_id)
         review_request = InvocationRequest(
             invocation_id=invocation_id,
             attempt_id=attempt_id,
@@ -1338,6 +1428,7 @@ class Controller:
             # approval for the implementer to write never extends to the review invocation.
             writes_allowed=False,
             data_dir=str(self.data_dir),
+            stop_requested=lambda: self._stop_recorded(run_id),
         )
         try:
             review_invocation = self.reviewer_driver.start(review_request)
@@ -1350,7 +1441,21 @@ class Controller:
                 "the review invocation could not be started, so no verdict exists: " f"{exc!r}",
             ) from exc
 
+        if review_invocation.outcome is InvocationOutcome.CANCELLED and self._stop_recorded(run_id):
+            # The stop won the handoff inside the driver, so no reviewer process was created.
+            # Nothing is attached to the attempt - there was no invocation - and the run keeps
+            # the stop decision it already made.
+            raise RefusedError(
+                RefusalCode.CANCELLED_BY_OPERATOR,
+                "the stop was seen before the reviewer process was created, so none was started "
+                "and no reviewer invocation is recorded",
+            )
+
         self.store.attach_review_result(attempt_id, review_invocation.model_dump(mode="json"))
+        pid, started_at, identity = ProcessGuard(self.controller_id).identity()
+        self.store.record_process_identity(
+            attempt_id, pid=pid, started_at=started_at, identity=identity, session_id=attempt_id
+        )
         if review_invocation.outcome is not InvocationOutcome.COMPLETED:
             # An unfinished turn is a transport failure, not the reviewer's judgment. It is
             # reported as such; a genuine rejection requires a validated `changes_requested`.
@@ -1485,6 +1590,20 @@ class Controller:
                 notes=["attempt was superseded before acceptance; no receipt was written"],
             )
         if row["cancel_intent_at"]:
+            # A late success is not applied. The block code is not downgraded either: if the run
+            # is already blocked as ``OUTCOME_UNKNOWN`` because the stop was never confirmed
+            # ("work may still be running"), that stronger fact is what a reader needs, and
+            # overwriting it with a confirmed-looking stop would be the same lie in the other
+            # direction. The same rule holds for every other block via ``_blocked``; it is
+            # repeated here only to attach the reason the *acceptance* path refused.
+            if row["block_code"] == RefusalCode.OUTCOME_UNKNOWN.value:
+                return self._outcome_for(
+                    run_id,
+                    notes=[
+                        "a cancellation intent is recorded and the stop was never confirmed; the "
+                        "late success was not applied and the run stays outcome_unknown"
+                    ],
+                )
             return self._blocked(
                 run_id,
                 RefusalCode.CANCELLED_BY_OPERATOR,
@@ -1586,7 +1705,13 @@ class Controller:
 
     def _block_attempt(
         self, run_id: str, attempt_id: str, code: RefusalCode, reason: str
-    ) -> None:
+    ) -> RunOutcome:
+        """Record a blocked attempt, then end the loop on the stopped-aware block.
+
+        The attempt row is always finished (it is the record of what happened to *that*
+        dispatch); the run's own block code goes through :meth:`_blocked`, so a stop recorded
+        first keeps deciding the run's state.
+        """
         try:
             self.store.finish_attempt(
                 run_id=run_id,
@@ -1598,11 +1723,153 @@ class Controller:
             )
         except StoreError:
             pass
-        self.store.set_blocked(run_id, code, reason)
+        return self._blocked(run_id, code, reason)
 
+    def _apply_result_or_stay_stopped(
+        self,
+        *,
+        run_id: str,
+        attempt_id: str,
+        state: AttemptState,
+        outcome: InvocationOutcome,
+        result: InvocationResult,
+        block_code: RefusalCode | None = None,
+        reason: str = "",
+    ) -> bool:
+        """Apply one invocation result, unless the run was stopped while it was in flight.
+
+        ``True`` when the result was applied to the live attempt; ``False`` when the attempt had
+        already been finalized - a cancellation recorded first, and possibly confirmed, is
+        exactly that case. That result is then a fact about an invocation which no longer
+        decides anything: it is recorded in the run's note table and the run keeps the decision
+        already taken. A late success must not overwrite a stop, and a late answer must not
+        resurrect a run somebody stopped.
+
+        Without this, the store's compare-and-set raises ``StoreError`` on a state that is
+        already correct, and the exception escapes the controller's own loop instead of the run
+        simply staying stopped.
+        """
+        try:
+            self.store.finish_attempt(
+                run_id=run_id,
+                attempt_id=attempt_id,
+                state=state,
+                outcome=outcome,
+                result=result.model_dump(mode="json"),
+                block_code=block_code,
+            )
+        except StoreError as exc:
+            self.store.record_note(
+                run_id,
+                f"{NOTE_LATE_RESULT}: the {outcome.value} result of invocation "
+                f"{result.invocation_id} for attempt {attempt_id} arrived after the attempt was "
+                f"finalized ({exc}); the run keeps its recorded decision and nothing is "
+                "re-dispatched",
+            )
+            return False
+        if block_code is not None:
+            self._blocked(run_id, block_code, reason)
+        return True
     def _blocked(self, run_id: str, code: RefusalCode, reason: str) -> RunOutcome:
-        self.store.set_blocked(run_id, code, reason)
-        return self._outcome_for(run_id)
+        """End the loop at this block, unless a stop already decided the run's state.
+
+        A stop is a decision about the *whole* run, recorded durably before anything was asked
+        to stop. Everything that fails afterwards - a driver error, a protocol failure, a
+        rejected review, a stale check - is a later fact about an invocation that the stop
+        already ended, and it must not relabel the run: a reader has to see
+        ``outcome_unknown`` for a stop that was never confirmed, and ``cancelled_by_operator``
+        for one that was.
+
+        The comparison happens **in the write**: ``block_unless_stopped`` carries
+        ``WHERE cancel_intent_at IS NULL``, so a stop committed at any point up to this
+        statement wins. Reading the row here and then writing unconditionally is the race this
+        replaces - a cancel landing between the two would have been overwritten by a late
+        ``review_protocol_error``.
+        """
+        if self.store.block_unless_stopped(run_id, code, reason):
+            return self._outcome_for(run_id)
+        return self._outcome_for(
+            run_id,
+            notes=[
+                f"the {code.value} block was not recorded: a stop had already decided this run's "
+                "state, which no later failure relabels"
+            ],
+        )
+
+    def _stop_recorded(self, run_id: str) -> bool:
+        """Has this run's stop been requested? The question a driver asks before it spawns.
+
+        Deliberately a plain read of one durable column: it is called from a driver's spawn path,
+        must not block, and must not start or send anything. It is handed to the driver as a
+        callable rather than answered by the controller, so the answer is taken at the instant
+        the process would be created instead of when the request was built.
+        """
+        return bool(self.store.get_run(run_id)["cancel_intent_at"])
+
+    def _refuse_if_stopped(self, run_id: str, *, where: str) -> None:
+        """Refuse to start model work for a run whose stop was already requested.
+
+        One read of a durable fact, at the moment of a handoff. It is *not* the coordination
+        mechanism by itself - a stop can commit immediately after it - so every handoff that
+        registers or starts a role also writes conditionally on the same fact (see
+        :meth:`_register_reviewer`), and the run's own block path is conditional too.
+        """
+        row = self.store.get_run(run_id)
+        if not row["cancel_intent_at"]:
+            return
+        raise RefusedError(
+            RefusalCode.CANCELLED_BY_OPERATOR,
+            f"a cancellation intent was recorded before {where}; no invocation was started and "
+            "none is re-dispatched",
+        )
+
+    def _register_reviewer(self, run_id: str, attempt_id: str, invocation_id: str) -> None:
+        """Register the reviewer invocation, or refuse because a stop won the handoff.
+
+        This is the atomic half of the handoff, and the reason the earlier read is not enough:
+        the registration and the stop decision are one statement, so exactly one of them wins.
+        If the stop won, no invocation id is registered and the reviewer is never started - the
+        run keeps its stop state and the caller sees a refusal, not a running process.
+
+        A stop that commits *after* this registration sees the reviewer as the live invocation
+        and is reported against it, which is the honest target even while the driver is still
+        publishing that invocation's process handle.
+        """
+        if self.store.register_attempt_invocation_unless_stopped(
+            run_id, attempt_id, column="review_invocation_id", invocation_id=invocation_id
+        ):
+            return
+        raise RefusedError(
+            RefusalCode.CANCELLED_BY_OPERATOR,
+            "a cancellation intent was recorded while the reviewer invocation was being "
+            "registered, so the registration was refused and no reviewer was started",
+        )
+
+    def _advance_to_review(self, run_id: str) -> RunOutcome | None:
+        """Enter the review phase, or report why the loop must stop here.
+
+        ``StoreError`` used to escape the run thread when a stop landed while the checks were
+        running: the transition asks for ``CHECKING``, and a stopped run is already ``BLOCKED``.
+        A transition that cannot happen because the run was stopped is not an error - it is the
+        stop, so it reports the run's own recorded state. When it cannot happen for any other
+        reason, the run is blocked through the same conditional path as every other failure.
+        """
+        try:
+            self.store.set_task_state(
+                run_id,
+                [TaskState.CHECKING],
+                TaskState.CHECKING,
+                phase=CheckPhase.REVIEW,
+            )
+        except StoreError as exc:
+            # ``block_unless_stopped`` is conditional on the same fact the stop writes, so this
+            # reports the stop's state when a stop won and this run's own block otherwise.
+            return self._blocked(
+                run_id,
+                RefusalCode.INTERNAL_ERROR,
+                f"the run could not enter the review phase: {exc}",
+            )
+        return None
 
     def _refuse(self, run_id: str, code: RefusalCode, reason: str) -> RunOutcome:
         return self._blocked(run_id, code, reason)
@@ -1639,6 +1906,7 @@ class Controller:
         if self.project_root is None:
             return None
         return workspace_drift(self.store, run_id, self.project_root)
+
 
 def inspect_run(store: Store, run_id: str, *, project_root: Path | None = None) -> RunInspection:
     """Read-only projection for ``status``/``report``. Zero model calls, by design."""

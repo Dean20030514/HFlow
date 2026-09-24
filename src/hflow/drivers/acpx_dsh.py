@@ -306,6 +306,17 @@ class AcpxDshDriver:
             list(agent_argv_override) if agent_argv_override else self.launch.agent_argv
         )
         self._handles: dict[str, DriverHandle] = {}
+        #: Serializes "publish the handle and create the child" against "a stop arrived". Held
+        #: for the spawn only, never across the wait for a result. A ``Condition`` rather than a
+        #: lock because a stop that finds a spawn already in flight must *wait for that spawn to
+        #: publish* - "no handle yet" is not an answer while a child is being created.
+        self._gate = threading.Condition()
+        #: Invocations whose spawn is inside the gate right now. A stop that arrives for one of
+        #: these waits for the publication instead of reporting that nothing was found.
+        self._spawn_pending: set[str] = set()
+        #: Invocations a stop has been requested for. A spawn that has not created its child yet
+        #: refuses, so the stop wins the handoff; it says nothing about a child that exists.
+        self._stop_requests: dict[str, bool] = {}
         self._processes: dict[str, subprocess.Popen] = {}
         self._boundaries: dict[str, ProcessBoundary] = {}
         self._streams: dict[str, Any] = {}
@@ -523,6 +534,10 @@ class AcpxDshDriver:
         prompt_bytes = prompt.encode("utf-8")
         task_file.write_bytes(prompt_bytes)
         prompt_digest = packet_digest(prompt)
+        # Recorded before the spawn decision: a stop that wins the handoff produces a cancelled
+        # invocation, and its result must still carry the digest of the prompt it would have been
+        # given rather than looking like an invocation that had no input.
+        self._prompt_digests[request.invocation_id] = prompt_digest
         config_path = self._write_config(invocation_dir, writes_allowed=request.writes_allowed)
 
         boundary = ProcessBoundary().open()
@@ -552,27 +567,57 @@ class AcpxDshDriver:
         acpx_home.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(config_path, acpx_home / "config.json")
 
-        try:
-            stdout_handle = stdout_path.open("wb")
-            child = popen_in_boundary(
-                argv,
-                cwd=str(invocation_dir),
-                env=env,
-                boundary=boundary,
-                stdout_handle=stdout_handle,
-                # stderr travels on a pipe this driver owns, so what is retained is genuinely
-                # bounded and the reader has a stream to read. Giving the child a file instead
-                # meant the reader had nothing to drain (`process.stderr` was ``None``) while the
-                # child wrote 2 MiB HFlow never noticed.
-                stderr_handle=subprocess.PIPE,
-            )
-        except BaseException:
-            boundary.close()
-            raise
-        handle.pid = child.pid
-        self._handles[request.invocation_id] = handle
-        self._processes[request.invocation_id] = child
-        self._boundaries[request.invocation_id] = boundary
+        # The child is created *inside* this gate, and both cancel entry points take the same
+        # gate to record their request. That is what makes the handoff decidable: either the stop
+        # is recorded first and no process is created at all, or the process is published first
+        # and the stop then finds a handle to act on. A read-then-spawn cannot give either
+        # guarantee - the stop lands between them.
+        #
+        # The gate is held for the spawn only, never for the wait for a model answer: holding it
+        # across ``collect`` would make cancellation block on the whole invocation, which is the
+        # opposite of what a stop is for.
+        with self._gate:
+            # Claimed before the spawn decision, so a stop that takes the gate during this spawn
+            # knows to wait for the publication below instead of finding "no handle yet".
+            self._spawn_pending.add(request.invocation_id)
+            try:
+                if self._stop_requests.get(request.invocation_id) or (
+                    request.stop_requested is not None and request.stop_requested()
+                ):
+                    # Nothing was created and nothing will be. The invocation is reported as
+                    # cancelled without a process, so the controller's stop wins the handoff.
+                    self._handles[request.invocation_id] = handle
+                    handle.start_cancelled = True
+                    handle.finished = True
+                    boundary.close()
+                    return handle
+                try:
+                    stdout_handle = stdout_path.open("wb")
+                    child = popen_in_boundary(
+                        argv,
+                        cwd=str(invocation_dir),
+                        env=env,
+                        boundary=boundary,
+                        stdout_handle=stdout_handle,
+                        # stderr travels on a pipe this driver owns, so what is retained is genuinely
+                        # bounded and the reader has a stream to read. Giving the child a file instead
+                        # meant the reader had nothing to drain (`process.stderr` was ``None``) while the
+                        # child wrote 2 MiB HFlow never noticed.
+                        stderr_handle=subprocess.PIPE,
+                    )
+                except BaseException:
+                    boundary.close()
+                    raise
+                handle.pid = child.pid
+                # Published while the gate is still held: a stop waiting on this publication wakes
+                # up to a handle it can act on, not to an empty map.
+                self._handles[request.invocation_id] = handle
+                self._processes[request.invocation_id] = child
+                self._boundaries[request.invocation_id] = boundary
+            finally:
+                self._spawn_pending.discard(request.invocation_id)
+                self._gate.notify_all()
+
         # One declared retention budget per invocation, split between the protocol stream and
         # stderr. The reader enforces it by writing only up to its share and repeatedly trimming
         # the client's own file back to that share: a looping client keeps writing, and the file
@@ -585,7 +630,6 @@ class AcpxDshDriver:
         self._unparsed[request.invocation_id] = 0
         self._overflow[request.invocation_id] = False
         self._oversized[request.invocation_id] = 0
-        self._prompt_digests[request.invocation_id] = prompt_digest
         self._events_capped[request.invocation_id] = False
         self._peak_raw_bytes[request.invocation_id] = 0
 
@@ -887,6 +931,25 @@ class AcpxDshDriver:
         invocation_id = handle.invocation_id
         if invocation_id in self._results:
             return self._results[invocation_id]
+        if handle.start_cancelled:
+            # A stop won the handoff, so no process was created. There is nothing to wait for,
+            # and this is terminal: a later start of the same invocation is refused.
+            result = InvocationResult(
+                invocation_id=invocation_id,
+                outcome=InvocationOutcome.CANCELLED,
+                prompt_digest=self._prompt_digests.get(invocation_id, ""),
+                agent_turns=0,
+                limitations=[
+                    "stopped before the process was created; no client was launched and no "
+                    "model request was made"
+                ],
+                error_code="cancelled",
+                error_message="the invocation was stopped before its process was created",
+                raw_ref=str(handle.event_log),
+            )
+            handle.finished = True
+            self._results[invocation_id] = result
+            return result
         process = self._processes[invocation_id]
         try:
             process.wait(timeout=self.completion_timeout_seconds)
@@ -1071,25 +1134,92 @@ class AcpxDshDriver:
 
     # -- stop ----------------------------------------------------------------
 
+    def _stop_state(self, invocation_id: str) -> str:
+        """Where this invocation is, as one answer taken under the gate.
+
+        ``"live"`` - a process exists (published) and the caller may act on it outside the gate;
+        ``"pending"`` - a spawn holds the gate right now, so "no handle" is not yet an answer;
+        ``"stopped_before_start"`` - no process exists and the stop is recorded, so none will be
+        created.
+
+        The process is checked **first**: once a child exists, a recorded stop does not make it
+        disappear - it is the thing the stop still has to terminate. Asking about the stop flag
+        first would report a confirmed stop of an invocation that is in fact running.
+        """
+        if invocation_id in self._processes:
+            return "live"
+        if invocation_id in self._spawn_pending:
+            return "pending"
+        if self._stop_requests.get(invocation_id):
+            return "stopped_before_start"
+        return "absent"
+
+    def _await_spawn_publication(self, invocation_id: str) -> None:
+        """Wait, outside the held gate, for an in-flight spawn to publish or to be cancelled.
+
+        Called with the gate held and returns with it held. ``Condition.wait`` releases the gate
+        while waiting, so the spawning thread finishes its publication and wakes this thread up;
+        there is no path here that holds the gate across the wait, and no re-entrant acquisition
+        that could deadlock on it.
+        """
+        deadline = time.monotonic() + BOUNDARY_EMPTY_TIMEOUT_SECONDS
+        while self._stop_state(invocation_id) == "pending":
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            self._gate.wait(timeout=remaining)
+
     def cancel_handle(self, handle: DriverHandle) -> CancellationReceipt:
-        """Request a stop and report facts. Idempotent; never sends another prompt."""
+        """Request a stop and report facts. Idempotent; never sends another prompt.
+
+        The request is recorded under the same gate the spawn uses, and a stop that arrives while
+        a spawn is in flight waits for that spawn to publish instead of concluding that there is
+        nothing to stop. Whichever side takes the gate first decides:
+
+        * the stop first - ``_stop_requests`` is set, the spawn refuses, and this reports a
+          confirmed stop of an invocation that never had a process;
+        * the spawn first - this waits outside the held lock for the publication, then terminates
+          the process it finds, reporting ``mechanism=forced``.
+
+        The wait happens with the gate released and never covers the invocation's result: a stop
+        is not blocked by the work it is stopping.
+        """
         invocation_id = handle.invocation_id
         previous = self._receipts.get(invocation_id)
         if previous is not None:
             return previous
 
-        process = self._processes[invocation_id]
-        boundary = self._boundaries[invocation_id]
-        if process.poll() is not None:
-            receipt = CancellationReceipt(
-                invocation_id=invocation_id,
-                status="confirmed_stopped",
-                mechanism="none",
-                local_process_stopped=True,
-                detail="the invocation had already exited when the stop was requested",
-            )
-            self._receipts[invocation_id] = receipt
-            return receipt
+        # Declared before taking the gate: a spawn that is already inside it re-reads this and
+        # refuses to create a process, which is the whole point of recording it first.
+        with self._gate:
+            self._stop_requests[invocation_id] = True
+            self._await_spawn_publication(invocation_id)
+            state = self._stop_state(invocation_id)
+            if state != "live":
+                receipt = CancellationReceipt(
+                    invocation_id=invocation_id,
+                    status="confirmed_stopped",
+                    mechanism="none",
+                    local_process_stopped=True,
+                    detail=(
+                        "the invocation was stopped before its process was created; no child ran "
+                        "and none will be started"
+                    ),
+                )
+                self._receipts[invocation_id] = receipt
+                return receipt
+            process = self._processes[invocation_id]
+            boundary = self._boundaries[invocation_id]
+            if process.poll() is not None:
+                receipt = CancellationReceipt(
+                    invocation_id=invocation_id,
+                    status="confirmed_stopped",
+                    mechanism="none",
+                    local_process_stopped=True,
+                    detail="the invocation had already exited when the stop was requested",
+                )
+                self._receipts[invocation_id] = receipt
+                return receipt
 
         # No protocol-cancel entry point exists on the one-shot exec path, so the only
         # mechanism available is the managed process boundary. Stated, not implied.
@@ -1199,13 +1329,30 @@ class AcpxDshDriver:
         return self.collect(handle)
 
     def cancel(self, invocation_id: str) -> CancellationReceipt:
-        handle = self._handles.get(invocation_id)
+        """Stop by invocation id, through the same gate as ``cancel_handle``.
+
+        A missing handle is **not** an answer here: the invocation may be inside the spawn gate
+        right now, with its process about to exist. This used to return ``unknown`` immediately
+        - bypassing the gate and forgetting the stop - which let a child be created after the
+        controller had already recorded that the run was stopped.
+
+        So the request is recorded first, under the gate, and only then is the handle looked up.
+        No handle *and* no spawn in flight means nothing was ever started for this id, which is
+        still reported as ``unknown``: that is a real fact about an unknown invocation, not a
+        stop that was dropped.
+        """
+        with self._gate:
+            self._stop_requests[invocation_id] = True
+            self._await_spawn_publication(invocation_id)
+            handle = self._handles.get(invocation_id)
         if handle is None:
             return CancellationReceipt(
                 invocation_id=invocation_id,
                 status="unknown",
                 mechanism="none",
-                detail="no handle for this invocation; nothing was stopped",
+                detail=(
+                    "no handle for this invocation and no spawn in flight; nothing was stopped"
+                ),
             )
         return self.cancel_handle(handle)
 

@@ -74,6 +74,8 @@ class FakeDriver:
         self.project_root = Path(project_root)
         self.script = script or FakeScript()
         self.started: list[InvocationRequest] = []
+        #: Invocations a recorded stop prevented from starting at all.
+        self.stopped_before_start: list[str] = []
         self.cancelled: list[str] = []
         self.reconciled: list[str] = []
         self._unknown_seen = 0
@@ -108,6 +110,18 @@ class FakeDriver:
 
     def start(self, request: InvocationRequest) -> InvocationResult:
         self.started.append(request)
+        if request.stop_requested is not None and request.stop_requested():
+            # The same contract as the production driver: a stop recorded before the process
+            # would be created means no work happens at all, not a late discovery.
+            self.stopped_before_start.append(request.invocation_id)
+            return InvocationResult(
+                invocation_id=request.invocation_id,
+                outcome=InvocationOutcome.CANCELLED,
+                agent_turns=0,
+                limitations=["stopped before the fake invocation would have run"],
+                error_code="cancelled",
+                error_message="the invocation was stopped before it started",
+            )
         attempt_dir = Path(request.workspace)
 
         if self._unknown_seen < self.script.unknown_invocations:
@@ -149,6 +163,13 @@ class FakeDriver:
         )
 
     def cancel(self, invocation_id: str) -> CancellationReceipt:
+        """Report the stop as confirmed, because this driver starts no external process.
+
+        There is nothing to terminate and nothing that can survive the call, so "confirmed" is
+        the true answer *for this driver*. It is a property of the fake, not of the contract: a
+        driver that launches a process must report ``unknown`` for an invocation whose handle it
+        never published, and a test that needs that behaviour must not use this stub to get it.
+        """
         self.cancelled.append(invocation_id)
         return CancellationReceipt(
             invocation_id=invocation_id,

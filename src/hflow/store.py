@@ -451,6 +451,65 @@ class Store:
             )
             return conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
 
+    def block_unless_stopped(self, run_id: str, code: RefusalCode, reason: str) -> bool:
+        """Record a block **unless a stop already decided this run's state**, atomically.
+
+        The stop decision and this write are one statement, so they cannot interleave: a
+        cancellation committed before it wins and this returns ``False``, and a cancellation
+        committed after it sees a run that is already ``BLOCKED`` and records its own state
+        through the same conditional form. Checking ``cancel_intent_at`` in Python and then
+        writing unconditionally is exactly the race this replaces - the check and the write
+        must be the same transaction.
+
+        ``WHERE cancel_intent_at IS NULL`` is the whole guard: once a stop is durable, no later
+        failure - a driver error, a protocol failure, a rejected review - may relabel the run.
+        """
+        now = utc_now()
+        with self.transaction() as conn:
+            cur = conn.execute(
+                """
+                UPDATE runs
+                   SET task_state = ?, block_code = ?, block_reason = ?, updated_at = ?
+                 WHERE run_id = ? AND cancel_intent_at IS NULL
+                """,
+                (TaskState.BLOCKED.value, code.value, reason, now, run_id),
+            )
+            return cur.rowcount == 1
+
+    def register_attempt_invocation_unless_stopped(
+        self, run_id: str, attempt_id: str, *, column: str, invocation_id: str
+    ) -> bool:
+        """Register a role's invocation for a run that has not been stopped, atomically.
+
+        This is the handoff a stop races with: the invocation id a stop would target and the
+        record that the process is about to be started must become visible together. Making the
+        registration conditional on ``cancel_intent_at IS NULL`` means the two orders are both
+        correct - either the stop commits first and no invocation is registered (so the handoff
+        is abandoned and nothing is started), or the registration commits first and the stop
+        targets *this* invocation instead of the implementer's.
+
+        The whole check is the ``WHERE`` clause, in one statement under ``BEGIN IMMEDIATE``: a
+        stop that commits at any point up to this statement wins, and no window exists between
+        deciding "not stopped" and writing the registration for one to land in.
+
+        ``column`` is one of the two invocation columns; it is never interpolated from user
+        input, and anything else is refused rather than formatted into SQL.
+        """
+        if column not in {"invocation_id", "review_invocation_id"}:
+            raise StoreError(f"unknown invocation column {column!r}")
+        with self.transaction() as conn:
+            cur = conn.execute(
+                f"""
+                UPDATE attempts
+                   SET {column} = ?
+                 WHERE attempt_id = ?
+                   AND run_id = ?
+                   AND (SELECT cancel_intent_at FROM runs WHERE run_id = ?) IS NULL
+                """,
+                (invocation_id, attempt_id, run_id, run_id),
+            )
+            return cur.rowcount == 1
+
     def save_receipt(self, run_id: str, receipt: ResultReceipt) -> None:
         """Persist a receipt without touching state.
 
@@ -887,6 +946,12 @@ class Store:
 
         Review runs as its own process with its own ID - it is not a continuation of the
         implementer session - even though both are recorded against the same attempt.
+
+        Unconditional, and therefore **not** what a controller should call before starting a
+        reviewer: a stop commits between this write and the driver launch it would miss.
+        :meth:`register_attempt_invocation_unless_stopped` is the conditional form the
+        controller uses; this one stays for the store-level tests and callers that hold their
+        own coordination.
         """
         with self.transaction() as conn:
             conn.execute(

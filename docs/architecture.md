@@ -126,6 +126,26 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
   statement about a process that leaves the job, about another platform, about a remote model
   request, or about remote billing having stopped. A stop that cannot be confirmed stays
   `still_running`/`unknown`, and the run blocks instead of re-dispatching.
+- **A stop goes to the role that is running, and both sides of a handoff are coordinated.**
+  Implementer and reviewer are separate invocations (`attempts.invocation_id` /
+  `attempts.review_invocation_id`) and may be separate driver objects. `Controller.cancel`
+  resolves the pair from the run's recorded `phase` - a review in progress means the reviewer's
+  invocation through `reviewer_driver` - records which role, driver and invocation were asked as
+  a run note, and reports the driver's facts. Coordination lives in the store and in the driver,
+  never in a controller read: `register_attempt_invocation_unless_stopped` and
+  `block_unless_stopped` write with `WHERE cancel_intent_at IS NULL`, and the driver's gate
+  (`_gate`, a `Condition`) is held while it publishes an invocation's handle **and** creates the
+  child, which *both* stop entry points - `cancel_handle` and `cancel(invocation_id)` - take to
+  record their request. A missing handle is not an answer while a spawn is in flight: a stop that
+  takes the gate waits for that critical section to end - normally by waiting to *acquire* the
+  gate, which the spawn releases only after publishing - and then acts on what the spawn
+  published. The wait is bounded by the spawn, never by the invocation: the gate is released
+  before the result is awaited, so a stop can wait for a process to be created but not for the
+  model call it is stopping to finish. The consequences that matter operationally: a stop that
+  wins that gate means no process is created at all (`DriverHandle.start_cancelled`, reported as
+  `cancelled` with `agent_turns=0`), and a stop that loses it finds a published handle and
+  terminates the process. `InvocationRequest` carries `stop_requested` so the driver asks the
+  run's state at the instant of the spawn. Reconciliation (`resume`) resolves the same way.
 - **Billing is unknown.** `provider_billed_tokens`, `provider_cost` and
   `subscription_quota_remaining` are `null` because nothing observes them. Do not read `null`
   as `0`.

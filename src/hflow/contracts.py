@@ -19,12 +19,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal, Protocol, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
 SCHEMA_VERSION = 1
 
@@ -558,6 +559,21 @@ class InvocationRequest(BaseModel):
     #: state). Never the project checkout: scaffolding inside the workspace would show up in
     #: candidate snapshots and dirty the tree under test.
     data_dir: str = ""
+    #: Supplied by the controller: ``True`` when the run's stop was already requested. A driver
+    #: must call it at the last moment before creating a process, inside whatever coordination it
+    #: uses to publish that invocation's handle, so an operator's stop can win the handoff
+    #: instead of being discovered after a child exists. It is a read-only question about the
+    #: run's recorded state; it starts nothing, sends nothing and blocks on nothing, so calling
+    #: it is safe from a spawn path.
+    #:
+    #: Why this belongs in the request rather than in the driver's own configuration: the stop
+    #: fact lives in the controller's store, and a driver cannot see it. Passing the *question*
+    #: (not a snapshot answer) is what keeps the decision at the instant of the spawn.
+    #:
+    #: Excluded from JSON Schema - it is a live callback, not a serializable field - so
+    #: ``hflow schema`` still generates. ``InvocationRequest`` is never persisted or sent over
+    #: the wire; it is the in-process hand-off to a driver.
+    stop_requested: SkipJsonSchema[Callable[[], bool] | None] = Field(default=None, exclude=True)
 
 
 class InvocationOutcome(StrEnum):
@@ -654,6 +670,11 @@ class DriverHandle(BaseModel):
     event_log: str = ""
     #: Set once the invocation reached a terminal state, so repeated calls are cheap.
     finished: bool = False
+    #: The invocation was stopped *before* its process was created, so there is no child and
+    #: none will be made. A driver must publish the handle before spawning and check the stop
+    #: inside that same coordination, which is what turns "a stop arrived while we were about
+    #: to launch" into "nothing was launched" rather than "a process exists that nobody owns".
+    start_cancelled: bool = False
 
 
 class ReconcileResult(BaseModel):

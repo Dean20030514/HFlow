@@ -9,7 +9,7 @@ not restate the design; read the plan and `docs/architecture.md` when the task n
 |---|---|
 | Every data contract (single source of truth) | `src/hflow/contracts.py` |
 | State machine, budget, acceptance, receipt, cancel intent | `src/hflow/controller.py` |
-| SQLite schema, transactions, compare-and-set | `src/hflow/store.py` |
+| SQLite schema, transactions, compare-and-set, stop-conditional writes | `src/hflow/store.py` |
 | Admission rules (scope, reuse, budget, risk) | `src/hflow/admission.py` |
 | Approved checks and evidence | `src/hflow/verify.py` |
 | Scope containment and candidate fingerprints | `src/hflow/workspace.py` |

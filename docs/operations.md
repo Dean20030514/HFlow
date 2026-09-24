@@ -582,6 +582,36 @@ actually happened:
 | `confirmed_stopped` + `mechanism=none` | there was nothing left to stop (already exited, or never dispatched) |
 | `still_running` / `unknown` | the stop could not be confirmed: the run stays blocked, the workspace and evidence are kept, and nothing is re-dispatched |
 
+The stop goes to the **role that is running**, not always to the implementer: while the review
+phase is live it names the reviewer's own invocation and asks the reviewer's driver (a profile
+may bind the two roles to different drivers). Which role, driver and invocation were asked, and
+what the stop reported, is recorded as a `cancel_target` line in the run's own note table
+(`run_notes`, alongside the effective configuration and the role input packets); the run's notes
+are not part of the `status`/`report` projection, so read them from the store.
+
+A recorded stop is coordinated through the **write** and through the **spawn gate**, not
+through a sequence of checks. Registering a role's invocation and every block of a run carry
+"no cancellation intent" as a condition in the same statement, and the driver publishes an
+invocation's handle and creates its child inside one gate that *both* stop entry points
+(`cancel_handle` and `cancel(invocation_id)`) take to record their request. So a stop that
+arrives while the reviewer packet is being built, while the review turn is being reserved, or
+while the checks are still running cannot be followed by a reviewer process - and a stop that
+arrives as the process is about to be created wins outright: no child is created, the invocation
+is reported as cancelled, and nothing runs. A stop that arrives while the child is being created
+waits for that critical section to end - normally by waiting to acquire the gate, which the spawn
+releases only after publishing the handle - and then terminates the process it finds, reported as
+`mechanism=forced`. "No handle for this invocation" is never an answer while a spawn is in
+flight. That wait is bounded by the spawn, not by the invocation: the gate is released before the
+model answer is awaited, so a stop may wait for a process to be created but never for the call it
+is stopping to finish. A review turn already reserved for a stopped run stays spent - nothing is
+refunded - but no process is started for it.
+
+Once an intent is recorded the run's stop state is final: acceptance refuses, and a later
+failure (a transport error, a `review_protocol_error`, a rejected review) is recorded against
+the attempt without relabelling the run - an unconfirmed stop stays `outcome_unknown`, a
+confirmed one stays `cancelled_by_operator`, and a result arriving after the attempt was
+finalized is recorded as a `late_result` note instead of being applied.
+
 A confirmed stop is **not** a rollback, **not** a successful protocol cancellation, and
 **not** a known business result. Cooperative cancellation (`session/cancel`) is unsupported
 on the one-shot `exec` launch path, so the only mechanism available is forced teardown of
