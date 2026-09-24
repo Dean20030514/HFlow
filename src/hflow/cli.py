@@ -218,7 +218,8 @@ def _zero_model_preflight(driver: object, args: argparse.Namespace):
 def cmd_run(args: argparse.Namespace) -> int:
     # The authorization question is settled before the task is even read: refusing here means a
     # missing approval cannot be confused with a malformed task, and no file is touched first.
-    if args.driver != "fake" and not args.authorization_file:
+    is_real_driver = args.driver != "fake"
+    if is_real_driver and not args.authorization_file:
         message = (
             f"driver {args.driver!r} is a real Harness driver and needs an explicit, bound user "
             "authorization file (--authorization-file). There is no flag that substitutes for "
@@ -247,7 +248,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     if overrides:
         spec = TaskSpec.model_validate({**spec.model_dump(mode="json"), **overrides})
 
-    validation = validate_task_spec(spec, project, project_root)
+    validation = validate_task_spec(
+        spec, project, project_root, allow_fake_checks=not is_real_driver
+    )
     if not validation.ok and not args.force:
         _write_out(
             {
@@ -266,7 +269,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     # task must not be able to authorize itself with a word.
     authorization = None
     authorization_binding = None
-    if args.driver != "fake":
+    if is_real_driver:
         from .authorization import (
             current_binding,
             load_authorization,
@@ -326,6 +329,11 @@ def cmd_run(args: argparse.Namespace) -> int:
             data_dir=data_dir,
             authorization=authorization,
             preflight=_zero_model_preflight(driver, args) if authorization is not None else None,
+            # `--driver fake` is the offline driver: it scripts its own change and its checks
+            # are fake by construction. Everything else is a real delivery, and a real delivery
+            # gets the stricter gates (real checks, isolated worktree, effective write
+            # permission, a budget that covers the review it requires).
+            production=is_real_driver,
         )
         request = RunRequest(
             task=spec,

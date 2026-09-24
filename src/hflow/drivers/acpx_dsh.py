@@ -16,6 +16,12 @@ Facts baked in from the M0 probe and the installed acpx 0.17.1 bundle (not assum
 * The task body goes through acpx's documented stdin path (``-f -``), then the child's
   stdin is closed so input is complete. The ACP stdin between acpx and DSH is acpx's own
   pipe and is never touched from here.
+* The body is the controller's rendered input packet, verbatim (``hflow.packet``). This
+  driver adds no task facts of its own: it does not read the repository to fill a gap, and
+  when the request carries no packet it transports the bare ``goal`` inside a digest
+  envelope. The digest of the text it was handed is reported back in the invocation result,
+  so a driver that sends something other than the packet is caught. That digest is a local
+  record of the input, not an acknowledgement from the agent or the model.
 * ``acpx cancel`` reaches a *queue owner* for a persisted session. One-shot ``exec`` runs
   without a saved session, so no protocol-cancel entry point exists on this path; the
   driver records that as ``cooperative_cancel=unsupported`` rather than pretending.
@@ -56,6 +62,8 @@ from ..contracts import (
     ReviewOutput,
 )
 from ..ids import utc_now
+from ..artifacts import BoundedTextSink, StreamCapture
+from ..packet import packet_digest
 from ..review import (
     MAX_ANSWER_BYTES,
     REVIEW_INVALID,
@@ -82,10 +90,16 @@ ENV_ALLOW_WRITES = "HFLOW_ALLOW_WRITES"
 #: No step installs, upgrades, or downloads anything.
 DEV_ACPX_RELATIVE = Path("m0/acpx/node_modules/acpx/dist/cli.js")
 PROBE_ACPX_RELATIVE = Path(".probe/acpx/node_modules/acpx/dist/cli.js")
-#: Cap on the raw event log so a chatty or looping agent cannot fill the disk.
-MAX_RAW_LOG_BYTES = 4 * 1024 * 1024
-#: Cap on retained lines: the log file is the full record, memory only needs recent context.
+#: Cap on the retained raw log for one invocation (plan 8.2). Everything the client writes is
+#: read and digested; only this prefix is kept, and the difference is recorded as truncation.
+MAX_RAW_LOG_BYTES = 32 * 1024 * 1024
+#: Cap on retained lines: the log file is the retained record, memory only needs recent context.
 MAX_BUFFERED_LINES = 5000
+#: Cap on a single line still waiting for its newline. A line longer than this cannot be a
+#: protocol message, and letting it grow would make the memory bound nominal rather than real.
+MAX_PENDING_LINE_BYTES = 1024 * 1024
+#: How much is read from a child pipe at a time.
+CAPTURE_READ_CHUNK = 64 * 1024
 #: How often the stream follower re-checks a file that has not grown yet.
 STREAM_POLL_SECONDS = 0.05
 #: How long ``collect`` waits for the reader to finish after the client exits.
@@ -94,6 +108,22 @@ STREAM_DRAIN_TIMEOUT_SECONDS = 5.0
 FORCE_STOP_GRACE_SECONDS = 2.0
 #: How long to wait for the boundary to report itself empty after termination.
 BOUNDARY_EMPTY_TIMEOUT_SECONDS = 10.0
+#: Written around a packet so the prompt text a driver actually sent is recoverable, and so a
+#: bare ``goal`` (a direct driver call) is still traceable to the request it came from. The
+#: digest covers the prompt text alone, so this envelope cannot change what the digest means.
+PROMPT_ENVELOPE = "HFLOW-PROMPT-DIGEST"
+
+
+def effective_prompt(request: InvocationRequest) -> str:
+    """The exact prompt text to send for one invocation.
+
+    The controller renders the input packet (``hflow.packet``) and puts it in the request;
+    the driver only transports it. An empty packet means the caller passed a bare ``goal``,
+    which is wrapped in the digest envelope so the sent prompt is still bound to its request.
+    """
+    return request.packet or (
+        f"{PROMPT_ENVELOPE}: {packet_digest(request.goal)}\n\n{request.goal}"
+    )
 
 
 class DriverSetupError(RuntimeError):
@@ -120,6 +150,7 @@ class AcpxDshDriver:
         extra_env: dict[str, str] | None = None,
         completion_timeout_seconds: int = 900,
         agent_argv_override: list[str] | None = None,
+        max_raw_log_bytes: int = MAX_RAW_LOG_BYTES,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.acpx_cli = Path(acpx_cli) if acpx_cli else self._resolve_acpx_cli()
@@ -130,6 +161,9 @@ class AcpxDshDriver:
         self.node_executable = os.environ.get(ENV_ACPX_NODE) or shutil.which("node") or "node"
         self.extra_env = dict(extra_env or {})
         self.completion_timeout_seconds = completion_timeout_seconds
+        #: Retention cap for one invocation's raw logs. A parameter rather than a constant so a
+        #: test can drive the overflow path without generating 32 MiB of output.
+        self.max_raw_log_bytes = max(0, int(max_raw_log_bytes))
         #: Test seam: the agent launch argv that goes into the acpx config. ``None`` means
         #: the real DSH launcher argv. Nothing else about the launch path is injectable.
         self.agent_argv_override = list(agent_argv_override) if agent_argv_override else None
@@ -149,7 +183,31 @@ class AcpxDshDriver:
         self._lines: dict[str, list[str]] = {}
         self._unparsed: dict[str, int] = {}
         self._overflow: dict[str, bool] = {}
+        #: Lines that never ended before the pending buffer's cap: counted separately from
+        #: unparseable lines so a client stuck writing one enormous line is diagnosable.
+        self._oversized: dict[str, int] = {}
+        #: Retained stderr per invocation, so ``collect`` can report what was kept rather than
+        #: implying the whole stream is on disk.
+        self._stderr_captures: dict[str, StreamCapture] = {}
+        #: Set once the in-memory event list stopped growing: the container is bounded too, not
+        #: only the retained file.
+        self._events_capped: dict[str, bool] = {}
+        #: Highest byte offset ever read from a client's output file. Reported so the retention
+        #: bound is a measured number rather than a claim: the file is trimmed back to the budget,
+        #: but a client can write between two trims.
+        self._peak_raw_bytes: dict[str, int] = {}
+        #: Retained protocol stream per invocation, for the same reporting purpose as stderr.
+        self._stdout_captures: dict[str, StreamCapture] = {}
+        #: Fraction of the retention budget reserved for stderr. A *fraction* rather than a fixed
+        #: number of bytes on purpose: with a fixed share, a small configured budget would leave
+        #: the protocol stream a zero-byte share, and the cap would silently mean "keep nothing".
+        self.stderr_share_fraction = 0.125
+        #: Hard cap on retained events for one invocation, independent of their byte size.
+        self.max_event_records = 20000
         self._results: dict[str, InvocationResult] = {}
+        #: Digest of the prompt text each invocation was launched with, reported by ``collect``
+        #: so the controller can tell "the model answered" from "the prompt arrived intact".
+        self._prompt_digests: dict[str, str] = {}
 
     # -- configuration -------------------------------------------------------
 
@@ -335,8 +393,13 @@ class AcpxDshDriver:
         task_file = invocation_dir / "task.txt"
 
         workspace = Path(request.workspace)
-        # Task body travels as a file, not as a command-line string.
-        task_file.write_text(request.goal, encoding="utf-8")
+        # Task body travels as a file, not as a command-line string. The file holds the whole
+        # prompt (packet + envelope) so what was sent is auditable after the fact, and the
+        # digest of exactly those bytes is what ``collect`` reports back to the controller.
+        prompt = effective_prompt(request)
+        prompt_bytes = prompt.encode("utf-8")
+        task_file.write_bytes(prompt_bytes)
+        prompt_digest = packet_digest(prompt)
         config_path = self._write_config(invocation_dir, writes_allowed=request.writes_allowed)
 
         boundary = ProcessBoundary().open()
@@ -368,14 +431,17 @@ class AcpxDshDriver:
 
         try:
             stdout_handle = stdout_path.open("wb")
-            stderr_handle = stderr_path.open("wb")
             child = popen_in_boundary(
                 argv,
                 cwd=str(invocation_dir),
                 env=env,
                 boundary=boundary,
                 stdout_handle=stdout_handle,
-                stderr_handle=stderr_handle,
+                # stderr travels on a pipe this driver owns, so what is retained is genuinely
+                # bounded and the reader has a stream to read. Giving the child a file instead
+                # meant the reader had nothing to drain (`process.stderr` was ``None``) while the
+                # child wrote 2 MiB HFlow never noticed.
+                stderr_handle=subprocess.PIPE,
             )
         except BaseException:
             boundary.close()
@@ -384,7 +450,10 @@ class AcpxDshDriver:
         self._handles[request.invocation_id] = handle
         self._processes[request.invocation_id] = child
         self._boundaries[request.invocation_id] = boundary
-        # Bounded: the raw log file is the full record, memory only needs recent context.
+        # One declared retention budget per invocation, split between the protocol stream and
+        # stderr. The reader enforces it by writing only up to its share and repeatedly trimming
+        # the client's own file back to that share: a looping client keeps writing, and the file
+        # keeps being returned to the budget instead of growing with it.
         self._events[request.invocation_id] = []
         self._transcripts[request.invocation_id] = AnswerTranscript(role=request.role)
         self._prompt_request_ids[request.invocation_id] = set()
@@ -392,12 +461,16 @@ class AcpxDshDriver:
         self._lines[request.invocation_id] = deque(maxlen=MAX_BUFFERED_LINES)
         self._unparsed[request.invocation_id] = 0
         self._overflow[request.invocation_id] = False
+        self._oversized[request.invocation_id] = 0
+        self._prompt_digests[request.invocation_id] = prompt_digest
+        self._events_capped[request.invocation_id] = False
+        self._peak_raw_bytes[request.invocation_id] = 0
 
         # Task text via stdin, then close it: HFlow -> acpx input is complete. The ACP pipe
         # between acpx and DSH is acpx's own and is not touched here.
         assert child.stdin is not None
         try:
-            child.stdin.write(task_file.read_text(encoding="utf-8").encode("utf-8"))
+            child.stdin.write(prompt_bytes)
             child.stdin.flush()
         except (BrokenPipeError, OSError):
             pass  # the process may already have failed; collect() reports the real reason
@@ -406,11 +479,18 @@ class AcpxDshDriver:
 
         thread = threading.Thread(
             target=self._consume_stream,
-            args=(request.invocation_id, stdout_path, stderr_path),
+            args=(request.invocation_id, stdout_path),
             daemon=True,
         )
         self._threads[request.invocation_id] = thread
         thread.start()
+        stderr_thread = threading.Thread(
+            target=self._consume_stderr,
+            args=(request.invocation_id, stderr_path),
+            daemon=True,
+        )
+        self._threads[request.invocation_id + ":stderr"] = stderr_thread
+        stderr_thread.start()
         return handle
 
     def _write_config(self, invocation_dir: Path, *, writes_allowed: bool) -> Path:
@@ -445,76 +525,163 @@ class AcpxDshDriver:
         path.write_text(json.dumps(config, indent=2), encoding="utf-8")
         return path
 
-    def _consume_stream(
-        self, invocation_id: str, stdout_path: Path, stderr_path: Path
-    ) -> None:
-        """Follow the client's stdout file and project each complete line to an event.
+    def _consume_stream(self, invocation_id: str, stdout_path: Path) -> None:
+        """Tail the client's protocol stream into a bounded retained log, projecting each line.
 
-        Reads by explicit byte offset instead of a persistent buffered reader: a reader that
-        latches EOF at the end of the currently written data stops delivering later output,
-        which silently loses everything after the first line. Runs on its own thread so a
-        live turn never blocks the caller and the stop path stays reachable.
+        What is bounded here is what HFlow **keeps**: the retained log stops at the protocol share
+        of the retention budget, and the in-memory event list stops growing with it. What is *not*
+        claimed is a bound on the client's own file (``stdout.ndjson``): the client owns that file
+        and keeps writing to it, and HFlow does not truncate a file another process is writing -
+        that removes bytes nobody has read and can leave a hole. Its measured size is reported
+        instead (``peak_raw_bytes``), so the difference between "bounded" and "measured" is
+        visible rather than implied.
+
+        A line that never ends is bounded too. Without that, a client writing a gigabyte with no
+        newline would grow ``pending`` in memory exactly as fast as the file - the bound would be
+        nominal. An over-long line is reported as an unusable line (which makes the turn's result
+        unknown) and the buffer is reset.
         """
-        log_path = Path(self._handles[invocation_id].event_log)
+        handle = self._handles[invocation_id]
         process = self._processes[invocation_id]
-        offset = 0
-        pending = b""
-        written = 0
-        line_index = 0
-        with log_path.open("a", encoding="utf-8") as log:
+        cap = self.protocol_share_bytes
+        with BoundedTextSink(Path(handle.event_log), limit=cap) as sink:
+            pending = b""
+            offset = 0
             while True:
                 chunk = b""
                 try:
-                    with stdout_path.open("rb") as handle:
-                        handle.seek(offset)
-                        chunk = handle.read()
+                    with stdout_path.open("rb") as source:
+                        source.seek(offset)
+                        chunk = source.read(CAPTURE_READ_CHUNK)
                 except OSError:
                     chunk = b""
                 if chunk:
                     offset += len(chunk)
+                    if offset > self._peak_raw_bytes[invocation_id]:
+                        self._peak_raw_bytes[invocation_id] = offset
+                    previous_total = sink.total_bytes
                     pending += chunk
                     *complete, pending = pending.split(b"\n")
                     for raw in complete:
-                        text = raw.decode("utf-8", errors="replace")
-                        if written < MAX_RAW_LOG_BYTES:
-                            log.write(text + "\n")
-                            written += len(raw) + 1
-                        else:
-                            self._overflow[invocation_id] = True
-                        self._lines[invocation_id].append(text)
-                        observed = project_line(text, len(self._events[invocation_id]), utc_now())
-                        line_index += 1
-                        if not observed.parsed:
-                            self._unparsed[invocation_id] += 1
-                            continue
-                        if observed.message is not None:
-                            self._note_message(
-                                invocation_id, observed.message, line_index=line_index - 1
-                            )
-                        if observed.event is not None:
-                            self._events[invocation_id].append(observed.event)
+                        self._project_line(invocation_id, sink, raw)
+                    if sink.total_bytes > sink.retained_bytes and (
+                        sink.total_bytes > previous_total or not self._overflow[invocation_id]
+                    ):
+                        # The budget ran out on this read: recorded now rather than on the next
+                        # line, so a stream whose *last* line crosses the cap is still reported.
+                        self._overflow[invocation_id] = True
+                    if len(pending) > MAX_PENDING_LINE_BYTES:
+                        # Unusable as a message; counted so the outcome cannot look clean. The
+                        # pending buffer is reset because an endless line is not a message.
+                        self._unparsed[invocation_id] += 1
+                        self._oversized[invocation_id] += 1
+                        pending = b""
                     continue
                 if process.poll() is not None:
-                    # The child is gone: one last read catches anything written on exit.
                     try:
-                        with stdout_path.open("rb") as handle:
-                            handle.seek(offset)
-                            tail = handle.read()
+                        with stdout_path.open("rb") as source:
+                            source.seek(offset)
+                            tail = source.read(CAPTURE_READ_CHUNK)
                     except OSError:
                         tail = b""
                     if not tail:
                         break
                     continue
                 time.sleep(STREAM_POLL_SECONDS)
+            if pending:
+                self._project_line(invocation_id, sink, pending)
+            self._overflow[invocation_id] = self._overflow[invocation_id] or sink.truncated
+            final_capture = sink.capture()
+        self._stdout_captures[invocation_id] = final_capture
         self._stream_drained[invocation_id] = True
         if os.environ.get("HFLOW_DRIVER_DEBUG"):
             print(
                 f"driver-debug: {invocation_id} lines={len(self._lines[invocation_id])} "
                 f"events={len(self._events[invocation_id])} "
-                f"unparsed={self._unparsed[invocation_id]} overflow={self._overflow[invocation_id]}",
+                f"unparsed={self._unparsed[invocation_id]} overflow={self._overflow[invocation_id]} "
+                f"oversized_lines={self._oversized[invocation_id]}",
                 file=sys.stderr,
                 flush=True,
             )
+
+    @property
+    def stderr_share_bytes(self) -> int:
+        """Bytes of the retention budget HFlow keeps for the client's stderr.
+
+        stderr goes into a pipe this driver owns, so this is a real limit on what is *retained*.
+        The client's own protocol file (``stdout.ndjson``) is deliberately **not** trimmed:
+        truncating a file another process is writing removes bytes that were never read and can
+        leave a hole, so it is not a bound HFlow can honestly enforce. What is bounded is
+        everything HFlow keeps; the client's file size is reported as the measured number it is.
+        """
+        return int(self.max_raw_log_bytes * self.stderr_share_fraction)
+
+    @property
+    def protocol_share_bytes(self) -> int:
+        """Budget for the retained protocol log (``events.ndjson``)."""
+        return max(0, self.max_raw_log_bytes - self.stderr_share_bytes)
+
+    def _project_line(self, invocation_id: str, sink: BoundedTextSink, raw: bytes) -> None:
+        """Retain one output line within the budget and project it to an event.
+
+        Two things stay bounded together. The retained file stops at the sink's limit, and the
+        in-memory event list stops growing once that budget is spent: parsing may continue (it is
+        how a stop reason is recognised), but nothing further is accumulated, so "the events are
+        capped" is a property of the container and not only of the file.
+        """
+        if not raw:
+            return
+        text = raw.decode("utf-8", errors="replace")
+        # Always written: the sink retains only up to its limit, but it *counts and digests* every
+        # byte it is given. Skipping the call once the limit was reached is what made the reported
+        # total describe HFlow's copy instead of the stream HFlow actually read.
+        sink.write(text.encode("utf-8") + b"\n")
+        self._lines[invocation_id].append(text)
+        observed = project_line(text, len(self._events[invocation_id]), utc_now())
+        if not observed.parsed:
+            self._unparsed[invocation_id] += 1
+            return
+        if observed.message is not None:
+            self._note_message(
+                invocation_id, observed.message, line_index=len(self._lines[invocation_id]) - 1
+            )
+        if observed.event is not None:
+            if self._events_capped[invocation_id]:
+                return
+            if sink.truncated or len(self._events[invocation_id]) >= self.max_event_records:
+                self._events_capped[invocation_id] = True
+                return
+            self._events[invocation_id].append(observed.event)
+
+    def _consume_stderr(self, invocation_id: str, stderr_path: Path) -> None:
+        """Drain the client's stderr from its pipe into a bounded sink.
+
+        The child writes into a pipe, so this is an entry-point limit on what HFlow retains and on
+        what the client can push: whatever exceeds the stderr share is read, counted and digested
+        but not written, and the client cannot fill the disk with it.
+        """
+        process = self._processes[invocation_id]
+        cap = self.stderr_share_bytes
+        with BoundedTextSink(stderr_path, limit=cap) as sink:
+            stream = process.stderr
+            status = "no_stream"
+            if stream is not None:
+                while True:
+                    try:
+                        chunk = stream.read(CAPTURE_READ_CHUNK)
+                    except (OSError, ValueError) as exc:
+                        status = f"read_failed: {type(exc).__name__}: {exc}"
+                        break
+                    if not chunk:
+                        status = "eof"
+                        break
+                    sink.write(chunk)
+            capture = sink.capture()
+        if status != "eof" and not capture.failure_reason:
+            capture.failure_reason = status
+            if status.startswith("read_failed"):
+                capture.failed = True
+        self._stderr_captures[invocation_id] = capture
 
     def _note_message(
         self, invocation_id: str, message: dict[str, Any], *, line_index: int = -1
@@ -604,6 +771,7 @@ class AcpxDshDriver:
             result = InvocationResult(
                 invocation_id=invocation_id,
                 outcome=InvocationOutcome.OUTCOME_UNKNOWN,
+                prompt_digest=self._prompt_digests.get(invocation_id, ""),
                 agent_turns=None,
                 limitations=["completion deadline exceeded while waiting for the client"],
                 error_code="completion_timeout",
@@ -623,6 +791,7 @@ class AcpxDshDriver:
         events = self._events.get(invocation_id, [])
         summary = summarize(events)
         unparsed = self._unparsed.get(invocation_id, 0)
+        oversized = self._oversized.get(invocation_id, 0)
         overflowed = self._overflow.get(invocation_id, False)
         stop_reason = summary["stop_reason"]
         receipt = self._receipts.get(invocation_id)
@@ -630,14 +799,21 @@ class AcpxDshDriver:
         if receipt is not None and receipt.status == "confirmed_stopped":
             outcome = InvocationOutcome.CANCELLED
             error_code, error_message = "cancelled", receipt.detail
+        elif overflowed:
+            # Reported before "unparseable lines": cutting the stream is what makes the tail
+            # unreadable, so the cause is named rather than one of its symptoms.
+            outcome = InvocationOutcome.OUTCOME_UNKNOWN
+            error_code = "output_limit_exceeded"
+            error_message = (
+                f"client output exceeded the {self.max_raw_log_bytes} byte retention budget; the "
+                "protocol stream was cut, so the result cannot be trusted"
+            )
         elif unparsed:
             outcome = InvocationOutcome.OUTCOME_UNKNOWN
             error_code = "unparseable_output"
             error_message = f"{unparsed} unparseable line(s) in the client output stream"
-        elif overflowed:
-            outcome = InvocationOutcome.OUTCOME_UNKNOWN
-            error_code = "output_limit_exceeded"
-            error_message = "client output exceeded the raw log cap; truncation makes the result untrustworthy"
+            if oversized:
+                error_message += f" ({oversized} of them exceeded the {MAX_PENDING_LINE_BYTES} byte line cap)"
         elif stop_reason in {None, ""}:
             outcome = InvocationOutcome.OUTCOME_UNKNOWN
             error_code = "no_stop_reason"
@@ -660,6 +836,18 @@ class AcpxDshDriver:
             "candidate content is not extracted here; verification runs on the workspace",
             "billed usage is not observable on this transport",
         ]
+        stderr_capture = self._stderr_captures.get(invocation_id)
+        if stderr_capture is not None:
+            limitations.append(
+                f"client stderr retained {stderr_capture.retained_bytes} of "
+                f"{stderr_capture.total_bytes} bytes at {stderr_capture.path}"
+                + (" (truncated: the retained file is the head only)" if stderr_capture.truncated else "")
+            )
+        if overflowed:
+            limitations.append(
+                f"client stdout exceeded the {self.max_raw_log_bytes} byte retention cap; the retained "
+                "log is a prefix, not the whole stream"
+            )
         if not handle.dispatched:
             limitations.append("no session/prompt was observed; the harness never received the task")
         if self._terminal_response_matches_prompt(invocation_id) is False:
@@ -675,6 +863,7 @@ class AcpxDshDriver:
             outcome=outcome,
             candidate=None,
             review=review,
+            prompt_digest=self._prompt_digests.get(invocation_id, ""),
             agent_turns=1 if handle.dispatched else 0,
             provider_billed_tokens=None,
             reported_cost=None,
@@ -911,7 +1100,7 @@ class AcpxDshDriver:
     # -- shutdown ------------------------------------------------------------
 
     def release(self, invocation_id: str) -> None:
-        """Drop an invocation: close its boundary and file handles.
+        """Drop an invocation: close its boundary, pipes and log handles.
 
         If the process is somehow still alive this terminates it through the boundary. That
         is a cleanup of a *managed* process, not a cancellation claim, so it never writes a
@@ -922,16 +1111,18 @@ class AcpxDshDriver:
         if process is not None and process.poll() is None and boundary is not None:
             boundary.terminate()
         self._close_boundary(invocation_id)
+        for name in (invocation_id, f"{invocation_id}:stderr"):
+            thread = self._threads.get(name)
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=2.0)
         if process is not None:
-            for stream in (
-                getattr(process, "_hflow_stdout", None),
-                getattr(process, "_hflow_stderr", None),
-            ):
-                if stream is not None and not getattr(stream, "closed", False):
-                    try:
-                        stream.close()
-                    except OSError:
-                        pass
+            for stream in (process.stdout, process.stderr, process.stdin):
+                if stream is None or getattr(stream, "closed", False):
+                    continue
+                try:
+                    stream.close()
+                except OSError:
+                    pass
 
     def events(self, invocation_id: str) -> list[NormalizedEvent]:
         return list(self._events.get(invocation_id, []))

@@ -52,7 +52,14 @@ STUB_AGENT = FIXTURES / "stub_acp_agent.py"
 class DriverHarness:
     """Owns one driver plus the temp roots its invocation state must stay inside."""
 
-    def __init__(self, tmp_path: Path, mode: str, *, delay_before_prompt: float = 0.0) -> None:
+    def __init__(
+        self,
+        tmp_path: Path,
+        mode: str,
+        *,
+        delay_before_prompt: float = 0.0,
+        max_raw_log_bytes: int | None = None,
+    ) -> None:
         self.mode = mode
         self.data_dir = (tmp_path / "data").resolve()
         self.workspace = (tmp_path / "ws").resolve()
@@ -67,12 +74,18 @@ class DriverHarness:
         if delay_before_prompt:
             # The fake client passes this through so a cancel can arrive pre-dispatch.
             stub_argv += ["--delay", str(delay_before_prompt)]
+        extra: dict[str, object] = {}
+        if max_raw_log_bytes is not None:
+            # Retention is configurable for exactly this reason: driving the overflow path should
+            # not require generating tens of megabytes of output.
+            extra["max_raw_log_bytes"] = max_raw_log_bytes
         self.driver = AcpxDshDriver(
             data_dir=self.data_dir,
             acpx_cli=FAKE_CLIENT,
             python_executable=sys.executable,
             completion_timeout_seconds=90,
             agent_argv_override=stub_argv,
+            **extra,  # type: ignore[arg-type]
         )
         # The stub keeps its marker files in STUB_SCRATCH_DIR; the fake client inherits the
         # driver's child environment, so pointing it here keeps scaffolding out of the
@@ -129,8 +142,15 @@ class DriverHarness:
 def harness_factory(tmp_path: Path):
     created: list[DriverHarness] = []
 
-    def make(mode: str, *, delay_before_prompt: float = 0.0) -> DriverHarness:
-        harness = DriverHarness(tmp_path / f"{mode}-{len(created)}", mode, delay_before_prompt=delay_before_prompt)
+    def make(
+        mode: str, *, delay_before_prompt: float = 0.0, max_raw_log_bytes: int | None = None
+    ) -> DriverHarness:
+        harness = DriverHarness(
+            tmp_path / f"{mode}-{len(created)}",
+            mode,
+            delay_before_prompt=delay_before_prompt,
+            max_raw_log_bytes=max_raw_log_bytes,
+        )
         created.append(harness)
         return harness
 
@@ -252,6 +272,7 @@ def test_controller_runs_the_driver_through_its_normal_contract(
         controller_build="test-build",
         runners=CheckRunners({"fake": runner}),
         data_dir=harness.data_dir,
+        production=False,
     )
     try:
         outcome = controller.run_task(
@@ -306,7 +327,9 @@ def test_exhausted_budget_never_reaches_the_cli(
 ) -> None:
     harness = harness_factory("cooperative")
     store = Store(tmp_path / "hflow.sqlite")
-    controller = Controller(store, harness.driver, controller_build="test-build", data_dir=harness.data_dir)
+    controller = Controller(
+        store, harness.driver, controller_build="test-build", data_dir=harness.data_dir, production=False
+    )
     try:
         run = store.create_run(
             run_id="R-seeded",
@@ -385,11 +408,105 @@ def test_missing_stop_reason_is_unknown_not_success(harness_factory) -> None:
 
 
 def test_output_overflow_is_untrustworthy_not_success(harness_factory) -> None:
-    harness = harness_factory("chatty")
+    """The retention budget is small for this case, so the overflow path is driven directly.
+
+    The production budget is 32 MiB; generating that much output in a unit test would be slow and
+    would prove nothing extra about the behaviour, which is what happens when the budget is spent.
+    """
+    harness = harness_factory("chatty", max_raw_log_bytes=256 * 1024)
     handle, _ = harness.start()
     result = harness.driver.collect(handle)
 
     assert result.outcome is InvocationOutcome.OUTCOME_UNKNOWN
+    assert result.error_code == "output_limit_exceeded"
+    harness.driver.release(handle.invocation_id)
+
+
+def test_the_retention_budget_bounds_what_hflow_keeps(harness_factory) -> None:
+    """The reported defect: a 256 KiB budget while 17 MiB was retained and reported as complete.
+
+    What is bounded is what HFlow keeps, and the test says exactly that: the retained protocol log
+    and the in-memory event container stay inside the budget, stderr is capped at its share, and
+    the client's own file is reported as the measured size it is - HFlow does not truncate a file
+    another process is writing, so it does not claim to bound it.
+    """
+    budget = 256 * 1024
+    harness = harness_factory("chatty", max_raw_log_bytes=budget)
+    handle, _ = harness.start()
+    result = harness.driver.collect(handle)
+    try:
+        invocation = harness.data_dir / "invocations" / handle.invocation_id
+        raw_bytes = (invocation / "stdout.ndjson").stat().st_size
+        event_bytes = (invocation / "events.ndjson").stat().st_size
+        stderr_bytes = (invocation / "stderr.txt").stat().st_size
+        protocol_share = harness.driver.protocol_share_bytes
+        peak = harness.driver._peak_raw_bytes[handle.invocation_id]
+
+        assert result.outcome is InvocationOutcome.OUTCOME_UNKNOWN
+        assert result.error_code == "output_limit_exceeded"
+        assert event_bytes <= protocol_share, (event_bytes, protocol_share)
+        assert stderr_bytes <= harness.driver.stderr_share_bytes
+        assert harness.driver._overflow[handle.invocation_id] is True
+        assert harness.driver._events_capped[handle.invocation_id] is True, (
+            "the in-memory event container must stop growing too"
+        )
+        assert len(harness.driver._events[handle.invocation_id]) <= harness.driver.max_event_records
+        # The client's own file is measured, not bounded, and the measurement is reported.
+        assert peak == raw_bytes, (peak, raw_bytes)
+        assert raw_bytes > budget, (
+            "this client really does write past the budget; that is why the claim is about "
+            "what HFlow keeps, not about the file"
+        )
+        capture = harness.driver._stdout_captures[handle.invocation_id]
+        assert capture.retained_bytes <= protocol_share
+        assert capture.total_bytes == raw_bytes
+        assert capture.truncated is True
+    finally:
+        harness.driver.release(handle.invocation_id)
+
+
+def test_stderr_is_read_from_a_pipe_and_really_recorded(harness_factory) -> None:
+    """The reported defect: the child wrote 2 MiB of stderr into a file nobody read.
+
+    ``process.stderr`` was ``None`` because the child had been given a file handle, so the reader
+    recorded "0 bytes, not truncated" for a stream that was never empty. stderr now travels on a
+    pipe, so this asserts the bytes *and* the bound.
+    """
+    harness = harness_factory("stderr-flood", max_raw_log_bytes=128 * 1024)
+    handle, _ = harness.start()
+    result = harness.driver.collect(handle)
+    try:
+        capture = harness.driver._stderr_captures[handle.invocation_id]
+        assert capture.total_bytes >= 2 * 1024 * 1024, capture.total_bytes
+        assert capture.retained_bytes == harness.driver.stderr_share_bytes
+        assert capture.truncated is True
+        assert (harness.data_dir / "invocations" / handle.invocation_id / "stderr.txt").stat().st_size == (
+            capture.retained_bytes
+        )
+        assert any("stderr retained" in note for note in result.limitations)
+    finally:
+        harness.driver.release(handle.invocation_id)
+
+
+def test_a_last_line_that_crosses_the_budget_is_still_reported(harness_factory) -> None:
+    """The other reported boundary error: only the *final* line crosses, and overflow was False.
+
+    A cooperative client whose whole stream is a few bytes larger than the budget used to end as
+    ``completed`` with ``overflow=False``. The budget is now detected per read, not one line late.
+    """
+    harness = harness_factory("cooperative", max_raw_log_bytes=1024)
+    handle, _ = harness.start()
+    result = harness.driver.collect(handle)
+    try:
+        assert harness.driver._overflow[handle.invocation_id] is True, (
+            "the read that spends the budget must record it, not the read after it"
+        )
+        assert result.outcome is InvocationOutcome.OUTCOME_UNKNOWN
+        assert result.error_code == "output_limit_exceeded"
+        invocation = harness.data_dir / "invocations" / handle.invocation_id
+        assert (invocation / "events.ndjson").stat().st_size <= harness.driver.protocol_share_bytes
+    finally:
+        harness.driver.release(handle.invocation_id)
     assert result.error_code == "output_limit_exceeded"
     assert harness.driver._overflow[handle.invocation_id] is True
     harness.driver.release(handle.invocation_id)
@@ -529,7 +646,9 @@ def test_controller_cancel_records_intent_and_blocks_late_acceptance(
     """A recorded cancellation intent must survive a late success and force BLOCKED."""
     harness = harness_factory("stubborn")
     store = Store(tmp_path / "hflow.sqlite")
-    controller = Controller(store, harness.driver, controller_build="test-build", data_dir=harness.data_dir)
+    controller = Controller(
+        store, harness.driver, controller_build="test-build", data_dir=harness.data_dir, production=False
+    )
     try:
         run = store.create_run(
             run_id="R-cancel",

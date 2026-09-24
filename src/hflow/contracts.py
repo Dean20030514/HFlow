@@ -321,13 +321,24 @@ class TaskSpec(BaseModel):
         return seen
 
     def needs_review(self, project: ProjectConfig) -> bool:
-        if not project.review_required:
-            return False
-        if not self.review.required:
-            # A task may not lower the project's risk requirement; validation
-            # rejects that combination before we ever get here.
-            return False
-        return True
+        """Is an independent review invocation required for this task?
+
+        The two flags are a floor and a request, not a switch and an override (plan 6):
+
+        * ``project.review_required=True`` is the project's floor. The task has no say: a spec
+          that waives it is refused at admission, and if one reaches this method anyway the
+          project's requirement still wins.
+        * ``project.review_required=False`` means the project does not require a model review.
+          The task then decides: a task that asks for one still gets one, because silently
+          skipping a review the task asked for would report a delivery the task never claimed.
+
+        So review is skipped in exactly one case - the project does not require it *and* the task
+        does not ask for it. That is the combination in which the reviewed artefact is a program
+        check plus human reading rather than a model review.
+        """
+        if project.review_required:
+            return True
+        return bool(self.review.required)
 
 
 # --------------------------------------------------------------------------
@@ -433,6 +444,12 @@ class InvocationRequest(BaseModel):
     workspace: str
     deadline_seconds: int
     spec_digest: str
+    #: The complete, controller-rendered prompt for this role (``packet.py``). When it is
+    #: present the driver sends exactly this text - it is the *whole* task input, so a
+    #: driver must never add facts of its own or explore the repository to fill gaps. When
+    #: it is empty the driver falls back to ``goal``, which keeps direct driver callers and
+    #: the offline fixtures working; the controller always renders a packet.
+    packet: str = ""
     #: May this invocation change files? Decided by the controller from the *role* and the
     #: run's approved mode - never by the driver's own default, and never by an ambient
     #: switch. A reviewer is read-only even when the implementer was allowed to write.
@@ -459,6 +476,12 @@ class InvocationResult(BaseModel):
     outcome: InvocationOutcome
     candidate: CandidateRef | None = None
     review: ReviewOutput | None = None
+    #: Digest of the prompt text this invocation was handed, as the transport reports it. This is
+    #: a *local* record of the input, not an acknowledgement from the ACP server or the model -
+    #: nothing here can observe remote receipt. The controller compares it with the packet it
+    #: rendered, so a driver that sends different text than it was given is caught instead of
+    #: having its result attributed to this task.
+    prompt_digest: str = ""
     agent_turns: int | None = None
     reported_cost: float | None = None
     provider_billed_tokens: int | None = None

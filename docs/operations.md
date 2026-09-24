@@ -223,6 +223,139 @@ Writes are off unless `HFLOW_ALLOW_WRITES=1`, which the controller honors only f
 workspace is a disposable worktree created from a fixed base commit; the effective mode is
 recorded in the run's notes.
 
+### What each role is actually told
+
+Neither invocation receives a bare one-line goal any more. The controller renders one
+**input packet** per role (`src/hflow/packet.py`) from recorded facts, and the driver transports
+that text verbatim through the client's stdin path - it never re-renders, extends or explores the
+repository to fill a gap.
+
+| Role | The packet carries |
+|---|---|
+| implementer | goal, acceptance criteria with their check ids, allowed/forbidden write paths, the workspace, the formal check ids, external-side-effect limits, the deadline and the effective file permission |
+| reviewer | the same task facts, the frozen candidate identity (base commit, candidate commit/tree, content fingerprint, diff reference, worktree), the recorded program evidence (verification status, per-check exit codes, evidence rows), the review rules, the canonical `ReviewOutput` contract, and the read-only constraint |
+
+Three facts about this wiring:
+
+- each packet is bounded (32 KiB by default). A packet that does not fit is refused **before**
+  dispatch; a required field is never silently truncated. A full diff or a full log travels by
+  reference, not inline;
+- the digest of the exact text is recorded in the run notes (`role_input_packet`) and reported
+  back by the driver (`prompt_digest`). A driver that hands the transport different text than the
+  controller rendered blocks the run rather than having its result attributed to this task.
+  That digest is a *local* record of what was sent - not a receipt from the ACP server or the
+  model, which nothing in this build can observe. "The prompt arrived" is evidenced in tests by
+  the receiving agent's own record of what it read;
+- the implementer is never told the candidate identity or the check results (it produces them),
+  and the reviewer is never handed the implementer's own summary of its work.
+
+### Three kinds of transport evidence, kept apart
+
+| Evidence | What it proves | Where |
+|---|---|---|
+| offline fake driver | the controller's state machine, budget, evidence and receipt rules | `tests/test_controller.py` and most of the suite |
+| production driver + Python stand-in for acpx | the driver's launch, framing, event projection, stop and reconcile logic | `tests/test_packet_wire.py` (most cases), `tests/test_driver_acpx_dsh.py` |
+| **installed pinned acpx + input-sensitive ACP stub** | the real Node client carries the rendered packet, and the agent checks the values it received | `tests/test_packet_wire.py`, the two `real_acpx` cases |
+| real DSH with a model | nothing in this repository claims it: a live task needs its own explicit approval | `docs/m2-live-acceptance-result.md` (historical) |
+
+A fake client result is never presented as a real-client proof, and a real-client result is never
+presented as a live-model proof. The pinned client is never downloaded or upgraded by the tests: a
+missing copy skips with the reason.
+
+### Refusals that now happen before the first invocation
+
+For a real driver (`--driver acpx-dsh`), admission refuses a run it already knows cannot finish,
+instead of spending an implementation turn and failing afterwards:
+
+| Refused up front | Why |
+|---|---|
+| a required check declared `kind=fake` | a fake check executes nothing: a receipt resting on it would claim a verification that never ran |
+| a task with write paths but `workspace.mode` not `worktree` | an in-place run would write into your own checkout |
+| a task with write paths but `HFLOW_ALLOW_WRITES` off | the invocation would be launched read-only and could not make the change |
+| a task that needs a review but reserves fewer than 2 turns | the review is a separate invocation; one turn cannot reach an accepted run |
+| a task whose fixed loop needs more submissions than the authorization has left | the predictable half of budget exhaustion: without this check the implementer would run and the run would then block with the implementation already paid for |
+| a repository that cannot be discovered, or a base commit that does not exist | both are knowable without side effects, and the worktree would otherwise fail after the run existed |
+| an implementer packet that does not fit the 32 KiB bound | the bound is checked against the packet this run would actually send, with its real worktree path - not against a placeholder |
+
+`--driver fake` is the offline driver: it keeps its fake checks and needs none of the above. A
+refusal through any of these gates creates no run, consumes no authorization allowance and starts
+no process. The per-dispatch ledger is still the authoritative limit; these checks remove the
+predictable failures in front of it, and they are not a substitute for its atomic claim.
+
+A request for a TaskSpec that already has a run is a **history query**, not a new dispatch: it
+returns the recorded outcome even when the authorization has since been used up, and it never
+consumes allowance. Only a run that still needs turns is checked against the remaining allowance,
+and only for the turns it still needs.
+
+### Check output: what is kept, and what that word means
+
+A command check's stdout and stderr are drained continuously through pipes into a bounded sink. The
+default retention is **8 MiB per stream** (the run's whole invocation budget, including the
+driver's own logs, is 32 MiB); both are operating values, not measured optima.
+
+What the evidence row and the artifact say, precisely:
+
+- `stdout`/`stderr` carry `total_bytes` (everything read), `retained_bytes` (what is on disk),
+  a `sha256` digest **of the retained bytes**, and a `truncated` flag. The digest covers what a
+  reader can actually obtain, so it can be recomputed; the discarded tail is a recorded count, not
+  a silent loss;
+- the files live under `<data-dir>/artifacts/<evidence-id>/<check-id>/` - inside the run's own
+  record, never in the workspace under test - together with an `artifact.json` manifest naming the
+  argv, sizes, digests, exit code and reason, elapsed time, and the environment summary;
+- **truncated output cannot authorize acceptance on its own**: a stream cut at the retention limit
+  is recorded as truncated in the evidence row. Debug output that is cut is not by itself a
+  business failure, but a verdict or a control event read from a cut stream is never treated as
+  complete;
+- a check whose output pipes are still held open after it exits (a descendant inherited them) is
+  reported as `output_capture_error` with `ERROR`, not as a clean pass. The wait for the readers is
+  bounded, and what was read is still digested;
+- `elapsed` covers launch, the check itself, the settle window and the reaping, so it is not a
+  claim that the check's own timeout bounds the whole call.
+
+### Worker log retention (what is bounded, and what is only measured)
+
+Two different things live here, and the difference is stated rather than glossed:
+
+**Bounded (HFlow's own retention).** Everything HFlow keeps is inside one declared budget per
+invocation (32 MiB by default):
+
+- the retained protocol log (`events.ndjson`) stops at the protocol share of that budget
+  (`max_raw_log_bytes` minus the stderr share), and the in-memory event list stops growing with it
+  (`events_capped`). Parsing continues, because that is how a stop reason is recognised, but
+  nothing further is accumulated;
+- the client's **stderr** is drained from a pipe this driver owns and retained up to the stderr
+  share. What exceeds it is read, counted and digested but not written. (It used to be a file the
+  child wrote into and a reader that had nothing to read: the record said "0 bytes, not truncated"
+  while the child wrote mebibytes. It is a pipe now, so the bound is real and the record is true.);
+- a single line that never ends is bounded at 1 MiB: it is counted as an unusable line, which also
+  makes the turn unknown, instead of growing in memory as fast as the client writes;
+- spending the budget is recorded **on the read that spends it**, not on the next line, so a stream
+  whose final line crosses the budget is reported as `output_limit_exceeded` with an
+  `OUTCOME_UNKNOWN` outcome. A cut protocol stream is never trusted.
+
+**Measured, not bounded (the client's own protocol file).** The client writes `stdout.ndjson`
+itself. HFlow does **not** truncate a file another process is writing - that removes bytes nobody
+has read and can leave a hole - so it does not claim to cap that file. Its size is reported as the
+measured number it is: `peak_raw_bytes` in the invocation record, and the retained copy's
+`total_bytes` equals what was actually read. A client that writes 17 MiB therefore leaves a 17 MiB
+file, and HFlow's record says exactly that instead of reporting the full stream as retained.
+
+Is a cut stderr file a failure? No - stderr is diagnostics, and it is reported as truncated. A cut
+*protocol* stream is: a verdict read from a stream that was cut is not a verdict.
+
+### What a check's environment contains
+
+The child environment is built from an **allowlist** of what a process needs to start and find its
+runtime (PATH/PATHEXT, SystemRoot/TEMP, the usual Windows and POSIX shell and locale variables, the
+Python/Node runtime variables), plus any variables the caller declares as approved test variables.
+Unlisted names do not travel, and a name that looks like a credential (`*_API_KEY`, `*_TOKEN`,
+`*_SECRET`, `*_PASSWORD`, `*_CREDENTIAL`, `*_AUTH*`, ...) is refused even when declared. The
+refusal is reported as a fact in the evidence row's `withheld_secret_like=` list.
+
+The environment summary records **names and counts only** - never a value, and never a hash of a
+value, since a hash of a low-entropy secret is still a disclosure. This is not confinement: a check
+still runs with the current user's rights and can read whatever that user can read.
+
 ## Preparing a real M2 task
 
 ```sh

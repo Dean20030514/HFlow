@@ -98,6 +98,11 @@ def controller_for(harness: DriverHarness, data_dir: Path) -> tuple[Controller, 
         controller_build="test-build",
         runners=CheckRunners({"fake": runner}),
         data_dir=harness.data_dir,
+        # The transport is the production one, but the *run* is offline: its approved checks
+        # are `kind=fake`. Saying so explicitly is what keeps the production rules (real
+        # checks, isolated worktree, effective write permission) from being silently disabled
+        # by a test that only wanted a working wire.
+        production=False,
     )
     return controller, store, runner
 

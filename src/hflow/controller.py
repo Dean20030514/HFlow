@@ -17,9 +17,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import timedelta
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
 from .admission import validate_task_spec
 from .authorization import AuthorizationRecord
@@ -35,6 +36,7 @@ from .contracts import (
     InvocationRequest,
     InvocationResult,
     IsolationLevel,
+    ProjectConfig,
     RefusalCode,
     RefusedError,
     ReconcileOutcome,
@@ -57,6 +59,12 @@ from .ids import (
     parse_ts,
     utc_now,
 )
+from .packet import (
+    PacketTooLargeError,
+    RenderedPacket,
+    render_implementer_packet,
+    render_reviewer_packet,
+)
 from .paths import default_data_dir
 from .review import REVIEW_MISSING, review_input_error
 from .drivers.base import assert_driver_shape
@@ -69,6 +77,113 @@ from .workspace import candidate_fingerprint, changed_paths, manifest, paths_out
 
 #: How long a reservation may stay open before it is considered abandoned.
 RESERVATION_TTL_SECONDS = 1800
+
+#: A role-packet renderer: the signature every renderer in ``hflow.packet`` shares.
+Renderer = Callable[..., RenderedPacket]
+
+
+class PreparedPacket:
+    """One implementer packet rendered for one run identity, plus the workspace it names.
+
+    The workspace is kept next to the packet so ``_drive`` can tell whether the packet it was
+    handed describes the workspace the run actually got: if the path changed (a lost insert
+    race, a different worktree), the packet is re-rendered rather than sent under a stale path.
+    """
+
+    __slots__ = ("packet", "run_id", "workspace")
+
+    def __init__(self, *, run_id: str, packet: RenderedPacket) -> None:
+        self.run_id = run_id
+        self.packet = packet
+        self.workspace = _packet_workspace(packet)
+
+
+def _packet_workspace(packet: RenderedPacket) -> str:
+    """The workspace path a rendered implementer packet names, or "" when it cannot be read.
+
+    Read back out of the packet rather than passed alongside it: a second copy of the path is
+    one more thing that can disagree with what the agent is told.
+    """
+    for line in packet.text.splitlines():
+        if line.startswith("- work in this directory: "):
+            return line[len("- work in this directory: ") :].strip()
+    return ""
+
+
+#: Field markers an evidence row's detail text uses. A reference value ends where the next marker
+#: begins - which is also what lets a path contain spaces: the path is not split on whitespace,
+#: because "C:/temp/run 1/artifact.json" is one value, not two tokens.
+_REFERENCE_MARKERS = (
+    "reason=",
+    "artifact=",
+    "stdout:",
+    "stdout=",
+    "stderr:",
+    "stderr=",
+    "env_names=",
+    "withheld_secret_like=",
+)
+
+#: Both spellings are accepted on purpose. The evidence row writes ``stdout: 3000/3000 bytes``
+#: (reading like a log line) and the reviewer packet writes ``stdout=3000/3000B``; a reader that
+#: matched only one of them returned "no evidence" for a row that had it. The separator and the
+#: optional ``B`` are the whole difference, so the parser does not depend on which produced it.
+_STREAM_REFERENCE = re.compile(
+    r"^(?P<retained>\d+)\s*/\s*(?P<total>\d+)\s*B?(?:\s*bytes)?"
+    r"\s+truncated=(?P<truncated>\w+)"
+    r"\s+digest=(?P<digest>\S+)"
+)
+
+
+def _reference_field(detail: str, field: str) -> str:
+    """One ``field=value`` (or ``field: value``) reference out of an evidence row's detail text.
+
+    The value runs to the next known marker (or to the end). Splitting on spaces would cut a path
+    that contains one, which is exactly how a real temp directory looks: the reviewer would be
+    handed "C:/temp/run" for "C:/temp/run 1".
+    """
+    for marker in (f"{field}=", f"{field}:"):
+        start = detail.find(marker)
+        while start != -1:
+            # Only a marker at a field boundary counts: "reason=" inside a word is not a field.
+            if start == 0 or detail[start - 1] == " ":
+                break
+            start = detail.find(marker, start + 1)
+        if start == -1:
+            continue
+        value_start = start + len(marker)
+        end = len(detail)
+        for other in _REFERENCE_MARKERS:
+            if other == marker:
+                continue
+            position = detail.find(other, value_start)
+            # The next field starts where the marker does, separated from this value by a space -
+            # or immediately, which is how the packet writes "…/3000B truncated=False".
+            if position != -1 and (position == value_start or detail[position - 1] == " "):
+                end = min(end, position)
+        return detail[value_start:end].strip()
+    return ""
+
+
+def _stream_reference(detail: str, name: str) -> dict[str, object]:
+    """The retained-bytes/truncated/digest facts for one stream, out of the detail text."""
+    value = _reference_field(detail, name)
+    if not value:
+        return {}
+    match = _STREAM_REFERENCE.match(value)
+    if match is None:
+        return {}
+    return {
+        "retained_bytes": match.group("retained"),
+        "total_bytes": match.group("total"),
+        "truncated": match.group("truncated"),
+        "digest": match.group("digest"),
+    }
+
+#: Note prefixes written by the controller. They are read back mechanically (by tests and by
+#: an operator grepping a run), so they are constants rather than inline strings.
+NOTE_PACKET = "role_input_packet"
+NOTE_PROMPT_DIGEST = "prompt_digest"
 
 
 class RunOutcome:
@@ -197,6 +312,7 @@ class Controller:
         data_dir: Path | None = None,
         authorization: AuthorizationRecord | None = None,
         preflight: PreflightCheck | None = None,
+        production: bool | None = None,
     ) -> None:
         self.store = store
         self.driver = driver
@@ -204,6 +320,17 @@ class Controller:
         self.runners = runners or CheckRunners.offline_default()
         self.controller_id = controller_id
         self.reservation_ttl_seconds = reservation_ttl_seconds
+        #: Is this a real Harness run rather than an offline one? It decides the gates that
+        #: make sense only for a delivery: approved checks must be real, the workspace must be
+        #: isolated, and the run must be able to write.
+        #:
+        #: The default is deliberately not "trust the driver object". A test that wires the
+        #: production transport to prove a code path would otherwise be handed production
+        #: rules it did not ask for, and the honest signal - does this run execute real
+        #: approved checks? - is in the runner registry. ``kind=fake`` exists only offline, so
+        #: a controller with no real command runner is an offline controller. The CLI states
+        #: the answer explicitly instead of relying on this inference.
+        self.production = production if production is not None else self._infer_production()
         #: Set only for a real Harness run, and only from a user-provenance artifact. Its
         #: allowance is consumed transactionally immediately before each dispatch.
         self.authorization = authorization
@@ -221,6 +348,40 @@ class Controller:
         self.project_root: Path | None = None
         assert_driver_shape(driver)
 
+    def _infer_production(self) -> bool:
+        """Can this controller execute a real approved check at all?
+
+        ``CommandCheckRunner`` is the only runner that runs an approved program. Without one,
+        every accepted check is a ``fake`` whose verdict came from the caller, so the run
+        cannot produce program evidence a delivery could rest on.
+        """
+        from .verify import CommandCheckRunner
+
+        return any(
+            isinstance(runner, CommandCheckRunner) for runner in self.runners.runners.values()
+        )
+
+    @property
+    def allow_fake_checks(self) -> bool:
+        """May admission accept ``kind=fake`` checks for this run?
+
+        Only for an offline run. A fake check executes nothing and returns a verdict chosen by
+        the caller, so accepting one on a real delivery would let a receipt claim a program
+        verification that never happened.
+        """
+        return not self.production
+
+    def render(self, renderer: Renderer) -> Renderer:
+        """The renderer to use for this role's packet.
+
+        A seam, not a policy: it exists so a test can drive the controller with a renderer that
+        omits a required field and observe the *consequence* - the agent refuses, because the
+        prompt it received was incomplete - without weakening the prompt-digest binding that
+        catches a driver corrupting a complete packet in transit. Production always renders with
+        the real one.
+        """
+        return renderer
+
     # -- public entry points -------------------------------------------------
 
     def run_task(self, request: RunRequest) -> RunOutcome:
@@ -228,7 +389,9 @@ class Controller:
         project = request.project
         project_root = Path(request.project_root)
 
-        report = validate_task_spec(spec, project, project_root)
+        report = validate_task_spec(
+            spec, project, project_root, allow_fake_checks=self.allow_fake_checks
+        )
         if not report.ok:
             first = report.issues[0]
             raise RefusedError(first.code, f"task {spec.task_id} refused: {first.detail}")
@@ -236,25 +399,12 @@ class Controller:
         self.project_root = project_root
         spec_digest = spec.spec_digest()
 
-        # --- real-run gate: the artifact is recorded first, then the zero-model preflight.
-        # Nothing expensive happens for an unauthorized real run - no credential read, no
-        # workspace, no budget reservation, no process. The artifact is registered *before*
-        # the preflight so that even a refused attempt leaves an auditable record of what was
-        # authorized and that nothing was spent. Its allowance is claimed later, at the moment
-        # a dispatch is actually certain, so a duplicate submission (which correctly dispatches
-        # nothing) cannot consume it.
-        if self.authorization is not None:
-            self.store.register_authorization(self.authorization.as_store_record())
-            report = self._preflight_report()
-            if not report[0]:
-                raise RefusedError(
-                    RefusalCode.NOT_IMPLEMENTED,
-                    f"zero-model preflight failed for this execution binding: {report[1]}. "
-                    "No authorization allowance was consumed and nothing was dispatched.",
-                )
-
+        # --- an identical TaskSpec is a *history query*, not a new dispatch ---------------
+        # This is checked before the authorization is registered, before any allowance is
+        # checked and before any preflight: a task that already ended must return its recorded
+        # outcome even when its authorization has since been used up. (Its own run keeps the
+        # budget it was admitted with; nothing here spends anything.)
         existing = self.store.find_run_by_spec_digest(project.project_id, spec_digest)
-
         if existing is not None:
             run_id = existing["run_id"]
             state = TaskState(existing["task_state"])
@@ -274,8 +424,10 @@ class Controller:
                         "(explicit new-run override is deferred to M3)"
                     ],
                 )
-            # Admitted but never dispatched (for example an interrupted controller):
-            # continue the existing run instead of opening a second one.
+            # Admitted but never dispatched (for example an interrupted controller): continue
+            # the existing run instead of opening a second one. Only the turns this run still
+            # needs are asked for, because its first dispatch may already have been paid for.
+            self._assert_allowance_for(run_id, spec, project)
             if not self.store.claim_run(run_id, self.controller_id):
                 raise RefusedError(
                     RefusalCode.RUN_CLAIMED_BY_OTHER,
@@ -283,7 +435,39 @@ class Controller:
                 )
             return self._drive(run_id, request)
 
+        # --- a new dispatch: gate everything before the artifact is even registered -------
+        # The run id is chosen here, not inside ``create_run``, because the implementer packet
+        # embeds the worktree path and that path contains the run id. Rendering with a
+        # placeholder path would let a packet pass this check and then fail after an allowance
+        # had been claimed - the exact gap this ordering closes.
         run_id = new_run_id()
+        repo, worktree_root = self._worktree_path(run_id, spec)
+        implementer_packet = self._render_implementer_packet(
+            run_id=run_id,
+            spec=spec,
+            workspace=str(worktree_root) if worktree_root is not None else str(project_root),
+            deadline_seconds=request.deadline_seconds,
+        )
+        self._assert_dispatch_preconditions(spec, project, request.deadline_seconds)
+        self._assert_allowance_for(run_id, spec, project)
+
+        # --- real-run gate: the artifact is recorded first, then the zero-model preflight.
+        # Nothing expensive happens for an unauthorized real run - no credential read, no
+        # workspace, no budget reservation, no process. The artifact is registered *before*
+        # the preflight so that even a refused attempt leaves an auditable record of what was
+        # authorized and that nothing was spent. Its allowance is claimed later, at the moment
+        # a dispatch is actually certain, so a duplicate submission (which correctly dispatches
+        # nothing) cannot consume it.
+        if self.authorization is not None:
+            self.store.register_authorization(self.authorization.as_store_record())
+            report = self._preflight_report()
+            if not report[0]:
+                raise RefusedError(
+                    RefusalCode.NOT_IMPLEMENTED,
+                    f"zero-model preflight failed for this execution binding: {report[1]}. "
+                    "No authorization allowance was consumed and nothing was dispatched.",
+                )
+
         row = self.store.create_run(
             run_id=run_id,
             project_id=project.project_id,
@@ -295,6 +479,16 @@ class Controller:
             repair_limit=spec.budget.max_repair_cycles,
         )
         run_id = row["run_id"]  # a concurrent identical submit may have won the insert
+        if run_id != implementer_packet.run_id:
+            # Lost the insert race, so this dispatch belongs to another run's identity. The
+            # packet names the previous id and must not be sent under this one.
+            return self._outcome_for(
+                run_id,
+                notes=[
+                    "a concurrent identical submission created this run first; no second "
+                    "dispatch was made"
+                ],
+            )
 
         if not self.store.claim_run(run_id, self.controller_id):
             raise RefusedError(
@@ -302,7 +496,7 @@ class Controller:
                 f"run {run_id} is owned by another controller; one owner per project at a time",
             )
 
-        return self._drive(run_id, request)
+        return self._drive(run_id, request, implementer_packet=implementer_packet)
 
     def resume(self, run_id: str) -> RunOutcome:
         """Continue the state machine. Never replays a prompt and never re-dispatches."""
@@ -428,6 +622,205 @@ class Controller:
 
     # -- the state machine ---------------------------------------------------
 
+    def _assert_dispatch_preconditions(
+        self, spec: TaskSpec, project: ProjectConfig, deadline_seconds: int
+    ) -> None:
+        """Refuse a run that is already known to be unable to finish, before anything is spent.
+
+        Everything here is decided from the TaskSpec, the project contract and the local
+        process environment - no model, no workspace, no authorization. These are the gates
+        that stop a *predictable* failure from being discovered after an implementation turn
+        has already been paid for (plan 3.2, 6.6).
+
+        What this cannot check is stated rather than implied: it does not verify that the
+        launcher works (the zero-model preflight does), it cannot see whether the target
+        repository is reachable (the worktree step does), and it says nothing about whether
+        the model will succeed.
+        """
+        if not self.production:
+            # An offline run is not a delivery: the fake driver scripts its own change and the
+            # checks are fake by construction, so these rules would refuse every offline run.
+            return
+
+        problems: list[tuple[RefusalCode, str]] = []
+
+        # 1. A run that must change files needs a write permission that is actually on and a
+        #    workspace that is not the user's own checkout. HFLOW_ALLOW_WRITES off plus a
+        #    non-empty write scope is a known-bad combination: the implementer cannot edit, so
+        #    the run would spend a turn and then fail verification.
+        if spec.scope.write_allow:
+            if spec.workspace.mode != "worktree":
+                problems.append(
+                    (
+                        RefusalCode.SCOPE_VIOLATION,
+                        "this task declares write paths but workspace.mode="
+                        f"{spec.workspace.mode!r}. A real change must run in an isolated Git "
+                        "worktree (workspace.mode='worktree' with a base commit); an in-place "
+                        "run would write into the user's own checkout",
+                    )
+                )
+            writes_on = os.environ.get(ENV_ALLOW_WRITES, "").strip().lower() in {"1", "true", "yes"}
+            if not writes_on:
+                problems.append(
+                    (
+                        RefusalCode.SCOPE_VIOLATION,
+                        f"this task declares write paths but {ENV_ALLOW_WRITES} is not enabled, so "
+                        "the invocation would be launched read-only and could not make the "
+                        "change. Enable writes for this run (see docs/operations.md) or submit a "
+                        "task that changes nothing",
+                    )
+                )
+
+        # 2. The budget must cover the whole fixed loop. A review is its own top-level
+        #    invocation, so a task that needs one needs two reserved turns; discovering that
+        #    after the implementation turn means paying for work that can never be accepted.
+        #    The matching check against the *authorization's remaining* allowance is separate
+        #    (`_assert_allowance_for`), because it depends on this run's history, not on the spec.
+        if spec.needs_review(project):
+            if spec.budget.max_agent_turns < 2:
+                problems.append(
+                    (
+                        RefusalCode.BUDGET_EXCEEDED,
+                        "review is required (project floor or task request) but "
+                        f"budget.max_agent_turns={spec.budget.max_agent_turns} covers only the "
+                        "implementation turn. A reviewed delivery needs at least 2",
+                    )
+                )
+
+        # 3. The packet bound is enforced where the packet is *rendered* (``run_task`` renders
+        #    it with this run's real workspace path before anything is claimed), not here: a
+        #    shorter placeholder path would prove a size this run will not actually produce.
+
+        if problems:
+            code, detail = problems[0]
+            more = f" (+{len(problems) - 1} more admission problem(s))" if len(problems) > 1 else ""
+            raise RefusedError(code, detail + more)
+
+    # -- allowance and packet preparation ------------------------------------
+
+    def _check_artifact_dir(self, check_id: str, evidence_id: str) -> Path:
+        """Where one check's captured output is kept: under the run's data dir, never a workspace.
+
+        Every reference an evidence row publishes is a file in here, so "read the full log" leads
+        to something that exists after the check has finished.
+        """
+        safe_id = "".join(
+            character if character.isalnum() or character in "-_." else "_" for character in check_id
+        )
+        directory = self.data_dir / "artifacts" / (evidence_id or "unknown") / (safe_id or "check")
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    def _loop_turns_required(self, spec: TaskSpec, project: ProjectConfig) -> int:
+        """How many top-level invocations the fixed loop needs: implementer (+ reviewer).
+
+        This is the *whole* remaining loop for a fresh dispatch, not what happens to be left in
+        the run's budget. It is deliberately not a promise about the model's behaviour, only
+        about how many invocations this build will start for one accepted delivery.
+        """
+        return 2 if spec.needs_review(project) else 1
+
+    def _assert_allowance_for(
+        self, run_id: str, spec: TaskSpec, project: ProjectConfig
+    ) -> None:
+        """Refuse a dispatch the authorization cannot cover, before anything is spent.
+
+        The per-dispatch ledger stays the real gate: this is an admission check, not a
+        reservation, and it cannot make the two claims atomic. What it removes is the
+        predictable case - a task whose review is required while only one submission is left -
+        which previously ran the implementer and then blocked with the implementation paid for.
+
+        History is not re-charged: for a run that already dispatched, only the turns it still
+        needs are required, and a run whose authorization is spent still returns its recorded
+        outcome (that path is handled before this method is reached).
+        """
+        if self.authorization is None:
+            return
+        state = self.store.authorization_state(self.authorization.authorization_id)
+        if state is None:
+            # Not registered yet: the recorded artifact is the only source, and it is the same
+            # object the CLI verified against this run's binding.
+            remaining = self.authorization.max_top_level_submissions
+            limit = self.authorization.max_top_level_submissions
+        else:
+            limit = int(state["max_top_level_submissions"])
+            remaining = limit - int(state["used_top_level_submissions"])
+
+        already_paid = self.store.invocation_counts(run_id)[0] + self.store.invocation_counts(run_id)[1]
+        needed = max(0, self._loop_turns_required(spec, project) - already_paid)
+        if needed > remaining:
+            raise RefusedError(
+                RefusalCode.BUDGET_EXHAUSTED,
+                f"authorization {self.authorization.authorization_id} has {remaining}/{limit} "
+                f"top-level submission(s) left, but this task's fixed loop needs {needed} more "
+                f"({self._loop_turns_required(spec, project)} for implementer + reviewer). "
+                "Nothing was dispatched and no allowance was consumed; obtain a new "
+                "authorization for this task or reduce it to a single invocation.",
+            )
+
+    def _worktree_path(self, run_id: str, spec: TaskSpec) -> tuple[GitRepo | None, Path | None]:
+        """Where this run's isolated worktree *would* go, without creating anything.
+
+        The implementer packet contains the workspace path, and on Windows a worktree path is
+        long enough to change whether the packet fits its bound. The path is therefore derived
+        here - from the run id and the repository root, the same inputs ``create_worktree`` uses
+        - so the packet that is checked is the packet that will be sent.
+
+        Refusals that a worktree run cannot survive are raised here, before the run row exists:
+        a repository that cannot be discovered, and a base commit that does not exist. Both are
+        knowable without side effects, and both used to be discovered after the run (and, with
+        an authorization, after a claim).
+        """
+        if spec.workspace.mode != "worktree":
+            return None, None
+        assert self.project_root is not None
+        try:
+            repo = GitRepo.discover(self.project_root)
+        except GitError as exc:
+            raise RefusedError(
+                RefusalCode.SCOPE_VIOLATION,
+                f"this task requires an isolated worktree but the repository could not be "
+                f"discovered: {exc}. Nothing was dispatched and no allowance was consumed.",
+            ) from exc
+        try:
+            base_commit = spec.workspace.base_commit or repo.resolve_commit("HEAD")
+        except GitError as exc:
+            raise RefusedError(
+                RefusalCode.SCOPE_VIOLATION,
+                f"the base commit for this worktree run could not be resolved: {exc}",
+            ) from exc
+        if not repo.commit_exists(base_commit):
+            raise RefusedError(
+                RefusalCode.SCOPE_VIOLATION,
+                f"base commit {base_commit!r} does not exist in {repo.root}. Nothing was "
+                "dispatched and no allowance was consumed.",
+            )
+        return repo, repo.worktree_parent() / run_id
+
+    def _render_implementer_packet(
+        self, *, run_id: str, spec: TaskSpec, workspace: str, deadline_seconds: int
+    ) -> PreparedPacket:
+        """Render the implementer packet for this run, or refuse before anything is claimed."""
+        try:
+            packet = self.render(render_implementer_packet)(
+                task_id=spec.task_id,
+                task_revision=spec.revision,
+                goal=spec.goal,
+                acceptance=spec.acceptance,
+                scope=spec.scope,
+                workspace=workspace,
+                spec_digest=spec.spec_digest(),
+                deadline_seconds=deadline_seconds,
+                writes_allowed=bool(spec.scope.write_allow),
+            )
+        except PacketTooLargeError as exc:
+            raise RefusedError(
+                RefusalCode.INVALID_SPEC,
+                f"the implementer input packet for this run does not fit, so nothing was "
+                f"dispatched and no allowance was consumed: {exc}",
+            ) from exc
+        return PreparedPacket(run_id=run_id, packet=packet)
+
     def _preflight_report(self) -> tuple[bool, str]:
         if self.preflight is None:
             return False, "no zero-model preflight is wired for this execution binding"
@@ -455,7 +848,13 @@ class Controller:
         )
         return used
 
-    def _drive(self, run_id: str, request: RunRequest) -> RunOutcome:
+    def _drive(
+        self,
+        run_id: str,
+        request: RunRequest,
+        *,
+        implementer_packet: PreparedPacket | None = None,
+    ) -> RunOutcome:
         spec = request.task
         project = request.project
         project_root = Path(request.project_root)
@@ -464,6 +863,10 @@ class Controller:
         reservation_id = new_reservation_id()
 
         # --- workspace preparation (M2): an isolated worktree, or the project in place
+        # The repository and the base commit were validated before the run row existed (see
+        # ``_worktree_path``), so what remains here is the one step that cannot be predicted:
+        # actually creating the worktree. If it fails, the run blocks with no dispatch - the
+        # allowance was not claimed and no budget was reserved yet.
         repo: GitRepo | None = None
         worktree: Path | None = None
         user_tree_before = ""
@@ -473,12 +876,6 @@ class Controller:
                 repo = GitRepo.discover(project_root)
                 user_tree_before = repo.user_change_fingerprint()
                 base_commit = spec.workspace.base_commit or repo.resolve_commit("HEAD")
-                if not repo.commit_exists(base_commit):
-                    return self._blocked(
-                        run_id,
-                        RefusalCode.SCOPE_VIOLATION,
-                        f"base commit {base_commit!r} does not exist in {repo.root}",
-                    )
                 worktree = repo.create_worktree(run_id, base_commit)
                 self.store.record_worktree(run_id, worktree)
             except (GitError, RefusedError) as exc:
@@ -548,8 +945,29 @@ class Controller:
             attempt_id, pid=pid, started_at=started_at, identity=identity, session_id=attempt_id
         )
 
-        pre_fingerprint = candidate_fingerprint(execution_root, spec.scope)
+        # Recorded before the worker runs: what the workspace looked like, so a change outside
+        # the declared scope is detected afterwards from two manifests rather than assumed.
         pre_manifest = manifest(execution_root)
+        # The role input packet is rendered from recorded facts and travels as one string. The
+        # driver transports it verbatim; it never rebuilds the task text.
+        #
+        # A packet prepared before admission (``run_task``) is reused only when the workspace it
+        # names is the workspace this run actually got. Any other path means the checked packet
+        # is not the packet that would be sent, so it is rendered again here and must fit.
+        if implementer_packet is not None and implementer_packet.workspace == str(execution_root):
+            prepared = implementer_packet
+        else:
+            prepared = self._render_implementer_packet(
+                run_id=run_id,
+                spec=spec,
+                workspace=str(execution_root),
+                deadline_seconds=request.deadline_seconds,
+            )
+        self.store.record_note(
+            run_id,
+            f"{NOTE_PACKET}: role=implementer bytes={prepared.packet.byte_length} "
+            f"digest={prepared.packet.digest}",
+        )
         invocation = InvocationRequest(
             invocation_id=invocation_id,
             attempt_id=attempt_id,
@@ -564,6 +982,7 @@ class Controller:
             workspace=str(execution_root),
             deadline_seconds=request.deadline_seconds,
             spec_digest=spec.spec_digest(),
+            packet=prepared.packet.text,
             writes_allowed=implementer_writes,
             data_dir=str(self.data_dir),
         )
@@ -596,6 +1015,31 @@ class Controller:
 
         if result.agent_turns is not None:
             self.store.set_turns_observed(run_id, result.agent_turns)
+
+        if result.prompt_digest and result.prompt_digest != prepared.packet.digest:
+            # The transport reports the digest of the text it sent (see ``packet_digest``: this
+            # is a local record of what was handed over, not a receipt from the remote side). A
+            # mismatch means the invocation did not receive this packet, so whatever it did is
+            # not an answer to this task; accepting it would attach a receipt to wrong input.
+            self.store.record_note(
+                run_id,
+                f"{NOTE_PROMPT_DIGEST}: MISMATCH sent={result.prompt_digest} "
+                f"expected={prepared.packet.digest}",
+            )
+            self.store.finish_attempt(
+                run_id=run_id,
+                attempt_id=attempt_id,
+                state=AttemptState.FAILED,
+                outcome=result.outcome,
+                result=result.model_dump(mode="json"),
+                block_code=RefusalCode.INTERNAL_ERROR,
+            )
+            return self._blocked(
+                run_id,
+                RefusalCode.INTERNAL_ERROR,
+                "the invocation's prompt digest does not match the rendered input packet, so the "
+                "result cannot be attributed to this task",
+            )
 
         if result.outcome is not InvocationOutcome.COMPLETED:
             self.store.finish_attempt(
@@ -666,6 +1110,10 @@ class Controller:
             attempt_id=attempt_id,
             run_id=run_id,
             runners=self.runners,
+            # A real check's captured output is kept under the run's own data directory, so the
+            # log an evidence row points at is a file that still exists afterwards. It never
+            # lands in the workspace under test.
+            artifact_factory=self._check_artifact_dir,
         )
 
         review = ReviewResult(status="not_run")
@@ -680,7 +1128,14 @@ class Controller:
             )
             try:
                 review = self._review(
-                    run_id, spec, execution_root, post_fingerprint, project.checks_digest()
+                    run_id,
+                    spec,
+                    execution_root,
+                    post_fingerprint,
+                    project.checks_digest(),
+                    verification=verification,
+                    freeze=freeze,
+                    project=project,
                 )
             except RefusedError as exc:
                 return self._blocked(run_id, exc.code, exc.message)
@@ -732,8 +1187,17 @@ class Controller:
         project_root: Path,
         candidate_fp: str,
         checks_digest: str,
+        *,
+        verification: VerificationResult | None = None,
+        freeze: CandidateFreeze | None = None,
+        project: ProjectConfig | None = None,
     ) -> ReviewResult:
         """Buy the review turn, run the reviewer, then interpret its structured verdict.
+
+        The reviewer is told the *task*, the *candidate identity the controller froze* and the
+        *program evidence the controller recorded* - never the implementer's own summary of its
+        work. Those facts come from this run's rows, so a reviewer cannot be handed a plausible
+        but invented candidate.
 
         Two things this deliberately does *not* do:
 
@@ -744,6 +1208,82 @@ class Controller:
         """
         attempt = self.store.open_attempt(run_id)
         attempt_id = attempt["attempt_id"] if attempt else ""
+        row = self.store.get_run(run_id)
+        invocation_id = new_invocation_id()
+
+        # The packet is rendered *before* the submission is claimed: an input that cannot be
+        # built must not consume an allowance or a budget turn.
+        check_summaries = [
+            {
+                "check_id": r["check_id"],
+                "status": r["status"],
+                "exit_code": r["exit_code"],
+                "command": " ".join(json.loads(r["command_json"])) if r["command_json"] else "",
+                "detail": r["detail"],
+                # References, extracted from the row rather than left inside the detail text: the
+                # packet renders them unshortened, so a long artifact path still reaches the
+                # reviewer in full.
+                "reason": _reference_field(r["detail"], "reason"),
+                "artifact": _reference_field(r["detail"], "artifact"),
+                "stdout": _stream_reference(r["detail"], "stdout"),
+                "stderr": _stream_reference(r["detail"], "stderr"),
+            }
+            for r in self.store.evidence_for(run_id, kind="verification")
+            if r["candidate_fingerprint"] == candidate_fp and r["checks_digest"] == checks_digest
+        ]
+        evidence_rows = [
+            {
+                "evidence_id": r["evidence_id"],
+                "check_id": r["check_id"],
+                "status": r["status"],
+                "exit_code": r["exit_code"],
+                "artifact": _reference_field(r["detail"], "artifact"),
+                "stdout_digest": r["stdout_digest"],
+                "candidate_fingerprint": r["candidate_fingerprint"],
+            }
+            for r in self.store.evidence_for(run_id, kind="verification")
+            if r["candidate_fingerprint"] == candidate_fp
+        ]
+        candidate_identity: dict[str, object] = {
+            "fingerprint": candidate_fp,
+            "worktree": str(project_root),
+            "paths": list(freeze.paths) if freeze else [],
+        }
+        if freeze is not None:
+            candidate_identity |= {
+                "base_commit": freeze.base_commit,
+                "git_commit": freeze.candidate_commit,
+                "git_tree": freeze.tree,
+            }
+        try:
+            reviewer_packet = self.render(render_reviewer_packet)(
+                task_id=spec.task_id,
+                task_revision=int(row["task_revision"]),
+                goal=spec.goal,
+                acceptance=spec.acceptance,
+                scope=spec.scope,
+                workspace=str(project_root),
+                spec_digest=row["spec_digest"],
+                candidate_fingerprint=candidate_fp,
+                deadline_seconds=900,
+                candidate=candidate_identity,
+                verification_status=verification.status if verification else "not_run",
+                verification_detail=verification.detail if verification else "",
+                check_summaries=check_summaries,
+                evidence_rows=evidence_rows,
+            )
+        except PacketTooLargeError as exc:
+            raise RefusedError(
+                RefusalCode.INVALID_SPEC,
+                f"the reviewer input packet could not be built, so no review was bought: {exc}",
+            ) from exc
+
+        self.store.record_note(
+            run_id,
+            f"{NOTE_PACKET}: role=reviewer bytes={reviewer_packet.byte_length} "
+            f"digest={reviewer_packet.digest}",
+        )
+
         if self.authorization is not None:
             # The reviewer is its own invocation and its own top-level submission.
             self._claim_submission(run_id, "reviewer invocation")
@@ -752,13 +1292,11 @@ class Controller:
         except StoreError as exc:
             raise RefusedError(RefusalCode.BUDGET_EXHAUSTED, str(exc)) from exc
 
-        invocation_id = new_invocation_id()
         self.store.record_review_invocation(attempt_id, invocation_id)
         pid, started_at, identity = ProcessGuard(self.controller_id).identity()
         self.store.record_process_identity(
             attempt_id, pid=pid, started_at=started_at, identity=identity, session_id=attempt_id
         )
-        row = self.store.get_run(run_id)
         review_request = InvocationRequest(
             invocation_id=invocation_id,
             attempt_id=attempt_id,
@@ -776,6 +1314,7 @@ class Controller:
             workspace=str(project_root),
             deadline_seconds=900,
             spec_digest=row["spec_digest"],
+            packet=reviewer_packet.text,
             # A reviewer is read-only, always: it checks what the implementer produced, and an
             # approval for the implementer to write never extends to the review invocation.
             writes_allowed=False,
@@ -801,6 +1340,21 @@ class Controller:
                 "the review invocation did not complete "
                 f"({review_invocation.outcome.value}: "
                 f"{review_invocation.error_message or 'no detail'}), so it produced no verdict",
+            )
+        if (
+            review_invocation.prompt_digest
+            and review_invocation.prompt_digest != reviewer_packet.digest
+        ):
+            # A verdict produced from a different prompt is not a verdict on this candidate.
+            self.store.record_note(
+                run_id,
+                f"{NOTE_PROMPT_DIGEST}: MISMATCH role=reviewer sent="
+                f"{review_invocation.prompt_digest} expected={reviewer_packet.digest}",
+            )
+            raise RefusedError(
+                RefusalCode.REVIEW_PROTOCOL_ERROR,
+                "the reviewer invocation received a different prompt than the rendered review "
+                "packet, so its verdict does not belong to this candidate",
             )
 
         review_output = review_invocation.review

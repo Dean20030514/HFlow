@@ -31,7 +31,7 @@ import sys
 import time
 from pathlib import Path
 
-MODES = ("cooperative", "stubborn", "slow-ready", "no-answer", "chatty", "structured")
+MODES = ("cooperative", "stubborn", "slow-ready", "no-answer", "chatty", "structured", "stderr-flood")
 HELPER_SLEEP = 300
 #: The controller's fixed reviewer instruction. Role detection uses it because the stub is
 #: launched by the driver, which passes one argv for every invocation.
@@ -285,6 +285,20 @@ def main(argv: list[str] | None = None) -> int:
                     },
                 }
             )
+        emit({"jsonrpc": "2.0", "id": 2, "result": {"stopReason": "end_turn"}})
+        return 0
+
+    if mode == "stderr-flood":
+        # A *stderr* flood with a normal, short protocol turn. This is the shape that used to be
+        # invisible: the client wrote its diagnostics to a file HFlow had handed it, the reader had
+        # no stream to drain, and the record said "0 bytes, not truncated".
+        blob = "e" * 65536
+        written = 0
+        while written < int(os.environ.get("STUB_STDERR_BYTES", str(2 * 1024 * 1024))):
+            sys.stderr.write(blob + "\n")
+            written += len(blob) + 1
+        sys.stderr.flush()
+        emit_message_chunk(session_id, "stderr flood complete", "m-1")
         emit({"jsonrpc": "2.0", "id": 2, "result": {"stopReason": "end_turn"}})
         return 0
 

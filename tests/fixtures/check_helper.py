@@ -61,11 +61,72 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="directory watched for a 'stop' file while lingering, so tests can retire a helper",
     )
+    parser.add_argument(
+        "--emit-bytes",
+        type=int,
+        default=0,
+        help="write this many bytes to stdout, with no newline, in 64 KiB chunks",
+    )
+    parser.add_argument(
+        "--emit-stderr-bytes",
+        type=int,
+        default=0,
+        help="write this many bytes to stderr, with no newline",
+    )
+    parser.add_argument(
+        "--emit-utf8",
+        type=int,
+        default=0,
+        help="write this many repetitions of a 3-byte character to stdout (no newline)",
+    )
+    parser.add_argument(
+        "--emit-then-hang",
+        action="store_true",
+        help="emit the configured output, then sleep past any deadline",
+    )
+    parser.add_argument(
+        "--env-dump",
+        default="",
+        help="write a JSON object of this process's environment to this path, then continue",
+    )
     args = parser.parse_args(argv)
+
+    if args.env_dump:
+        import json
+
+        Path(args.env_dump).write_text(
+            json.dumps(dict(os.environ), sort_keys=True), encoding="utf-8"
+        )
 
     marker_dir = Path(args.markers)
     marker_dir.mkdir(parents=True, exist_ok=True)
     label, own_pid = args.label, os.getpid()
+
+    if args.emit_bytes or args.emit_stderr_bytes or args.emit_utf8:
+        # Deliberately one line and chunked: a runner that reads whole lines, or that reads the
+        # entire stream into memory before deciding anything, has to cope with this shape.
+        chunk = b"x" * 65536
+        remaining = args.emit_bytes
+        stream = sys.stdout.buffer
+        while remaining > 0:
+            piece = chunk[: min(65536, remaining)]
+            stream.write(piece)
+            remaining -= len(piece)
+        stream.flush()
+        if args.emit_utf8:
+            text = "\u4e2d" * args.emit_utf8  # three bytes per character in UTF-8
+            stream.write(text.encode("utf-8"))
+        stderr_remaining = args.emit_stderr_bytes
+        while stderr_remaining > 0:
+            piece = chunk[: min(65536, stderr_remaining)]
+            sys.stderr.buffer.write(piece)
+            stderr_remaining -= len(piece)
+        sys.stderr.buffer.flush()
+        if args.emit_then_hang:
+            # Past any deadline: this is the case where a runner that stopped draining would
+            # deadlock the child on a full pipe instead of reaching its timeout.
+            time.sleep(600)
+        return args.exit_code
 
     if args.stdin:
         # Announce readiness first: the test must be able to observe that we are waiting for

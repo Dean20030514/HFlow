@@ -17,14 +17,24 @@ with a timeout; that limits blast radius but is not a security boundary.
 from __future__ import annotations
 
 import contextlib
-import os
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Protocol
 
+from .artifacts import (
+    DEFAULT_EXCERPT_BYTES,
+    DEFAULT_STREAM_LIMIT_BYTES,
+    BoundedTextSink,
+    StreamCapture,
+    child_environment,
+    drain,
+    environment_summary,
+    write_artifact_manifest,
+)
 from .contracts import (
     CheckDef,
     EvidenceStatus,
@@ -56,9 +66,27 @@ CHILD_REAP_SECONDS = 5.0
 
 
 class CheckOutcome:
-    """Result of one check execution, before it becomes stored evidence."""
+    """Result of one check execution, before it becomes stored evidence.
 
-    __slots__ = ("command", "detail", "exit_code", "stderr_digest", "stdout_digest", "status")
+    ``status`` is the verdict; ``exit_reason`` says *why* it ended the way it did, so a timeout, a
+    forced settlement, a boundary that could not be observed and a plain non-zero exit are not all
+    folded into one word. ``artifacts``/``artifact_path``/``environment`` are the references that
+    make the run's own record readable after the fact.
+    """
+
+    __slots__ = (
+        "artifact_path",
+        "artifacts",
+        "command",
+        "detail",
+        "environment",
+        "exit_code",
+        "exit_reason",
+        "stderr_digest",
+        "stdout_digest",
+        "status",
+        "timed_out",
+    )
 
     def __init__(
         self,
@@ -69,6 +97,11 @@ class CheckOutcome:
         stderr_digest: str = "",
         detail: str = "",
         command: list[str] | None = None,
+        exit_reason: str = "",
+        timed_out: bool = False,
+        artifacts: dict[str, dict[str, object]] | None = None,
+        artifact_path: str = "",
+        environment: str = "",
     ) -> None:
         self.status = status
         self.exit_code = exit_code
@@ -76,6 +109,11 @@ class CheckOutcome:
         self.stderr_digest = stderr_digest
         self.detail = detail
         self.command = command or []
+        self.exit_reason = exit_reason
+        self.timed_out = timed_out
+        self.artifacts = artifacts or {}
+        self.artifact_path = artifact_path
+        self.environment = environment
 
 
 class CheckRunner(Protocol):
@@ -149,19 +187,45 @@ class CommandCheckRunner:
     only a boundary that is *known* not to own a tree ("direct_child_only") may pass without a
     settlement observation.
 
-    Output-size limits and environment minimization are not part of this slice:
-    ``extra_env`` is still merged over the ambient environment.
+    Output is captured through pipes drained by two reader threads into bounded sinks, and the
+    environment a check sees is built from an allowlist. What that means, and what it does not:
+
+    * a check that writes gigabytes is read to the end, digested in full, and *retained* only up
+      to the stream limit - so neither controller memory nor disk grows without bound, and the
+      difference between "this is all of it" and "this is the head of it" is recorded rather
+      than hidden. Draining continuously is also what keeps the child from blocking on a full
+      pipe, which capturing to a file never had to worry about;
+    * the retained bytes, their sizes, digests and truncation state are written as artifacts
+      under the run's data directory, and the evidence row names them - so "the log is
+      available" is a file a reader can actually open;
+    * the environment is an allowlist of what a process needs to start plus the variables the
+      caller declares, not the controller's environment with a few names deleted. A variable
+      whose *name* looks like a credential is dropped even if it was declared, and the fact that
+      it was dropped is recorded.
+
+    None of this is a sandbox: the check still runs with the current user's rights.
     """
 
     def __init__(
         self,
-        excerpt_limit: int = 2000,
+        excerpt_limit: int = DEFAULT_EXCERPT_BYTES,
         extra_env: dict[str, str] | None = None,
         *,
+        stream_limit_bytes: int = DEFAULT_STREAM_LIMIT_BYTES,
+        artifact_factory: Callable[[str, str], Path] | None = None,
+        reader_timeout_seconds: float = 10.0,
         _observation_override: Callable[[ProcessBoundary], int | None] | None = None,
     ) -> None:
         self.excerpt_limit = excerpt_limit
         self.extra_env = dict(extra_env or {})
+        self.stream_limit_bytes = max(0, int(stream_limit_bytes))
+        #: Where this check's captured output and manifest go. ``None`` means a private temporary
+        #: directory that is cleaned up afterwards - the offline/default behaviour. The controller
+        #: supplies a run-scoped factory so a real run keeps a readable artifact.
+        self._artifact_factory = artifact_factory
+        #: How long the reader threads are given to finish after the child is gone. A descendant
+        #: that inherited the pipe can hold it open; that is reported, not waited on forever.
+        self.reader_timeout_seconds = reader_timeout_seconds
         # Test-only: supplies the boundary observation instead of querying it, so a lifecycle
         # test can reproduce a query that failed on a real Windows Job Object (the helper returns
         # ``None`` for that, exactly as it does where no job exists). Production code never
@@ -170,55 +234,137 @@ class CommandCheckRunner:
 
     def run(self, check: CheckDef, cwd: Path, timeout_seconds: int) -> CheckOutcome:
         if not check.argv:
-            return CheckOutcome(EvidenceStatus.ERROR, detail=f"check {check.id}: empty argv")
+            return CheckOutcome(
+                EvidenceStatus.ERROR, detail=f"check {check.id}: empty argv", exit_reason="empty_argv"
+            )
         started = time.monotonic()
         deadline = started + max(0.0, float(timeout_seconds))
-        env = {**os.environ, **self.extra_env}
+        env, withheld = child_environment(extra=self.extra_env)
+        summary = environment_summary(env, withheld=withheld)
         argv = list(check.argv)
-        # Deliberately not ``TemporaryDirectory``: on Windows a process that still holds the
-        # captured file open makes deleting it fail, and failing to delete a log file must not
-        # turn a check's real result into an exception. Removal is explicit, best effort and
-        # bounded, and a file that stays behind is reported as a fact in the detail text.
-        try:
-            scratch = Path(tempfile.mkdtemp(prefix="hflow-check-"))
-            out_path = scratch / "stdout.txt"
-            err_path = scratch / "stderr.txt"
-        except OSError as exc:
-            # Refusing to run without somewhere to capture output is the honest answer: the
-            # alternative is a check whose evidence cannot be recorded.
+
+        scratch, artifact_dir, keep_artifacts = self._resolve_artifact_dir(check)
+        if artifact_dir is None:
+            # Refusing to run without somewhere to keep the captured output is the honest answer:
+            # the alternative is a check whose evidence cannot be read after the fact.
             return CheckOutcome(
                 EvidenceStatus.ERROR,
-                detail=f"check {check.id}: no writable scratch directory for its output ({exc})",
+                detail=(
+                    f"check {check.id}: no writable scratch directory is available for its output "
+                    f"({scratch})"
+                ),
                 command=argv,
+                exit_reason="no_artifact_dir",
+                environment=summary,
             )
-        kept = 0
+
+        out_sink = BoundedTextSink(artifact_dir / "stdout.txt", limit=self.stream_limit_bytes)
+        err_sink = BoundedTextSink(artifact_dir / "stderr.txt", limit=self.stream_limit_bytes)
         try:
-            result = self._execute(argv, check, cwd, env, out_path, err_path, deadline)
-            stdout = out_path.read_bytes() if out_path.exists() else b""
-            stderr = err_path.read_bytes() if err_path.exists() else b""
-        finally:
-            kept = self._discard_output_files(scratch, (out_path, err_path))
+            result = self._execute(argv, check, cwd, env, out_sink, err_sink, deadline)
+        except OSError as exc:
+            # The artifact files themselves could not be opened: nothing ran.
+            return CheckOutcome(
+                EvidenceStatus.ERROR,
+                detail=f"check {check.id}: its output could not be captured ({exc})",
+                command=argv,
+                exit_reason="output_capture_error",
+                environment=summary,
+            )
+        stdout_capture = out_sink.capture()
+        stderr_capture = err_sink.capture()
         elapsed = round(time.monotonic() - started, 3)
-        if kept:
-            result["details"] = [*(result.get("details") or []), "output_files_kept=1"]
-        return self._outcome(check, argv, result, stdout, stderr, elapsed)
+        outcome = self._outcome(
+            check, argv, result, stdout_capture, stderr_capture, elapsed, summary
+        )
+        outcome.artifact_path = str(artifact_dir)
+        outcome.artifacts = {
+            "stdout": stdout_capture.as_dict(),
+            "stderr": stderr_capture.as_dict(),
+        }
+        # A capture that did not finish cleanly is never a pass, and it is decided here - after
+        # ``_outcome`` - so no other branch can return PASSED for a stream the runner could not
+        # read. Two distinct endings both count: a reader still running when the wait expired, and
+        # a reader that ended on an error (a failed read, a failed write to the artifact, a failed
+        # flush/close). The second is the one a "did the thread exit?" test misses: the thread
+        # exits, so the run looks complete.
+        capture_failure = ""
+        if result.get("readers_incomplete"):
+            capture_failure = (
+                "the check's output pipes were still held open after it exited, so its captured "
+                "output is incomplete"
+            )
+        else:
+            for name, status in dict(result.get("reader_status") or {}).items():
+                if status != "eof":
+                    capture_failure = (
+                        f"the {name} capture did not finish cleanly ({status}), so its output is "
+                        "incomplete"
+                    )
+                    break
+            if not capture_failure:
+                for name, capture in (("stdout", stdout_capture), ("stderr", stderr_capture)):
+                    if capture.failed:
+                        capture_failure = (
+                            f"the {name} capture ended with an error ({capture.failure_reason}), "
+                            "so its output is incomplete"
+                        )
+                        break
+        if capture_failure:
+            outcome.status = EvidenceStatus.ERROR
+            outcome.exit_reason = "output_capture_error"
+            outcome.detail += f" {capture_failure} and this is not a clean result"
+        if truncated := (stdout_capture.truncated or stderr_capture.truncated):
+            outcome.detail += (
+                f" retained output was truncated at {self.stream_limit_bytes} byte(s) per stream;"
+                " the digest covers the retained head, the artifact holds exactly that head"
+            )
+        manifest = write_artifact_manifest(
+            artifact_dir,
+            {
+                "check_id": check.id,
+                "argv": argv,
+                "retained": outcome.artifacts,
+                "truncated": bool(truncated),
+                "capture_failure": capture_failure,
+                "exit_code": outcome.exit_code,
+                "exit_reason": outcome.exit_reason,
+                "status": outcome.status.value,
+                "elapsed_seconds": elapsed,
+                "environment": summary,
+            },
+        )
+        outcome.artifact_path = str(manifest)
+        if not keep_artifacts:
+            self._discard_artifacts(artifact_dir)
+        return outcome
+
+    def _resolve_artifact_dir(self, check: CheckDef) -> tuple[str, Path | None, bool]:
+        """``(description, directory, keep)`` for this check's artifacts."""
+        if self._artifact_factory is not None:
+            try:
+                directory = Path(self._artifact_factory(check.id, ""))
+                directory.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                return f"could not create {directory}: {exc}", None, True
+            return str(directory), directory, True
+        try:
+            directory = Path(tempfile.mkdtemp(prefix=f"hflow-check-{check.id}-"))
+        except OSError as exc:
+            return f"could not create a temporary directory: {exc}", None, False
+        return str(directory), directory, False
 
     @staticmethod
-    def _discard_output_files(directory: Path, paths: tuple[Path, ...]) -> int:
-        """Remove this call's scratch files; report how many could not be removed."""
-        for _ in range(10):
-            try:
-                for path in paths:
-                    path.unlink(missing_ok=True)
-                directory.rmdir()
-                return 0
-            except OSError:
-                time.sleep(0.02)
-        try:
+    def _discard_artifacts(directory: Path) -> None:
+        """Remove a private temporary artifact directory; a failure here is not a check failure."""
+        for child in sorted(directory.glob("**/*"), reverse=True):
+            with contextlib.suppress(OSError):
+                if child.is_file():
+                    child.unlink()
+                else:
+                    child.rmdir()
+        with contextlib.suppress(OSError):
             directory.rmdir()
-            return 0
-        except OSError:
-            return 1
 
     # -- one execution, fully owned ------------------------------------------
 
@@ -228,8 +374,8 @@ class CommandCheckRunner:
         check: CheckDef,
         cwd: Path,
         env: dict[str, str],
-        out_path: Path,
-        err_path: Path,
+        out_sink: BoundedTextSink,
+        err_sink: BoundedTextSink,
         deadline: float,
     ) -> dict[str, object]:
         """Launch, observe and settle one check. Never raises for a check-level failure."""
@@ -243,22 +389,27 @@ class CommandCheckRunner:
             }
 
         child: subprocess.Popen | None = None
+        readers: list[threading.Thread] = []
         details: list[str] = [f"boundary={boundary.kind}"]
         try:
+            out_sink.__enter__()
+            err_sink.__enter__()
             try:
-                with out_path.open("wb") as out, err_path.open("wb") as err:
-                    child = popen_in_boundary(
-                        argv,
-                        cwd=str(cwd),
-                        env=env,
-                        boundary=boundary,
-                        stdout_handle=out,
-                        stderr_handle=err,
-                    )
+                child = popen_in_boundary(
+                    argv,
+                    cwd=str(cwd),
+                    env=env,
+                    boundary=boundary,
+                    stdout_handle=subprocess.PIPE,
+                    stderr_handle=subprocess.PIPE,
+                )
             except (JobBoundaryError, OSError, ValueError) as exc:
                 # Covers "could not start" and "started but could not be assigned/resumed".
                 # Nothing here ran unmanaged, so there is nothing to tear down.
                 return {"phase": "startup", "error": f"the check could not be started ({exc})"}
+            # The output pipes are drained continuously, on their own threads, so a check that
+            # writes more than a pipe buffer holds cannot block waiting for a reader.
+            readers = self._start_readers(child, out_sink, err_sink)
             # A check receives no interactive input. The helper creates a stdin pipe, so it is
             # closed here: a check that waits for EOF would otherwise hang until its deadline.
             self._close_stdin(child)
@@ -283,6 +434,23 @@ class CommandCheckRunner:
                 # is answerable only once nothing is holding the process object open.
                 self._reap_direct_child(child)
                 details.append(f"direct_child_gone={process_gone(child.pid, 0.0)}")
+            readers_incomplete = not self._join_readers(readers)
+            reader_status = {
+                str(getattr(thread, "_hflow_name", index)): str(
+                    getattr(thread, "_hflow_status", "unknown")
+                )
+                for index, thread in enumerate(readers)
+            }
+            if readers_incomplete:
+                details.append("output_pipes_still_open=True")
+            if any(status != "eof" for status in reader_status.values()):
+                details.append(
+                    "reader_status="
+                    + ",".join(f"{name}:{status}" for name, status in reader_status.items())
+                )
+            read_seconds = round(
+                sum(getattr(thread, "_hflow_finished_at", 0.0) for thread in readers), 3
+            )
             return {
                 "phase": "completed",
                 "returncode": returncode,
@@ -290,17 +458,67 @@ class CommandCheckRunner:
                 # ``settled`` is "settled", "forced" or "unknown"; only "settled" may pass.
                 "settled": settled,
                 "details": details,
+                "readers_incomplete": readers_incomplete,
+                "reader_status": reader_status,
+                "read_seconds": read_seconds,
             }
         finally:
-            # Both steps happen before the caller reads the captured output: on Windows a
-            # process that is still inside the boundary holds its stdout/stderr handles open,
-            # and reading or deleting those files while it does is a sharing violation. The
-            # boundary is therefore released here - kill-on-close settles whatever is left -
-            # and this also guarantees the handle never outlives the call.
+            # Everything that holds a pipe or a boundary handle is released here, on every path:
+            # a reader left running would keep a pipe open, and on Windows a process still inside
+            # the boundary holds its stdout/stderr handles. Closing the boundary also settles
+            # whatever is left in it (kill-on-close).
+            self._join_readers(readers)
+            with contextlib.suppress(Exception):
+                out_sink.close()
+            with contextlib.suppress(Exception):
+                err_sink.close()
             if child is not None:
                 self._reap_direct_child(child)
             with contextlib.suppress(Exception):
                 boundary.close()
+
+    def _start_readers(
+        self, child: subprocess.Popen, out_sink: BoundedTextSink, err_sink: BoundedTextSink
+    ) -> list[threading.Thread]:
+        """One drain thread per stream: bounded memory, no pipe back-pressure deadlock."""
+        readers: list[threading.Thread] = []
+        for name, stream, sink in (
+            ("stdout", child.stdout, out_sink),
+            ("stderr", child.stderr, err_sink),
+        ):
+            thread = threading.Thread(
+                target=self._drain_stream, args=(stream, sink), daemon=True
+            )
+            thread._hflow_name = name  # type: ignore[attr-defined]
+            thread.start()
+            readers.append(thread)
+        return readers
+
+    @staticmethod
+    def _drain_stream(stream: object, sink: BoundedTextSink) -> None:
+        """Drain one stream, recording *how* it ended instead of discarding the reason.
+
+        The status is kept on the thread and read by the caller: a thread that exits after a
+        failed write is not a finished capture, and "the thread is gone" must never be read as
+        "the output is complete".
+        """
+        status = "unknown"
+        try:
+            status = drain(stream, sink)  # type: ignore[arg-type]
+        except (OSError, ValueError) as exc:  # defensive: drain reports instead of raising
+            status = f"read_failed: {type(exc).__name__}: {exc}"
+        finally:
+            thread = threading.current_thread()
+            thread._hflow_status = status  # type: ignore[attr-defined]
+            thread._hflow_finished_at = time.monotonic()  # type: ignore[attr-defined]
+
+    def _join_readers(self, readers: list[threading.Thread]) -> bool:
+        """Wait a bounded time for the drain threads. ``False`` means a pipe is still held open."""
+        deadline = time.monotonic() + self.reader_timeout_seconds
+        for thread in readers:
+            remaining = max(0.0, deadline - time.monotonic())
+            thread.join(timeout=remaining)
+        return all(not thread.is_alive() for thread in readers)
 
     def _reap_direct_child(self, child: subprocess.Popen) -> None:
         """Wait a bounded time for the direct child, then make sure it is gone.
@@ -383,18 +601,21 @@ class CommandCheckRunner:
         check: CheckDef,
         argv: list[str],
         result: dict[str, object],
-        stdout: bytes,
-        stderr: bytes,
+        stdout: StreamCapture,
+        stderr: StreamCapture,
         elapsed: float,
+        environment: str,
     ) -> CheckOutcome:
         """Map one execution to a CheckOutcome. Only this method decides PASSED."""
         status = EvidenceStatus.ERROR
         returncode: int | None = None
         detail = ""
+        reason = ""
 
         if result["phase"] in {"boundary", "startup"}:
             # Nothing ran, or nothing ran unmanaged. The reason is the whole detail.
             detail = f"check {check.id}: {result['error']}"
+            reason = str(result["phase"])
         else:
             returncode = result["returncode"]  # type: ignore[assignment]
             timed_out = bool(result["timed_out"])
@@ -407,12 +628,17 @@ class CommandCheckRunner:
                     f"check {check.id}: exit={returncode} elapsed={elapsed}s "
                     f"(timeout after {check.timeout_seconds}s)"
                 )
+                reason = "timed_out"
             else:
                 detail = f"check {check.id}: exit={returncode} elapsed={elapsed}s"
                 if returncode == 0 and settled == "settled":
                     status = EvidenceStatus.PASSED
+                    reason = "completed"
                 elif returncode != 0:
                     status = EvidenceStatus.FAILED
+                    reason = "nonzero_exit"
+                else:
+                    reason = f"settlement_{settled}"
             if settled == "forced":
                 # A zero exit is not completion if the check left processes behind.
                 segments.insert(
@@ -420,6 +646,7 @@ class CommandCheckRunner:
                     "the check left processes running after it finished; its owned boundary was "
                     "terminated, so this is a lifecycle error, not a clean result",
                 )
+                reason = "settlement_forced"
             elif settled == "unknown":
                 # Distinct from the case above on purpose: no lingering process was observed
                 # here, the observation itself failed. Saying "processes were left running"
@@ -429,17 +656,25 @@ class CommandCheckRunner:
                     "the owned boundary could not be observed, so settlement is unconfirmed; an "
                     "unanswered query is not an empty process tree and this is not a clean result",
                 )
+                reason = "settlement_unknown"
             detail += " " + " ".join(segments)
 
-        if stderr:
-            detail += " stderr=" + stderr[: self.excerpt_limit].decode("utf-8", "replace")
+        if stderr.total_bytes:
+            # The head of the stream, decoded for the evidence row; the retained stream stays in
+            # the artifact file this row names.
+            detail += " stderr=" + stderr.head[: self.excerpt_limit]
+            if stderr.truncated:
+                detail += "… (stderr truncated for display)"
         return CheckOutcome(
             status,
             exit_code=returncode,
-            stdout_digest=digest_of(stdout.decode("utf-8", "replace")),
-            stderr_digest=digest_of(stderr.decode("utf-8", "replace")),
+            stdout_digest=stdout.digest,
+            stderr_digest=stderr.digest,
             detail=detail,
             command=argv,
+            exit_reason=reason,
+            timed_out=bool(result.get("timed_out")),
+            environment=environment,
         )
 
 
@@ -463,8 +698,20 @@ class CheckRunners:
         self.runners: dict[str, CheckRunner] = dict(runners or {})
 
     @classmethod
-    def offline_default(cls, extra_env: dict[str, str] | None = None) -> CheckRunners:
-        return cls({"fake": FakeCheckRunner(), "command": CommandCheckRunner(extra_env=extra_env)})
+    def offline_default(
+        cls,
+        extra_env: dict[str, str] | None = None,
+        *,
+        artifact_factory: Callable[[str, str], Path] | None = None,
+    ) -> CheckRunners:
+        return cls(
+            {
+                "fake": FakeCheckRunner(),
+                "command": CommandCheckRunner(
+                    extra_env=extra_env, artifact_factory=artifact_factory
+                ),
+            }
+        )
 
     def for_kind(self, kind: str) -> CheckRunner:
         return self.runners.get(kind, DenyCheckRunner())
@@ -481,12 +728,18 @@ def verify_candidate(
     attempt_id: str,
     run_id: str,
     runners: CheckRunners,
+    artifact_factory: Callable[[str, str], Path] | None = None,
 ) -> VerificationResult:
     """Execute every required check once for this candidate; store evidence.
 
     Reuse rule (acceptance A10): an existing passing evidence row with the same
     candidate fingerprint and checks digest is reused for cacheable checks, and
     never reused for checks marked ``cacheable=False``.
+
+    ``artifact_factory`` decides where a check's captured output is kept. The controller passes a
+    run-scoped directory under its own data dir, so the log a reviewer is pointed at is a file in
+    the run's record; without one (offline callers) the runner uses a private temporary directory
+    and cleans it up.
     """
     check_map = project.check_map()
     required = spec.required_check_ids()
@@ -523,9 +776,30 @@ def verify_candidate(
                     runner.cache_hits += 1
             continue
 
-        outcome = runners.for_kind(check.kind).run(check, project_root, check.timeout_seconds)
+        evidence_id = new_evidence_id()
+        runner = runners.for_kind(check.kind)
+        if isinstance(runner, CommandCheckRunner) and artifact_factory is not None:
+            # One directory per check execution, named after the evidence row it belongs to, so
+            # the artifact and the row can be matched in both directions. The runner is rebuilt
+            # with that factory rather than mutated, so a shared runner instance in a registry
+            # never carries one run's directory into another run.
+            runner = CommandCheckRunner(
+                excerpt_limit=runner.excerpt_limit,
+                extra_env=runner.extra_env,
+                stream_limit_bytes=runner.stream_limit_bytes,
+                artifact_factory=lambda _check, _ignored, _eid=evidence_id: artifact_factory(
+                    check_id, _eid
+                ),
+                reader_timeout_seconds=runner.reader_timeout_seconds,
+            )
+        outcome = runner.run(check, project_root, check.timeout_seconds)
+
+        # The evidence row carries a human-readable reason and the *readable* artifact references,
+        # because "the full log is available" has to name a file a reader can open. Only the
+        # paths, sizes, digests and truncation state are added; the detail and digests the row
+        # already had are unchanged, so nothing downstream has to parse this to work.
         record = store.record_evidence(
-            evidence_id=new_evidence_id(),
+            evidence_id=evidence_id,
             run_id=run_id,
             attempt_id=attempt_id,
             kind="verification",
@@ -537,7 +811,7 @@ def verify_candidate(
             exit_code=outcome.exit_code,
             stdout_digest=outcome.stdout_digest,
             stderr_digest=outcome.stderr_digest,
-            detail=outcome.detail,
+            detail=_detail_with_references(outcome),
         )
         evidence_ids.append(record.evidence_id)
         if outcome.status is not EvidenceStatus.PASSED:
@@ -555,6 +829,33 @@ def verify_candidate(
         evidence_ids=evidence_ids,
         detail=f"{len(required)} check(s) passed for candidate {candidate_fingerprint}",
     )
+
+
+def _detail_with_references(outcome: CheckOutcome) -> str:
+    """The record of one check: reason, references, then the human-readable detail.
+
+    The reference fields come **first** on purpose. Anything downstream that shortens this string
+    (a log line cap, a packet summary) cuts the tail, and the tail must not be the part that says
+    where the artifact is and what the check could see. The order is fixed, so the same outcome
+    always produces the same string.
+    """
+    references: list[str] = []
+    if outcome.exit_reason:
+        references.append(f"reason={outcome.exit_reason}")
+    if outcome.artifact_path:
+        references.append(f"artifact={outcome.artifact_path}")
+    for name, capture in sorted(outcome.artifacts.items()):
+        references.append(
+            f"{name}: {capture.get('retained_bytes')}/{capture.get('total_bytes')} bytes"
+            f" truncated={capture.get('truncated')} digest={capture.get('digest')}"
+        )
+    if outcome.environment:
+        # The environment summary is a named list, so it also belongs in the reference block: it
+        # is evidence ("the check could not see X"), not prose.
+        references.append(outcome.environment)
+    if outcome.detail:
+        references.append(outcome.detail)
+    return " ".join(references)
 
 
 def evidence_is_current(

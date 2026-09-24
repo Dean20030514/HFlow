@@ -603,6 +603,7 @@ def test_check_runner_without_a_kind_is_refused_not_guessed(
         driver,
         controller_build="test-build",
         runners=CheckRunners({"fake": FakeCheckRunner()}),  # no 'command' runner registered
+        production=False,
     )
     request = RunRequest(
         task=unit_only(task_spec),
@@ -628,7 +629,8 @@ def test_command_check_runs_through_the_real_runner(
         update={"checks": [CheckDef(id="unit", kind="command", argv=["python", "-c", "raise SystemExit(0)"])]}
     )
     controller = Controller(
-        store, driver, controller_build="test-build", runners=CheckRunners.offline_default()
+        store, driver, controller_build="test-build", runners=CheckRunners.offline_default(),
+        production=False,
     )
     request = RunRequest(
         task=unit_only(task_spec),

@@ -60,8 +60,19 @@ read TaskSpec -> deterministic admission -> SQLite create-or-reuse run
 
 Both drivers run through the same controller; `--driver fake` is the offline one, and the real
 one needs an authorization artifact (see `docs/operations.md`). Admission now refuses a spec it
-cannot honour - an unanswered or failed reuse/adapt fit test, or a delivery level this build
-cannot reach - instead of warning and delivering less.
+cannot honour - an unanswered or failed reuse/adapt fit test, a delivery level this build
+cannot reach, a non-empty `dependencies` list this build cannot schedule, a real delivery whose
+approved checks are `kind=fake`, a write task with no isolated worktree or no write opt-in, and
+a task that needs a review but reserves only one turn - instead of warning and delivering less.
+
+Each invocation also receives a complete **role input packet** rendered by the controller from
+recorded facts (goal, acceptance criteria, write scope, candidate identity for the reviewer,
+program evidence, output contract), bounded at 32 KiB and bound to its dispatch by a prompt
+digest. The bound is checked against the packet the run would actually send, and a run that
+cannot cover its own fixed loop - in budget or in remaining authorization - is refused before the
+first invocation. See "What each role is actually told" in `docs/operations.md`, which also keeps
+the three kinds of transport evidence apart (offline fake driver / production driver with a Python
+stand-in for acpx / the installed pinned acpx).
 
 ## Install and test
 
@@ -81,12 +92,13 @@ being tested, so they are recorded rather than asserted:
 | Snapshot | Command | Result |
 |---|---|---|
 | `9483a84` with the uncommitted T02 admission patch and its new tests | `python -m pytest -q` | `225 passed, 1 skipped in 131.85s` (exit 0) |
-| the same tree after two annotation-only edits to the new test file | `python -m pytest -q tests/test_admission_dispatch_boundary.py tests/test_contracts.py` | `44 passed, 1 skipped` (exit 0) |
-| current working tree (collection only, nothing executed) | `python -m pytest -q --collect-only` | `226 tests collected` |
+| current working tree with the batch A close-out, batch B (re-check fixes) and the batch C package checks (uncommitted) | `python -m pytest -q` | `298 passed, 1 skipped in 190.18s` (exit 0) |
+| the same working tree (collection only, nothing executed) | `python -m pytest -q --collect-only` | `299 tests collected` |
 
-The first row is a full-suite result, the second is a targeted re-check after the last edit, and
-no full suite was re-run after that edit. The committed HEAD on its own has not been re-measured;
-its recorded count was `197 passed, 1 skipped`, which predates the added tests.
+The last two rows are this working tree, not a commit; the committed HEAD (`86bc34b`) was not
+re-measured on its own - its recorded count was `238 passed, 1 skipped`, which predates the batch A
+and B tests. The collected total is one higher than the executed total because a test that skips
+itself still counts as collected.
 
 Four tests skip themselves when their precondition is absent rather than pretending to pass:
 the directory-link test in `test_contracts.py` (the skip seen above), the installed-acpx test in
@@ -160,6 +172,13 @@ from it (`hflow schema`). There is no second hand-written schema to drift.
   produced no usable verdict blocks as `review_protocol_error` (a wire failure) instead of
   being reported as the reviewer requesting changes, and a validated `changes_requested`
   stays a review rejection.
+- What each role is told is rendered once, from stored facts, by the controller
+  (`packet.py`) and transported verbatim; a driver may not rebuild or extend it. The prompt
+  digest the transport reports is compared with the packet the controller rendered, so a
+  result that arrived with different input is refused instead of attributed to this task.
+- Review is a floor plus a request: a project that requires review cannot be waived by a task
+  (refused at admission), and a task that asks for review gets one even when the project does
+  not require it. Only both saying no may skip it.
 - An unknown outcome blocks and never auto-retries.
 - Verification is bound to a candidate fingerprint and a checks digest.
 - A delivery can be recorded as a **later decision** about an execution that already ended (an
@@ -197,21 +216,30 @@ Not verified, even where something works on one binding:
 
 ```sh
 python -m pytest -q tests/test_authorization.py          # 12 tests: the authorized real-run gate
-python -m pytest -q tests/test_driver_acpx_dsh.py        # 24 tests, no model, no credential
+python -m pytest -q tests/test_driver_acpx_dsh.py        # 27 tests, no model, no credential
 python -m pytest -q tests/test_review.py                 # 37 tests: the review output grammar
 python -m pytest -q tests/test_review_wire.py            # 21 tests: reviewer verdict -> receipt
 python -m pytest -q tests/test_real_client_review.py     # 3 tests: installed acpx + mock agent, no model
+python -m pytest -q tests/test_packet_wire.py            # 18 tests: role packets -> pinned acpx + input-sensitive agent, no model
 python -m pytest -q tests/test_saved_review_replay.py    # 8 tests: the recorded live review, replayed offline
 python -m pytest -q tests/test_local_finalization.py     # 13 tests: one later decision, recorded through the Store
 python -m pytest -q tests/test_concurrency.py            # 8 deterministic thread/cancel-orderings tests
 python -m pytest -q tests/test_m2_slice.py               # 5 tests: Git worktree -> frozen candidate
 python -m pytest -q tests/test_cli_m2_cleanup.py         # 15 tests: the same flow through the CLI + guarded clean
+python -m pytest -q tests/test_dispatch_gates.py         # 19 tests: pre-dispatch gates, loop allowance, packet bound
+python -m pytest -q tests/test_check_resources.py        # 21 tests: bounded output, artifacts, minimal environment, reference round-trip
+python tools/verify_b_recheck.py <temp-dir>              # the three re-checked B failure paths: failed capture, retention budget, last-line overflow
 python tools/m0_probe/check_process_boundary.py          # Job Object teardown, standalone (Windows)
 python tools/m0_probe/real_client_checks.py all          # real acpx: version + mock-agent round trip
 python tools/m2_live/prepare_m2_live.py                  # build the real M2 task package (dispatches nothing)
 python tools/m2_live/replay_review.py R-gkb3ld97x8       # replay a recorded review; no model, no writes
 python tools/m2_live/replay_review.py R-xxxxxxxxxx --finalize  # record one later decision (needs explicit approval)
 ```
+
+Business-task scripts that only mean something next to a local handoff package (a package verifier, an
+authorization writer, an environment probe for one specific task) are kept on this machine and are
+deliberately not listed here: they are not part of the committed tree, and their inputs live under
+`handoffs/`, which is local too.
 
 The per-file numbers were checked against the current tree with `python -m pytest --collect-only`
 (collection only, nothing executed); they change as tests are added.

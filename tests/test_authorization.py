@@ -27,6 +27,7 @@ from hflow.authorization import (
 from hflow.contracts import (
     RefusalCode,
     RefusedError,
+    ReviewRequirement,
     RunRequest,
     TaskState,
 )
@@ -157,11 +158,17 @@ def test_authorized_run_dispatches_and_records_the_consumed_submission(
     driver = RecordingDriver()
     authorization = _record(real_request, project, tmp_path / "task.json")
     # Review is a separate submission and is covered by its own test; here the point is the
-    # implementer dispatch and the ledger record, so the project does not require review.
+    # implementer dispatch and the ledger record. Both the project floor *and* the task request
+    # have to say no for a run to skip review (plan 6), so the task is narrowed too.
     no_review = project.model_copy(update={"review_required": False})
+    task_without_review = real_request.task.model_copy(
+        update={"review": ReviewRequirement(required=False)}
+    )
     controller = _controller(store, tmp_path, driver, authorization)
     try:
-        outcome = controller.run_task(real_request.model_copy(update={"project": no_review}))
+        outcome = controller.run_task(
+            real_request.model_copy(update={"project": no_review, "task": task_without_review})
+        )
 
         assert driver.invocations == ["implementer"], driver.invocations
         assert outcome.task_state in {TaskState.BLOCKED, TaskState.ACCEPTED}

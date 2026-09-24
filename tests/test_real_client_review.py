@@ -133,6 +133,9 @@ def test_real_client_delivers_the_reviewer_verdict_to_a_receipt(tmp_path: Path, 
         controller_build="test-build",
         runners=CheckRunners({"fake": runner}),
         data_dir=run_dir / "data",
+        # Real client and real transport, but an offline run with fake checks: the production
+        # gates are stated as off rather than inferred away.
+        production=False,
     )
     try:
         outcome = controller.run_task(

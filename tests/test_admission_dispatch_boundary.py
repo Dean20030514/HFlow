@@ -62,6 +62,11 @@ def _refused_specs(task_spec: TaskSpec) -> dict[str, TaskSpec]:
         "delivery published": task_spec.model_copy(
             update={"delivery": DeliveryRequirement(mode="published")}
         ),
+        # ``dependencies`` is in the contract but nothing in this build schedules a DAG, so a
+        # non-empty list would be ignored rather than enforced. Refusing is the honest answer.
+        "declared dependency": task_spec.model_copy(
+            update={"dependencies": ["T-000-prerequisite"]}
+        ),
     }
 
 

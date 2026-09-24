@@ -30,9 +30,20 @@ _IMPLEMENTED_DELIVERY = "local_candidate"
 
 
 def validate_task_spec(
-    spec: TaskSpec, project: ProjectConfig, project_root: Path
+    spec: TaskSpec,
+    project: ProjectConfig,
+    project_root: Path,
+    *,
+    allow_fake_checks: bool = True,
 ) -> ValidationReport:
-    """Return every admission problem at once, instead of failing one at a time."""
+    """Return every admission problem at once, instead of failing one at a time.
+
+    ``allow_fake_checks`` is the one parameter that depends on *how* the task will be
+    executed rather than on the task itself. ``kind=fake`` checks exist for offline work: they
+    return a caller-chosen verdict and execute nothing. That is honest for a development run
+    and unacceptable for a real delivery, where it would let a receipt claim a program
+    verification that never ran. The caller passes ``False`` for a real Harness run.
+    """
     issues: list[ValidationIssue] = []
     warnings: list[str] = []
 
@@ -69,6 +80,47 @@ def validate_task_spec(
                             "which is not an approved check in the project contract"
                         ),
                         location=f"acceptance.{criterion.id}",
+                    )
+                )
+
+    # --- dependencies ------------------------------------------------------
+    # ``dependencies`` exists in the contract but nothing in this build schedules a DAG: no
+    # ready/claimed query, no invalidation propagation, no serialization. Accepting a
+    # non-empty list would start a task whose stated prerequisite was never checked, so it is
+    # refused as unimplemented rather than silently ignored (plan 6.7).
+    if spec.dependencies:
+        issues.append(
+            ValidationIssue(
+                code=RefusalCode.NOT_IMPLEMENTED,
+                detail=(
+                    "dependencies="
+                    + ", ".join(repr(dep) for dep in spec.dependencies)
+                    + " is not implemented: this build runs one task at a time with no "
+                    "dependency scheduling, so a prerequisite would be ignored rather than "
+                    "enforced. Nothing was dispatched."
+                ),
+                location="dependencies",
+            )
+        )
+
+    # --- checks that cannot support a real delivery -----------------------
+    # A ``fake`` check returns a verdict chosen by the test harness and executes nothing.
+    # It is the right tool offline and a false claim in a real receipt, so this build refuses
+    # it here - before a run row, a workspace or an authorization exists - instead of
+    # discovering it after paying for an implementation turn.
+    if not allow_fake_checks:
+        for check_id in spec.required_check_ids():
+            check = known_checks.get(check_id)
+            if check is not None and check.kind == "fake":
+                issues.append(
+                    ValidationIssue(
+                        code=RefusalCode.NOT_IMPLEMENTED,
+                        detail=(
+                            f"check {check_id!r} is declared kind='fake', which executes nothing "
+                            "and returns a caller-chosen verdict. A real Harness run must be "
+                            "verified by approved command checks; nothing was dispatched."
+                        ),
+                        location=f"checks.{check_id}",
                     )
                 )
 
@@ -208,9 +260,17 @@ def validate_task_spec(
     )
 
 
-def assert_admissible(spec: TaskSpec, project: ProjectConfig, project_root: Path) -> None:
+def assert_admissible(
+    spec: TaskSpec,
+    project: ProjectConfig,
+    project_root: Path,
+    *,
+    allow_fake_checks: bool = True,
+) -> None:
     """``validate_task_spec`` as a fail-fast refusal, used before creating a run."""
-    report = validate_task_spec(spec, project, project_root)
+    report = validate_task_spec(
+        spec, project, project_root, allow_fake_checks=allow_fake_checks
+    )
     if not report.ok:
         first = report.issues[0]
         raise RefusedError(first.code, first.detail)

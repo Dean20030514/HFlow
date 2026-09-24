@@ -188,6 +188,11 @@ def _controller(store: Store, repo: Path, data_dir: Path) -> Controller:
         controller_build="m2-test-build",
         runners=CheckRunners.offline_default(),
         data_dir=data_dir,
+        # The offline driver scripts its own change, so it needs no write permission. This slice
+        # is about the worktree and the frozen candidate, not about the production write gate -
+        # which is stated here rather than inferred away (a real change needs both a worktree and
+        # HFLOW_ALLOW_WRITES; see tests/test_dispatch_gates.py).
+        production=False,
     )
 
 
@@ -304,6 +309,7 @@ def test_candidate_survives_but_check_failure_blocks_delivery(
         controller_build="m2-test-build",
         runners=CheckRunners.offline_default(),
         data_dir=tmp_path / "data",
+        production=False,
     )
     try:
         outcome = controller.run_task(
