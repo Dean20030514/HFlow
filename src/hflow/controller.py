@@ -22,7 +22,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Callable, Protocol
 
-from .admission import validate_task_spec
+from .admission import predictable_dispatch_problems, validate_task_spec
 from .authorization import AuthorizationRecord
 from .contracts import (
     AttemptState,
@@ -30,12 +30,14 @@ from .contracts import (
     CandidateSnapshot,
     CheckPhase,
     DeliveryState,
+    EffectiveConfig,
     EvidenceStatus,
     HarnessDriver,
     InvocationOutcome,
     InvocationRequest,
     InvocationResult,
     IsolationLevel,
+    LaunchConfig,
     ProjectConfig,
     RefusalCode,
     RefusedError,
@@ -66,6 +68,7 @@ from .packet import (
     render_reviewer_packet,
 )
 from .paths import default_data_dir
+from .prepare import resolve_permissions
 from .review import REVIEW_MISSING, review_input_error
 from .drivers.base import assert_driver_shape
 from .drivers.acpx_dsh import ENV_ALLOW_WRITES
@@ -313,9 +316,14 @@ class Controller:
         authorization: AuthorizationRecord | None = None,
         preflight: PreflightCheck | None = None,
         production: bool | None = None,
+        reviewer_driver: HarnessDriver | None = None,
+        effective_config: EffectiveConfig | None = None,
     ) -> None:
         self.store = store
+        #: The implementer's driver. A machine profile may bind the reviewer elsewhere, so the
+        #: two roles are separate objects rather than one driver used twice by assumption.
         self.driver = driver
+        self.reviewer_driver = reviewer_driver or driver
         self.controller_build = controller_build
         self.runners = runners or CheckRunners.offline_default()
         self.controller_id = controller_id
@@ -343,10 +351,15 @@ class Controller:
         self.data_dir = Path(data_dir) if data_dir else default_data_dir()
         #: Recorded isolation for reviews. The driver cannot raise it by claiming so.
         self.review_isolation = review_isolation
+        #: The configuration this run was resolved with, recorded against the run so `status`
+        #: and `report` can state which profile, role bindings and permissions were in effect -
+        #: instead of a reader having to infer them from whatever is configured later.
+        self.effective_config = effective_config
         #: Workspace the current run targets; set by ``run_task``. Only used for the
         #: read-only drift check in ``workspace_matches_receipt``.
         self.project_root: Path | None = None
         assert_driver_shape(driver)
+        assert_driver_shape(self.reviewer_driver)
 
     def _infer_production(self) -> bool:
         """Can this controller execute a real approved check at all?
@@ -433,6 +446,7 @@ class Controller:
                     RefusalCode.RUN_CLAIMED_BY_OTHER,
                     f"run {run_id} is owned by another controller; one owner per project at a time",
                 )
+            self._record_effective_config(run_id)
             return self._drive(run_id, request)
 
         # --- a new dispatch: gate everything before the artifact is even registered -------
@@ -447,6 +461,7 @@ class Controller:
             spec=spec,
             workspace=str(worktree_root) if worktree_root is not None else str(project_root),
             deadline_seconds=request.deadline_seconds,
+            writes_allowed=resolve_permissions(spec)[0],
         )
         self._assert_dispatch_preconditions(spec, project, request.deadline_seconds)
         self._assert_allowance_for(run_id, spec, project)
@@ -490,6 +505,8 @@ class Controller:
                 ],
             )
 
+        self._record_effective_config(run_id)
+
         if not self.store.claim_run(run_id, self.controller_id):
             raise RefusedError(
                 RefusalCode.RUN_CLAIMED_BY_OTHER,
@@ -497,6 +514,32 @@ class Controller:
             )
 
         return self._drive(run_id, request, implementer_packet=implementer_packet)
+
+    def _record_effective_config(self, run_id: str) -> None:
+        """Record the configuration this run is executing under, once, next to the run.
+
+        ``status`` and ``report`` read it back, so "which profile, which role bindings, which
+        permissions" is a recorded fact rather than something the reader infers from whatever
+        happens to be configured now. A run's first recorded configuration is never
+        overwritten: if a later invocation resolves a different one (another profile, a flipped
+        write opt-in), that is recorded as a divergence note and the run keeps its identity.
+        """
+        if self.effective_config is None:
+            return
+        existing = self.store.effective_config_for(run_id)
+        if existing is None:
+            self.store.record_effective_config(run_id, self.effective_config)
+            return
+        if existing.digest() != self.effective_config.digest():
+            self.store.record_note(
+                run_id,
+                "the configuration resolved for this invocation differs from the one recorded "
+                f"for this run: recorded profile={existing.profile_id or '(command line)'} "
+                f"digest={existing.digest()}, current "
+                f"profile={self.effective_config.profile_id or '(command line)'} "
+                f"digest={self.effective_config.digest()}. The run keeps the configuration it "
+                "was admitted with; nothing is re-dispatched under the new one.",
+            )
 
     def resume(self, run_id: str) -> RunOutcome:
         """Continue the state machine. Never replays a prompt and never re-dispatches."""
@@ -627,74 +670,33 @@ class Controller:
     ) -> None:
         """Refuse a run that is already known to be unable to finish, before anything is spent.
 
-        Everything here is decided from the TaskSpec, the project contract and the local
-        process environment - no model, no workspace, no authorization. These are the gates
-        that stop a *predictable* failure from being discovered after an implementation turn
-        has already been paid for (plan 3.2, 6.6).
-
-        What this cannot check is stated rather than implied: it does not verify that the
-        launcher works (the zero-model preflight does), it cannot see whether the target
-        repository is reachable (the worktree step does), and it says nothing about whether
-        the model will succeed.
+        The rules themselves live in ``admission.predictable_dispatch_problems``, which
+        ``hflow prepare`` calls too: a preview that reported "admitted" for a task this gate
+        would refuse would be answering a different question than the user asked. This method
+        only supplies the resolved facts - the write permission and the launches - and turns
+        the first problem into a refusal.
         """
-        if not self.production:
-            # An offline run is not a delivery: the fake driver scripts its own change and the
-            # checks are fake by construction, so these rules would refuse every offline run.
-            return
-
-        problems: list[tuple[RefusalCode, str]] = []
-
-        # 1. A run that must change files needs a write permission that is actually on and a
-        #    workspace that is not the user's own checkout. HFLOW_ALLOW_WRITES off plus a
-        #    non-empty write scope is a known-bad combination: the implementer cannot edit, so
-        #    the run would spend a turn and then fail verification.
-        if spec.scope.write_allow:
-            if spec.workspace.mode != "worktree":
-                problems.append(
-                    (
-                        RefusalCode.SCOPE_VIOLATION,
-                        "this task declares write paths but workspace.mode="
-                        f"{spec.workspace.mode!r}. A real change must run in an isolated Git "
-                        "worktree (workspace.mode='worktree' with a base commit); an in-place "
-                        "run would write into the user's own checkout",
-                    )
-                )
-            writes_on = os.environ.get(ENV_ALLOW_WRITES, "").strip().lower() in {"1", "true", "yes"}
-            if not writes_on:
-                problems.append(
-                    (
-                        RefusalCode.SCOPE_VIOLATION,
-                        f"this task declares write paths but {ENV_ALLOW_WRITES} is not enabled, so "
-                        "the invocation would be launched read-only and could not make the "
-                        "change. Enable writes for this run (see docs/operations.md) or submit a "
-                        "task that changes nothing",
-                    )
-                )
-
-        # 2. The budget must cover the whole fixed loop. A review is its own top-level
-        #    invocation, so a task that needs one needs two reserved turns; discovering that
-        #    after the implementation turn means paying for work that can never be accepted.
-        #    The matching check against the *authorization's remaining* allowance is separate
-        #    (`_assert_allowance_for`), because it depends on this run's history, not on the spec.
-        if spec.needs_review(project):
-            if spec.budget.max_agent_turns < 2:
-                problems.append(
-                    (
-                        RefusalCode.BUDGET_EXCEEDED,
-                        "review is required (project floor or task request) but "
-                        f"budget.max_agent_turns={spec.budget.max_agent_turns} covers only the "
-                        "implementation turn. A reviewed delivery needs at least 2",
-                    )
-                )
-
-        # 3. The packet bound is enforced where the packet is *rendered* (``run_task`` renders
-        #    it with this run's real workspace path before anything is claimed), not here: a
-        #    shorter placeholder path would prove a size this run will not actually produce.
-
+        problems = predictable_dispatch_problems(
+            spec,
+            project,
+            production=self.production,
+            implementer_writes=resolve_permissions(spec)[0],
+            launches=self._resolved_launches(),
+        )
         if problems:
-            code, detail = problems[0]
+            first = problems[0]
             more = f" (+{len(problems) - 1} more admission problem(s))" if len(problems) > 1 else ""
-            raise RefusedError(code, detail + more)
+            raise RefusedError(first.code, first.detail + more)
+
+    def _resolved_launches(self) -> list[LaunchConfig]:
+        """The launches this run would perform, as resolved before any approval.
+
+        Empty when no configuration was resolved (a direct library caller, or an offline run):
+        the gate then cannot know the answer, which is different from knowing it is fine.
+        """
+        if self.effective_config is None:
+            return []
+        return [entry.launch for entry in self.effective_config.roles if entry.launch is not None]
 
     # -- allowance and packet preparation ------------------------------------
 
@@ -798,9 +800,22 @@ class Controller:
         return repo, repo.worktree_parent() / run_id
 
     def _render_implementer_packet(
-        self, *, run_id: str, spec: TaskSpec, workspace: str, deadline_seconds: int
+        self,
+        *,
+        run_id: str,
+        spec: TaskSpec,
+        workspace: str,
+        deadline_seconds: int,
+        writes_allowed: bool,
     ) -> PreparedPacket:
-        """Render the implementer packet for this run, or refuse before anything is claimed."""
+        """Render the implementer packet for this run, or refuse before anything is claimed.
+
+        ``writes_allowed`` is the run's *effective* permission, not "the scope lists a path".
+        The packet tells the worker whether it may change files at all, so rendering it from
+        anything other than the permission the dispatch will carry would tell the worker
+        something the transport does not honour - and ``prepare`` reports the same packet, so
+        the preview and the dispatch have to agree byte for byte.
+        """
         try:
             packet = self.render(render_implementer_packet)(
                 task_id=spec.task_id,
@@ -811,7 +826,7 @@ class Controller:
                 workspace=workspace,
                 spec_digest=spec.spec_digest(),
                 deadline_seconds=deadline_seconds,
-                writes_allowed=bool(spec.scope.write_allow),
+                writes_allowed=writes_allowed,
             )
         except PacketTooLargeError as exc:
             raise RefusedError(
@@ -895,8 +910,11 @@ class Controller:
         # Permission is decided per role, from the run's own mode plus an explicit local
         # opt-in, and recorded before dispatch. A reviewer never inherits an implementer's
         # write permission: `_review` passes writes_allowed=False unconditionally.
-        allow_writes = os.environ.get(ENV_ALLOW_WRITES, "").strip().lower() in {"1", "true", "yes"}
-        implementer_writes = allow_writes and spec.workspace.mode == "worktree"
+        #
+        # The rule itself lives in `prepare.resolve_permissions`, which is also what the
+        # effective configuration reports - so the permission an approval covers and the
+        # permission the dispatch uses are one value, not two copies of one idea.
+        implementer_writes, _reviewer_writes = resolve_permissions(spec)
         self.store.record_note(
             run_id,
             "effective permissions - implementer: "
@@ -962,6 +980,7 @@ class Controller:
                 spec=spec,
                 workspace=str(execution_root),
                 deadline_seconds=request.deadline_seconds,
+                writes_allowed=implementer_writes,
             )
         self.store.record_note(
             run_id,
@@ -1321,7 +1340,7 @@ class Controller:
             data_dir=str(self.data_dir),
         )
         try:
-            review_invocation = self.driver.start(review_request)
+            review_invocation = self.reviewer_driver.start(review_request)
         except Exception as exc:  # noqa: BLE001 - a broken reviewer must not become an accept
             self.store.attach_review_result(
                 attempt_id, {"error": repr(exc), "invocation_id": invocation_id}
@@ -1670,6 +1689,7 @@ def inspect_run(store: Store, run_id: str, *, project_root: Path | None = None) 
         )
         for e in store.evidence_for(run_id)
     ]
+    recorded_config = store.effective_config_for(run_id)
     return RunInspection(
         run=_summary_from_row(row, workspace_matches_receipt=drift),
         task_spec=TaskSpec.model_validate(json.loads(row["task_spec_json"])),
@@ -1678,5 +1698,6 @@ def inspect_run(store: Store, run_id: str, *, project_root: Path | None = None) 
         receipt=ResultReceipt.model_validate(json.loads(row["receipt_json"]))
         if row["receipt_json"]
         else None,
+        effective_config=recorded_config,
         model_calls_made=0,
     )

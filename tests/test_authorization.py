@@ -30,12 +30,37 @@ from hflow.contracts import (
     ReviewRequirement,
     RunRequest,
     TaskState,
+    digest_of,
 )
 from hflow.controller import Controller
 from hflow.store import Store, StoreError
 from hflow.verify import CheckRunners, FakeCheckRunner
 
 USER_TEXT = "I approve one real M2 run on this exact task, driver and base commit."
+
+#: A checked-in authorization written in the *old* format - the shape this repository produced
+#: before effective-configuration binding existed. It is a synthetic fixture: it names no real
+#: repository, and its `user_text` says so. It is deliberately not a copy of any real approval,
+#: and no test reads a real one from disk.
+LEGACY_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "legacy_authorization.json"
+
+#: The binding digest of that fixture, computed the way the pre-batch-D code computed it: over
+#: exactly the eight fields that existed then. A single-use ledger row is keyed by this value,
+#: so if it ever changes, an already-consumed approval looks unused again and can be spent
+#: twice. Pinned by value, and cross-checked against the recipe rather than only against itself.
+LEGACY_FIXTURE_DIGEST = "sha256:604316e4547082df38f60a6d971a30b74c65a2237fa949bfb4b654a17e03a30f"
+#: The fields the old formula covered. Spelled out here so "the new fields are excluded while
+#: empty" is checked against an independent statement of the old rule.
+LEGACY_BINDING_FIELDS = (
+    "mode",
+    "driver",
+    "project_id",
+    "repo_path",
+    "base_commit",
+    "spec_digest",
+    "spec_path",
+    "roles",
+)
 
 
 class RecordingDriver:
@@ -207,6 +232,126 @@ def test_reviewer_is_a_separate_consumed_submission(
 # --------------------------------------------------------------------------
 # refusals: self-authorization, mismatch, exhaustion, preflight
 # --------------------------------------------------------------------------
+
+
+def test_a_recorded_authorization_from_an_earlier_build_still_loads_and_digests_the_same(
+    tmp_path: Path,
+) -> None:
+    """Read compatibility, pinned by value against a checked-in fixture.
+
+    The fixture is the old format: no ``effective_config_digest``, no ``profile_id``. It must
+    still load, and its binding digest must still be the value its consumed-allowance row is
+    keyed by. The digest is checked twice on purpose - against the pinned constant, and against
+    an independent restatement of the old formula - so a change to either the stored value or
+    the computation fails here.
+    """
+    record = load_authorization(LEGACY_FIXTURE)
+
+    assert record.authorization_id == "AUTH-legacy-fixture-1"
+    assert record.provided_by == "user"
+    assert record.binding.effective_config_digest == ""
+    assert record.binding.profile_id == ""
+    assert record.binding_digest() == LEGACY_FIXTURE_DIGEST
+
+    binding_document = record.binding.model_dump(mode="json")
+    assert set(binding_document) == set(LEGACY_BINDING_FIELDS) | {
+        "effective_config_digest",
+        "profile_id",
+    }
+    old_recipe = digest_of({field: binding_document[field] for field in LEGACY_BINDING_FIELDS})
+    assert old_recipe == LEGACY_FIXTURE_DIGEST
+
+    # Re-serializing and reloading it is still the same artifact, not a re-bound one.
+    copy = tmp_path / "copy.json"
+    copy.write_text(
+        json.dumps(record.model_dump(mode="json"), ensure_ascii=False), encoding="utf-8"
+    )
+    assert load_authorization(copy).binding_digest() == LEGACY_FIXTURE_DIGEST
+
+
+def test_a_configuration_digest_separates_two_otherwise_identical_approvals(
+    tmp_path: Path, project, task_spec, project_root: Path, real_request: RunRequest
+) -> None:
+    """Two approvals for the same task on different configurations are different approvals."""
+    from hflow.contracts import EffectiveConfig, RoleConfig
+
+    def config(model: str) -> EffectiveConfig:
+        return EffectiveConfig(
+            source="machine_profile",
+            profile_id="dsh-local",
+            profile_digest="sha256:" + "0" * 64,
+            roles=[
+                RoleConfig(
+                    role=role,
+                    agent="a",
+                    harness="dsh",
+                    driver="acpx-dsh",
+                    driver_id="acpx-dsh-acp",
+                    model_selection=model,
+                )
+                for role in ("implementer", "reviewer")
+            ],
+        )
+
+    spec_path = tmp_path / "task.json"
+    first = current_binding(
+        mode="m2-live-change",
+        driver="acpx-dsh",
+        project=project,
+        request=real_request,
+        spec_path=spec_path,
+        effective=config("model-one"),
+    )
+    second = current_binding(
+        mode="m2-live-change",
+        driver="acpx-dsh",
+        project=project,
+        request=real_request,
+        spec_path=spec_path,
+        effective=config("model-two"),
+    )
+    assert first.digest() != second.digest()
+
+    record = AuthorizationRecord(
+        authorization_id="AUTH-config-1",
+        user_text=USER_TEXT,
+        authorized_at="2026-09-20T00:00:00Z",
+        max_top_level_submissions=2,
+        binding=first,
+    )
+    verify_authorization(record, expected=first)  # the configuration it names is accepted
+    with pytest.raises(RefusedError) as excinfo:
+        verify_authorization(record, expected=second)
+    assert "different configuration" in excinfo.value.message
+
+    # A store row for one configuration does not silently cover the other under one id.
+    store = Store(tmp_path / "hflow.sqlite")
+    try:
+        store.register_authorization(record.as_store_record())
+        other = record.model_copy(update={"binding": second})
+        with pytest.raises(StoreError) as excinfo:
+            store.register_authorization(other.as_store_record())
+        assert "different target" in str(excinfo.value)
+    finally:
+        store.close()
+
+
+def test_an_unchanged_legacy_record_keeps_one_ledger_row(
+    tmp_path: Path, project, task_spec, project_root: Path, real_request: RunRequest
+) -> None:
+    """The compatibility rule exists for the ledger: same digest, so a re-register is a no-op."""
+    store = Store(tmp_path / "hflow.sqlite")
+    authorization = _record(real_request, project, tmp_path / "task.json", max_submissions=1)
+    try:
+        store.register_authorization(authorization.as_store_record())
+        store.claim_authorized_submission("AUTH-test-1")
+        # Re-registering the identical artifact returns the existing row rather than a new one.
+        again = store.register_authorization(authorization.as_store_record())
+        assert again["used_top_level_submissions"] == 1
+        with pytest.raises(StoreError):
+            store.claim_authorized_submission("AUTH-test-1")
+    finally:
+        store.close()
 
 
 def test_schema_rejects_any_provenance_other_than_user(

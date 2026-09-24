@@ -9,7 +9,10 @@ file's test numbers were checked.
 
 ```sh
 hflow doctor --json                        # what is on this machine; no model calls
+hflow doctor --profile <id>                # resolve the profile per role; non-zero if unusable
+hflow prepare --task task.json --profile <id> --project-root <repo>
 hflow run --task task.json --project-root <repo> --driver fake --json
+hflow run --task task.json --profile <id> --authorization-file auth.json --json
 hflow status <run_id>
 hflow report <run_id>
 hflow resume <run_id>                      # only reconciles; never re-dispatches
@@ -20,12 +23,146 @@ hflow cancel <run_id>
 write only the receipt, and check the exit code: `0` accepted, `2` refused at admission,
 `3` blocked after dispatch.
 
+## Configure once, then reuse it
+
+A machine profile is the machine half of a run: which agent, transport and permission each
+**role** uses. It lives beside the runtime data, never inside a project checkout:
+
+```text
+%LOCALAPPDATA%\HFlow\profiles\<id>.json          (or <data-dir>/profiles/<id>.json)
+```
+
+The shape is generated, not hand-written twice - `hflow schema` prints it under
+`MachineProfile`. A two-role profile looks like this:
+
+```json
+{
+  "schema_version": 1,
+  "profile_id": "dsh-local",
+  "role_bindings": { "implementer": "dsh-worker", "reviewer": "dsh-reviewer" },
+  "agents": {
+    "dsh-worker":   { "harness": "dsh", "driver": "acpx-dsh", "model_selection": "native_profile" },
+    "dsh-reviewer": { "harness": "dsh", "driver": "acpx-dsh", "model_selection": "native_profile" }
+  },
+  "limits": { "max_parallel_workers": 1, "max_native_children": 0 },
+  "security_mode": "trusted_local"
+}
+```
+
+`model_selection` is a recorded label in this build, not a launcher flag: the DSH launcher
+still starts with the profile its driver was built with, and `hflow doctor --profile dsh-local`
+prints that exact argv so nothing about it has to be assumed.
+
+**Both roles must be bound.** An unbound role is refused instead of inheriting the other one,
+because a task revision can start requiring a review. Every one of these is a refusal, never a
+fallback to a default:
+
+| Input | What happens |
+|---|---|
+| `--profile ghost` (no such file) | refused, naming the path it looked in |
+| a file whose `profile_id` disagrees with its name | refused |
+| an unknown field, or a role bound to an undeclared agent | refused, naming the field |
+| a role the profile does not bind | refused, naming the role |
+| `driver: "some-other-harness"` | refused: one production transport plus the offline fake |
+| `harness: "codex"` with `driver: "acpx-dsh"` | refused: that driver launches `dsh`, and every process the run started would be DSH while the record said Codex |
+| one role `fake`, the other `acpx-dsh` | refused: half a run scripted, half a model |
+| `--driver fake` together with a real profile | refused, naming the roles that disagree |
+
+Precedence, defined once in `profiles.requested_profile_id`: `--profile` beats `HFLOW_PROFILE`;
+with neither, `--driver` decides and defaults to `fake` (offline).
+
+## Before you run anything: `hflow prepare`
+
+`prepare` resolves the task, the project contract and the machine bindings through the *same*
+function `run` uses, and prints what would happen. It calls no model, creates no run row, no
+workspace, no SQLite database and no authorization:
+
+```sh
+hflow prepare --task task.json --profile dsh-local --project-root <repo>
+hflow prepare --task task.json --profile dsh-local --project-root <repo> --json
+```
+
+It reports:
+
+| Section | What it answers |
+|---|---|
+| `effective_config` | which profile, which agent/driver per role, the **resolved launch**, which write permission, and a `digest` |
+| `admission` | every problem with the task's definition that `run` would refuse on |
+| `dispatch_preconditions` | every problem with running it *now* that `run`'s dispatch gate would refuse on |
+| `write_allow` / `write_deny` | the scope the worker will be told |
+| `checks` | the approved checks this task's acceptance needs, and which criterion needs each |
+| `budget` | implementer + reviewer turns required, against the task budget and project ceiling |
+| `packet_preview` | the implementer's input packet, byte length and digest |
+| `authorization` | the binding an approval would have to cover, and nothing that is one |
+
+Two things it deliberately does not do. It does not render the **reviewer's** packet - that
+packet embeds the frozen candidate identity, the verification status and the evidence rows, none
+of which exists before the implementer runs, so a preview now would be an invented input. And it
+does not mint an approval: `creates_authorization` is pinned to `false`, no `user_text` and no
+`provided_by` appear anywhere in its output, and feeding its output to `load_authorization`
+fails. Approving is a user action.
+
+For a worktree run the workspace path contains the run id, which is chosen at dispatch, so
+`execution_root_is_final` is `false` and the packet size/digest are for the template path.
+
+Exit code: `0` when the run would get past admission **and** its dispatch gate, `2` otherwise.
+The full preview prints either way - that is the point of asking. What `prepare` cannot check is
+stated rather than implied: remaining authorization allowance depends on a run's history, so it
+is checked only once a run exists, and it says so in its notes.
+
+### What stops a run before it dispatches, and what `prepare` therefore reports
+
+| Condition | Where it is decided |
+|---|---|
+| the task declares write paths but `workspace.mode` is not `worktree` | shared precondition |
+| the task declares write paths but `HFLOW_ALLOW_WRITES` is not enabled | shared precondition |
+| a required review, but `budget.max_agent_turns` is 1 | shared precondition |
+| a role's launch could not be resolved (no acpx client on this machine) | shared precondition |
+| a real delivery whose approved checks are `kind=fake` | admission |
+| unknown check, scope violation, risk below the project floor, unmet delivery level, reuse not decided, budget above the project ceiling | admission |
+| not enough authorization allowance left for the whole fixed loop | controller, once a run exists |
+
+The first four are the ones `prepare` reports under `dispatch_preconditions`, and they are the
+same list the run's own gate raises - one function, two callers.
+
+## What an approval now covers
+
+The authorization artifact binds the *effective configuration*, not just the task: profile id,
+per-role agents and drivers, model selections, limits, the write permission, and the **resolved
+launch** - the client entry point, the interpreter that starts it, the launcher argv, and the DSH
+home/profile. `prepare` prints exactly that binding, and `run` verifies against the same
+resolution, so a preview and a run cannot disagree.
+
+Consequences worth knowing:
+
+- Approving a task on one profile does not approve it on another; switching profile after
+  approval changes the digest and the run is refused, naming both sides.
+- Changing where the client or the interpreter lives changes it too: `HFLOW_ACPX_NODE`,
+  `HFLOW_ACPX_CLI`, `DSH_HOME`, or a different `dsh`/`node`/`python` earlier on `PATH` all change
+  the approval digest, because all of them change which program would run.
+- The launch is resolved **once**, before the approval, and then consumed by the driver. Nothing
+  re-reads the environment after the check, so a variable changed mid-run cannot swap the client.
+- `DSH_HOME` is part of the launch in both directions: a bound value is set on the child, and
+  *absence is bound too* - when the resolution found no DSH home, the variable is removed from
+  the child environment rather than inherited, including any value passed in through the
+  driver's `extra_env`. A `DSH_HOME` that appears after the resolution therefore cannot reach
+  the process.
+- An artifact written before config binding existed still loads, still lists, and still keys its
+  own single-use ledger row - but it cannot authorize a run that resolved a configuration,
+  because nothing in it says which one. Re-issue it.
+- The digest of an old artifact is unchanged by this build: the new fields are omitted while
+  they are empty, so an already-consumed approval cannot look unused again.
+- The launch is bound by *paths and argv*, not by program content: replacing a file at the same
+  path does not change the approval.
+
 ## Where the data lives
 
 | Data | Path |
 |---|---|
 | Runtime database | `%LOCALAPPDATA%\HFlow\hflow.sqlite` (Windows), `$XDG_DATA_HOME/hflow/` otherwise |
+| Machine profiles | `<data-dir>/profiles/<id>.json` |
 | Override | `--data-dir <dir>` or `HFLOW_DATA_DIR` |
+| Profile selection | `--profile <id>` or `HFLOW_PROFILE` |
 | Build id recorded into every run | `HFLOW_BUILD_ID`, else `hflow/<version>` plus the short git SHA |
 
 `run`/`status`/`report` accept `--data-dir` before or after the subcommand. Runtime data

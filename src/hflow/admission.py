@@ -7,9 +7,11 @@ the gate itself cost nothing.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
 from .contracts import (
+    LaunchConfig,
     ProjectConfig,
     ReuseStatus,
     RefusalCode,
@@ -18,6 +20,7 @@ from .contracts import (
     ValidationIssue,
     ValidationReport,
 )
+from .paths import ENV_ALLOW_WRITES
 from .store import SCHEMA_VERSION as STORE_SCHEMA_VERSION
 from .workspace import check_scope
 
@@ -274,3 +277,113 @@ def assert_admissible(
     if not report.ok:
         first = report.issues[0]
         raise RefusedError(first.code, first.detail)
+
+
+def predictable_dispatch_problems(
+    spec: TaskSpec,
+    project: ProjectConfig,
+    *,
+    production: bool,
+    implementer_writes: bool,
+    launches: Sequence[LaunchConfig] = (),
+) -> list[ValidationIssue]:
+    """Problems knowable before a dispatch, from the task, the contract and this machine.
+
+    These are a different class of fact from ``validate_task_spec``'s: that one asks "is this
+    task defined in a way this build can honour?", this one asks "can this machine run it
+    *now*?". Both are refusals before anything is spent, so both belong in a preview - a
+    ``prepare`` that answered "admitted" for a task every run would refuse was answering the
+    wrong question.
+
+    Shared deliberately, and every input already resolved: the write permission comes from
+    ``prepare.resolve_permissions`` and the launches from the effective configuration, so
+    ``prepare`` and the controller's dispatch gate cannot drift apart. There is no environment
+    read here at all.
+
+    What is *not* here is stated rather than implied: this cannot see whether the target
+    repository is reachable (the worktree step does), whether the launcher actually works (the
+    zero-model preflight does), whether the model will succeed, or how much authorization
+    allowance is left - that depends on this run's history, and the controller checks it
+    separately.
+    """
+    if not production:
+        # An offline run is not a delivery: the fake driver scripts its own change and its
+        # checks are fake by construction, so these rules would refuse every offline run.
+        return []
+
+    issues: list[ValidationIssue] = []
+
+    # 1. A run that must change files needs a write permission that is actually on and a
+    #    workspace that is not the user's own checkout. Writes off plus a non-empty write scope
+    #    is a known-bad combination: the implementer cannot edit, so the run would spend a turn
+    #    and then fail verification.
+    if spec.scope.write_allow:
+        if spec.workspace.mode != "worktree":
+            issues.append(
+                ValidationIssue(
+                    code=RefusalCode.SCOPE_VIOLATION,
+                    detail=(
+                        "this task declares write paths but workspace.mode="
+                        f"{spec.workspace.mode!r}. A real change must run in an isolated Git "
+                        "worktree (workspace.mode='worktree' with a base commit); an in-place "
+                        "run would write into the user's own checkout"
+                    ),
+                    location="workspace.mode",
+                )
+            )
+        if not implementer_writes:
+            issues.append(
+                ValidationIssue(
+                    code=RefusalCode.SCOPE_VIOLATION,
+                    detail=(
+                        f"this task declares write paths but {ENV_ALLOW_WRITES} is not enabled, so "
+                        "the invocation would be launched read-only and could not make the "
+                        "change. Enable writes for this run (see docs/operations.md) or submit a "
+                        "task that changes nothing"
+                    ),
+                    location="scope.write_allow",
+                )
+            )
+
+    # 2. The budget must cover the whole fixed loop. A review is its own top-level invocation,
+    #    so a task that needs one needs two reserved turns; discovering that after the
+    #    implementation turn means paying for work that can never be accepted. The matching
+    #    check against the authorization's *remaining* allowance is separate, because it
+    #    depends on this run's history rather than on the spec.
+    if spec.needs_review(project) and spec.budget.max_agent_turns < 2:
+        issues.append(
+            ValidationIssue(
+                code=RefusalCode.BUDGET_EXCEEDED,
+                detail=(
+                    "review is required (project floor or task request) but "
+                    f"budget.max_agent_turns={spec.budget.max_agent_turns} covers only the "
+                    "implementation turn. A reviewed delivery needs at least 2"
+                ),
+                location="budget.max_agent_turns",
+            )
+        )
+
+    # 3. Every role's launch must have resolved to real programs. This is recorded on the
+    #    launch config rather than raised when it is resolved, so a preview can name the missing
+    #    dependency instead of dying before it prints anything. Two roles sharing one resolved
+    #    launch produce one problem, not two copies of it.
+    seen_launches: set[tuple[str, str]] = set()
+    for launch in launches:
+        if launch.resolvable:
+            continue
+        key = (launch.driver_id, launch.detail)
+        if key in seen_launches:
+            continue
+        seen_launches.add(key)
+        issues.append(
+            ValidationIssue(
+                code=RefusalCode.NOT_IMPLEMENTED,
+                detail=(
+                    f"the launch for driver {launch.driver_id!r} could not be resolved, so no "
+                    f"process could be started: {launch.detail or 'no detail'}"
+                ),
+                location="effective_config.launch",
+            )
+        )
+
+    return issues

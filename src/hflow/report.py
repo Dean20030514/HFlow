@@ -26,6 +26,30 @@ def _drift_line(inspection: RunInspection) -> str:
     )
 
 
+def _config_lines(inspection: RunInspection) -> list[str]:
+    """Which configuration the run used. A historical run says so instead of being guessed at."""
+    effective = inspection.effective_config
+    if effective is None:
+        return [
+            "configuration not recorded: this run predates config binding, so its profile and "
+            "role bindings are unknown rather than assumed"
+        ]
+    lines = [
+        f"configuration {effective.source}"
+        + (f" profile={effective.profile_id}" if effective.profile_id else " (no profile)")
+        + f" digest={effective.digest()}"
+    ]
+    for entry in effective.roles:
+        lines.append(
+            f"  {entry.role:<12} agent={entry.agent} driver={entry.driver} -> {entry.driver_id}"
+        )
+    lines.append(
+        f"  writes      implementer={effective.implementer_writes} "
+        f"reviewer={effective.reviewer_writes}"
+    )
+    return lines
+
+
 def status_text(inspection: RunInspection) -> str:
     run = inspection.run
     lines = [
@@ -39,6 +63,7 @@ def status_text(inspection: RunInspection) -> str:
         "(a self-report, not a dispatched count and not a bill)",
         f"spec_digest   {run.spec_digest}",
     ]
+    lines.extend(_config_lines(inspection))
     implementer = sum(1 for a in inspection.attempts if a.invocation_id)
     reviewer = sum(1 for a in inspection.attempts if a.review_invocation_id)
     lines.append(
@@ -150,6 +175,12 @@ def report_json(inspection: RunInspection) -> dict[str, object]:
         "attempts": [a.model_dump(mode="json") for a in inspection.attempts],
         "evidence": [e.model_dump(mode="json") for e in inspection.evidence],
         "receipt": inspection.receipt.model_dump(mode="json") if inspection.receipt else None,
+        "effective_config": inspection.effective_config.model_dump(mode="json")
+        if inspection.effective_config
+        else None,
+        "effective_config_digest": inspection.effective_config.digest()
+        if inspection.effective_config
+        else None,
         "model_calls_made": inspection.model_calls_made,
     }
     return payload

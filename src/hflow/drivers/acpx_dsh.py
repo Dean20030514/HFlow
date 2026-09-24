@@ -42,7 +42,7 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +56,7 @@ from ..contracts import (
     InvocationOutcome,
     InvocationRequest,
     InvocationResult,
+    LaunchConfig,
     NormalizedEvent,
     ReconcileOutcome,
     ReconcileResult,
@@ -64,6 +65,7 @@ from ..contracts import (
 from ..ids import utc_now
 from ..artifacts import BoundedTextSink, StreamCapture
 from ..packet import packet_digest
+from ..paths import ENV_ALLOW_WRITES  # noqa: F401 - re-exported for existing importers
 from ..review import (
     MAX_ANSWER_BYTES,
     REVIEW_INVALID,
@@ -80,9 +82,10 @@ DRIVER_VERSION = "0.1.0"
 
 ENV_ACPX_CLI = "HFLOW_ACPX_CLI"
 ENV_ACPX_NODE = "HFLOW_ACPX_NODE"
-#: Opt-in to file writes for a real invocation. Off by default; the controller sets it only
-#: for runs whose workspace is a disposable worktree created from a fixed base commit.
-ENV_ALLOW_WRITES = "HFLOW_ALLOW_WRITES"
+#: Opt-in to file writes for a real invocation. Defined once in ``hflow.paths`` (the admission
+#: gate, the resolution path and the controller all have to agree on the name) and re-exported
+#: here for the callers that already import it from this module.
+
 #: Resolution order for the acpx entry point, most explicit first:
 #:   1. ``$HFLOW_ACPX_CLI`` (operator intent; wins over everything);
 #:   2. ``~/.hflow/`` sibling layout used by the repo-local development install;
@@ -130,6 +133,114 @@ class DriverSetupError(RuntimeError):
     """The driver cannot be used as configured. Fail loudly, never silently degrade."""
 
 
+def build_agent_argv(
+    *,
+    dsh_executable: str,
+    profile: str,
+    override: list[str] | None = None,
+) -> list[str]:
+    """The launcher argv as a real command line, wrapped for the Windows batch shim.
+
+    Only the launcher path and the fixed profile flag live here: no task text, no nonce, no
+    user content, no credentials.
+    """
+    if override is not None:
+        return list(override)
+    argv = [dsh_executable, "--profile", profile]
+    if os.name == "nt" and dsh_executable.lower().endswith((".cmd", ".bat")):
+        return ["cmd.exe", "/c", *argv]
+    return argv
+
+
+def resolve_launch_config(
+    *,
+    data_dir: Path,
+    profile: str = "acp",
+    dsh_home: Path | None = None,
+    acpx_cli: Path | None = None,
+    dsh_executable: str | None = None,
+    python_executable: str | None = None,
+    node_executable: str | None = None,
+    agent_argv_override: list[str] | None = None,
+    env: Mapping[str, str] | None = None,
+) -> LaunchConfig:
+    """Resolve every fact that decides *which programs* a real invocation launches.
+
+    No process is started and no model is reachable from here: this is path resolution plus
+    environment lookup, so ``prepare`` and ``doctor`` can call it for free. A missing client is
+    reported (``resolvable=False``) rather than raised, because a preview that died before
+    printing anything would be less useful than one that says which program is missing.
+
+    This is the one place the launch is decided. The driver is later built *from* the returned
+    object, so nothing can re-select a different interpreter after an approval was checked.
+    """
+    source = env if env is not None else os.environ
+    resolved_data_dir = Path(data_dir)
+
+    entry = _resolve_client_entry(
+        data_dir=resolved_data_dir, explicit=acpx_cli, env=source
+    )
+    resolved_dsh = dsh_executable or shutil.which("dsh") or "dsh"
+    resolved_python = python_executable or shutil.which("python") or "python"
+    resolved_node = node_executable or source.get(ENV_ACPX_NODE) or shutil.which("node") or "node"
+    # An explicit DSH home wins; otherwise the ambient one is *recorded*, because the child
+    # inherits this process's environment and would use it.
+    resolved_home = dsh_home or (Path(source["DSH_HOME"]) if source.get("DSH_HOME") else None)
+
+    resolvable = entry is not None
+    detail = "" if resolvable else (
+        "acpx CLI not found. Set HFLOW_ACPX_CLI to the acpx entry point, or install the "
+        "project-local copy the M0 probe uses. This driver never installs or upgrades it "
+        "silently."
+    )
+    return LaunchConfig(
+        driver_id=DRIVER_ID,
+        harness="dsh",
+        agent_argv=build_agent_argv(
+            dsh_executable=resolved_dsh, profile=profile, override=agent_argv_override
+        ),
+        client_argv_prefix=_client_prefix_for(entry, node=resolved_node, python=resolved_python),
+        client_entry=str(entry) if entry is not None else "",
+        node=resolved_node,
+        python=resolved_python,
+        dsh_executable=resolved_dsh,
+        profile=profile,
+        dsh_home=str(resolved_home) if resolved_home is not None else "",
+        resolvable=resolvable,
+        detail=detail,
+    )
+
+
+def _resolve_client_entry(
+    *, data_dir: Path, explicit: Path | None, env: Mapping[str, str]
+) -> Path | None:
+    """Which acpx entry point this machine has, or ``None``. Never installs anything."""
+    if explicit is not None:
+        candidate = Path(explicit)
+        return candidate if candidate.exists() else None
+    override = env.get(ENV_ACPX_CLI)
+    if override:
+        candidate = Path(override)
+        return candidate if candidate.exists() else None
+    repo_root = Path(__file__).resolve().parents[3]
+    for candidate in (data_dir / DEV_ACPX_RELATIVE, repo_root / PROBE_ACPX_RELATIVE):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _client_prefix_for(entry: Path | None, *, node: str, python: str) -> list[str]:
+    """Interpreter prefix for the client entry point, chosen by its kind."""
+    if entry is None:
+        return []
+    suffix = entry.suffix.lower()
+    if suffix in {".js", ".mjs", ".cjs"}:
+        return [node]
+    if suffix == ".py":
+        return [python, "-u"]
+    return []
+
+
 class AcpxDshDriver:
     """One implementation, one transport. It refuses rather than guessing."""
 
@@ -151,22 +262,49 @@ class AcpxDshDriver:
         completion_timeout_seconds: int = 900,
         agent_argv_override: list[str] | None = None,
         max_raw_log_bytes: int = MAX_RAW_LOG_BYTES,
+        launch: LaunchConfig | None = None,
     ) -> None:
         self.data_dir = Path(data_dir)
-        self.acpx_cli = Path(acpx_cli) if acpx_cli else self._resolve_acpx_cli()
-        self.dsh_executable = dsh_executable or shutil.which("dsh") or "dsh"
-        self.profile = profile
-        self.dsh_home = Path(dsh_home) if dsh_home else None
-        self.python_executable = python_executable or shutil.which("python") or "python"
-        self.node_executable = os.environ.get(ENV_ACPX_NODE) or shutil.which("node") or "node"
+        #: The resolved launch. Given one, this driver uses it verbatim - it does not read the
+        #: environment again, which is what makes an approval of this configuration an approval
+        #: of what actually runs. Constructed without one (a direct caller, tests), it resolves
+        #: its own from the arguments below.
+        if launch is None:
+            launch = resolve_launch_config(
+                data_dir=self.data_dir,
+                profile=profile,
+                dsh_home=dsh_home,
+                acpx_cli=acpx_cli,
+                dsh_executable=dsh_executable,
+                python_executable=python_executable,
+                agent_argv_override=agent_argv_override,
+            )
+        if launch.driver_id != DRIVER_ID:
+            raise DriverSetupError(
+                f"launch config is for driver {launch.driver_id!r}, not {DRIVER_ID!r}"
+            )
+        if not launch.resolvable:
+            raise DriverSetupError(launch.detail or "the launch could not be resolved")
+        self.launch = launch
+        self.acpx_cli = Path(launch.client_entry)
+        self.dsh_executable = launch.dsh_executable
+        self.profile = launch.profile
+        self.dsh_home = Path(launch.dsh_home) if launch.dsh_home else None
+        self.python_executable = launch.python
+        self.node_executable = launch.node
         self.extra_env = dict(extra_env or {})
         self.completion_timeout_seconds = completion_timeout_seconds
         #: Retention cap for one invocation's raw logs. A parameter rather than a constant so a
         #: test can drive the overflow path without generating 32 MiB of output.
         self.max_raw_log_bytes = max(0, int(max_raw_log_bytes))
-        #: Test seam: the agent launch argv that goes into the acpx config. ``None`` means
-        #: the real DSH launcher argv. Nothing else about the launch path is injectable.
-        self.agent_argv_override = list(agent_argv_override) if agent_argv_override else None
+        #: Test seam, resolved into ``self.launch.agent_argv`` before construction: the agent
+        #: launch argv that goes into the acpx config. It lives in the launch config rather
+        #: than beside it, so an override is part of what an approval covers instead of a
+        #: value that could differ from the recorded one. Nothing else about the launch path
+        #: is injectable.
+        self.agent_argv_override = (
+            list(agent_argv_override) if agent_argv_override else self.launch.agent_argv
+        )
         self._handles: dict[str, DriverHandle] = {}
         self._processes: dict[str, subprocess.Popen] = {}
         self._boundaries: dict[str, ProcessBoundary] = {}
@@ -211,42 +349,27 @@ class AcpxDshDriver:
 
     # -- configuration -------------------------------------------------------
 
-    def _resolve_acpx_cli(self) -> Path:
-        override = os.environ.get(ENV_ACPX_CLI)
-        if override:
-            path = Path(override)
-            if not path.exists():
-                raise DriverSetupError(f"{ENV_ACPX_CLI} points at a missing file: {path}")
-            return path
-        repo_root = Path(__file__).resolve().parents[3]
-        for candidate in (self.data_dir / DEV_ACPX_RELATIVE, repo_root / PROBE_ACPX_RELATIVE):
-            if candidate.exists():
-                return candidate
-        raise DriverSetupError(
-            "acpx CLI not found. Set HFLOW_ACPX_CLI to the acpx entry point, or install the "
-            "project-local copy the M0 probe uses "
-            f"({repo_root / PROBE_ACPX_RELATIVE}). This driver never installs or upgrades it "
-            "silently."
-        )
-
     def _agent_argv(self) -> list[str]:
-        """The launch command as a real argv, wrapped for the Windows batch shim.
-
-        Only the launcher path and the fixed profile flag live here: no task text, no nonce,
-        no user content, no credentials.
-        """
-        if self.agent_argv_override is not None:
-            return list(self.agent_argv_override)
-        argv = [self.dsh_executable, "--profile", self.profile]
-        if os.name == "nt" and self.dsh_executable.lower().endswith((".cmd", ".bat")):
-            return ["cmd.exe", "/c", *argv]
-        return argv
+        """The launcher command as a real argv, as resolved before any approval."""
+        return list(self.launch.agent_argv)
 
     def _child_env(self, handle_workspace: Path) -> dict[str, str]:
+        """The environment a child process is started with.
+
+        ``DSH_HOME`` is part of the *resolved launch*, so it is set from the bound value or
+        removed - never inherited by accident. Copying the ambient environment and only
+        overriding a non-empty bound home would leave an unset variable unset, and a
+        ``DSH_HOME`` added *after* the launch was resolved would then still reach the child:
+        the approval would say one thing and the process would do another. ``extra_env`` is
+        subject to the same rule, because it is not a way to smuggle a different launch past
+        the binding.
+        """
         env = dict(os.environ)
         env.update(self.extra_env)
-        if self.dsh_home is not None:
-            env["DSH_HOME"] = str(self.dsh_home)
+        if self.launch.dsh_home:
+            env["DSH_HOME"] = self.launch.dsh_home
+        else:
+            env.pop("DSH_HOME", None)
         env.setdefault("PYTHONIOENCODING", "utf-8")
         return env
 
@@ -263,6 +386,11 @@ class AcpxDshDriver:
         ]
         if self.dsh_home is not None:
             notes.append(f"probe DSH_HOME: {self.dsh_home}")
+        else:
+            notes.append(
+                "probe DSH_HOME: none bound, so DSH_HOME is removed from the child environment "
+                "rather than inherited"
+            )
         return CapabilityReport(
             driver_id=DRIVER_ID,
             driver_version=DRIVER_VERSION,
@@ -371,13 +499,8 @@ class AcpxDshDriver:
         }
 
     def _client_prefix(self) -> list[str]:
-        """Interpreter prefix for the client entry point, chosen by its kind."""
-        suffix = self.acpx_cli.suffix.lower()
-        if suffix in {".js", ".mjs", ".cjs"}:
-            return [self.node_executable]
-        if suffix == ".py":
-            return [self.python_executable, "-u"]
-        return []
+        """Interpreter prefix for the client entry point, as resolved before any approval."""
+        return list(self.launch.client_argv_prefix)
 
     def start_handle(self, request: InvocationRequest) -> DriverHandle:
         """Launch one invocation and return immediately with an observable handle."""

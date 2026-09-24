@@ -52,18 +52,33 @@ property of "the controller", and upgrading a dependency invalidates it until re
 ## What works today
 
 ```text
-read TaskSpec -> deterministic admission -> SQLite create-or-reuse run
-  -> transactional budget reservation -> driver invocation (fake, or acpx -> DSH ACP)
-  -> verification evidence over a frozen candidate -> independent review verdict
-  -> controller-generated ResultReceipt -> status / report
+MachineProfile (per role) ─┐
+TaskSpec ──────────────────┼─> one resolution ─┬─> hflow prepare   (zero model, no state)
+ProjectConfig ─────────────┘                   └─> hflow run       (same config, same binding)
+                                                   -> deterministic admission
+                                                   -> SQLite create-or-reuse run
+                                                   -> transactional budget reservation
+                                                   -> driver invocation per role
+                                                   -> verification evidence over a frozen candidate
+                                                   -> independent review verdict
+                                                   -> controller-generated ResultReceipt
+                                                   -> status / report
 ```
 
-Both drivers run through the same controller; `--driver fake` is the offline one, and the real
-one needs an authorization artifact (see `docs/operations.md`). Admission now refuses a spec it
-cannot honour - an unanswered or failed reuse/adapt fit test, a delivery level this build
-cannot reach, a non-empty `dependencies` list this build cannot schedule, a real delivery whose
-approved checks are `kind=fake`, a write task with no isolated worktree or no write opt-in, and
-a task that needs a review but reserves only one turn - instead of warning and delivering less.
+Admission refuses a spec it cannot honour - an unanswered or failed reuse/adapt fit test, a
+delivery level this build cannot reach, a non-empty `dependencies` list this build cannot
+schedule, a real delivery whose approved checks are `kind=fake`, a write task with no isolated
+worktree or no write opt-in, and a task that needs a review but reserves only one turn -
+instead of warning and delivering less.
+
+A machine profile (`<data-dir>/profiles/<id>.json`) binds `implementer` and `reviewer`
+independently: agent, transport, model selection and capability record per role. An unknown
+profile, an unreadable one, a role the profile does not bind, a driver name this build does not
+implement, a harness no implemented driver launches, or a profile that mixes the offline fake
+with a real transport all **refuse** - there is no default binding and no fallback. `hflow
+prepare` resolves exactly what `run` will use and prints it before anything is dispatched,
+including the **resolved launch** (client entry point, interpreter, launcher argv, DSH
+home/profile).
 
 Each invocation also receives a complete **role input packet** rendered by the controller from
 recorded facts (goal, acceptance criteria, write scope, candidate identity for the reviewer,
@@ -92,13 +107,16 @@ being tested, so they are recorded rather than asserted:
 | Snapshot | Command | Result |
 |---|---|---|
 | `9483a84` with the uncommitted T02 admission patch and its new tests | `python -m pytest -q` | `225 passed, 1 skipped in 131.85s` (exit 0) |
-| current working tree with the batch A close-out, batch B (re-check fixes) and the batch C package checks (uncommitted) | `python -m pytest -q` | `298 passed, 1 skipped in 190.18s` (exit 0) |
-| the same working tree (collection only, nothing executed) | `python -m pytest -q --collect-only` | `299 tests collected` |
+| the batch A/B/C working tree (uncommitted) | `python -m pytest -q` | `298 passed, 1 skipped in 190.18s` (exit 0) |
+| current working tree with the batch D configuration wiring and its corrections (uncommitted) | `python -m pytest -q` | `353 passed, 1 skipped in 192.25s` (exit 0) |
 
-The last two rows are this working tree, not a commit; the committed HEAD (`86bc34b`) was not
-re-measured on its own - its recorded count was `238 passed, 1 skipped`, which predates the batch A
-and B tests. The collected total is one higher than the executed total because a test that skips
-itself still counts as collected.
+The last row is this working tree, not a commit; the committed HEAD (`5382470`) was not
+re-measured on its own. Before this batch's tests were added the same tree measured
+`299 passed, 1 skipped`, so the batch adds 54: machine-profile loading and its refusals, the
+zero-model `prepare` preview, per-role dispatch through two configured drivers, the
+effective-configuration and resolved-launch halves of the authorization binding, the dispatch
+preconditions `prepare` shares with the run's own gate, and the two checks that the child
+process really receives the launch that was bound.
 
 Four tests skip themselves when their precondition is absent rather than pretending to pass:
 the directory-link test in `test_contracts.py` (the skip seen above), the installed-acpx test in
@@ -111,23 +129,31 @@ missing, not that the suite failed.
 
 ```sh
 hflow doctor   --json                     # read-only environment probe, no model calls
+hflow doctor   --profile dsh-local        # resolve a profile per role; non-zero if unusable
+hflow prepare  --task t.json --profile dsh-local   # zero-model preview: config, admission,
+                                                   # scope, checks, budget, packet preview
 hflow run      --task examples/task.json --project-root . --driver fake --json
+hflow run      --task t.json --profile dsh-local --authorization-file auth.json --json
 hflow status   R-xxxxxxxxxx               # pure SQLite read, zero model calls
-hflow report   R-xxxxxxxxxx --json        # receipt + evidence, zero model calls
+hflow report   R-xxxxxxxxxx --json        # receipt + evidence + the config it ran under
 hflow resume   R-xxxxxxxxxx               # reconcile an interrupted attempt; never re-dispatches
 hflow cancel   R-xxxxxxxxxx
 hflow clean    R-xxxxxxxxxx               # preview releasing the run's worktree
 hflow clean    R-xxxxxxxxxx --apply       # remove it; the candidate and receipt are kept
-hflow schema                              # generated JSON Schema for every contract
+hflow schema                              # generated JSON Schema, MachineProfile included
 ```
 
-An offline M2 candidate end to end, including cleanup, is runnable as a demo:
+`prepare` is the intended first step for any task: it answers "what would this run actually do?"
+without a model, without a run row, without a workspace and without an authorization. It exits
+`2` when admission **or a dispatch precondition** would refuse, and still prints the whole
+preview. It never mints an approval - the binding it prints is what an approval would have to
+cover (`creates_authorization` is pinned to `false`).
 
-```sh
-python examples/m2_cli_demo.py
-```
+`--profile` (or `HFLOW_PROFILE`) is the only source of per-role bindings, and `--driver` must
+agree with it when both are given. Neither present means `--driver fake`, the offline default.
+Precedence is defined once, in `profiles.requested_profile_id`.
 
-Runtime data (SQLite, evidence) goes to `%LOCALAPPDATA%\HFlow` on Windows or
+Runtime data (SQLite, evidence, profiles) goes to `%LOCALAPPDATA%\HFlow` on Windows or
 `$XDG_DATA_HOME/hflow` elsewhere; override with `--data-dir` or `HFLOW_DATA_DIR`.
 It never lands inside a project checkout.
 
@@ -144,7 +170,7 @@ python -c "import sys; sys.path.insert(0,'src'); from hflow.cli import main; rai
 | Kind | Location | Notes |
 |---|---|---|
 | Project contract | `<repo>/.hflow/project.json` | approved checks, deny paths, limits; versioned with the project |
-| Machine binding | not implemented yet | the schemas exist (`MachineProfile`, `AgentBinding`, `CapabilityReport`) and a driver is resolved from a binding, but no profile file is loaded from disk yet |
+| Machine binding | `<data-dir>/profiles/<id>.json` | `MachineProfile`: per-role agent, transport, model selection, limits. Loaded by `profiles.py`; `hflow prepare` / `run --profile` / `doctor --profile` all resolve it. Never versioned with a project, and never read from inside a checkout |
 | Runtime data | platform data dir | SQLite plus evidence references; outside the repo |
 
 `contracts.py` is the single definition of every structure; JSON Schema is generated
@@ -181,6 +207,30 @@ from it (`hflow schema`). There is no second hand-written schema to drift.
   not require it. Only both saying no may skip it.
 - An unknown outcome blocks and never auto-retries.
 - Verification is bound to a candidate fingerprint and a checks digest.
+- The implementer and the reviewer are resolved from the profile **independently** and
+  dispatched through their own driver object; a role the profile does not bind is refused rather
+  than inheriting the other's agent. A binding's declared **harness** must be one its driver
+  actually launches, so a profile cannot record `codex` next to a driver whose every process is
+  DSH.
+- `prepare` and `run` derive everything - task overrides, project contract, role bindings,
+  driver names, the resolved launch, write permission, admission - from one resolution
+  (`prepare.resolve_run`), so a preview cannot describe a configuration the run does not execute.
+- `prepare` exits non-zero both for a task admission refuses **and** for a dispatch precondition
+  a run would refuse on (a write scope with no worktree or no write opt-in, a required review the
+  budget cannot cover, a launch this machine cannot resolve). Reporting "ready" for a task the
+  run refuses would be answering a different question than the user asked.
+- An authorization binds the **effective configuration**, not just the task: profile, per-role
+  agents and drivers, model selections, limits, write permission, and the *resolved launch* -
+  the client entry point, the interpreter that starts it, the launcher argv and the DSH
+  home/profile. Changing any of them - including `HFLOW_ACPX_NODE` or `HFLOW_ACPX_CLI` - changes
+  the digest and the old approval stops applying. The launch is resolved once and then consumed
+  by the driver, never re-selected after the check: a bound `DSH_HOME` is set on every child
+  process, and a launch that bound none has it *removed* from the child environment rather than
+  inherited. An artifact written before config binding still loads and still keys its own ledger
+  row, but it cannot authorize a run that resolved a configuration.
+- A run records the configuration it executed under, once; `status` and `report` read it back,
+  and a run that predates it says "not recorded" instead of being back-filled from whatever is
+  configured now.
 - A delivery can be recorded as a **later decision** about an execution that already ended (an
   offline reprocessing of recorded evidence). Such a receipt carries `provenance` naming the
   original decision, its build and the evidence it came from, and `report` prints that next to
@@ -196,6 +246,27 @@ integration/publish delivery; reuse-research automation; teams and native subage
 billing observation; metrics against a direct-DSH baseline. A reviewer's answer is read as
 text and decoded against the contract - the harness is not asked for structured output, and no
 model is ever asked to repair a malformed verdict.
+
+Not built around configuration either:
+
+- **A profile selects which agent, transport and permission each role uses. It does not yet
+  select the model inside a DSH launch.** The launcher still starts the DSH profile its driver
+  was built with; `model_selection` is recorded, reported and bound by an approval, but it is
+  not passed as a launcher flag. `hflow doctor --profile <id>` prints the exact resolved argv.
+- **No `hflow init`.** A project contract is still hand-written, and no `--format markdown`
+  handoff renderer or `hflow repair` / `hflow integrate` command exists. `resume` still only
+  reconciles.
+- **The reviewer's live invocation cannot be stopped separately.** `cancel` targets the
+  attempt's implementer invocation; a reviewer bound to the same driver is covered by the same
+  process boundary, but a stop that arrives while the review is running is not yet routed to the
+  reviewer's own invocation.
+- **An offline profile is all-or-nothing.** A profile may bind every role to the offline fake
+  (for development) or every role to a real transport; mixing the two is refused rather than
+  half-scripted.
+- **The launch is bound by paths and argv, not by program content.** A run records *which*
+  client entry point, interpreter and launcher it will start; it does not hash those programs, so
+  replacing a file at the same path does not change the approval. Version or content identity of
+  the client remains part of the capability record, not of the binding.
 
 Not verified, even where something works on one binding:
 

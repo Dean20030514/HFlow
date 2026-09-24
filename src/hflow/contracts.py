@@ -381,6 +381,106 @@ class MachineProfile(BaseModel):
         return self
 
 
+class LaunchConfig(BaseModel):
+    """The concrete program launch a role's driver will perform.
+
+    Why this exists: the logical binding ("driver acpx-dsh") does not decide which programs
+    actually run. The client entry point, the interpreter that starts it, the launcher path,
+    its fixed flags and the DSH home/profile all come from the machine and the environment.
+    An approval that covered only the logical name would still be an approval of *something
+    else* once one of those changed.
+
+    So they are resolved once, before an approval, and then **consumed** rather than
+    re-derived: :meth:`EffectiveConfig.digest` covers them, and the driver is built from this
+    object instead of reading the environment a second time.
+
+    Nothing secret belongs here and nothing does - the argv carries only program paths and
+    fixed flags (rule 9). Task text, nonces and credentials never reach this structure.
+    """
+
+    model_config = Strict
+
+    driver_id: str
+    harness: str
+    #: Launcher command line: the program that hosts the agent, plus fixed flags only.
+    agent_argv: list[str] = Field(default_factory=list)
+    #: Interpreter prefix for the client entry point (for example ``[node]`` or ``[python,-u]``).
+    client_argv_prefix: list[str] = Field(default_factory=list)
+    #: The client entry point itself (the acpx CLI file).
+    client_entry: str = ""
+    node: str = ""
+    python: str = ""
+    dsh_executable: str = ""
+    #: The DSH profile the launcher starts with, and the DSH home it will use ("" = ambient).
+    profile: str = ""
+    dsh_home: str = ""
+    #: False when a program this launch needs could not be resolved on this machine. Recorded
+    #: rather than raised so a preview can report the missing dependency instead of failing
+    #: before it has said anything; the launch itself still refuses.
+    resolvable: bool = True
+    detail: str = ""
+
+
+class RoleConfig(BaseModel):
+    """One role's binding as resolved, including the driver id it will actually construct.
+
+    ``driver`` is the name the profile wrote (possibly an alias); ``driver_id`` is what that
+    name resolves to. Recording both is what makes "the config was accepted" checkable
+    instead of assumed.
+    """
+
+    model_config = Strict
+
+    role: str
+    agent: str
+    harness: str
+    driver: str
+    driver_id: str
+    model_selection: str = "native_profile"
+    capability_record: str = ""
+    #: Present for a driver that launches a program; ``None`` for the offline fake, which
+    #: starts nothing.
+    launch: LaunchConfig | None = None
+
+
+class EffectiveConfig(BaseModel):
+    """The configuration a run will *actually* use, resolved once.
+
+    Why it is a contract and not a debug print: ``prepare`` shows it and ``run`` consumes it,
+    so a preview cannot describe a different configuration than the one that executes.
+    :meth:`digest` is what an approval binds - changing the profile, a role's model selection
+    or the write permission changes the digest, so an earlier approval stops covering the run
+    instead of being silently reused.
+    """
+
+    model_config = Strict
+
+    #: Where the bindings came from: a machine profile file, or the command line alone.
+    source: Literal["machine_profile", "command_line"]
+    profile_id: str = ""
+    profile_digest: str = ""
+    roles: list[RoleConfig] = Field(default_factory=list)
+    security_mode: Literal["trusted_local", "restricted", "unknown"] = "unknown"
+    limits: ProfileLimits = Field(default_factory=ProfileLimits)
+    #: Permission facts, decided from the run's own mode plus an explicit local opt-in and
+    #: recorded here so the approval covers them. A reviewer never writes.
+    implementer_writes: bool = False
+    reviewer_writes: bool = False
+
+    def role(self, name: str) -> RoleConfig | None:
+        for entry in self.roles:
+            if entry.role == name:
+                return entry
+        return None
+
+    def driver_ids(self) -> list[str]:
+        return [entry.driver_id for entry in self.roles]
+
+    def digest(self) -> str:
+        """Identity of this configuration. Stable across processes, JSON-order independent."""
+        return digest_of(self.model_dump(mode="json"))
+
+
 # --------------------------------------------------------------------------
 # Driver-facing contracts (plan 16.3). Agents never see TaskState.
 # --------------------------------------------------------------------------
@@ -792,6 +892,110 @@ class RunSummary(BaseModel):
     updated_at: str
 
 
+# --------------------------------------------------------------------------
+# Zero-model preparation (`hflow prepare`). A preview, never an authorization.
+# --------------------------------------------------------------------------
+
+
+class PlannedCheck(BaseModel):
+    """One approved check this task will run, and which acceptance criteria need it."""
+
+    model_config = Strict
+
+    check: CheckDef
+    required_by: list[str] = Field(default_factory=list)
+
+
+class BudgetPlan(BaseModel):
+    """What this task's fixed loop reserves, before anything is spent.
+
+    ``required_turns`` is implementer + reviewer, because the two are separate dispatches with
+    separate reservations. It is what an authorization has to cover: a task whose review is
+    required while only one submission is authorized is refused before the first invocation,
+    and this is the number that says so in advance.
+    """
+
+    model_config = Strict
+
+    implementer_turns: int = 0
+    reviewer_turns: int = 0
+    repair_cycles: int = 0
+    required_turns: int = 0
+    task_turn_budget: int = 0
+    project_turn_limit: int = 0
+    within_budget: bool = False
+    detail: str = ""
+
+
+class PendingAuthorization(BaseModel):
+    """The approval this run would need. Deliberately *not* an authorization artifact.
+
+    It carries the exact binding ``verify_authorization`` will compare, so a user can approve
+    a configuration they have actually seen. It carries no ``user_text`` and no
+    ``provided_by``: only the user's own approval produces those, and nothing in this build
+    mints one from a preview. ``creates_authorization`` is pinned to ``False`` so that
+    promise is checkable rather than asserted.
+    """
+
+    model_config = Strict
+
+    required: bool = False
+    creates_authorization: Literal[False] = False
+    mode: str = ""
+    driver: str = ""
+    binding_digest: str = ""
+    binding: dict[str, Any] = Field(default_factory=dict)
+    max_top_level_submissions_required: int = 0
+
+
+class PrepareReport(BaseModel):
+    """Everything a task's execution can be known to cost and to require, before dispatch.
+
+    ``model_calls_made`` is pinned to ``0``: a preview that could spend a model request would
+    be a different feature. Whether the configuration is *usable* lives in ``effective_config``
+    (resolved) and ``admission`` (the same gate ``run`` applies).
+    """
+
+    model_config = Strict
+
+    schema_version: int = SCHEMA_VERSION
+    task_id: str
+    task_revision: int
+    spec_digest: str
+    spec_path: str
+    project_id: str
+    project_root: str
+    #: Where the work would happen. For a worktree run the run id is chosen at dispatch, so
+    #: this is the path template and ``execution_root_is_final`` is False.
+    execution_root: str = ""
+    execution_root_is_final: bool = False
+    workspace_mode: str = "in_place"
+    driver_mode: Literal["offline", "live"] = "offline"
+    effective_config: EffectiveConfig
+    #: ``effective_config.digest()``, carried explicitly so the JSON preview and the run report
+    #: can be compared without either side re-deriving it.
+    effective_config_digest: str = ""
+    admission: ValidationReport
+    #: Problems that are knowable before a dispatch from the spec, the contract and this
+    #: machine's resolved launch - the same list the run's own dispatch gate uses. They are
+    #: kept apart from ``admission`` because they are a different class of fact ("this task is
+    #: defined in a way this build cannot honour" versus "this machine cannot run it now"), and
+    #: a preview that called one of them "admitted" would be answering the wrong question.
+    dispatch_preconditions: list[ValidationIssue] = Field(default_factory=list)
+    write_allow: list[str] = Field(default_factory=list)
+    write_deny: list[str] = Field(default_factory=list)
+    checks: list[PlannedCheck] = Field(default_factory=list)
+    budget: BudgetPlan = Field(default_factory=BudgetPlan)
+    roles: list[str] = Field(default_factory=list)
+    #: role -> what that role's input packet will contain, rendered from the same facts the
+    #: controller uses. The reviewer's packet embeds the frozen candidate identity, which does
+    #: not exist yet, so it is reported as rendered-at-dispatch instead of being invented here.
+    packet_preview: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    authorization: PendingAuthorization = Field(default_factory=PendingAuthorization)
+    model_calls_made: Literal[0] = 0
+    notes: list[str] = Field(default_factory=list)
+
+
 class EvidenceRecord(BaseModel):
     model_config = Strict
 
@@ -845,4 +1049,8 @@ class RunInspection(BaseModel):
     attempts: list[AttemptRecord] = Field(default_factory=list)
     evidence: list[EvidenceRecord] = Field(default_factory=list)
     receipt: ResultReceipt | None = None
+    #: The configuration this run actually used, as recorded when the run row was created.
+    #: ``None`` for a run that predates config binding: reported as "not recorded" rather
+    #: than back-filled from whatever configuration happens to be current now.
+    effective_config: EffectiveConfig | None = None
     model_calls_made: int = 0

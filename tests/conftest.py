@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from hflow.contracts import (
     DeliveryRequirement,
     MachineProfile,
     ProjectConfig,
+    ProfileLimits,
     ProjectLimits,
     ReuseDecision,
     ReuseStatus,
@@ -21,6 +23,7 @@ from hflow.contracts import (
     RunRequest,
     Scope,
     TaskSpec,
+    WorkspaceSpec,
 )
 from hflow.controller import Controller
 from hflow.drivers.fake import FakeDriver, FakeScript
@@ -29,6 +32,37 @@ from hflow.store import Store
 from hflow.verify import CheckRunners, FakeCheckRunner
 
 PROJECT_ID = "demo-project"
+
+#: The checked-in stand-in for the acpx client. A test that resolves a *real* binding needs the
+#: launcher to resolve, and the real acpx install is machine-local (`.probe/` is not committed),
+#: so tests point at this file instead. Nothing here is a compatibility proof.
+FAKE_ACPX_CLIENT = Path(__file__).resolve().parent / "fixtures" / "fake_acpx_client.py"
+
+
+@pytest.fixture()
+def acpx_client(monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Make the production launch resolve to the checked-in client stand-in.
+
+    Without this, whether a live binding resolves would depend on what happens to be installed
+    on the machine running the tests.
+    """
+    monkeypatch.setenv("HFLOW_ACPX_CLI", str(FAKE_ACPX_CLIENT))
+    monkeypatch.delenv("HFLOW_ACPX_NODE", raising=False)
+    return FAKE_ACPX_CLIENT
+
+
+@pytest.fixture()
+def worktree_task(task_spec: TaskSpec) -> TaskSpec:
+    """The same task as an isolated real delivery: a worktree with a fixed base commit.
+
+    A task that declares write paths cannot run in place, so this is the shape a real
+    (production) run has to have - and the shape a preview must be exercised against.
+    """
+    return task_spec.model_copy(
+        update={
+            "workspace": WorkspaceSpec(mode="worktree", base_commit="0" * 40),
+        }
+    )
 
 
 @pytest.fixture()
@@ -82,6 +116,23 @@ def task_spec() -> TaskSpec:
         review=ReviewRequirement(required=True),
         delivery=DeliveryRequirement(mode="local_candidate"),
         budget=BudgetRequest(max_agent_turns=4, max_repair_cycles=1),
+    )
+
+
+@pytest.fixture()
+def live_project(project: ProjectConfig) -> ProjectConfig:
+    """The same contract with approved *command* checks: what a real delivery requires.
+
+    Admission refuses ``kind=fake`` for a real Harness run, so a live-profile test needs a
+    project whose checks actually execute something.
+    """
+    return project.model_copy(
+        update={
+            "checks": [
+                CheckDef(id="unit", kind="command", argv=[sys.executable, "-c", "pass"]),
+                CheckDef(id="docs-check", kind="command", argv=[sys.executable, "-c", "pass"]),
+            ]
+        }
     )
 
 
@@ -153,6 +204,38 @@ def profile() -> MachineProfile:
 def write_task(path: Path, spec: TaskSpec) -> Path:
     path.write_text(json.dumps(spec.model_dump(mode="json"), indent=2), encoding="utf-8")
     return path
+
+
+def write_profile(data_dir: Path, profile: MachineProfile) -> Path:
+    """Write one machine profile where the loader looks for it."""
+    path = data_dir / "profiles" / f"{profile.profile_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(profile.model_dump(mode="json"), indent=2), encoding="utf-8")
+    return path
+
+
+@pytest.fixture()
+def live_profile() -> MachineProfile:
+    """Two roles, two agents, two model selections: what per-role binding is for."""
+    return MachineProfile(
+        profile_id="dsh-local",
+        role_bindings={"implementer": "dsh-implementer", "reviewer": "dsh-reviewer"},
+        agents={
+            "dsh-implementer": {
+                "harness": "dsh",
+                "driver": "acpx-dsh",
+                "model_selection": "implementer-model",
+                "capability_record": "local-capability-record-id",
+            },
+            "dsh-reviewer": {
+                "harness": "dsh",
+                "driver": "acpx-dsh",
+                "model_selection": "reviewer-model",
+                "capability_record": "local-capability-record-id",
+            },
+        },
+        limits=ProfileLimits(max_parallel_workers=1, max_native_children=0),
+    )
 
 
 def unit_only(spec: TaskSpec) -> TaskSpec:

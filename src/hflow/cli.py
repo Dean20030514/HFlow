@@ -15,8 +15,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .admission import validate_task_spec
 from .contracts import (
+    CapabilityState,
     InvocationOutcome,
     ProjectConfig,
     RefusalCode,
@@ -30,8 +30,11 @@ from .contracts import (
 )
 from .controller import Controller, RunOutcome, inspect_run
 from .drivers.fake import FakeDriver, FakeScript
+from .drivers.acpx_dsh import DriverSetupError
 from .drivers.selected import default_refusal_reason, local_probe
 from .paths import database_path, default_data_dir
+from . import profiles
+from .profiles import ENV_PROFILE
 from .report import report_json, report_text
 from .runtime import controller_build
 from .store import RunNotFound, Store
@@ -124,27 +127,152 @@ def _outcome_exit_code(outcome: RunOutcome) -> int:
 # --------------------------------------------------------------------------
 
 
+def _doctor_profile_section(
+    data_dir: Path, requested: str, source: str
+) -> tuple[dict[str, object], int]:
+    """Resolve the named profile and report whether it is usable. No model, no launch.
+
+    Three states stay distinguishable, which is the whole point of this section: no profile
+    was named, a profile was named but cannot be used, or a profile was named and resolved.
+    The third reports each role's agent, driver and the dependencies that driver needs - so
+    "the config is selected" and "the config can actually start something" are separate,
+    visible answers rather than one optimistic one.
+    """
+    section: dict[str, object] = {
+        "requested": requested,
+        "requested_via": source,
+        "selected": bool(requested),
+        "usable": False,
+        "path": str(profiles.profile_path(data_dir, requested)) if requested else "",
+        "detail": "no machine profile selected",
+        "roles": {},
+    }
+    if not requested:
+        return section, EXIT_OK
+    try:
+        profile = profiles.load_profile(data_dir, requested)
+        bindings = profiles.resolve_role_bindings(profile)
+    except RefusedError as exc:
+        section["detail"] = exc.message
+        return section, EXIT_REFUSED
+
+    from .drivers.selected import build_driver, resolve_driver_id
+
+    roles: dict[str, object] = {}
+    dependency_problems: list[str] = []
+    for role, (agent_id, binding) in bindings.items():
+        entry: dict[str, object] = {
+            "agent": agent_id,
+            "harness": binding.harness,
+            "driver": binding.driver,
+            "model_selection": binding.model_selection,
+            "capability_record": binding.capability_record,
+        }
+        try:
+            driver_id = resolve_driver_id(binding)
+            entry["driver_id"] = driver_id
+        except RefusedError as exc:
+            entry["driver_id"] = None
+            entry["usable"] = False
+            entry["detail"] = exc.message
+            dependency_problems.append(f"{role}: {exc.message}")
+            roles[role] = entry
+            continue
+        if driver_id == "fake":
+            # Building the offline driver would create its scratch directory; there is no
+            # external dependency to prove either, so nothing is constructed here.
+            entry["usable"] = True
+            entry["dependencies"] = ["none (offline fake driver: no model, no external client)"]
+            roles[role] = entry
+            continue
+        try:
+            instance = build_driver(binding, data_dir=data_dir)
+        except Exception as exc:  # noqa: BLE001 - an unusable binding is a report, not a crash
+            entry["usable"] = False
+            entry["detail"] = f"{type(exc).__name__}: {exc}"
+            dependency_problems.append(f"{role}: {exc}")
+        else:
+            probe = instance.probe(binding)  # type: ignore[attr-defined]
+            entry["usable"] = True
+            entry["dependencies"] = list(probe.notes)
+            entry["probe_only"] = probe.probe_only
+            entry["live_tested"] = probe.live_tested
+        roles[role] = entry
+
+    section["roles"] = roles
+    section["profile_id"] = profile.profile_id
+    section["profile_digest"] = profiles.profile_digest(profile)
+    section["security_mode"] = profile.security_mode
+    section["limits"] = profile.limits.model_dump(mode="json")
+    section["usable"] = not dependency_problems
+    section["detail"] = (
+        "every bound role resolved"
+        if not dependency_problems
+        else "; ".join(dependency_problems)
+    )
+    return section, (EXIT_OK if not dependency_problems else EXIT_REFUSED)
+
+
+def _capability_section(probe: object) -> dict[str, object]:
+    """Group the capability record so "verified" and "unknown" cannot be read as one list.
+
+    The states keep their existing meaning and none of them is upgraded here: ``probed`` and
+    ``enforced`` are the observed ones, ``documented`` is upstream documentation only,
+    ``unsupported`` is a known absence and ``unknown`` was never observed. The record is a
+    static table from the selected driver's ``probe``, so it is labelled as such - doctor
+    itself observes executables and file presence, not a live model round.
+    """
+    states: dict[str, list[str]] = {state.value: [] for state in CapabilityState}
+    for name, state in getattr(probe, "capabilities", {}).items():
+        states[state.value].append(name)
+    for names in states.values():
+        names.sort()
+    return {
+        "record": "static capability table from the selected driver's probe",
+        "source": "src/hflow/drivers/acpx_dsh.py::AcpxDshDriver.probe",
+        "evidence": "docs/m0-results.md, docs/adr/0001-transport.md",
+        "observed_here": ["probed", "enforced"],
+        "documented_only": ["documented"],
+        "known_absent": ["unsupported"],
+        "not_observed": ["unknown"],
+        "probe_only": getattr(probe, "probe_only", True),
+        "live_tested": getattr(probe, "live_tested", False),
+        "states": states,
+        "meaning": {
+            "probed": "behaviour observed locally on this machine; the observation is recorded "
+            "in the evidence above, not made by this doctor run",
+            "enforced": "observed and constrained by this code, not merely observed",
+            "documented": "claimed by upstream documentation only; not observed here",
+            "unsupported": "known not to work on this launch path",
+            "unknown": "never observed; no value is claimed",
+        },
+    }
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Read-only environment probe. Never installs, never modifies global config."""
     data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
+    profile_source = (
+        "--profile"
+        if args.profile
+        else (ENV_PROFILE if os.environ.get(ENV_PROFILE) else "none")
+    )
+    requested_profile = profiles.requested_profile_id(args.profile)
     report: dict[str, object] = {
         "python": sys.version.split()[0],
         "executables": {},
         "dsh_profiles": [],
         "data_dir": str(data_dir),
         "data_dir_writable": os.access(data_dir.parent if not data_dir.exists() else data_dir, os.W_OK),
-        "selected_driver": "unselected",
-        "driver_status": "NOT_LIVE_TESTED",
         "notes": [
-            default_refusal_reason(),
-            "doctor performed no model calls and did not boot any DSH profile",
+            "doctor performed no model calls, built no run and did not boot any DSH profile",
         ],
     }
     executables = report["executables"]
     assert isinstance(executables, dict)
     for name in ("python", "git", "dsh", "acpx", "node"):
         found = shutil.which(name)
-        entry: dict[str, object] = {"path": found}
+        entry: dict[str, object] = {"path": found, "available": bool(found)}
         if found and name in {"git", "dsh", "node"}:
             try:
                 completed = subprocess.run(  # noqa: S603 - fixed, read-only version probes
@@ -171,6 +299,34 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     probe = local_probe()
     report["capability_record"] = probe.model_dump(mode="json")
+    report["capabilities"] = _capability_section(probe)
+
+    profile_section, profile_exit = _doctor_profile_section(
+        data_dir, requested_profile, profile_source
+    )
+    report["profile"] = profile_section
+    if requested_profile and profile_section.get("usable"):
+        implementer = (profile_section.get("roles") or {}).get("implementer", {})  # type: ignore[union-attr]
+        report["selected_driver"] = implementer.get("driver_id") or "unresolved"
+        report["driver_status"] = "RESOLVED_FROM_PROFILE"
+    elif requested_profile:
+        report["selected_driver"] = "unresolved"
+        report["driver_status"] = "PROFILE_NOT_USABLE"
+    else:
+        # Not "unselected" as a defect: no profile was named. A live run needs one, and saying
+        # so is different from saying a binding exists.
+        report["selected_driver"] = "none"
+        report["driver_status"] = "NO_PROFILE_SELECTED"
+        report["notes"].append(  # type: ignore[union-attr]
+            f"no machine profile selected: pass --profile <id> or set {ENV_PROFILE}. "
+            "`--driver fake` remains the offline default."
+        )
+        # Why nothing runs unattended by default, stated where a reader looks for it.
+        report["notes"].append(default_refusal_reason())  # type: ignore[union-attr]
+    report["notes"].append(  # type: ignore[union-attr]
+        "capability states are the recorded table, not a live compatibility proof; doctor "
+        "observed only executables and file presence"
+    )
 
     if args.json:
         print(canonical_json(report))
@@ -182,46 +338,132 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"dsh home      {report.get('dsh_home', 'not found')}")
         print(f"dsh profiles  {', '.join(report['dsh_profiles']) or 'none'}")  # type: ignore[arg-type]
         print(f"data dir      {report['data_dir']} (writable={report['data_dir_writable']})")
+        print(
+            f"profile       {profile_section['requested'] or '(none selected)'} "
+            f"[via {profile_section['requested_via']}] "
+            f"{'usable' if profile_section['usable'] else 'NOT USABLE'}"
+        )
+        if not profile_section["usable"]:
+            print(f"  detail      {profile_section['detail']}")
+        for role, entry in (profile_section.get("roles") or {}).items():  # type: ignore[union-attr]
+            state = "usable" if entry.get("usable") else "NOT USABLE"
+            print(
+                f"  {role:<11} agent={entry.get('agent')} driver={entry.get('driver')} "
+                f"-> {entry.get('driver_id') or 'unresolved'} [{state}]"
+            )
+            if entry.get("detail"):
+                print(f"               {entry['detail']}")
+            for dependency in entry.get("dependencies") or []:
+                print(f"               dep  {dependency}")
         print(f"driver        {report['selected_driver']} [{report['driver_status']}]")
+        capability_states = report["capabilities"]["states"]  # type: ignore[index]
+        for state in ("probed", "enforced", "documented", "unsupported", "unknown"):
+            names = ", ".join(capability_states[state]) or "-"
+            print(f"cap {state:<11} {names}")
         for note in report["notes"]:  # type: ignore[union-attr]
             print(f"note          {note}")
-    return EXIT_OK
+    return profile_exit
 
 
-def _zero_model_preflight(driver: object, args: argparse.Namespace):
-    """A cheap, model-free check that the launch binding works, run before any dispatch.
+def cmd_prepare(args: argparse.Namespace) -> int:
+    """Zero-model resolution of one task: what would run, under which config, for how much.
+
+    This command exists so a task can be read *before* it is approved. It resolves the same
+    inputs `run` does - through the same function - and reports the effective configuration,
+    the admission problems, the write scope, the approved checks, the budget the fixed loop
+    needs and a preview of the implementer's input packet.
+
+    It creates nothing: no run row, no workspace, no SQLite database, no authorization. The
+    binding it prints is what an approval *would* have to cover; producing the approval itself
+    is the user's action, and `creates_authorization` is pinned to false so that promise is
+    checkable rather than asserted.
+    """
+    from .prepare import build_prepare_report, render_prepare_text, resolve_run
+
+    data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
+    resolved = resolve_run(
+        task_path=Path(args.task),
+        project_root=Path(args.project_root),
+        data_dir=data_dir,
+        project_path=Path(args.project) if args.project else None,
+        profile_id=args.profile,
+        driver=args.driver,
+        base_commit=args.base_commit,
+        workspace_mode=args.workspace,
+    )
+    report = build_prepare_report(resolved, authorization_mode=args.authorization_mode)
+    if args.json:
+        print(canonical_json(report.model_dump(mode="json")))
+    else:
+        print(render_prepare_text(report))
+    # "Will this run?" is the question prepare is asked, so anything the run itself would
+    # refuse on has to reach the exit code: the admission gate *and* the dispatch gate. A
+    # preview that reported success for a task a run refuses would be worse than no preview.
+    return EXIT_OK if resolved.ready_to_dispatch else EXIT_REFUSED
+
+
+def _zero_model_preflight(role_drivers: dict[str, object]):
+    """A cheap, model-free check that every role's launch binding works, before any dispatch.
 
     For the selected transport this launches the installed client with a metadata argument -
     no session, no prompt, no credential - which is exactly the failure mode that cost a
     submission in an earlier round. It runs once per real invocation, and its result is
     returned rather than logged, so a failure refuses the run instead of warning about it.
+
+    Every distinct role driver is checked, and the failure names the role: with per-role
+    bindings the reviewer can use a different configuration than the implementer, and a broken
+    reviewer binding must be discovered here rather than after the implementer has been paid for.
     """
+    checked: list[tuple[str, object]] = []
+    for role, instance in role_drivers.items():
+        if any(instance is seen for _, seen in checked):
+            continue  # same configuration, same object: one launch proves it
+        checked.append((role, instance))
 
     def check() -> tuple[bool, str]:
-        readonly = getattr(driver, "readonly_client_check", None)
-        if not callable(readonly):
-            return False, f"driver {getattr(driver, 'driver_id', '?')!r} has no zero-model probe"
-        result = readonly(["--version"], timeout_seconds=90)
-        reported = str(result.get("stdout", "")).strip()
-        if result.get("returncode") != 0 or not reported:
-            return False, (
-                f"the client did not report a version (rc={result.get('returncode')}, "
-                f"stderr={str(result.get('stderr', ''))[:160]!r})"
-            )
-        if not result.get("process_gone") or not result.get("boundary_empty"):
-            return False, "the client process or its boundary did not settle after the probe"
-        return True, f"client reports {reported}"
+        for role, driver in checked:
+            readonly = getattr(driver, "readonly_client_check", None)
+            if not callable(readonly):
+                return False, (
+                    f"driver {getattr(driver, 'driver_id', '?')!r} (role {role}) has no "
+                    "zero-model probe"
+                )
+            result = readonly(["--version"], timeout_seconds=90)
+            reported = str(result.get("stdout", "")).strip()
+            if result.get("returncode") != 0 or not reported:
+                return False, (
+                    f"role {role}: the client did not report a version "
+                    f"(rc={result.get('returncode')}, "
+                    f"stderr={str(result.get('stderr', ''))[:160]!r})"
+                )
+            if not result.get("process_gone") or not result.get("boundary_empty"):
+                return False, (
+                    f"role {role}: the client process or its boundary did not settle after "
+                    "the probe"
+                )
+        if not checked:
+            return False, "no role driver was resolved, so no launch binding could be proven"
+        return True, f"client reports a version for role(s) {', '.join(r for r, _ in checked)}"
 
     return check
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    from .prepare import resolve_machine_bindings, resolve_run, role_drivers
+
+    data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
+
     # The authorization question is settled before the task is even read: refusing here means a
     # missing approval cannot be confused with a malformed task, and no file is touched first.
-    is_real_driver = args.driver != "fake"
+    # "Is this a real run?" comes from the resolved machine bindings - the profile when one is
+    # named, the command line otherwise - which is the same resolution the run itself uses.
+    machine = resolve_machine_bindings(
+        data_dir=data_dir, profile_id=args.profile, driver=args.driver
+    )
+    is_real_driver = machine.is_real_driver
     if is_real_driver and not args.authorization_file:
         message = (
-            f"driver {args.driver!r} is a real Harness driver and needs an explicit, bound user "
+            "this run resolves to a real Harness driver and needs an explicit, bound user "
             "authorization file (--authorization-file). There is no flag that substitutes for "
             "one and no fallback to the fake driver."
         )
@@ -229,34 +471,40 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"refused: {message}", file=sys.stderr)
         return EXIT_REFUSED
 
-    task_path = Path(args.task)
-    spec = TaskSpec.model_validate(_load_json(task_path))
-    project_root = Path(args.project_root).resolve()
-    project_path = Path(args.project) if args.project else project_root / ".hflow" / "project.json"
-    project = ProjectConfig.model_validate(_load_json(project_path))
-
-    # Command-line overrides become part of the *effective* TaskSpec before admission, so the
-    # stored spec, its digest and the run's identity all describe the same thing.
-    overrides: dict[str, object] = {}
-    if args.base_commit or args.workspace:
-        mode = args.workspace or spec.workspace.mode
-        overrides["workspace"] = {
-            "mode": mode,
-            "base_commit": args.base_commit or spec.workspace.base_commit,
-            "keep": True if mode == "worktree" else spec.workspace.keep,
-        }
-    if overrides:
-        spec = TaskSpec.model_validate({**spec.model_dump(mode="json"), **overrides})
-
-    validation = validate_task_spec(
-        spec, project, project_root, allow_fake_checks=not is_real_driver
+    resolved = resolve_run(
+        task_path=Path(args.task),
+        project_root=Path(args.project_root),
+        data_dir=data_dir,
+        project_path=Path(args.project) if args.project else None,
+        profile_id=args.profile,
+        driver=args.driver,
+        base_commit=args.base_commit,
+        workspace_mode=args.workspace,
     )
-    if not validation.ok and not args.force:
+    spec = resolved.spec
+    project = resolved.project
+    project_root = resolved.project_root
+    task_path = resolved.spec_path
+
+    if resolved.is_real_driver != is_real_driver:
+        # The profile is read once to settle the authorization question and once by the full
+        # resolution. If those disagree, the file changed underneath this command, and
+        # continuing would mean dispatching under a configuration no gate has seen.
+        raise RefusedError(
+            RefusalCode.INVALID_SPEC,
+            "the machine configuration changed while this run was being resolved "
+            f"(was real_driver={is_real_driver}, now {resolved.is_real_driver}). Nothing was "
+            "dispatched and no allowance was consumed; re-run when the configuration is stable.",
+        )
+
+    if not resolved.admission.ok and not args.force:
         _write_out(
             {
                 "refused": True,
-                "issues": [issue.model_dump(mode="json") for issue in validation.issues],
-                "warnings": validation.warnings,
+                "issues": [
+                    issue.model_dump(mode="json") for issue in resolved.admission.issues
+                ],
+                "warnings": resolved.admission.warnings,
             },
             args.json,
         )
@@ -266,7 +514,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     # checked before any credential is read, any workspace is created and any budget or
     # submission allowance is consumed, and it refuses rather than falling back to the fake
     # driver. A bare flag is deliberately not accepted: the same process that would run the
-    # task must not be able to authorize itself with a word.
+    # task must not be able to authorize itself with a word. The binding now covers the
+    # *effective configuration*, so approving one profile does not approve another.
     authorization = None
     authorization_binding = None
     if is_real_driver:
@@ -279,25 +528,24 @@ def cmd_run(args: argparse.Namespace) -> int:
         authorization = load_authorization(Path(args.authorization_file))
         authorization_binding = current_binding(
             mode=args.authorization_mode,
-            driver=args.driver,
+            driver=resolved.effective.role("implementer").driver,  # type: ignore[union-attr]
             project=project,
-            request=RunRequest(
-                task=spec, project=project, project_root=project_root, workspace_root=project_root
-            ),
+            request=resolved.request(),
             spec_path=task_path,
+            effective=resolved.effective,
         )
         # Refuses with a specific mismatch list when the artifact covers a different task,
-        # project, base commit, driver or execution mode.
+        # project, base commit, driver, execution mode or configuration.
         verify_authorization(authorization, expected=authorization_binding)
 
     store = _open_store(args)
     try:
-        data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
-        if args.driver == "fake":
+        if not is_real_driver:
             # The fake driver is a scripted stand-in for tests and examples. Its change comes
             # from a plan file so an offline run is reproducible from the CLI alone, without a
-            # test harness. It is explicitly the test driver: `--driver fake` never pretends
-            # to be a real Harness delivery.
+            # test harness. It is explicitly the test driver: it never pretends to be a real
+            # Harness delivery. Both roles share it when a profile binds them to the same
+            # offline agent, because there is nothing per-role to distinguish offline.
             script = FakeScript(outcome=InvocationOutcome.COMPLETED, agent_turns=1)
             if args.fake_write_plan:
                 plan = _load_json(Path(args.fake_write_plan))
@@ -307,17 +555,26 @@ def cmd_run(args: argparse.Namespace) -> int:
                     )
                 script.write_plan = {str(key): str(value) for key, value in plan.items()}
                 script.limitations = ["fake driver: no model was invoked; change came from a plan file"]
-            driver = FakeDriver(project_root, script)
+            implementer_driver: object = FakeDriver(project_root, script)
+            drivers = {"implementer": implementer_driver, "reviewer": implementer_driver}
         else:
-            from .contracts import AgentBinding
-            from .drivers.selected import build_driver
+            try:
+                drivers = role_drivers(resolved)
+            except DriverSetupError as exc:
+                # A launcher that cannot be resolved is a refusal with a reason, not a
+                # traceback: it is knowable before anything is claimed, and `prepare` reports
+                # the same condition as a dispatch precondition.
+                raise RefusedError(
+                    RefusalCode.NOT_IMPLEMENTED,
+                    f"the launch for this configuration could not be resolved: {exc}. Nothing "
+                    "was dispatched and no allowance was consumed.",
+                ) from exc
+            implementer_driver = drivers["implementer"]
 
-            driver = build_driver(
-                AgentBinding(harness="dsh", driver=args.driver), data_dir=data_dir
-            )
         controller = Controller(
             store,
-            driver,  # type: ignore[arg-type]
+            implementer_driver,  # type: ignore[arg-type]
+            reviewer_driver=drivers["reviewer"],  # type: ignore[arg-type]
             controller_build=controller_build(),
             # Keep approved checks from scattering caches into the workspace under test: a
             # check should leave evidence, not untracked files that later look like unfrozen
@@ -328,21 +585,25 @@ def cmd_run(args: argparse.Namespace) -> int:
             controller_id=args.controller_id,
             data_dir=data_dir,
             authorization=authorization,
-            preflight=_zero_model_preflight(driver, args) if authorization is not None else None,
+            preflight=(
+                _zero_model_preflight(drivers) if authorization is not None else None
+            ),
             # `--driver fake` is the offline driver: it scripts its own change and its checks
             # are fake by construction. Everything else is a real delivery, and a real delivery
             # gets the stricter gates (real checks, isolated worktree, effective write
             # permission, a budget that covers the review it requires).
             production=is_real_driver,
+            effective_config=resolved.effective,
         )
-        request = RunRequest(
-            task=spec,
-            project=project,
-            project_root=project_root,
-            workspace_root=project_root,
-            controller_id=args.controller_id,
+        outcome = controller.run_task(
+            RunRequest(
+                task=spec,
+                project=project,
+                project_root=project_root,
+                workspace_root=project_root,
+                controller_id=args.controller_id,
+            )
         )
-        outcome = controller.run_task(request)
     finally:
         store.close()
 
@@ -522,12 +783,22 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
 
 def cmd_schema(args: argparse.Namespace) -> int:
-    """Print the generated JSON Schema. Generated, never a second hand-written copy."""
+    """Print the generated JSON Schema. Generated, never a second hand-written copy.
+
+    ``MachineProfile`` is here because a profile is a document a person writes by hand
+    (``<data-dir>/profiles/<id>.json``), and ``PrepareReport`` because its output is consumed
+    by scripts. Both are generated from the same models the loader validates against.
+    """
+    from .contracts import EffectiveConfig, MachineProfile, PrepareReport
+
     models = {
         "TaskSpec": TaskSpec,
         "ProjectConfig": ProjectConfig,
         "ResultReceipt": ResultReceipt,
         "RunRequest": RunRequest,
+        "MachineProfile": MachineProfile,
+        "EffectiveConfig": EffectiveConfig,
+        "PrepareReport": PrepareReport,
     }
     payload = {name: json_schema(model) for name, model in models.items()}
     print(canonical_json(payload))
@@ -557,10 +828,47 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument(
         "--profile",
         default=None,
-        help="accepted for interface stability; this build has no profile binding yet",
+        help=(
+            f"machine profile id to resolve and report on (or {ENV_PROFILE}); without one, "
+            "doctor says so instead of guessing a binding"
+        ),
     )
     _add_store_args(doctor)
     doctor.set_defaults(func=cmd_doctor)
+
+    prepare = sub.add_parser(
+        "prepare",
+        help="zero-model resolution: what a task would run, under which config, for how much",
+    )
+    prepare.add_argument("--task", required=True, help="path to task.json")
+    prepare.add_argument("--project", default=None, help="path to .hflow/project.json")
+    prepare.add_argument("--project-root", default=".", help="target project root (workspace)")
+    prepare.add_argument("--profile", default=None, help=f"machine profile id (or {ENV_PROFILE})")
+    prepare.add_argument(
+        "--driver",
+        default=None,
+        help="driver override; must agree with --profile when both are given",
+    )
+    prepare.add_argument(
+        "--base-commit",
+        default=None,
+        help="fix the base commit for a Git-worktree run (the same override `run` applies)",
+    )
+    prepare.add_argument(
+        "--workspace",
+        choices=["worktree", "in_place"],
+        default=None,
+        help="workspace mode override (the same override `run` applies)",
+    )
+    prepare.add_argument(
+        "--authorization-mode",
+        choices=["stop-trial", "m2-live-change"],
+        default="m2-live-change",
+        help="which authorized activity the pending binding would be for; modes are not interchangeable",
+    )
+    prepare.add_argument("--json", action="store_true")
+    _add_store_args(prepare)
+    prepare.set_defaults(func=cmd_prepare)
 
     run = sub.add_parser("run", help="admit and run one task")
     run.add_argument("--task", required=True, help="path to task.json")
@@ -568,8 +876,20 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--project-root", default=".", help="target project root (workspace)")
     run.add_argument(
         "--driver",
-        default="fake",
-        help="driver id: 'fake' (offline) or 'acpx-dsh' (the M0-selected transport)",
+        default=None,
+        help=(
+            "driver id override: 'fake' (offline) or 'acpx-dsh' (the M0-selected transport). "
+            "Without --profile the default is 'fake'. With --profile the profile supplies the "
+            "per-role bindings and this flag must name the same driver or the run is refused."
+        ),
+    )
+    run.add_argument(
+        "--profile",
+        default=None,
+        help=(
+            f"machine profile id, loaded from <data-dir>/profiles/<id>.json (or {ENV_PROFILE}). "
+            "Binds the implementer and the reviewer independently"
+        ),
     )
     run.add_argument("--controller-id", default="local-controller")
     run.add_argument("--receipt-out", default=None, help="write the result receipt to this path")

@@ -24,6 +24,7 @@ from ..contracts import (
     CancellationReceipt,
     InvocationRequest,
     InvocationResult,
+    LaunchConfig,
     ReconcileResult,
     RefusalCode,
     RefusedError,
@@ -34,6 +35,60 @@ from .acpx_dsh import AcpxDshDriver
 SELECTED_DRIVER_ID = ACPX_DSH_DRIVER_ID
 #: Names a machine profile may use for the selected transport.
 ACPX_DSH_ALIASES = {ACPX_DSH_DRIVER_ID, "acpx-dsh", "acpx", "dsh-acp"}
+#: The offline driver, which never reaches a model.
+FAKE_DRIVER_ID = "fake"
+FAKE_ALIASES = {FAKE_DRIVER_ID, "fake-offline"}
+#: The one harness this build implements. Both drivers serve it: the production transport
+#: launches it, and the offline fake stands in for it.
+HARNESS_DSH = "dsh"
+#: Which harness each implemented driver actually launches. A binding whose declared harness is
+#: not in its driver's set is refused: a profile that says `codex` while naming a DSH driver
+#: would otherwise be recorded as a Codex run whose every process was DSH.
+DRIVER_HARNESSES: dict[str, frozenset[str]] = {
+    SELECTED_DRIVER_ID: frozenset({HARNESS_DSH}),
+    FAKE_DRIVER_ID: frozenset({HARNESS_DSH}),
+}
+
+
+def driver_id_for_name(driver_name: str) -> str:
+    """Map a driver *name* to the driver id it selects. Pure name resolution, no binding.
+
+    Separate from :func:`resolve_driver_id` because it is also needed where no binding exists
+    yet - a command line that named only a driver, or a conflict check between two sources.
+    """
+    name = driver_name.strip().lower()
+    if name in FAKE_ALIASES:
+        return FAKE_DRIVER_ID
+    if name in ACPX_DSH_ALIASES:
+        return SELECTED_DRIVER_ID
+    raise RefusedError(
+        RefusalCode.NOT_IMPLEMENTED,
+        f"driver {driver_name!r} is not implemented. This build has exactly one production "
+        f"transport ({SELECTED_DRIVER_ID}) plus the offline fake; there is no runtime fallback.",
+    )
+
+
+def resolve_driver_id(binding: AgentBinding) -> str:
+    """Map a binding to the driver id that will actually be constructed.
+
+    Both halves of the binding are checked, not just the driver name: the declared harness has
+    to be one this driver implements. Pure - it constructs nothing and touches no file - so
+    ``prepare`` and ``doctor`` can report exactly the resolution a run would perform, including
+    the refusal, without side effects.
+    """
+    driver_id = driver_id_for_name(binding.driver)
+    declared = binding.harness.strip().lower()
+    allowed = DRIVER_HARNESSES[driver_id]
+    if declared not in allowed:
+        raise RefusedError(
+            RefusalCode.NOT_IMPLEMENTED,
+            f"harness {binding.harness!r} is not served by driver {binding.driver!r}, which "
+            f"launches {', '.join(sorted(allowed))}. This build implements exactly one harness "
+            f"({HARNESS_DSH}) plus the offline fake; naming a different harness next to an "
+            "implemented driver would record a run whose processes are all DSH. There is no "
+            "driver for that harness here.",
+        )
+    return driver_id
 
 
 def default_refusal_reason() -> str:
@@ -97,22 +152,23 @@ def build_driver(
     *,
     data_dir: Path,
     dsh_home: Path | None = None,
+    launch: LaunchConfig | None = None,
 ) -> object:
-    """Resolve a binding to the driver instance. Refuses anything not selected in M0."""
-    name = binding.driver.strip().lower()
-    if name in {"fake", "fake-offline"}:
+    """Resolve a binding to the driver instance. Refuses anything not selected in M0.
+
+    The name resolution is ``resolve_driver_id``'s, not a second copy of it, so a name that
+    ``prepare`` accepted cannot fail here for a different reason. ``launch`` is the launch that
+    was resolved *before* the approval; when given, the driver consumes it instead of reading
+    the environment again, so what was approved is what runs.
+    """
+    resolved = resolve_driver_id(binding)
+    if resolved == FAKE_DRIVER_ID:
         from .fake import FakeDriver
 
         root = Path(data_dir)
         root.mkdir(parents=True, exist_ok=True)
         return FakeDriver(root)
-    if name in ACPX_DSH_ALIASES:
-        return AcpxDshDriver(data_dir=data_dir, dsh_home=dsh_home)
-    raise RefusedError(
-        RefusalCode.NOT_IMPLEMENTED,
-        f"driver {binding.driver!r} is not implemented. This build has exactly one production "
-        f"transport ({SELECTED_DRIVER_ID}) plus the offline fake; there is no runtime fallback.",
-    )
+    return AcpxDshDriver(data_dir=data_dir, dsh_home=dsh_home, launch=launch)
 
 
 class UnselectedDriver:

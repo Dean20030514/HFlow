@@ -26,12 +26,15 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from .contracts import (
     AttemptRecord,
     AttemptState,
     CancellationReceipt,
     CheckPhase,
     DeliveryState,
+    EffectiveConfig,
     EvidenceRecord,
     EvidenceStatus,
     InvocationOutcome,
@@ -45,13 +48,20 @@ from .contracts import (
     json_schema,
 )
 from .ids import new_evidence_id, utc_now
-
 SCHEMA_VERSION = 1
 
 #: Marks a receipt that records an offline reprocessing decision rather than the outcome of
 #: the execution it belongs to. The string lives here because both the store guard and the
 #: local finalization entry point must agree on it.
 OFFLINE_REPROCESSING_KIND = "offline_reprocessing"
+
+#: Prefix of the run note that carries the resolved configuration. A prefix rather than a
+#: schema change: the note table already has the durability this record needs, and a reader
+#: that does not know the prefix simply sees one more note.
+_EFFECTIVE_CONFIG_PREFIX = "effective_config: "
+#: The effective configuration is a document, not a one-line operator remark, so it gets its
+#: own bound instead of the 1000-character default (which would cut it mid-JSON).
+EFFECTIVE_CONFIG_NOTE_LIMIT = 8000
 
 
 def _same_offline_reprocessing(
@@ -941,30 +951,98 @@ class Store:
         )
         return (str(row["cancel_intent_at"]) if row["cancel_intent_at"] else None, receipt)
 
-    def record_note(self, run_id: str, note: str) -> None:
+    def record_note(
+        self,
+        run_id: str,
+        note: str,
+        *,
+        limit: int = 1000,
+        only_if_absent_prefix: str | None = None,
+    ) -> None:
         """Append an operator-facing note to the run's own audit trail.
 
         Notes live in their own table rather than in ``block_reason``, because a terminal
         transition clears that column and an audit fact (an authorization being consumed, a
         dirty target being left alone) must survive the run reaching a final state.
+
+        ``limit`` bounds an operator note by default. A structured record that happens to ride
+        in this table (the effective configuration) passes its own, larger bound instead of
+        being silently truncated into something a reader could misread.
+
+        ``only_if_absent_prefix`` makes the note write-once for that prefix: the first recorded
+        value wins and a later one is dropped. That is what keeps a run's recorded configuration
+        part of its identity rather than a field a later invocation can rewrite.
         """
         with self.transaction() as conn:
-            self._record_note_locked(conn, run_id, note)
+            if only_if_absent_prefix is not None and self._note_with_prefix(
+                conn, run_id, only_if_absent_prefix
+            ):
+                return
+            self._record_note_locked(conn, run_id, note, limit=limit)
 
-    def _record_note_locked(self, conn: sqlite3.Connection, run_id: str, note: str) -> None:
+    def _note_with_prefix(
+        self, conn: sqlite3.Connection, run_id: str, prefix: str
+    ) -> sqlite3.Row | None:
+        """Exact prefix match. ``substr`` rather than ``LIKE`` so a prefix containing ``%`` or
+        ``_`` is still matched literally."""
+        return conn.execute(
+            "SELECT note_id FROM run_notes WHERE run_id = ? AND substr(note, 1, ?) = ? LIMIT 1",
+            (run_id, len(prefix), prefix),
+        ).fetchone()
+
+    def _record_note_locked(
+        self, conn: sqlite3.Connection, run_id: str, note: str, *, limit: int = 1000
+    ) -> None:
         """The note insert, for callers that already hold a transaction."""
         row = conn.execute("SELECT run_id FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         if row is None:
             raise RunNotFound(run_id)
         conn.execute(
             "INSERT INTO run_notes (note_id, run_id, note, created_at) VALUES (?, ?, ?, ?)",
-            (new_evidence_id(), run_id, note[:1000], utc_now()),
+            (new_evidence_id(), run_id, note[:limit], utc_now()),
         )
 
     def notes_for(self, run_id: str) -> list[str]:
         return [row["note"] for row in self._fetchall(
             "SELECT note FROM run_notes WHERE run_id = ? ORDER BY created_at, rowid", (run_id,)
         )]
+
+    def record_effective_config(self, run_id: str, config: EffectiveConfig) -> None:
+        """Record the configuration this run executes under, once, verbatim.
+
+        Kept in ``run_notes`` as one canonical-JSON line rather than in a new column: it needs
+        the same durability as every other audit fact (a terminal transition must not erase it)
+        and none of the columns in ``runs`` are read as a document. The stored text *is* the
+        ``EffectiveConfig`` document - not a paraphrase with a digest bolted on - so a reader
+        re-derives the same identity from the same contract. Written only when absent: a run's
+        recorded configuration is part of its identity and is never rewritten.
+        """
+        self.record_note(
+            run_id,
+            _EFFECTIVE_CONFIG_PREFIX + canonical_json(config.model_dump(mode="json")),
+            limit=EFFECTIVE_CONFIG_NOTE_LIMIT,
+            only_if_absent_prefix=_EFFECTIVE_CONFIG_PREFIX,
+        )
+
+    def effective_config_for(self, run_id: str) -> EffectiveConfig | None:
+        """The recorded configuration, or ``None`` for a run that predates config binding."""
+        for note in self.notes_for(run_id):
+            if not note.startswith(_EFFECTIVE_CONFIG_PREFIX):
+                continue
+            try:
+                loaded = json.loads(note[len(_EFFECTIVE_CONFIG_PREFIX) :])
+            except json.JSONDecodeError:
+                # A truncated or hand-edited note is not a configuration. Reporting "not
+                # recorded" is honest; guessing one from a partial document is not.
+                return None
+            if not isinstance(loaded, dict):
+                return None
+            try:
+                return EffectiveConfig.model_validate(loaded)
+            except ValidationError:
+                return None
+        return None
+        return None
 
     def record_worktree(self, run_id: str, path: Path) -> None:
         """Record the workspace this run was given. Written before any work happens in it."""
@@ -1335,3 +1413,25 @@ class Store:
         )
         assert row is not None
         return int(row["implementer"]), int(row["reviewer"])
+
+    def reserved_turns_and_attempts(self, run_id: str) -> tuple[int, int]:
+        """``(turns_reserved, attempt_count)`` read in **one statement**.
+
+        Two separate reads are two snapshots: a dispatch can commit between them, and an
+        observer would then see a budget that looks smaller than the attempts it covers. That
+        skew is an artifact of the observation, not of the transaction, so a consistency check
+        has to observe both facts at once - a single SQL statement is a single snapshot.
+        """
+        row = self._fetchone(
+            """
+            SELECT
+                r.turns_reserved AS reserved,
+                (SELECT COUNT(*) FROM attempts a WHERE a.run_id = r.run_id) AS attempts
+              FROM runs r
+             WHERE r.run_id = ?
+            """,
+            (run_id,),
+        )
+        if row is None:
+            raise RunNotFound(run_id)
+        return int(row["reserved"]), int(row["attempts"])

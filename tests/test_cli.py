@@ -12,13 +12,13 @@ from pathlib import Path
 import pytest
 
 from hflow.cli import EXIT_BLOCKED, EXIT_OK, EXIT_REFUSED, main
-from hflow.contracts import EvidenceStatus
+from hflow.contracts import EvidenceStatus, MachineProfile
 from hflow.report import report_json, status_text
 from hflow.controller import inspect_run
 from hflow.store import Store
 from hflow.verify import CheckRunners, FakeCheckRunner
 
-from .conftest import write_project, write_task
+from .conftest import write_profile, write_project, write_task
 
 @pytest.fixture()
 def cli_env(tmp_path: Path, project, task_spec) -> dict[str, Path]:
@@ -190,8 +190,13 @@ def test_doctor_makes_no_model_calls_and_admits_what_is_unknown(
     assert exit_code == EXIT_OK
     payload = json.loads(capsys.readouterr().out)
 
-    assert payload["driver_status"] == "NOT_LIVE_TESTED"
-    assert payload["selected_driver"] == "unselected"
+    # No profile was named, and doctor now says exactly that instead of reporting a driver
+    # status that reads as if a binding had been selected and tested.
+    assert payload["driver_status"] == "NO_PROFILE_SELECTED"
+    assert payload["selected_driver"] == "none"
+    assert payload["profile"]["selected"] is False
+    assert payload["profile"]["usable"] is False
+    assert "no machine profile selected" in payload["profile"]["detail"]
     record = payload["capability_record"]
     assert record["live_tested"] is False
     assert record["probe_only"] is True
@@ -202,19 +207,100 @@ def test_doctor_makes_no_model_calls_and_admits_what_is_unknown(
     assert record["capabilities"]["process_boundary_teardown"] == "probed"
     assert record["capabilities"]["readonly_enforcement"] == "unsupported"
     assert record["capabilities"]["billing_usage"] == "unknown"
+    # Verified and unverified capabilities are separate lists, so one cannot be read as the
+    # other: the states come from the recorded table, and doctor re-states their meaning.
+    states = payload["capabilities"]["states"]
+    assert "process_boundary_teardown" in states["probed"]
+    assert "billing_usage" in states["unknown"]
+    assert states["enforced"] == []
+    assert payload["capabilities"]["live_tested"] is False
+    assert "not a live compatibility proof" in " ".join(payload["notes"])
     # No credential material is read or printed.
     assert ".credentials" not in json.dumps(payload)
+
+
+def test_doctor_resolves_a_selected_profile_per_role(
+    tmp_path: Path, profile: MachineProfile, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A named profile is resolved and reported, role by role, without launching anything."""
+    data_dir = tmp_path / "data"
+    write_profile(data_dir, profile)
+
+    exit_code = main(["doctor", "--json", "--profile", "dsh-local", "--data-dir", str(data_dir)])
+    assert exit_code == EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["profile"]["selected"] is True
+    assert payload["profile"]["requested_via"] == "--profile"
+    assert payload["profile"]["usable"] is True
+    assert payload["profile"]["profile_id"] == "dsh-local"
+    assert payload["driver_status"] == "RESOLVED_FROM_PROFILE"
+    assert payload["selected_driver"] == "fake"
+    for role in ("implementer", "reviewer"):
+        entry = payload["profile"]["roles"][role]
+        assert entry["usable"] is True
+        assert entry["driver"] == "fake-offline"
+        assert entry["driver_id"] == "fake"
+
+
+def test_doctor_refuses_a_profile_it_cannot_resolve(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An unusable configuration is reported in full and exits non-zero: scriptable and readable."""
+    data_dir = tmp_path / "data"
+    write_profile(
+        data_dir,
+        MachineProfile(
+            profile_id="broken",
+            role_bindings={"implementer": "a", "reviewer": "a"},
+            agents={"a": {"harness": "other", "driver": "some-other-harness"}},
+        ),
+    )
+
+    exit_code = main(["doctor", "--json", "--profile", "broken", "--data-dir", str(data_dir)])
+    assert exit_code == EXIT_REFUSED
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["profile"]["usable"] is False
+    assert payload["driver_status"] == "PROFILE_NOT_USABLE"
+    assert "no runtime fallback" in payload["profile"]["detail"]
+    assert payload["profile"]["roles"]["implementer"]["driver_id"] is None
+    # The rest of the probe is still reported: doctor answers even when the config is unusable.
+    assert payload["executables"]["python"]["available"] is True
+
+
+def test_doctor_reports_an_unknown_profile_without_creating_anything(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "data"
+    exit_code = main(["doctor", "--json", "--profile", "ghost", "--data-dir", str(data_dir)])
+    assert exit_code == EXIT_REFUSED
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["profile"]["usable"] is False
+    assert "profile 'ghost' not found" in payload["profile"]["detail"]
+    assert not (data_dir / "hflow.sqlite").exists()
 
 
 def test_schema_command_prints_generated_contracts(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["schema"]) == EXIT_OK
     payload = json.loads(capsys.readouterr().out)
-    assert set(payload) == {"TaskSpec", "ProjectConfig", "ResultReceipt", "RunRequest"}
+    assert set(payload) == {
+        "TaskSpec",
+        "ProjectConfig",
+        "ResultReceipt",
+        "RunRequest",
+        # A profile is a document a person writes by hand, so its schema is part of the
+        # command surface rather than something to reverse-engineer from the loader.
+        "MachineProfile",
+        "EffectiveConfig",
+        "PrepareReport",
+    }
     receipt_schema = payload["ResultReceipt"]
     # Enums are referenced, not inlined; the definition must be present in the same document.
     ref = receipt_schema["properties"]["task_state"]["$ref"].rsplit("/", 1)[-1]
     assert ref in receipt_schema["$defs"]
     assert "ACCEPTED" in receipt_schema["$defs"][ref]["enum"]
+    profile_schema = payload["MachineProfile"]
+    assert set(profile_schema["required"]) == {"profile_id", "role_bindings", "agents"}
 
 
 def test_status_text_marks_unknowns_instead_of_zeroing_them(

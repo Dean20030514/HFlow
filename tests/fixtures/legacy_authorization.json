@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "authorization_id": "AUTH-legacy-fixture-1",
+  "provided_by": "user",
+  "user_text": "FIXTURE, not a real approval: this synthetic artifact exists so tests can read an authorization written before effective-configuration binding existed. It names no real repository.",
+  "authorized_at": "2026-09-20T00:00:00Z",
+  "max_top_level_submissions": 2,
+  "binding": {
+    "mode": "m2-live-change",
+    "driver": "acpx-dsh",
+    "project_id": "fixture-project",
+    "repo_path": "C:\\fixture\\repo",
+    "base_commit": "1111111111111111111111111111111111111111",
+    "spec_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "spec_path": "C:\\fixture\\repo\\task.json",
+    "roles": [
+      "implementer",
+      "reviewer"
+    ]
+  }
+}

@@ -431,11 +431,15 @@ def test_transaction_is_one_write_unit_in_the_file(tmp_path: Path, project, task
         stop = threading.Event()
 
         def observe() -> None:
-            """One read of both facts, so a skew cannot come from two separate reads."""
+            """One *statement* for both facts, so a skew cannot come from two snapshots.
+
+            Reading the run row and then the attempt rows is two implicit transactions: a
+            dispatch can commit between them, and the observer then reports a budget that
+            looks smaller than the attempts it covers. That skew belongs to the observation,
+            not to the transaction under test, so both facts are read in one query.
+            """
             while not stop.is_set():
-                row = observer.get_run(run_id)
-                attempts = observer.attempts_for(run_id)
-                seen.append((int(row["turns_reserved"]), len(attempts)))
+                seen.append(observer.reserved_turns_and_attempts(run_id))
                 time.sleep(0.005)
 
         thread = threading.Thread(target=observe, daemon=True)

@@ -24,7 +24,15 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .contracts import ProjectConfig, RefusalCode, RefusedError, RunRequest, canonical_json, digest_of
+from .contracts import (
+    EffectiveConfig,
+    ProjectConfig,
+    RefusalCode,
+    RefusedError,
+    RunRequest,
+    canonical_json,
+    digest_of,
+)
 
 SCHEMA_VERSION = 1
 #: Only this provenance may authorize a real model run. A model-authored note is refused.
@@ -32,9 +40,23 @@ USER_PROVENANCE = "user"
 #: Modes kept separate on purpose: a stop trial never authorizes a business task.
 ExecutionMode = Literal["stop-trial", "m2-live-change"]
 
+#: Binding fields added after the first live rounds. They are omitted from ``binding_digest``
+#: while empty so that an artifact written before they existed digests to exactly the same
+#: value as it did then - a different digest for an already-consumed authorization would make
+#: it look unused again, which is the one thing the single-use ledger must never allow.
+POST_BINDING_FIELDS = ("profile_id", "effective_config_digest")
+
 
 class AuthorizationBinding(BaseModel):
-    """What this authorization is for. Any mismatch refuses the run."""
+    """What this authorization is for. Any mismatch refuses the run.
+
+    Beyond the task and the repository, a binding from this build also names the *effective
+    configuration* - the resolved profile, each role's agent, driver and model selection, and
+    the write permission. An approval therefore covers a configuration, not just a task:
+    switching profile or model after approval changes the digest and the old approval stops
+    applying. Artifacts written before that field existed still load; they simply cannot
+    authorize a run that resolved a configuration (see :func:`verify_authorization`).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -46,6 +68,26 @@ class AuthorizationBinding(BaseModel):
     spec_digest: str
     spec_path: str
     roles: list[str] = Field(default_factory=lambda: ["implementer", "reviewer"])
+    #: ``EffectiveConfig.digest()`` of the configuration this run will actually use.
+    effective_config_digest: str = ""
+    #: The profile the configuration came from, for a readable mismatch message. Empty when
+    #: the bindings came from the command line alone.
+    profile_id: str = ""
+
+    def digest(self) -> str:
+        """Identity of what this binding covers.
+
+        Backward compatible on purpose: the post-batch-D fields are dropped while they are
+        empty, so an artifact written by an earlier build digests to the value it always had
+        and its single-use ledger row keeps matching. Dropping them is what stops an
+        already-consumed approval from looking unused again - while a binding that *does*
+        carry a configuration digests differently from the same task on another profile.
+        """
+        payload = self.model_dump(mode="json")
+        for field in POST_BINDING_FIELDS:
+            if not payload.get(field):
+                payload.pop(field, None)
+        return digest_of(payload)
 
 
 class AuthorizationRecord(BaseModel):
@@ -62,7 +104,7 @@ class AuthorizationRecord(BaseModel):
     binding: AuthorizationBinding
 
     def binding_digest(self) -> str:
-        return digest_of(self.binding.model_dump(mode="json"))
+        return self.binding.digest()
 
     def as_store_record(self) -> dict[str, object]:
         return {
@@ -103,9 +145,16 @@ def current_binding(
     project: ProjectConfig,
     request: RunRequest,
     spec_path: Path,
+    effective: EffectiveConfig | None = None,
 ) -> AuthorizationBinding:
-    """The binding of the run that is about to happen."""
-    return AuthorizationBinding(
+    """The binding of the run that is about to happen.
+
+    ``effective`` is the configuration that was actually resolved. ``prepare`` and ``run``
+    pass the same object from the same resolution, so a user approves the configuration they
+    were shown. Callers that do not resolve one (the historical re-verification tools) get the
+    legacy binding: identical to what those artifacts already carry.
+    """
+    binding = AuthorizationBinding(
         mode=mode,
         driver=driver,
         project_id=project.project_id,
@@ -113,7 +162,19 @@ def current_binding(
         base_commit=request.task.workspace.base_commit,
         spec_digest=request.task.spec_digest(),
         spec_path=str(Path(spec_path).resolve()),
+        roles=list(effective_roles(effective)),
     )
+    if effective is not None:
+        binding.effective_config_digest = effective.digest()
+        binding.profile_id = effective.profile_id
+    return binding
+
+
+def effective_roles(effective: EffectiveConfig | None) -> tuple[str, ...]:
+    """Which roles the approval has to cover: the ones the configuration resolves."""
+    if effective is None:
+        return ("implementer", "reviewer")
+    return tuple(entry.role for entry in effective.roles) or ("implementer", "reviewer")
 
 
 def verify_authorization(
@@ -146,6 +207,37 @@ def verify_authorization(
         raise RefusedError(
             RefusalCode.RISK_DOWNGRADE,
             "the authorization does not cover this run: " + "; ".join(mismatches),
+        )
+    _verify_effective_config(actual, expected)
+
+
+def _verify_effective_config(actual: AuthorizationBinding, expected: AuthorizationBinding) -> None:
+    """The configuration half of the check, checked only when a configuration was resolved.
+
+    An artifact written before this field existed carries no configuration digest. It stays
+    *readable* - it loads, it is listed, its ledger row still matches - but it cannot start a
+    run that resolved a configuration, because nothing in it says which profile, model or
+    permission the user approved. Re-issue it instead of reusing it.
+    """
+    if not expected.effective_config_digest:
+        return
+    if not actual.effective_config_digest:
+        raise RefusedError(
+            RefusalCode.RISK_DOWNGRADE,
+            "this authorization carries no effective-configuration binding, so it does not say "
+            "which profile, model selection or write permission it approves. It predates "
+            "configuration binding and cannot authorize this run; re-issue it against the "
+            "current configuration.",
+        )
+    if actual.effective_config_digest != expected.effective_config_digest:
+        raise RefusedError(
+            RefusalCode.RISK_DOWNGRADE,
+            "the authorization covers a different configuration than this run resolved: "
+            f"authorized profile={actual.profile_id or '(command line)'} "
+            f"digest={actual.effective_config_digest} != actual "
+            f"profile={expected.profile_id or '(command line)'} "
+            f"digest={expected.effective_config_digest}. Switching profile, model selection "
+            "or write permission after approval does not extend the approval.",
         )
 
 

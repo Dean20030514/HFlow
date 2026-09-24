@@ -34,13 +34,20 @@ from hflow.contracts import (
     TaskState,
 )
 from hflow.controller import Controller
-from hflow.drivers.acpx_dsh import DRIVER_ID, AcpxDshDriver
+from hflow.drivers.acpx_dsh import (
+    DRIVER_ID,
+    AcpxDshDriver,
+    DriverSetupError,
+    resolve_launch_config,
+)
 from hflow.drivers.winjob import process_gone
 from hflow.store import Store
 from hflow.verify import CheckRunners, FakeCheckRunner
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 FAKE_CLIENT = FIXTURES / "fake_acpx_client.py"
+#: A client whose only job is to report the environment it was started with.
+ENV_REPORT_CLIENT = FIXTURES / "env_report_client.py"
 STUB_AGENT = FIXTURES / "stub_acp_agent.py"
 
 
@@ -181,10 +188,14 @@ def test_client_argv_uses_the_right_interpreter_for_the_entry_point(tmp_path: Pa
     This is a regression test for a real failure: the live trial launched acpx's
     ``dist/cli.js`` as ``python -u cli.js``, which cannot parse JavaScript, so the client
     died before the harness ever saw the task.
+
+    The entry points are created for real: a launch is resolved from programs that exist, and
+    a path that is not there is refused rather than assumed to be launchable.
     """
-    node_entry = AcpxDshDriver(
-        data_dir=tmp_path, acpx_cli=Path("fake/node_modules/acpx/dist/cli.js")
-    )
+    node_cli = tmp_path / "node_modules" / "acpx" / "dist" / "cli.js"
+    node_cli.parent.mkdir(parents=True)
+    node_cli.write_text("// the client entry point, not executed here\n", encoding="utf-8")
+    node_entry = AcpxDshDriver(data_dir=tmp_path, acpx_cli=node_cli)
     argv = node_entry._client_argv(tmp_path, tmp_path, 60)
     assert argv[0] == node_entry.node_executable
     assert argv[1].endswith("cli.js")
@@ -196,9 +207,84 @@ def test_client_argv_uses_the_right_interpreter_for_the_entry_point(tmp_path: Pa
     assert argv[1] == "-u"
     assert argv[2].endswith("fake_acpx_client.py")
 
-    shim_entry = AcpxDshDriver(data_dir=tmp_path, acpx_cli=Path("C:/tools/acpx.cmd"))
+    shim = tmp_path / "tools" / "acpx.cmd"
+    shim.parent.mkdir(parents=True)
+    shim.write_text("@echo off\n", encoding="utf-8")
+    shim_entry = AcpxDshDriver(data_dir=tmp_path, acpx_cli=shim)
     argv = shim_entry._client_argv(tmp_path, tmp_path, 60)
     assert argv[0].endswith("acpx.cmd"), "a real executable is launched directly"
+
+
+def test_a_launch_whose_entry_point_is_missing_is_refused(tmp_path: Path) -> None:
+    """An explicit client path is not assumed to be launchable: it has to exist."""
+    with pytest.raises(DriverSetupError) as excinfo:
+        AcpxDshDriver(data_dir=tmp_path, acpx_cli=tmp_path / "gone" / "cli.js")
+    assert "acpx CLI not found" in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------
+# the bound launch is what the child gets, not what the environment says now
+# --------------------------------------------------------------------------
+
+
+def _observe_child_env(driver: AcpxDshDriver, tmp_path: Path) -> dict[str, object]:
+    """Start the reporting client for real and return the environment *it* observed.
+
+    Through the driver's own launch path (same argv construction, same boundary, same child
+    environment), so the answer is a fact about a process rather than about the mapping that
+    was supposed to produce it.
+    """
+    result = driver.readonly_client_check(["--version"], timeout_seconds=90)
+    assert result["returncode"] == 0, result
+    return json.loads(str(result["stdout"]).strip().splitlines()[-1])
+
+
+def test_a_launch_that_bound_no_dsh_home_keeps_it_out_of_the_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resolved without DSH_HOME, and one appears afterwards: the child must still not see it.
+
+    The resolution pins *absence*, not just presence. Copying the ambient environment and only
+    overriding a non-empty bound home would let a variable added after the launch was resolved
+    reach the process - the approval would name one launch and the process would run another.
+    """
+    monkeypatch.delenv("DSH_HOME", raising=False)
+    launch = resolve_launch_config(data_dir=tmp_path, acpx_cli=ENV_REPORT_CLIENT)
+    assert launch.dsh_home == "", "an absent DSH_HOME is resolved as absent, not as a default"
+
+    # `extra_env` is not a way around the binding either.
+    driver = AcpxDshDriver(
+        data_dir=tmp_path, launch=launch, extra_env={"DSH_HOME": "smuggled-by-extra-env"}
+    )
+    monkeypatch.setenv("DSH_HOME", "appeared-after-resolution")
+
+    assert "DSH_HOME" not in driver._child_env(tmp_path)
+
+    observed = _observe_child_env(driver, tmp_path)
+    assert observed["dsh_home_present"] is False, observed
+    assert observed["dsh_home"] is None, observed
+
+
+def test_a_launch_that_bound_a_dsh_home_keeps_it_after_the_environment_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resolved with A, changed to B afterwards: the child must still get A."""
+    bound_home = tmp_path / "bound-home"
+    bound_home.mkdir()
+    monkeypatch.setenv("DSH_HOME", str(bound_home))
+    launch = resolve_launch_config(data_dir=tmp_path, acpx_cli=ENV_REPORT_CLIENT)
+    assert launch.dsh_home == str(bound_home)
+
+    driver = AcpxDshDriver(
+        data_dir=tmp_path, launch=launch, extra_env={"DSH_HOME": "changed-by-extra-env"}
+    )
+    monkeypatch.setenv("DSH_HOME", str(tmp_path / "something-else"))
+
+    assert driver._child_env(tmp_path)["DSH_HOME"] == str(bound_home)
+
+    observed = _observe_child_env(driver, tmp_path)
+    assert observed["dsh_home_present"] is True, observed
+    assert observed["dsh_home"] == str(bound_home), observed
 
 
 # --------------------------------------------------------------------------
