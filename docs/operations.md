@@ -80,6 +80,7 @@ workspace, no SQLite database and no authorization:
 ```sh
 hflow prepare --task task.json --profile dsh-local --project-root <repo>
 hflow prepare --task task.json --profile dsh-local --project-root <repo> --json
+hflow prepare --task task.json --profile dsh-local --root-budget-file root-budget.json
 ```
 
 It reports:
@@ -92,6 +93,7 @@ It reports:
 | `write_allow` / `write_deny` | the scope the worker will be told |
 | `checks` | the approved checks this task's acceptance needs, and which criterion needs each |
 | `budget` | implementer + reviewer turns required, against the task budget and project ceiling |
+| `root_budget` | with `--root-budget-file`: the root binding, its ceilings, the normal dispatch count, the repair switch and the deadline. `null` without the flag (a legacy-shaped run) |
 | `packet_preview` | the implementer's input packet, byte length and digest |
 | `authorization` | the binding an approval would have to cover, and nothing that is one |
 
@@ -101,6 +103,12 @@ of which exists before the implementer runs, so a preview now would be an invent
 does not mint an approval: `creates_authorization` is pinned to `false`, no `user_text` and no
 `provided_by` appear anywhere in its output, and feeding its output to `load_authorization`
 fails. Approving is a user action.
+
+A third: it does not promise **remaining allowance**. With `--root-budget-file` it prints the
+root binding and the ledger path it would use, but it opens no database at all - no SQLite file
+is created, no run row, no authorization - so the number that matters (does this root still have
+allowance, has its deadline passed) is decided by the run's own dispatch transaction. A preview
+that printed a remaining figure would be reading a file another process may already have spent.
 
 For a worktree run the workspace path contains the run id, which is chosen at dispatch, so
 `execution_root_is_final` is `false` and the packet size/digest are for the template path.
@@ -155,6 +163,88 @@ Consequences worth knowing:
 - The launch is bound by *paths and argv*, not by program content: replacing a file at the same
   path does not change the approval.
 
+## Root budgets: `--root-budget-file` (batch E1)
+
+A **root** is one requirement in one repository, across revisions. One root budget file, passed
+as `--root-budget-file` to `prepare` and `run`, declares what that requirement may spend in
+total. It is a JSON document with exactly two members:
+
+```json
+{
+  "limits": {
+    "max_top_level_submissions": 4,
+    "max_repairs": 1,
+    "deadline_seconds": 86400
+  },
+  "note": "E2 repair ceiling for the parser task; approved 2026-01-01"
+}
+```
+
+| Field | Meaning | Range |
+|---|---|---|
+| `max_top_level_submissions` | how many top-level dispatches (implementer + reviewer invocations) this root may buy in total | 1..64 |
+| `max_repairs` | how many *additional* implementer attempts the root may buy. The first implementer attempt is not a repair. **Only recorded and enforced in E1** - no repair loop spends it yet | 0..8, default 0 |
+| `deadline_seconds` | wall-clock ceiling measured from the root's **first successful reservation**, recorded as `deadline_at`; a later dispatch past it is refused | >= 60, default 86400 |
+| `note` | free text the user keeps in the file. Never an approval: the approval is the authorization artifact's `user_text` | - |
+
+Unknown members, a missing `limits`, or a value outside its range is refused rather than
+defaulted - a ceiling nobody chose is not a ceiling.
+
+What the root file does, and what it does not:
+
+- The root identity is **derived mechanically** from `(project_id, canonical repo path, task_id)`
+  (`root-<32 hex>`). No worker and no flag can choose one; a new `task_id` is a new root and needs
+  its own approval.
+- The **ledger path is part of the authorization binding**. `run` refuses an artifact whose
+  `root_budget.ledger_path` is not the ledger this `--data-dir` resolves, so changing
+  `--data-dir` gives a refusal naming the fields, not a second unused allowance. That guard is
+  against ordinary path mistakes: copying the database, deleting it, or editing the artifact all
+  stay inside the trusted-local boundary and are not defended against.
+- A root charge is always recorded **with the authorization that bought it**. For a real driver
+  that means `--root-budget-file` requires `--authorization-file`: the artifact must bind the same
+  root, and its `root_limits` must equal the file's `limits`, or the run is refused before anything
+  is dispatched. The offline fake driver reaches no model and has no approval to give, so an
+  offline root run **without** `--authorization-file` mints a labelled in-memory record instead
+  (`authorization_id` starts with `AUTH-offline`), whose `user_text` states that it is not a user
+  approval and whose binding names `driver: fake`, so it can never authorize a real transport.
+  Pass `--authorization-file` if you want the offline run charged to your own artifact: it is then
+  loaded and verified exactly like a real one. No path charges a root with an empty authorization
+  id.
+- `prepare` prints the root binding, its ceilings, the normal dispatch count (implementer +
+  reviewer), the repair switch (**OFF in E1**) and the deadline, and prints the same root inside
+  the pending authorization binding, so the digest a user approves is the digest the run checks.
+  It creates nothing.
+- One transaction reserves a dispatch: ownership, role/phase, root ownership and allowance,
+  authorization allowance, the attempt row, the invocation row and every counter commit together
+  or not at all. The deadline and the counters are read and written inside it, so two controllers
+  cannot both spend the last submission.
+- **One root runs one task at a time.** A dispatch is refused while another run of the same root
+  is not `ACCEPTED`/`BLOCKED`/`CANCELLED`; the refusal names the owning run. Unresolved
+  invocations are not the whole rule - a run is busy while its approved checks run and while a
+  verdict is rendered, and in both windows nothing is pending.
+- **The whole remaining loop has to fit.** The reservation is checked against this dispatch plus
+  every further dispatch the run needs, so a revision whose reviewer cannot be afforded is refused
+  before the implementer is bought.
+- **One review per candidate.** A non-implementer dispatch attaches to the attempt the implementer
+  created and is refused if that attempt already recorded a reviewer invocation - whether or not
+  the first review is still unresolved. A new invocation id is not a second review and not a
+  second allowance.
+- A pending invocation of a root - `reserved`, `requested`, `started`, `unknown` or
+  `launch_unknown` - blocks every later dispatch of that root, **including under a new revision**.
+  An unresolved invocation is never refunded, retried or re-dispatched; an operator reconciles it.
+  The ledger separates four facts: `requested` (a driver was asked), `started` (the launch
+  happened), the process count (a driver reported a pid) and the settlement. `not_started` is
+  recorded only when no driver was ever asked; a launch that was requested and never reported back
+  is `launch_unknown`, because an empty timestamp is not evidence that nothing ran - a forced stop
+  of a real child is evidence of the opposite.
+- `status`/`report` read the ledger back: root id, used/limit submissions, repairs used/limit,
+  deadline, and per-invocation role, launch state and spawn kind. The `processes` line counts
+  reported operating-system children, so an offline run shows zero however many times it settled.
+  A run recorded before E1 has no root row and says `legacy / not recorded` - absent facts, never
+  zeros.
+- Automatic repair is **not implemented**. E1 is the ledger and the one dispatch transaction; the
+  E2 loop that would spend `max_repairs` does not exist, and a budget field is not a feature.
+
 ## Where the data lives
 
 | Data | Path |
@@ -167,6 +257,48 @@ Consequences worth knowing:
 
 `run`/`status`/`report` accept `--data-dir` before or after the subcommand. Runtime data
 is never written inside a project checkout, so a run cannot dirty the tree it measures.
+
+## Storage version and migrations (batch E1)
+
+The database records its own **storage version**, separate from the public contract version.
+Batch E1 adds `root_budgets` and `invocations` (plus a few columns), so the file goes from
+version 1 to version 2 the first time a build that understands v2 opens it.
+
+What happens on that first open:
+
+1. The version is read **before** anything is written. A file that records a version newer than
+   this build understands is refused with nothing touched - no snapshot, no write.
+2. If the file is at version > 0, it is copied first with the SQLite backup API to
+   `<db>.pre-v<version>.bak` (for example `hflow.sqlite.pre-v1.bak`), next to the database. A
+   brand-new file gets no backup: there is nothing to protect.
+3. The migration runs inside one `BEGIN IMMEDIATE` transaction of plain statements. Any failure
+   rolls the whole thing back, and re-opening an already-migrated file does nothing (no second
+   backup, no rewrite). The backup is never overwritten, so the earliest pre-migration state
+   stays restorable.
+
+**Do not open a migrated database with an older binary.** A build that predates the version
+check has no idea what `root_budgets`/`invocations` mean and would read (and write) a layout it
+does not understand. There is no downgrade path and no partial-version support.
+
+To roll back, stop everything, keep the migrated file, and restore the snapshot:
+
+```sh
+# Windows PowerShell, with data-dir pointing at the directory that holds the database
+Copy-Item "$data\hflow.sqlite" "$data\hflow.sqlite.migrated"
+Copy-Item "$data\hflow.sqlite.pre-v1.bak" "$data\hflow.sqlite"
+```
+
+```sh
+# POSIX
+cp "$data/hflow.sqlite" "$data/hflow.sqlite.migrated"
+cp "$data/hflow.sqlite.pre-v1.bak" "$data/hflow.sqlite"
+```
+
+The restored file is the pre-migration state: runs, authorizations and evidence as they were at
+that moment, and **without** anything the newer build wrote afterwards (a root ledger row, an
+invocation reservation, a delivery decision recorded later). Restoring is a deliberate data loss
+of everything after the snapshot; it is the only supported rollback, and it is why the snapshot is
+never overwritten.
 
 ## Reading a blocked run
 
@@ -322,6 +454,36 @@ hflow run --task task.json --project .hflow/project.json --project-root <repo> \
           --driver acpx-dsh --authorization-file auth.json \
           --authorization-mode m2-live-change --data-dir <data> --json
 ```
+
+For a run that spends against a **root ledger** (`--root-budget-file`, batch E1) the artifact
+carries two more members: the derived `binding.root_budget` and the approved `root_limits`. Write
+them from `hflow prepare --root-budget-file <file> --json`, which prints exactly that binding:
+
+```json
+{
+  "binding": {
+    "...": "the same fields as above, plus:",
+    "root_budget": {
+      "root_id": "root-<32 hex>",
+      "project_id": "<project>",
+      "repo_path": "<abs path>",
+      "task_id": "<task id>",
+      "ledger_path": "<abs path to hflow.sqlite>"
+    }
+  },
+  "root_limits": {
+    "max_top_level_submissions": 4,
+    "max_repairs": 1,
+    "deadline_seconds": 86400
+  }
+}
+```
+
+`root_limits` is **required** whenever the binding carries a root: an approval that named a root
+but not its ceiling would otherwise get whatever default the build happens to use. Both
+directions are checked - a root run whose artifact carries no root is refused, and a root artifact
+used for a run that resolves no root is refused. `root_limits` must equal the `limits` in the
+`--root-budget-file`, or the run is refused before anything is dispatched.
 
 Why an artifact instead of a flag: a flag would be written by the same process that runs the
 task, so an agent could authorize itself. The artifact is refused unless
@@ -550,11 +712,16 @@ not confine anything by itself.
 
 ## Reading the counters honestly
 
-`status` prints three things that are easy to confuse:
+`status` prints several things that are easy to confuse:
 
 ```text
 turns         reserved 2/4, implementer self-reported 1 (a self-report, not a dispatched count and not a bill)
-invocations   implementer=1 reviewer=1 (deterministic dispatch count; billed model requests: unknown)
+invocations   implementer=1 reviewer=1 (attempt rows; a deterministic dispatch count, not a model-request count)
+root budget   root-1f0c... (a root run; a run with no root ledger row says "legacy / not recorded")
+  submissions used 2/3 (remaining 1)
+  repairs     used 0/1 (recorded counter; the repair loop that would spend it is not implemented in E1)
+dispatch ledger
+  reserved=0 started=1 not_started=0 settled=1 unknown=0 (total 2, ever started 2)
 candidate     workspace still matches the accepted fingerprint
 ```
 
@@ -564,9 +731,25 @@ candidate     workspace still matches the accepted fingerprint
 - `implementer self-reported 1` is what the worker claimed for its own turn. It is not the
   run total and it cannot return reserved budget. The controller's own **dispatch** count is
   the `invocations` line.
+- The **dispatch ledger** keeps three different facts apart, and they are not one number:
+  - `reserved` - the dispatch transaction committed. The allowance is spent and the intent is
+    durable, but no process has been recorded as started. A reservation is neither a process
+    nor a model request.
+  - `started` - a process was handed to the driver (`ever started` counts the ones that also
+    settled afterwards). It is still not a provider model request.
+  - `not_started` - reserved, but provably never launched (a stop won the handoff). The
+    allowance is kept, never refunded.
+  - `settled` - a recorded result was applied; `unknown` - started and never settled, which
+    blocks the root and is never re-dispatched.
+  - **provider model requests: unknown.** No invocation row records one, and a reservation is
+    never counted as one.
 - Whether a Harness makes internal model requests per turn is not observable here, so billed
   usage stays `null` and "billed model requests" stays `unknown`. Do not read `null` as `0`.
   ACP `usage_update.used/size` is context-window usage, not a bill.
+- A run with no root ledger row (any run recorded before E1, or one that never used a root
+  budget file) prints `legacy / not recorded` for both the root budget and the dispatch ledger.
+  That is **not** "0 used": there is no root, no invocation row and no counter to read, and
+  nothing is back-filled from the new rules.
 - `candidate` compares the workspace against the fingerprint the run was accepted at. If it
   says `DRIFTED`, the stored `ACCEPTED` describes the candidate as it was, not the files on
   disk now; nothing has been re-verified.

@@ -30,12 +30,14 @@ from .contracts import (
     CandidateSnapshot,
     CheckPhase,
     DeliveryState,
+    DispatchReservation,
     EffectiveConfig,
     EvidenceStatus,
     HarnessDriver,
     InvocationOutcome,
     InvocationRequest,
     InvocationResult,
+    InvocationStartState,
     IsolationLevel,
     LaunchConfig,
     ProjectConfig,
@@ -44,9 +46,13 @@ from .contracts import (
     ReconcileOutcome,
     ResultReceipt,
     ReviewResult,
+    RootBudgetBinding,
+    RootBudgetLimits,
     RunInspection,
     RunRequest,
     RunSummary,
+    SpawnFact,
+    SpawnReporter,
     TaskSpec,
     TaskState,
     UsageFacts,
@@ -194,6 +200,14 @@ NOTE_CANCEL_TARGET = "cancel_target"
 #: outcome, so the fact is recorded in the note table where a terminal transition cannot
 #: erase it - instead of the controller raising on a state that is already correct.
 NOTE_LATE_RESULT = "late_result"
+#: One reserved dispatch (batch E1): its role, root, round, repair flag and start state as the
+#: transaction left them. Written after the commit, so it describes a reservation that exists
+#: rather than one that was attempted.
+NOTE_DISPATCH = "dispatch"
+#: One reserved dispatch (batch E1): its role, root, round, repair flag and start state as the
+#: transaction left them. Written after the commit, so it describes a reservation that exists
+#: rather than one that was attempted.
+NOTE_DISPATCH = "dispatch"
 
 
 class RunOutcome:
@@ -325,6 +339,8 @@ class Controller:
         production: bool | None = None,
         reviewer_driver: HarnessDriver | None = None,
         effective_config: EffectiveConfig | None = None,
+        root_binding: RootBudgetBinding | None = None,
+        root_limits: RootBudgetLimits | None = None,
     ) -> None:
         self.store = store
         #: The implementer's driver. A machine profile may bind the reviewer elsewhere, so the
@@ -335,6 +351,21 @@ class Controller:
         self.runners = runners or CheckRunners.offline_default()
         self.controller_id = controller_id
         self.reservation_ttl_seconds = reservation_ttl_seconds
+        #: Batch E1. The root this run's dispatches are charged against, and its immutable
+        #: ceilings. Both come from the loaded authorization artifact, never from the worker:
+        #: a caller that could choose its own root could choose a fresh, unspent one.
+        #:
+        #: They stay ``None`` for an offline run and for every run whose artifact predates roots -
+        #: which is exactly the legacy path (no ``invocations`` row, no root counter), so this
+        #: default cannot silently enable anything.
+        if (root_binding is None) != (root_limits is None):
+            raise RefusedError(
+                RefusalCode.INVALID_SPEC,
+                "a root budget needs both its binding and its limits: a binding without a "
+                "ceiling would spend against an allowance nobody approved",
+            )
+        self.root_binding = root_binding
+        self.root_limits = root_limits
         #: Is this a real Harness run rather than an offline one? It decides the gates that
         #: make sense only for a delivery: approved checks must be real, the workspace must be
         #: isolated, and the run must be able to write.
@@ -470,6 +501,12 @@ class Controller:
             deadline_seconds=request.deadline_seconds,
             writes_allowed=resolve_permissions(spec)[0],
         )
+        # The root is registered before the run row exists: its ceilings are an admission
+        # precondition, and refusing them after the run row was written would leave a run
+        # pointing at a root nothing agreed to. Registration is idempotent, so this is one call
+        # on purpose - two would be a reader's puzzle, not an extra guarantee.
+        if self.root_binding is not None:
+            self._register_root_budget()
         self._assert_dispatch_preconditions(spec, project, request.deadline_seconds)
         self._assert_allowance_for(run_id, spec, project)
 
@@ -482,13 +519,19 @@ class Controller:
         # nothing) cannot consume it.
         if self.authorization is not None:
             self.store.register_authorization(self.authorization.as_store_record())
-            report = self._preflight_report()
-            if not report[0]:
-                raise RefusedError(
-                    RefusalCode.NOT_IMPLEMENTED,
-                    f"zero-model preflight failed for this execution binding: {report[1]}. "
-                    "No authorization allowance was consumed and nothing was dispatched.",
-                )
+            # The preflight proves that a *launch* works before a submission is spent: it starts
+            # the resolved client with a metadata argument. A driver that starts no process has
+            # no launch binding to prove, so demanding a probe from it would refuse the one path
+            # an offline run has. A driver that *does* offer the check still gets it whatever the
+            # run's production flag says: the gate is about the binding, not about a label.
+            if self._launch_is_probeable():
+                report = self._preflight_report()
+                if not report[0]:
+                    raise RefusedError(
+                        RefusalCode.NOT_IMPLEMENTED,
+                        f"zero-model preflight failed for this execution binding: {report[1]}. "
+                        "No authorization allowance was consumed and nothing was dispatched.",
+                    )
 
         row = self.store.create_run(
             run_id=run_id,
@@ -572,7 +615,19 @@ class Controller:
         The observation goes to the invocation the run was actually on - the reviewer's own
         driver during ``phase=review`` - because a process the other driver never started
         cannot be reported on. Nothing is re-dispatched either way.
+
+        Batch E1 adds the ledger half, and it is deliberately the *first* thing that happens: an
+        invocation that was reserved or started and never settled becomes ``unknown``, which
+        keeps blocking the root. Recording the reconciliation payload is a description of what
+        was observed; not closing the ledger entry would leave a run whose controller died
+        between the commit and the spawn looking like a run with work still in flight, and the
+        next revision of the same task would be refused for the wrong reason.
         """
+        closed = self.store.mark_unsettled_invocations_unknown(
+            run_id,
+            "the controller did not observe a result for this invocation; reconciled by an "
+            "operator. The consumption stands and this root does not re-dispatch.",
+        )
         attempt = self.store.open_attempt(run_id)
         if attempt is None:
             return ReconcileOutcome.NOT_STARTED
@@ -581,6 +636,12 @@ class Controller:
             return ReconcileOutcome.NOT_STARTED
         result = driver.reconcile(invocation_id)
         self.store.record_reconcile(attempt["attempt_id"], result.model_dump(mode="json"))
+        if closed:
+            self.store.record_note(
+                run_id,
+                f"{NOTE_DISPATCH}: {closed} unresolved invocation(s) recorded as unknown; no "
+                "re-dispatch and no refund - the allowance they consumed stands",
+            )
         return result.outcome
 
     def cancel(self, run_id: str) -> CancellationReceipt:
@@ -652,6 +713,10 @@ class Controller:
                 )
             except StoreError:
                 pass  # the attempt may already be terminal; the receipt is still recorded
+            # The ledger records the same fact: the allowance this dispatch consumed stays
+            # consumed, and the invocation is closed so it does not keep the root open for
+            # nothing. A stopped invocation is not an unknown one.
+            self._settle_cancelled_invocation(run_id, active_invocation, receipt)
             self.store.set_blocked(
                 run_id,
                 RefusalCode.CANCELLED_BY_OPERATOR,
@@ -667,6 +732,54 @@ class Controller:
                 f"({self._driver_label(driver, role)}): {receipt.status}; work may still be running",
             )
         return receipt
+
+    def _settle_cancelled_invocation(
+        self, run_id: str, invocation_id: str, receipt: CancellationReceipt
+    ) -> None:
+        """Close the ledger entry a confirmed stop ended.
+
+        Only for a *confirmed* stop: an unconfirmed one stays open on purpose, because "work may
+        still be running" is exactly the state that must keep blocking. The consumption is never
+        returned - the allowance was committed before the process existed - so this records the
+        outcome, not a refund.
+
+        Three shapes, and the difference between the last two is the whole point:
+
+        * a launch is recorded (``started_at`` set) -> the launch happened, so the entry is
+          settled as cancelled;
+        * **no launch was ever requested** (``launch_requested_at`` is NULL) -> nothing was asked
+          of any driver, so ``not_started`` is a fact: the allowance bought nothing at all;
+        * a launch *was* requested and no report came back -> nobody may say whether a process
+          exists, and a confirmed stop of a real child is direct evidence that one did. This is
+          ``launch_unknown``: the root stays blocked and an operator reconciles it. Recording
+          ``not_started`` here would be claiming, from an empty timestamp, that no driver was ever
+          asked - which is false, and was reproduced against a real forced stop of a real pid.
+        """
+        recorded = self.store.invocation(invocation_id) if invocation_id else None
+        if recorded is None:
+            # A legacy run: its dispatch facts live on the attempt row, and there is no ledger
+            # entry to close.
+            return
+        if recorded.started_at is not None:
+            self.store.settle_invocation(
+                invocation_id,
+                outcome=InvocationOutcome.CANCELLED,
+                detail=f"stop confirmed ({receipt.mechanism}) for run {run_id}",
+            )
+            return
+        if not recorded.launch_requested:
+            self.store.mark_invocation_not_started(
+                invocation_id,
+                f"a confirmed stop ({receipt.mechanism}) ended run {run_id} before any driver was "
+                "asked to launch this invocation",
+            )
+            return
+        self.store.mark_launch_unresolved(
+            invocation_id,
+            f"a stop was confirmed ({receipt.mechanism}) for run {run_id} after the launch was "
+            "requested and before any spawn report arrived: no launch is recorded and no process "
+            "is known, so the ledger does not claim either",
+        )
 
     def _active_invocation(
         self, row: object, attempt: object
@@ -910,6 +1023,268 @@ class Controller:
         except Exception as exc:  # noqa: BLE001 - a broken preflight is a refusal, not a crash
             return False, f"preflight raised {exc!r}"
 
+    def _launch_is_probeable(self) -> bool:
+        """Is there a launch binding for the zero-model preflight to prove?
+
+        A driver that starts no process cannot fail a launch test, so requiring one from it would
+        refuse an offline run for a property it cannot have - and the offline fake driver is the
+        only way an E1 root run is exercised end to end without buying a model call.
+
+        The question is asked of the *resolved configuration* first, because that is what the
+        preflight actually inspects: a run with no launch config has nothing to prove. When no
+        configuration was resolved (a direct library caller), the drivers themselves are asked.
+        """
+        if self.effective_config is not None:
+            return bool(self._resolved_launches())
+        return any(
+            callable(getattr(driver, "readonly_client_check", None))
+            for driver in (self.driver, self.reviewer_driver)
+        )
+
+    def _register_root_budget(self) -> None:
+        """Record this root's binding and ceilings before any run row or dispatch exists.
+
+        ``StoreError`` here is an admission refusal, not a crash: it means this run presents a
+        different ceiling, or a second root id, for a task that already has one. Either way the
+        allowance belongs to the recorded root and nothing is dispatched.
+        """
+        assert self.root_binding is not None and self.root_limits is not None
+        try:
+            self.store.register_root_budget(self.root_binding, self.root_limits)
+        except StoreError as exc:
+            raise RefusedError(RefusalCode.BUDGET_EXHAUSTED, str(exc)) from exc
+
+    def _reserve_dispatch(
+        self,
+        *,
+        run_id: str,
+        attempt_id: str | None,
+        invocation_id: str,
+        reservation_id: str,
+        role: str,
+        purpose: str,
+        spec: TaskSpec,
+        project: ProjectConfig,
+    ) -> DispatchReservation:
+        """The one dispatch transaction, for both roles.
+
+        Everything a dispatch costs and everything that proves it happened commit together: the
+        authorization's submission, the run's reserved turn, the root's consumption (when this
+        run has a root) and the invocation record. A refusal raises ``RefusedError`` carrying the
+        store's own message, and the caller blocks the run - nothing is dispatched, no driver is
+        built and no process is created.
+
+        ``required_loop_remaining`` is what the root must still be able to afford: this dispatch
+        plus every further top-level dispatch this run needs for one accepted delivery. Passing
+        only "one more" is how a revision with an implementer's worth of allowance but no
+        reviewer's worth got admitted and then blocked with the implementation paid for.
+
+        A replay of the same ``invocation_id`` returns ``is_new=False``. The caller must then only
+        coordinate: starting the driver again would be the second dispatch this ordering exists
+        to prevent.
+        """
+        expires_at = (
+            parse_ts(utc_now()) + timedelta(seconds=self.reservation_ttl_seconds)
+        ).isoformat().replace("+00:00", "Z")
+        already_paid = sum(self.store.invocation_counts(run_id))
+        needed = max(1, self._loop_turns_required(spec, project) - already_paid)
+        try:
+            reservation = self.store.reserve_dispatch(
+                run_id=run_id,
+                controller_id=self.controller_id,
+                invocation_id=invocation_id,
+                role=role,
+                reservation_id=reservation_id,
+                reserved_turns=1,
+                reservation_expires_at=expires_at,
+                attempt_id=attempt_id,
+                root_binding=self.root_binding,
+                root_limits=self.root_limits,
+                authorization_id=(
+                    self.authorization.authorization_id if self.authorization is not None else ""
+                ),
+                authorization_max=(
+                    self.authorization.max_top_level_submissions
+                    if self.authorization is not None
+                    else None
+                ),
+                required_loop_remaining=needed,
+            )
+        except StoreError as exc:
+            raise RefusedError(self._dispatch_refusal_code(str(exc)), str(exc)) from exc
+        if self.authorization is not None:
+            self.store.record_note(
+                run_id,
+                f"authorization {self.authorization.authorization_id}: consumed top-level "
+                f"submission {reservation.authorization_used}/"
+                f"{self.authorization.max_top_level_submissions} for {purpose} "
+                f"(reserved in the same transaction as the attempt and the invocation record; "
+                f"this run's remaining loop needs {needed} dispatch(es))",
+            )
+        if reservation.invocation is not None:
+            self.store.record_note(
+                run_id,
+                f"{NOTE_DISPATCH}: role={role} invocation={reservation.invocation.invocation_id} "
+                f"root={reservation.invocation.root_id} round={reservation.invocation.round} "
+                f"repair={reservation.invocation.is_repair} state="
+                f"{reservation.invocation.state.value}",
+            )
+        return reservation
+
+    def _dispatch_refusal_code(self, message: str) -> RefusalCode:
+        """Which refusal a refused reservation is, read from the store's own wording.
+
+        Deliberately narrow: only the cases the store states explicitly are re-labelled, so an
+        unexpected failure keeps its own message and is not dressed up as a budget decision.
+        """
+        if "cancellation intent" in message:
+            return RefusalCode.CANCELLED_BY_OPERATOR
+        if (
+            "unresolved invocation" in message
+            or "deadline" in message
+            or "exhausted" in message
+            or "cannot complete this run's loop" in message
+            or "is owned by run" in message
+        ):
+            return RefusalCode.BUDGET_EXHAUSTED
+        return RefusalCode.INTERNAL_ERROR
+
+    def _spawn_reporter(self, reservation: DispatchReservation) -> SpawnReporter:
+        """The callback a driver uses to report what it observed at its spawn decision.
+
+        Wired into every ``InvocationRequest`` this controller builds. A driver that calls it
+        turns "we asked for a launch" into either "a process exists" or "no process was created";
+        a driver that does not leaves the invocation ``REQUESTED``, which is reported as an
+        unconfirmed launch rather than being counted as a start.
+
+        A bookkeeping failure inside the callback is swallowed on purpose: the driver is inside
+        its own spawn gate, and raising there would turn a ledger problem into "the launch
+        failed". The consequence of a lost report is the conservative one - the invocation stays
+        ``REQUESTED`` and keeps blocking - and the run's note table records it.
+        """
+        invocation = reservation.invocation
+        if invocation is None:
+            return lambda _fact: None
+        run_id = invocation.run_id
+
+        def report(fact: SpawnFact) -> None:
+            try:
+                self.store.record_invocation_spawn(fact)
+            except StoreError as exc:
+                self.store.record_note(
+                    run_id,
+                    f"{NOTE_DISPATCH}: the driver's spawn fact for {invocation.invocation_id} "
+                    f"could not be recorded ({exc}); the invocation keeps the state it had",
+                )
+
+        return report
+
+    def _mark_launch_requested(self, reservation: DispatchReservation) -> None:
+        """Record that a driver is about to be asked to launch this invocation.
+
+        Deliberately not a start. The last moment at which "no process exists" is certainly true
+        is this one, so recording a request here is honest; recording a start here is what made a
+        driver-suppressed launch look like a running model call. The process fact comes from the
+        driver through the spawn report wired into the request.
+        """
+        if reservation.invocation is not None:
+            self.store.mark_invocation_launch_requested(reservation.invocation.invocation_id)
+
+    def _settle_invocation(
+        self, reservation: DispatchReservation, outcome: InvocationOutcome | None, detail: str = ""
+    ) -> None:
+        """Close the dispatch record with the outcome the driver reported.
+
+        Never refunds: an ``OUTCOME_UNKNOWN`` becomes ``unknown``, which keeps blocking the root
+        until an operator reconciles it. A failure to record the settlement is not allowed to
+        replace the result the caller already has - it is reported as a note instead.
+        """
+        if reservation.invocation is None:
+            return
+        try:
+            self.store.settle_invocation(
+                reservation.invocation.invocation_id, outcome=outcome, detail=detail
+            )
+        except StoreError as exc:
+            self.store.record_note(
+                reservation.invocation.run_id,
+                f"{NOTE_DISPATCH}: invocation {reservation.invocation.invocation_id} could not be "
+                f"settled ({exc}); its consumption stands and the root keeps it open",
+            )
+
+    def _mark_invocation_not_started(self, reservation: DispatchReservation, detail: str) -> None:
+        """Record a reservation that provably never reached a launch. The spend is kept."""
+        if reservation.invocation is None:
+            return
+        self.store.mark_invocation_not_started(reservation.invocation.invocation_id, detail)
+
+    def _mark_driver_failure(self, reservation: DispatchReservation, exc: BaseException) -> None:
+        """Record a driver that raised before it reported anything.
+
+        Deliberately **not** "not started": nobody said whether a process exists, and a driver can
+        raise *after* creating one (a failed pipe write, a broken handle). The safe reading of "no
+        report and an exception" is an unconfirmed launch - the same state a crash in this window
+        leaves - so the root stays blocked and an operator looks. Recording it as "never started"
+        would be the mirror image of the earlier bug: an assumption in the direction that makes a
+        possibly-billed invocation look free.
+
+        Only the ledger state is left alone. The attempt is still failed and the run still blocks
+        with the driver's error, because that part *is* known.
+        """
+        if reservation.invocation is None:
+            return
+        try:
+            self.store.record_note(
+                reservation.invocation.run_id,
+                f"{NOTE_DISPATCH}: the driver raised for invocation "
+                f"{reservation.invocation.invocation_id} without reporting a spawn fact "
+                f"({exc!r}); the ledger keeps it as a launch that was requested and unconfirmed, "
+                "which blocks the root until an operator reconciles it",
+            )
+        except StoreError:
+            pass  # a broken note write must not change what the caller reports
+
+    def _confirm_driver_ran(
+        self, reservation: DispatchReservation, result: InvocationResult
+    ) -> None:
+        """Decide what a driver's return means when it did not report a spawn fact.
+
+        Only for a driver that does not implement ``on_spawn`` (an older or third-party one), and
+        only when no report arrived: a driver that reports *has* answered, whatever its report
+        says, and inferring on top of that answer would let a silent-looking return overwrite a
+        recorded "no process was created". The two readable shapes for a silent driver are:
+
+        * a completed invocation that produced work - a candidate, a review verdict or observed
+          agent turns - so a process existed and it is recorded as started;
+        * a cancelled invocation that produced no work at all, so nothing ran and it is recorded
+          as never started.
+
+        Anything else stays ``requested``: guessing in either direction is what produced both of
+        the bugs this replaces.
+        """
+        if reservation.invocation is None:
+            return
+        invocation_id = reservation.invocation.invocation_id
+        current = self.store.invocation(invocation_id)
+        if current is None:
+            return
+        if current.started_at is not None or current.launch_requested_at is not None:
+            # A driver was asked and answered - or a process is already recorded. An inference is
+            # not evidence, and it never overrides one.
+            return
+        if current.state is InvocationStartState.NOT_STARTED:
+            return  # already reported as producing nothing
+        produced_work = bool(
+            result.candidate is not None or result.review is not None or result.agent_turns
+        )
+        if result.outcome is InvocationOutcome.COMPLETED and produced_work:
+            self.store.mark_invocation_started(invocation_id)
+        elif result.outcome is InvocationOutcome.CANCELLED and not produced_work:
+            self.store.mark_invocation_not_started(
+                invocation_id,
+                "the driver reported a cancelled invocation that produced no work and no process",
+            )
+
     def _claim_submission(self, run_id: str, purpose: str) -> int:
         """Consume one authorized top-level submission, or refuse to dispatch.
 
@@ -996,34 +1371,33 @@ class Controller:
                 "implicitly",
             )
 
-        # --- dispatch, with the authorized-submission claim and the budget gate
-        if self.authorization is not None:
-            self._claim_submission(run_id, "implementer invocation")
-
-        # --- dispatch, with the budget gate and the dispatch intent in one transaction
-        expires_at = (
-            parse_ts(utc_now()) + timedelta(seconds=self.reservation_ttl_seconds)
-        ).isoformat().replace("+00:00", "Z")
+        # --- the one dispatch transaction: the authorization's submission, the run's turn,
+        # the root's consumption and the invocation record all commit together. Every
+        # predictable refusal happens before this (admission checks, the packet, the allowance
+        # gate); every *failure* after it is recorded against the invocation it belongs to,
+        # instead of leaving a counter that moved with nothing to show for it.
         try:
-            self.store.dispatch_attempt(
+            dispatch = self._reserve_dispatch(
                 run_id=run_id,
-                controller_id=self.controller_id,
                 attempt_id=attempt_id,
-                role="implementer",
+                invocation_id=invocation_id,
                 reservation_id=reservation_id,
-                reserved_turns=1,
-                reservation_expires_at=expires_at,
+                role="implementer",
+                purpose="implementer invocation",
+                spec=spec,
+                project=project,
             )
-        except StoreError as exc:
-            return self._refuse(
-                run_id,
-                RefusalCode.BUDGET_EXHAUSTED
-                if "budget exhausted" in str(exc)
-                else RefusalCode.INTERNAL_ERROR,
-                str(exc),
-            )
+        except RefusedError as exc:
+            return self._refuse(run_id, exc.code, str(exc))
+        attempt_id = dispatch.attempt_id
+        invocation_id = (
+            dispatch.invocation.invocation_id if dispatch.invocation else invocation_id
+        )
+        if dispatch.invocation is None:
+            # The legacy path: no ledger row, so the dispatch facts stay on the attempt row, and
+            # that write is the stop-aware one - a stop committing first must win the handoff.
+            self.store.record_invocation(attempt_id, invocation_id)
 
-        self.store.record_invocation(attempt_id, invocation_id)
         pid, started_at, identity = ProcessGuard(self.controller_id).identity()
         self.store.record_process_identity(
             attempt_id, pid=pid, started_at=started_at, identity=identity, session_id=attempt_id
@@ -1073,17 +1447,31 @@ class Controller:
             # Asked by the driver at the instant it creates the process, not answered here: a
             # snapshot taken now would be stale by the time the child is spawned.
             stop_requested=lambda: self._stop_recorded(run_id),
+            # The other half of that handoff: the driver reports what it observed at its spawn
+            # decision, so "a process exists" is a recorded observation. A driver that never calls
+            # it leaves this invocation `requested`, which is reported as an unconfirmed launch
+            # rather than counted as a start.
+            on_spawn=self._spawn_reporter(dispatch),
         )
 
-        # From here on, failures must not re-dispatch: the model may already have run.
+        # From here on, failures must not re-dispatch: the model may already have run. The
+        # ledger records how far this dispatch got before it is handed over - a launch *requested*
+        # and nothing more - so a crash here is visible as an unconfirmed launch rather than
+        # rounded up to a model call.
+        self._mark_launch_requested(dispatch)
         try:
             result = self.driver.start(invocation)
         except RefusedError as exc:
+            self._mark_invocation_not_started(dispatch, f"refused before launch: {exc}")
             return self._block_attempt(run_id, attempt_id, exc.code, str(exc))
         except Exception as exc:  # noqa: BLE001 - controller must not hot-fix a driver
+            self._mark_driver_failure(dispatch, exc)
             return self._block_attempt(run_id, attempt_id, RefusalCode.INTERNAL_ERROR, repr(exc))
+        else:
+            self._confirm_driver_ran(dispatch, result)
 
         if result.outcome is InvocationOutcome.OUTCOME_UNKNOWN:
+            self._settle_invocation(dispatch, result.outcome, "driver reported an unknown outcome")
             self._apply_result_or_stay_stopped(
                 run_id=run_id,
                 attempt_id=attempt_id,
@@ -1109,6 +1497,7 @@ class Controller:
                 f"{NOTE_PROMPT_DIGEST}: MISMATCH sent={result.prompt_digest} "
                 f"expected={prepared.packet.digest}",
             )
+            self._settle_invocation(dispatch, result.outcome, "prompt digest mismatch")
             self.store.finish_attempt(
                 run_id=run_id,
                 attempt_id=attempt_id,
@@ -1125,6 +1514,9 @@ class Controller:
             )
 
         if result.outcome is not InvocationOutcome.COMPLETED:
+            self._settle_invocation(
+                dispatch, result.outcome, "driver reported a non-completed outcome"
+            )
             self._apply_result_or_stay_stopped(
                 run_id=run_id,
                 attempt_id=attempt_id,
@@ -1138,6 +1530,7 @@ class Controller:
             # Applied or already finalized by a stop: the run's own recorded state is the answer.
             return self._outcome_for(run_id)
 
+        self._settle_invocation(dispatch, result.outcome, "implementer invocation completed")
         if not self._apply_result_or_stay_stopped(
             run_id=run_id,
             attempt_id=attempt_id,
@@ -1388,24 +1781,37 @@ class Controller:
         # a review turn for a run a human already stopped is exactly the spend a stop prevents.
         self._refuse_if_stopped(run_id, where="the review turn was bought")
 
-        if self.authorization is not None:
-            # The reviewer is its own invocation and its own top-level submission.
-            self._claim_submission(run_id, "reviewer invocation")
-        try:
-            self.store.reserve_review_turn(run_id, self.controller_id)
-        except StoreError as exc:
-            raise RefusedError(RefusalCode.BUDGET_EXHAUSTED, str(exc)) from exc
-
-        # The last handoff, and the one a read cannot protect: registering the reviewer's
-        # invocation and the stop's decision are a single conditional write, so exactly one of
-        # them wins. If the stop won, nothing is registered and the reviewer is never started.
-        #
-        # Registration is *not* enough on its own, which is why the handoff does not end here: a
-        # stop can still commit between this write and the driver creating a child. The request
-        # therefore carries the stop question, and the driver decides it inside the gate it also
-        # uses to publish that invocation's handle - so either the stop is seen and no process is
-        # created, or the process exists and the stop finds a published handle to act on.
-        self._register_reviewer(run_id, attempt_id, invocation_id)
+        # The reviewer is its own invocation and its own top-level submission, bought through
+        # the same single transaction as the implementer's: the submission, the review turn, the
+        # root's consumption and the invocation record commit together or not at all. A stop that
+        # commits first is refused there rather than after one of them moved.
+        dispatch = self._reserve_dispatch(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            invocation_id=invocation_id,
+            reservation_id=new_reservation_id(),
+            role="reviewer",
+            purpose="reviewer invocation",
+            spec=spec,
+            # ``_drive`` always passes the project through; the default only keeps a direct
+            # caller from crashing on this path, and it fails closed rather than open.
+            project=project if project is not None else ProjectConfig(project_id="", checks=[]),
+        )
+        attempt_id = dispatch.attempt_id
+        invocation_id = (
+            dispatch.invocation.invocation_id if dispatch.invocation else invocation_id
+        )
+        if dispatch.invocation is None:
+            # The legacy path: registering the reviewer's invocation and the stop's decision are
+            # a single conditional write, so exactly one of them wins. If the stop won, nothing
+            # is registered and the reviewer is never started.
+            #
+            # Registration is *not* enough on its own: a stop can still commit between this write
+            # and the driver creating a child. The request therefore carries the stop question,
+            # and the driver decides it inside the gate it also uses to publish that invocation's
+            # handle - so either the stop is seen and no process is created, or the process
+            # exists and the stop finds a published handle to act on.
+            self._register_reviewer(run_id, attempt_id, invocation_id)
         review_request = InvocationRequest(
             invocation_id=invocation_id,
             attempt_id=attempt_id,
@@ -1429,10 +1835,16 @@ class Controller:
             writes_allowed=False,
             data_dir=str(self.data_dir),
             stop_requested=lambda: self._stop_recorded(run_id),
+            # The reviewer's launch is reported the same way the implementer's is: the ledger
+            # learns whether a process was created from the driver, not from the fact that a
+            # review turn was bought.
+            on_spawn=self._spawn_reporter(dispatch),
         )
+        self._mark_launch_requested(dispatch)
         try:
             review_invocation = self.reviewer_driver.start(review_request)
         except Exception as exc:  # noqa: BLE001 - a broken reviewer must not become an accept
+            self._mark_driver_failure(dispatch, exc)
             self.store.attach_review_result(
                 attempt_id, {"error": repr(exc), "invocation_id": invocation_id}
             )
@@ -1440,11 +1852,15 @@ class Controller:
                 RefusalCode.REVIEW_PROTOCOL_ERROR,
                 "the review invocation could not be started, so no verdict exists: " f"{exc!r}",
             ) from exc
+        self._confirm_driver_ran(dispatch, review_invocation)
 
         if review_invocation.outcome is InvocationOutcome.CANCELLED and self._stop_recorded(run_id):
             # The stop won the handoff inside the driver, so no reviewer process was created.
             # Nothing is attached to the attempt - there was no invocation - and the run keeps
-            # the stop decision it already made.
+            # the stop decision it already made. The reservation is recorded as never started:
+            # its allowance stays consumed (it was committed before the handoff) and the ledger
+            # says so instead of counting a process that never existed.
+            self._mark_invocation_not_started(dispatch, "the stop won the reviewer handoff")
             raise RefusedError(
                 RefusalCode.CANCELLED_BY_OPERATOR,
                 "the stop was seen before the reviewer process was created, so none was started "
@@ -1459,6 +1875,9 @@ class Controller:
         if review_invocation.outcome is not InvocationOutcome.COMPLETED:
             # An unfinished turn is a transport failure, not the reviewer's judgment. It is
             # reported as such; a genuine rejection requires a validated `changes_requested`.
+            self._settle_invocation(
+                dispatch, review_invocation.outcome, "review invocation did not complete"
+            )
             raise RefusedError(
                 RefusalCode.REVIEW_PROTOCOL_ERROR,
                 "the review invocation did not complete "
@@ -1475,41 +1894,51 @@ class Controller:
                 f"{NOTE_PROMPT_DIGEST}: MISMATCH role=reviewer sent="
                 f"{review_invocation.prompt_digest} expected={reviewer_packet.digest}",
             )
+            self._settle_invocation(dispatch, review_invocation.outcome, "review prompt mismatch")
             raise RefusedError(
                 RefusalCode.REVIEW_PROTOCOL_ERROR,
                 "the reviewer invocation received a different prompt than the rendered review "
                 "packet, so its verdict does not belong to this candidate",
             )
 
-        review_output = review_invocation.review
-        if review_output is None:
-            return self._unusable_review(
+        try:
+            review_output = review_invocation.review
+            if review_output is None:
+                return self._unusable_review(
+                    run_id=run_id,
+                    attempt_id=attempt_id,
+                    invocation=review_invocation,
+                    candidate_fp=candidate_fp,
+                    checks_digest=checks_digest,
+                )
+
+            evidence = self.store.record_evidence(
+                evidence_id=self._new_evidence_id(),
                 run_id=run_id,
                 attempt_id=attempt_id,
-                invocation=review_invocation,
-                candidate_fp=candidate_fp,
+                kind="review",
+                status=EvidenceStatus.PASSED
+                if review_output.verdict == "accepted"
+                else EvidenceStatus.FAILED,
+                candidate_fingerprint=candidate_fp,
                 checks_digest=checks_digest,
+                check_id="review",
+                detail=canonical_json(review_output.model_dump(mode="json")),
             )
-
-        evidence = self.store.record_evidence(
-            evidence_id=self._new_evidence_id(),
-            run_id=run_id,
-            attempt_id=attempt_id,
-            kind="review",
-            status=EvidenceStatus.PASSED
-            if review_output.verdict == "accepted"
-            else EvidenceStatus.FAILED,
-            candidate_fingerprint=candidate_fp,
-            checks_digest=checks_digest,
-            check_id="review",
-            detail=canonical_json(review_output.model_dump(mode="json")),
-        )
-        return ReviewResult(
-            status="accepted" if review_output.verdict == "accepted" else "changes_requested",
-            isolation=self.review_isolation,
-            evidence_ids=[evidence.evidence_id],
-            checked_fingerprint=candidate_fp,
-        )
+            return ReviewResult(
+                status="accepted" if review_output.verdict == "accepted" else "changes_requested",
+                isolation=self.review_isolation,
+                evidence_ids=[evidence.evidence_id],
+                checked_fingerprint=candidate_fp,
+            )
+        finally:
+            # One close for every way out of this block, including a vanished verdict and an
+            # unexpected error in the evidence write. Without it a reviewer that ran but whose
+            # verdict was unusable would leave its invocation open forever, and an open
+            # invocation blocks the whole root - a wedge, not a safety property.
+            self._settle_invocation(
+                dispatch, review_invocation.outcome, "review invocation completed"
+            )
 
     def _unusable_review(
         self,
@@ -1958,6 +2387,11 @@ def inspect_run(store: Store, run_id: str, *, project_root: Path | None = None) 
         for e in store.evidence_for(run_id)
     ]
     recorded_config = store.effective_config_for(run_id)
+    # Batch E1 ledger facts. A run with no root reports ``None`` and no invocations, which the
+    # text projection renders as "not recorded" - rather than as a root with zero usage, which a
+    # reader could mistake for a real ledger that has not been spent yet.
+    root_row = store.root_budget_for_run(run_id)
+    root_usage = store.root_budget_view(str(root_row["root_id"])) if root_row is not None else None
     return RunInspection(
         run=_summary_from_row(row, workspace_matches_receipt=drift),
         task_spec=TaskSpec.model_validate(json.loads(row["task_spec_json"])),
@@ -1968,4 +2402,7 @@ def inspect_run(store: Store, run_id: str, *, project_root: Path | None = None) 
         else None,
         effective_config=recorded_config,
         model_calls_made=0,
+        root_budget=root_usage,
+        invocations=store.invocations_for(run_id),
+        invocation_counts=store.invocation_state_counts(run_id),
     )

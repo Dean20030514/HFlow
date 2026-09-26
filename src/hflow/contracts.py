@@ -258,6 +258,106 @@ class BudgetRequest(BaseModel):
     max_repair_cycles: int = 1
 
 
+# --------------------------------------------------------------------------
+# Root budget (batch E1): the optional ledger a task's revisions share
+# --------------------------------------------------------------------------
+#
+# Why this is a separate contract and not more fields on ``BudgetRequest``: a task revision
+# has a budget for *its* run, while a root has a budget for the *task* across revisions. A
+# new revision, a new run id or a resubmitted spec must not hand the task a second allowance,
+# so the root is named by facts that do not change when any of those do - the project, the
+# canonical repository path and the task id - and the ledger that holds the consumption is
+# named by its own absolute path, so moving ``--data-dir`` does not silently move the limit.
+
+
+def root_id_for(*, project_id: str, repo_path: str, task_id: str) -> str:
+    """The mechanical root identity: same project/repository/task => same root.
+
+    Derived rather than chosen. A worker that could name its own root id could also declare a
+    fresh one and get an unused allowance for the same task, which is exactly what the root
+    ledger exists to prevent. A *different* task id is a different root and still needs its own
+    approval; nothing here tries to guess whether two task names describe one requirement.
+    """
+    return "root-" + digest_of(
+        {
+            "project_id": project_id,
+            "repo_path": str(Path(repo_path).resolve()),
+            "task_id": task_id,
+        }
+    ).removeprefix("sha256:")[:32]
+
+
+class RootBudgetBinding(BaseModel):
+    """What a root covers: one task of one project in one repository, in one ledger.
+
+    ``ledger_path`` is the canonical absolute path of the database that holds the
+    consumption. It is part of the binding so that an E-mode authorization cannot be spent
+    against a different ``--data-dir``: the same task would otherwise look unused again.
+    This is a guard against ordinary path mistakes, not a defence against a hand-edited
+    database or a copied ledger - those stay inside the trusted-local boundary.
+    """
+
+    model_config = Strict
+
+    root_id: str
+    project_id: str
+    repo_path: str
+    task_id: str
+    ledger_path: str
+
+    @classmethod
+    def derive(
+        cls,
+        *,
+        project_id: str,
+        repo_path: str,
+        task_id: str,
+        ledger_path: str | Path,
+    ) -> RootBudgetBinding:
+        repo = str(Path(repo_path).resolve())
+        return cls(
+            root_id=root_id_for(project_id=project_id, repo_path=repo, task_id=task_id),
+            project_id=project_id,
+            repo_path=repo,
+            task_id=task_id,
+            ledger_path=str(Path(ledger_path).resolve()),
+        )
+
+
+class RootBudgetLimits(BaseModel):
+    """The immutable ceilings of one root. Never re-initialised for a later revision."""
+
+    model_config = Strict
+
+    max_top_level_submissions: int = Field(ge=1, le=64)
+    #: How many *additional* implementer attempts the root may buy. The first implementer
+    #: attempt of a root is not a repair. E1 records and enforces the counter; the repair loop
+    #: that spends it is E2 and stays unimplemented here.
+    max_repairs: int = Field(default=0, ge=0, le=8)
+    #: Wall-clock ceiling measured from the root's first successful reservation. E1 refuses a
+    #: dispatch past it; it does not (yet) bound checks or settle an in-flight model call.
+    deadline_seconds: int = Field(default=24 * 60 * 60, ge=60)
+
+    def digest(self) -> str:
+        return digest_of(self.model_dump(mode="json"))
+
+
+class RootBudgetPlan(BaseModel):
+    """The user's root budget file, as written.
+
+    ``hflow prepare`` computes the binding this would produce and does *not* create the
+    ledger: a preview that touched SQLite would be a different command. The binding itself is
+    minted at ``run``, where the plan is combined with the resolved repository and data dir.
+    """
+
+    model_config = Strict
+
+    limits: RootBudgetLimits
+    #: Optional note the user may keep in the file. Never an approval: the approval is the
+    #: authorization artifact's own ``user_text``, which no preview and no model can write.
+    note: str = ""
+
+
 class WorkspaceSpec(BaseModel):
     """Optional Git-backed isolation for a task (M2).
 
@@ -574,6 +674,16 @@ class InvocationRequest(BaseModel):
     #: ``hflow schema`` still generates. ``InvocationRequest`` is never persisted or sent over
     #: the wire; it is the in-process hand-off to a driver.
     stop_requested: SkipJsonSchema[Callable[[], bool] | None] = Field(default=None, exclude=True)
+    #: Supplied by the controller: called by the driver the moment its spawn decision is final,
+    #: with what it observed (``created`` and the pid, if any). This is how "a process exists"
+    #: reaches the ledger as a *driver-reported fact* instead of the controller assuming that
+    #: asking for a launch means one happened. A driver that does not call it leaves the
+    #: invocation recorded as "a launch was requested and no process is known", which is exactly
+    #: what an honest ledger should say about a driver that never reported.
+    #:
+    #: Excluded from JSON Schema for the same reason as ``stop_requested``: it is a live callback
+    #: in the in-process hand-off, not a serializable field of a persisted contract.
+    on_spawn: SkipJsonSchema[SpawnReporter | None] = Field(default=None, exclude=True)
 
 
 class InvocationOutcome(StrEnum):
@@ -616,6 +726,289 @@ class CancellationReceipt(BaseModel):
     #: managed process boundary was terminated; ``none`` = nothing was stopped.
     mechanism: Literal["cooperative", "forced", "none"] = "none"
     local_process_stopped: bool | None = None
+    detail: str = ""
+
+
+class SpawnKind(StrEnum):
+    """What a driver's launch physically creates, as the driver reports it.
+
+    Kept next to the process fact rather than inferred from the driver's name: "this kind of
+    launch creates no child process" is a property of the transport, and the ledger has to record
+    it to avoid counting an offline run's two completed invocations as two processes on the
+    machine.
+    """
+
+    #: A real operating-system child was created (the production launch path).
+    PROCESS = "process"
+    #: The launch does what it does without creating a child: the offline fake driver, which runs
+    #: in-process. It is still a launch, and it still settles.
+    NO_PROCESS = "no_process"
+    #: No driver reported, so the kind of launch is not known.
+    UNKNOWN = "unknown"
+
+
+class SpawnFact(BaseModel):
+    """What a driver observed at the moment its launch decision was final.
+
+    Why this is a contract and not an inference: "the controller asked a driver to launch", "the
+    launch happened" and "an operating-system child exists" are three different facts, and only
+    the driver knows the last two. A stop that wins the gate, a client that fails to start and a
+    launcher that exits before any child exists all look alike from the controller's side - and a
+    handle with no pid is not proof either way. A driver that runs its work in-process (the
+    offline fake) reports ``created=True`` with no pid and ``spawn_kind=no_process``: the launch
+    happened, no child appeared, and no process count may claim one.
+    """
+
+    model_config = Strict
+
+    invocation_id: str
+    #: True when the launch happened - whether or not it created a child process. False covers
+    #: every suppressed or failed launch, including a stop that won the handoff inside the gate.
+    created: bool
+    #: The child's pid when one exists, ``None`` otherwise, as the driver reported it.
+    pid: int | None = None
+    #: What this driver's kind of launch physically creates. Defaults to ``unknown`` so a driver
+    #: that predates this field cannot accidentally claim a process it never reported.
+    spawn_kind: SpawnKind = SpawnKind.UNKNOWN
+    detail: str = ""
+
+
+#: A driver's spawn report: called once per invocation, at the moment the spawn decision is
+#: final and before ``start``/``start_handle`` returns. It is not called for an invocation whose
+#: launch was suppressed before that decision, so "no report" is itself a fact the controller can
+#: keep rather than a gap it has to fill with an assumption.
+SpawnReporter = Callable[["SpawnFact"], None]
+
+
+class InvocationStartState(StrEnum):
+    """How far one top-level invocation actually got. Facts, never one merged number.
+
+    A reserved slot is not a requested launch, a requested launch is not a created process, and a
+    created process is not a provider request. The ledger keeps them apart so a report cannot
+    present a reservation count as "calls to the model", and so a launch that produced no process
+    is visible as exactly that instead of being rounded up to a start.
+    """
+
+    #: The dispatch transaction committed: the allowance is spent and the intent is durable.
+    RESERVED = "reserved"
+    #: The controller asked a driver to launch this invocation and no process is known to exist
+    #: yet: for a live driver this is the window between the request and the spawn fact.
+    REQUESTED = "requested"
+    #: The launch was carried out: whatever process the driver's kind of launch creates, it
+    #: happened. Whether an operating-system child exists is a *separate* recorded fact
+    #: (``started_at`` / ``spawn_kind``), because a driver that runs no child - the offline fake -
+    #: also reaches this state when it does its work, and counting it as a process would be a
+    #: claim about the machine that is false.
+    STARTED = "started"
+    #: The reservation never reached a launch: a stop won the handoff, or the controller stopped
+    #: before asking. The consumption is kept; only the process is not there.
+    NOT_STARTED = "not_started"
+    #: A result was observed and applied to this invocation.
+    SETTLED = "settled"
+    #: A launch happened and was never settled. It blocks the root: no automatic refund, no
+    #: retry, no re-dispatch.
+    UNKNOWN = "unknown"
+    #: A launch was *requested* and the controller never learned whether it happened.
+    #: Distinct from ``UNKNOWN`` on purpose: no process is known - so it counts as no process -
+    #: while the fact that the launch may have run is what keeps the root blocked until an
+    #: operator looks.
+    LAUNCH_UNKNOWN = "launch_unknown"
+
+
+class InvocationIntent(BaseModel):
+    """One reserved top-level dispatch, as recorded in the ledger.
+
+    This is the E1 record the root, the run and the authorization counters are committed with.
+    It deliberately does not copy the attempt or evidence lifecycles: it answers "what did the
+    dispatch transaction reserve, under which root, and how far did it get".
+    """
+
+    model_config = Strict
+
+    invocation_id: str
+    root_id: str
+    run_id: str
+    attempt_id: str
+    role: Literal["implementer", "reviewer", "planner"]
+    authorization_id: str = ""
+    round: int = 0
+    state: InvocationStartState = InvocationStartState.RESERVED
+    reserved_at: str
+    #: The counters as committed *by this reservation*. Recorded so a later reader can see the
+    #: ledger's state at the moment of the dispatch instead of re-deriving it.
+    root_used_at_reservation: int = 0
+    authorization_used_at_reservation: int = 0
+    is_repair: bool = False
+    #: When the controller asked a driver to launch this invocation. ``None`` means no driver was
+    #: ever asked - the fact that decides whether a later failure may be called "never started".
+    launch_requested_at: str | None = None
+    #: When the driver reported that its launch happened (``created``). ``None`` means no launch
+    #: was reported as having taken place.
+    started_at: str | None = None
+    #: When an operating-system child existed, as the driver reported its pid. ``None`` means no
+    #: child is known - either because this kind of launch creates none, or because nobody said.
+    process_started_at: str | None = None
+    #: The child's pid, as the driver reported it. Never the controller's own process standing in
+    #: for a child: that would be a claim about a process nobody created.
+    process_pid: int | None = None
+    #: What this driver's launch creates physically. Recorded rather than inferred, so a process
+    #: count cannot be derived from a result state.
+    spawn_kind: SpawnKind = SpawnKind.UNKNOWN
+    settled_at: str | None = None
+    outcome: InvocationOutcome | None = None
+    detail: str = ""
+
+    @property
+    def launch_requested(self) -> bool:
+        """Was a driver asked to launch this invocation?"""
+        return self.launch_requested_at is not None
+
+    @property
+    def launched(self) -> bool:
+        """Did the driver report that its launch happened? True for a childless launch too."""
+        return self.started_at is not None
+
+    @property
+    def process_created(self) -> bool:
+        """Did a driver report creating an operating-system child?
+
+        The only fact a process count may use. Deliberately *not* "the invocation reached
+        ``started``" and deliberately not "it settled": a completed offline invocation created no
+        child, and an unknown result does not create one either.
+        """
+        return self.process_started_at is not None
+
+    @property
+    def pending(self) -> bool:
+        """Does this invocation still block its root?
+
+        Everything that is not explicitly finished blocks: a reservation, a requested launch, a
+        created process, and both unknown shapes. ``NOT_STARTED`` and ``SETTLED`` are done - the
+        former spent an allowance for nothing, which is recorded rather than refunded.
+        """
+        return self.state not in {
+            InvocationStartState.NOT_STARTED,
+            InvocationStartState.SETTLED,
+        }
+
+
+class DispatchReservation(BaseModel):
+    """What one call to the dispatch transaction returns.
+
+    ``is_new`` is the difference between "this call reserved the dispatch and is the single
+    starter" and "this invocation id is already recorded, so the caller may only coordinate".
+    A replay therefore cannot launch the driver a second time.
+    """
+
+    model_config = Strict
+
+    is_new: bool
+    #: The recorded dispatch record. ``None`` on the legacy path, where a run with no root keeps
+    #: its dispatch facts on the attempt row (``invocation_id`` / ``review_invocation_id``).
+    invocation: InvocationIntent | None = None
+    attempt_id: str
+    role: str
+    #: The run's own counters as this reservation left them, so a caller can report the spend
+    #: without another read that a sibling writer could have moved.
+    run_turns_reserved: int = 0
+    authorization_used: int = 0
+    detail: str = ""
+
+
+class RootBudgetUsage(BaseModel):
+    """Read model over one root's ledger row. Counters here are recorded facts, not estimates."""
+
+    model_config = Strict
+
+    binding: RootBudgetBinding
+    limits: RootBudgetLimits
+    used_top_level_submissions: int = 0
+    used_repairs: int = 0
+    run_ids: list[str] = Field(default_factory=list)
+    authorization_ids: list[str] = Field(default_factory=list)
+    first_dispatch_at: str | None = None
+    deadline_at: str | None = None
+
+    @property
+    def remaining(self) -> int:
+        return self.limits.max_top_level_submissions - self.used_top_level_submissions
+
+
+class InvocationStateCounts(BaseModel):
+    """How many top-level dispatches reached each recorded state, and what physically happened.
+
+    Three families of fact, deliberately not derivable from one another:
+
+    * **dispatch states** - ``reserved``, ``requested``, ``started``, ``not_started``, ``settled``,
+      ``unknown``, ``launch_unknown``: how far each invocation got in this build's lifecycle;
+    * **processes** - ``processes`` counts invocations whose driver reported an operating-system
+      child (``process_started_at`` set). An offline invocation that completed in-process is
+      ``settled`` with ``spawn_kind = no_process`` and is **not** a process;
+    * a **provider request** stays unknown: no invocation row records one.
+
+    ``ever_started`` is kept as the process count under its historical name, so an existing reader
+    that asked "how many invocations were started" now gets the honest answer instead of a number
+    derived from result states.
+    """
+
+    model_config = Strict
+
+    reserved: int = 0
+    #: A launch was asked for and nothing has been reported about it yet.
+    requested: int = 0
+    #: The launch happened (whatever it creates physically).
+    started: int = 0
+    not_started: int = 0
+    settled: int = 0
+    unknown: int = 0
+    #: A launch was requested and never reported either way. Not counted as a process; it still
+    #: blocks the root.
+    launch_unknown: int = 0
+    #: ``reserved + requested + started``: allowance spent with no observed result yet.
+    open: int = 0
+    #: Invocations whose driver reported creating an operating-system child.
+    processes: int = 0
+    #: Invocations whose driver reported doing its work without a child (the offline driver).
+    childless_launches: int = 0
+
+    @property
+    def total(self) -> int:
+        return (
+            self.reserved
+            + self.requested
+            + self.started
+            + self.not_started
+            + self.settled
+            + self.unknown
+            + self.launch_unknown
+        )
+
+    @property
+    def ever_started(self) -> int:
+        """Operating-system children a driver reported creating.
+
+        The name is historical and the meaning is now the recorded process fact: counting a
+        ``settled`` offline invocation here was a claim about the machine that was simply false.
+        """
+        return self.processes
+
+
+class RootBudgetPreview(BaseModel):
+    """What a preview can honestly say about a root, before any dispatch exists.
+
+    ``models_remaining`` is deliberately absent: whether the root still has allowance is decided
+    by the run's own dispatch transaction against the ledger, and a preview that promised a
+    number would be reading a file another process may already have spent.
+    """
+
+    model_config = Strict
+
+    binding: RootBudgetBinding
+    limits: RootBudgetLimits
+    #: Top-level dispatches one accepted delivery normally needs: implementer + reviewer.
+    required_top_level_submissions: int = 0
+    #: False in this build. A budget field existing is not the same fact as a repair loop.
+    repair_enabled: bool = False
     detail: str = ""
 
 
@@ -1008,6 +1401,10 @@ class PrepareReport(BaseModel):
     checks: list[PlannedCheck] = Field(default_factory=list)
     budget: BudgetPlan = Field(default_factory=BudgetPlan)
     roles: list[str] = Field(default_factory=list)
+    #: Batch E1. The root this run *would* be spent against when a root budget file was given.
+    #: ``None`` means no root: a legacy-shaped run, whose allowance is the artifact's alone.
+    #: Reported as data - a preview does not mint the binding an approval would cover.
+    root_budget: RootBudgetPreview | None = None
     #: role -> what that role's input packet will contain, rendered from the same facts the
     #: controller uses. The reviewer's packet embeds the frozen candidate identity, which does
     #: not exist yet, so it is reported as rendered-at-dispatch instead of being invented here.
@@ -1075,3 +1472,9 @@ class RunInspection(BaseModel):
     #: than back-filled from whatever configuration happens to be current now.
     effective_config: EffectiveConfig | None = None
     model_calls_made: int = 0
+    #: Batch E1. The root this run was spent against, and the dispatch records that spent it.
+    #: Both stay empty for a legacy run: "not recorded" is reported as such, rather than as a
+    #: ledger with zero usage that a reader could mistake for a real root.
+    root_budget: RootBudgetUsage | None = None
+    invocations: list[InvocationIntent] = Field(default_factory=list)
+    invocation_counts: InvocationStateCounts = Field(default_factory=InvocationStateCounts)

@@ -60,6 +60,8 @@ from ..contracts import (
     NormalizedEvent,
     ReconcileOutcome,
     ReconcileResult,
+    SpawnFact,
+    SpawnKind,
     ReviewOutput,
 )
 from ..ids import utc_now
@@ -357,8 +359,50 @@ class AcpxDshDriver:
         #: Digest of the prompt text each invocation was launched with, reported by ``collect``
         #: so the controller can tell "the model answered" from "the prompt arrived intact".
         self._prompt_digests: dict[str, str] = {}
+        #: Invocations whose spawn report the callback refused. Recorded rather than raised, so a
+        #: reader can see that the ledger entry for that invocation is conservative by accident
+        #: instead of by fact.
+        self._spawn_report_errors: list[str] = []
 
     # -- configuration -------------------------------------------------------
+
+    def _report_spawn(
+        self,
+        request: InvocationRequest,
+        *,
+        created: bool,
+        pid: int | None,
+        detail: str,
+    ) -> None:
+        """Report what this driver observed at its spawn decision.
+
+        Called inside the spawn gate, once per invocation: either a stop won the gate and no
+        process exists, or a child was created and its pid is known. The controller's ledger
+        turns this into ``started`` or ``not_started``; a driver that never reports leaves its
+        invocation recorded as a launch that was requested, which is the honest reading of "nobody
+        said whether a process exists".
+
+        A callback that raises must not break the launch - it is the *operator's* record, and the
+        process is already created or already refused. The worst case of swallowing it is a
+        conservative ledger entry ("requested and unconfirmed"), never a missing child.
+        """
+        if request.on_spawn is None:
+            return
+        try:
+            request.on_spawn(
+                SpawnFact(
+                    invocation_id=request.invocation_id,
+                    created=created,
+                    pid=pid,
+                    # This launch path creates a real operating-system child, so a reported
+                    # creation is a reported process. That is a property of the transport, stated
+                    # here rather than guessed from the fact that the driver is the real one.
+                    spawn_kind=SpawnKind.PROCESS if created else SpawnKind.UNKNOWN,
+                    detail=detail,
+                )
+            )
+        except Exception:  # noqa: BLE001 - bookkeeping must not fail the spawn path
+            self._spawn_report_errors.append(request.invocation_id)
 
     def _agent_argv(self) -> list[str]:
         """The launcher command as a real argv, as resolved before any approval."""
@@ -590,6 +634,14 @@ class AcpxDshDriver:
                     handle.start_cancelled = True
                     handle.finished = True
                     boundary.close()
+                    self._report_spawn(
+                        request,
+                        created=False,
+                        pid=None,
+                        detail=(
+                            "a recorded stop won the spawn gate: no client process was created"
+                        ),
+                    )
                     return handle
                 try:
                     stdout_handle = stdout_path.open("wb")
@@ -614,6 +666,15 @@ class AcpxDshDriver:
                 self._handles[request.invocation_id] = handle
                 self._processes[request.invocation_id] = child
                 self._boundaries[request.invocation_id] = boundary
+                # Reported inside the same gate, right after the process exists: the controller's
+                # ledger learns "a child was created" as an observation, not as an assumption made
+                # from the fact that it asked for a launch.
+                self._report_spawn(
+                    request,
+                    created=True,
+                    pid=child.pid,
+                    detail=f"client process {child.pid} created inside the managed boundary",
+                )
             finally:
                 self._spawn_pending.discard(request.invocation_id)
                 self._gate.notify_all()

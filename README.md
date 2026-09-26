@@ -146,6 +146,9 @@ hflow prepare  --task t.json --profile dsh-local   # zero-model preview: config,
                                                    # scope, checks, budget, packet preview
 hflow run      --task examples/task.json --project-root . --driver fake --json
 hflow run      --task t.json --profile dsh-local --authorization-file auth.json --json
+hflow prepare  --task t.json --profile dsh-local --root-budget-file root-budget.json
+hflow run      --task t.json --profile dsh-local --authorization-file auth.json \
+               --root-budget-file root-budget.json   # spend against a root ledger (batch E1)
 hflow status   R-xxxxxxxxxx               # pure SQLite read, zero model calls
 hflow report   R-xxxxxxxxxx --json        # receipt + evidence + the config it ran under
 hflow resume   R-xxxxxxxxxx               # reconcile an interrupted attempt; never re-dispatches
@@ -192,6 +195,34 @@ from it (`hflow schema`). There is no second hand-written schema to drift.
 
 - The controller generates `ResultReceipt`; a worker cannot report `ACCEPTED`.
 - Budget is reserved in the same transaction that records the dispatch.
+- A **root budget** (batch E1) is one ledger row for one `(project_id, repository, task_id)`,
+  across revisions. `--root-budget-file` binds the run to it, the ledger path is part of the
+  authorization binding - so pointing `--data-dir` somewhere else is refused rather than
+  handing the same task a second unused allowance - and every top-level dispatch is reserved
+  with its attempt row and counters in **one** transaction. That root runs **one task at a
+  time**: a dispatch is refused while another run of the same root has not reached a terminal
+  state, because a settled invocation is not a finished run. Every dispatch also has to leave
+  enough allowance for the rest of that run's loop, so a revision that can afford its
+  implementer but not its reviewer is refused instead of buying half a loop, and one attempt
+  records **one review**: a second reviewer invocation id is refused whether or not the first
+  review has settled. Four facts stay separate in the ledger - an allowance `reserved`, a launch
+  `requested`, a launch that happened `started`, and a result `settled` - and the physical facts
+  are separate again: `processes` counts invocations whose driver reported a pid, so an offline
+  run that completes in-process is two settled dispatches and **zero** processes, while a launch
+  that reports no child is recorded as such and never counted as one. Every unresolved state
+  (`reserved`, `requested`, `started`, `unknown`, `launch_unknown`) blocks every later dispatch of
+  that root, whatever the revision. `not_started` is recorded only when no driver was ever asked:
+  a launch that was requested and never reported back is `launch_unknown`, because an empty
+  timestamp is not evidence that nothing ran - and settling that same unresolved launch twice (a
+  reconcile followed by a confirmed stop) is idempotent, so a stop that really happened never
+  fails to report itself.
+  What the root may spend is recorded and enforced; what it may *repair* is only recorded:
+  `max_repairs` is not a working repair loop (see "Not implemented"). A root charge is always
+  recorded with the artifact that bought it, so a root run needs one: a real driver needs your
+  `--authorization-file`, while the offline fake driver - which reaches no model and has no
+  approval to give - gets a CLI-computed record whose id starts `AUTH-offline`, whose `origin` is
+  `cli_offline_synthetic` (a structural field, not just a sentence), and whose binding names
+  `driver: fake`, so it can never authorize a real transport.
 - Identical TaskSpec does not buy a second worker turn. Note what that means: the reply
   is the **historical** run, and `status`/`report` print a `candidate` line saying whether
   the scoped files still match the fingerprint that run was accepted at. A historical
@@ -253,11 +284,17 @@ from it (`hflow schema`). There is no second hand-written schema to drift.
 
 ## Not implemented (do not assume otherwise)
 
-Not built: cooperative (protocol) cancellation on the selected launch path; a repair cycle;
-integration/publish delivery; reuse-research automation; teams and native subagents; real
-billing observation; metrics against a direct-DSH baseline. A reviewer's answer is read as
-text and decoded against the contract - the harness is not asked for structured output, and no
-model is ever asked to repair a malformed verdict.
+Not built: cooperative (protocol) cancellation on the selected launch path; **automatic repair** -
+E1's root ledger and its single dispatch transaction exist (`--root-budget-file`, the
+`root_budgets`/`invocations` rows, the `reserved`/`requested`/`started`/`not_started`/`settled`/
+`unknown`/`launch_unknown` states and the separate process facts reported by `status`/`report`),
+and a root's `max_repairs` counter is recorded and enforced, but the E2 repair
+loop that would spend it does not exist: nothing re-dispatches an implementer after a failed
+check or a `changes_requested`, and no `hflow repair` command exists. Integration/publish
+delivery; reuse-research automation; teams and native subagents; real billing observation; metrics
+against a direct-DSH baseline. A reviewer's answer is read as text and decoded against the
+contract - the harness is not asked for structured output, and no model is ever asked to repair a
+malformed verdict.
 
 Not built around configuration either:
 

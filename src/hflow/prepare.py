@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from .admission import predictable_dispatch_problems, validate_task_spec
 from .contracts import (
     AgentBinding,
@@ -35,6 +37,9 @@ from .contracts import (
     RefusalCode,
     RefusedError,
     RoleConfig,
+    RootBudgetBinding,
+    RootBudgetPlan,
+    RootBudgetPreview,
     RunRequest,
     TaskSpec,
     ValidationIssue,
@@ -161,6 +166,81 @@ def load_json_file(path: Path, *, what: str) -> object:
         raise RefusedError(
             RefusalCode.INVALID_SPEC, f"{what} {path} is not valid JSON: {exc}"
         ) from exc
+
+
+def load_root_budget_plan(path: Path) -> RootBudgetPlan:
+    """Read one root budget file: the user's ceilings for one root, never an approval.
+
+    A missing file, invalid JSON, an unknown field or a limit this build cannot honour is
+    refused rather than defaulted: a ceiling that came from a build default is a ceiling nobody
+    chose. Only the *shape* is checked here. Whether the root still has allowance is decided by
+    the run's own dispatch transaction against the ledger, because a preview cannot know what an
+    earlier revision of the same task already consumed.
+    """
+    from .authorization import root_budget_from_plan
+
+    raw = load_json_file(Path(path), what="root budget file")
+    if not isinstance(raw, dict):
+        raise RefusedError(
+            RefusalCode.INVALID_SPEC,
+            f"root budget file {path} must be a JSON object with a 'limits' member (see "
+            f"docs/operations.md), not a JSON {type(raw).__name__}",
+        )
+    try:
+        plan = RootBudgetPlan.model_validate(raw)
+    except ValidationError as exc:
+        raise RefusedError(
+            RefusalCode.INVALID_SPEC,
+            f"root budget file {path} is not a valid root budget plan: {exc}",
+        ) from exc
+    return root_budget_from_plan(plan)
+
+
+def root_binding_for(resolved: ResolvedRun) -> RootBudgetBinding:
+    """The root a run would be spent against. It computes the ledger path and opens nothing.
+
+    The path is derived, never created: that is what keeps ``prepare`` from producing the
+    SQLite file it names. The same call is made by ``run``, so the binding the preview reports
+    and the binding the artifact must cover are the same object, field for field.
+    """
+    from .authorization import resolve_root_binding
+
+    return resolve_root_binding(
+        project_id=resolved.project.project_id,
+        request=resolved.request(),
+        data_dir=resolved.data_dir,
+    )
+
+
+def root_budget_preview(
+    resolved: ResolvedRun, plan: RootBudgetPlan, *, budget: BudgetPlan
+) -> RootBudgetPreview:
+    """What a preview can honestly say about a root: what it covers, its ceilings, its clock.
+
+    It deliberately reports no "remaining" number: the ledger is not opened here - that is what
+    keeps ``prepare`` from having a side effect - and even a number read now could be spent by
+    another process before this run reserves. Every dispatch and every counter is decided by the
+    run's own transaction.
+    """
+    binding = root_binding_for(resolved)
+    limits = plan.limits
+    detail = (
+        f"one accepted delivery needs {budget.required_turns} top-level submission(s) "
+        f"(implementer {budget.implementer_turns} + reviewer {budget.reviewer_turns}), and this "
+        f"root allows at most {limits.max_top_level_submissions}. The repair switch is OFF: E1 "
+        f"records and enforces the {limits.max_repairs}-repair counter but implements no repair "
+        f"loop, so the normal count is also the maximum this build dispatches. The "
+        f"{limits.deadline_seconds}s deadline starts at the root's first successful reservation "
+        f"and is recorded as deadline_at. Whether any allowance remains is decided by the run's "
+        f"own dispatch transaction against {binding.ledger_path}, not by this preview"
+    )
+    return RootBudgetPreview(
+        binding=binding,
+        limits=limits,
+        required_top_level_submissions=budget.required_turns,
+        repair_enabled=False,
+        detail=detail,
+    )
 
 
 def effective_spec(
@@ -577,21 +657,38 @@ def build_prepare_report(
     *,
     authorization_mode: str = "m2-live-change",
     max_top_level_submissions_required: int | None = None,
+    root_budget_plan: RootBudgetPlan | None = None,
     env: Mapping[str, str] | None = None,
 ) -> PrepareReport:
-    """Assemble the preview. Zero model calls, zero writes, zero run state."""
+    """Assemble the preview. Zero model calls, zero writes, zero run state.
+
+    ``root_budget_plan`` is the parsed ``--root-budget-file``, when one was given. The root it
+    describes is reported as *data* - the binding, the ceilings, the clock - and the pending
+    authorization carries the same root, so the digest the preview prints is the digest an
+    artifact must have for this run to accept it. Neither step touches the ledger.
+    """
     from .authorization import current_binding
 
     roles = resolved.roles
     execution_root, execution_root_is_final = resolved.execution_root()
     budget = _budget_plan(resolved, roles)
+    root_preview = (
+        root_budget_preview(resolved, root_budget_plan, budget=budget)
+        if root_budget_plan is not None
+        else None
+    )
     submissions = (
         max_top_level_submissions_required
         if max_top_level_submissions_required is not None
         else budget.required_turns
     )
-    pending = PendingAuthorization(required=resolved.is_real_driver)
-    if resolved.is_real_driver:
+    # A root budget file makes the artifact necessary even for the offline driver: every charge
+    # against a root is recorded with the artifact that bought it, and the store refuses to spend
+    # a root under an empty authorization id. For the offline driver `run` mints a labelled
+    # record; for any other it requires the user's own artifact.
+    needs_authorization = resolved.is_real_driver or root_preview is not None
+    pending = PendingAuthorization(required=needs_authorization)
+    if needs_authorization:
         implementer = resolved.effective.role("implementer")
         assert implementer is not None
         binding = current_binding(
@@ -601,6 +698,9 @@ def build_prepare_report(
             request=resolved.request(),
             spec_path=resolved.spec_path,
             effective=resolved.effective,
+            # The same root ``run`` will bind when handed the same file: the two must agree or
+            # the preview would print an artifact digest that the run then refuses.
+            root_binding=root_preview.binding if root_preview is not None else None,
         )
         pending = PendingAuthorization(
             required=True,
@@ -646,6 +746,31 @@ def build_prepare_report(
             "this task does not fit its budget: it needs more reserved turns than are "
             "available, so a run refuses before dispatching anything"
         )
+    if root_preview is not None:
+        notes.append(
+            f"a root budget file was given: this run would register root "
+            f"{root_preview.binding.root_id} and spend both roles' dispatches against "
+            f"{root_preview.binding.ledger_path}. That path is derived here, not created - "
+            "prepare opened no database"
+        )
+        notes.append(
+            "whether the root still has allowance, and whether its deadline has passed, is "
+            "decided by the run's own dispatch transaction against the ledger; this preview "
+            "cannot promise a remaining number"
+        )
+        notes.append(
+            "automatic repair is not implemented in this build (E1): the root's repair "
+            "allowance is recorded and counted, but no loop spends it until E2. A budget field "
+            "is not an implemented feature"
+        )
+        if not resolved.is_real_driver:
+            notes.append(
+                "this run uses the offline fake driver, but the root budget file still makes an "
+                "authorization necessary: every charge against a root is recorded with the "
+                "artifact that bought it. `run` mints a clearly-labelled offline record (its "
+                "user_text says it is not an approval, and it binds the fake driver) unless you "
+                "pass your own --authorization-file"
+            )
     for issue in resolved.dispatch_preconditions:
         notes.append(f"dispatch precondition: {issue.code.value}: {issue.detail}")
 
@@ -669,6 +794,7 @@ def build_prepare_report(
         checks=_planned_checks(resolved.spec, resolved.project),
         budget=budget,
         roles=roles,
+        root_budget=root_preview,
         packet_preview=preview,
         authorization=pending,
         notes=notes,
@@ -739,6 +865,43 @@ def render_prepare_text(report: PrepareReport) -> str:
         f"project pre-authorization {report.budget.project_turn_limit}"
     )
     lines.append(f"  fits        {report.budget.within_budget}")
+    lines.append("root budget")
+    root = report.root_budget
+    if root is None:
+        lines.append(
+            "  not bound   no --root-budget-file was given: this run would spend the "
+            "authorization's own allowance, with no root ledger row and no repair allowance"
+        )
+    else:
+        lines.append(
+            f"  binding     {root.binding.root_id} (project {root.binding.project_id}, "
+            f"task {root.binding.task_id})"
+        )
+        lines.append(f"  repo        {root.binding.repo_path}")
+        lines.append(
+            f"  ledger      {root.binding.ledger_path}  (derived; prepare created nothing)"
+        )
+        lines.append(
+            f"  limits      top-level submissions {root.limits.max_top_level_submissions}, "
+            f"repairs {root.limits.max_repairs}, deadline {root.limits.deadline_seconds}s"
+        )
+        lines.append(
+            f"  needs       {root.required_top_level_submissions} top-level submission(s) for "
+            "one accepted delivery (implementer + reviewer)"
+        )
+        lines.append(
+            "  repair      OFF - not implemented in E1: the repair counter is recorded and "
+            "enforced, but no repair loop spends it, so the normal count is the maximum"
+        )
+        lines.append(
+            f"  deadline    {root.limits.deadline_seconds}s counted from the root's first "
+            "successful reservation (recorded as deadline_at), not from now"
+        )
+        lines.append(
+            "  allowance   not checked here: the run's own dispatch transaction decides whether "
+            "any is left"
+        )
+        lines.append(f"  detail      {root.detail}")
     lines.append("admission")
     if report.admission.ok:
         lines.append("  ok          no admission problem found")

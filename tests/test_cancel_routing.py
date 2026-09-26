@@ -734,16 +734,27 @@ def test_a_stop_after_the_review_turn_is_reserved_still_prevents_the_start(
     The review turn is already spent when this stop is recorded - a reservation is not refunded,
     and it never will be - so the only thing left to get right is that the reviewer process is
     not launched for a run a human already stopped.
+
+    Batch E1 moved the window into one transaction: the submission, the review turn and (for a
+    root run) the invocation record commit together, and the next thing the controller does is
+    register or mark the handoff before it asks the driver. The stop is injected immediately
+    after that commit - the same window as before, after the spend and before any process - and
+    the run's own facts have to keep deciding the outcome.
     """
     implementer, reviewer = _pair(project_root)
     controller = _controller(store, implementer, reviewer, tmp_path / "data")
-    original = store.reserve_review_turn
+    original = store.reserve_dispatch
 
-    def reserve_then_stop(run_id: str, controller_id: str) -> None:
-        original(run_id, controller_id)
-        controller.cancel(run_id)
+    def reserve_then_stop(**kwargs):
+        reservation = original(**kwargs)
+        if kwargs.get("role") == "reviewer":
+            # The only run in this database: read it directly rather than threading the id
+            # through the controller, because the point is that the stop lands *here*.
+            (run_row,) = store.list_runs(limit=1)
+            controller.cancel(str(run_row["run_id"]))
+        return reservation
 
-    monkeypatch.setattr(store, "reserve_review_turn", reserve_then_stop)
+    monkeypatch.setattr(store, "reserve_dispatch", reserve_then_stop)
     outcome = controller.run_task(run_request)
 
     row = store.get_run(outcome.run_id)
@@ -751,6 +762,12 @@ def test_a_stop_after_the_review_turn_is_reserved_still_prevents_the_start(
     assert row["turns_reserved"] == 2, "the reserved review turn is spent, never refunded"
     assert row["block_code"] == RefusalCode.CANCELLED_BY_OPERATOR.value
     assert row["receipt_json"] is None
+
+    # Batch E1 (legacy path): a run with no root writes no invocation row, so the ledger stays
+    # empty and the attempt row keeps the dispatch facts. What must hold is that nothing is
+    # pending and nothing was refunded.
+    assert store.invocations_for(outcome.run_id) == []
+    assert store.pending_invocations("") == []
 
 
 def test_a_late_failed_review_does_not_relabel_an_unconfirmed_stop(

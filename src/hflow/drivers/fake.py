@@ -28,6 +28,8 @@ from ..contracts import (
     ReconcileOutcome,
     ReconcileResult,
     ReviewOutput,
+    SpawnFact,
+    SpawnKind,
 )
 from ..ids import utc_now
 
@@ -108,12 +110,38 @@ class FakeDriver:
             ],
         )
 
+    def _report_spawn(self, request: InvocationRequest, *, created: bool, pid: int | None = None,
+                      detail: str = "") -> None:
+        """Tell the controller what this driver observed at its launch decision.
+
+        The fake driver runs in-process: it creates **no** operating-system child. So a launch
+        that goes through is reported ``created=True`` with ``spawn_kind=no_process`` - the launch
+        happened, nothing was created on the machine - and a stop that wins is ``created=False``.
+        Reporting ``created=True`` with a claimed process would make an offline run's two settled
+        invocations look like two processes, which is a statement about this machine that is not
+        true.
+        """
+        if request.on_spawn is None:
+            return
+        request.on_spawn(
+            SpawnFact(
+                invocation_id=request.invocation_id,
+                created=created,
+                pid=pid,
+                spawn_kind=SpawnKind.NO_PROCESS if created else SpawnKind.UNKNOWN,
+                detail=detail,
+            )
+        )
+
     def start(self, request: InvocationRequest) -> InvocationResult:
         self.started.append(request)
         if request.stop_requested is not None and request.stop_requested():
             # The same contract as the production driver: a stop recorded before the process
             # would be created means no work happens at all, not a late discovery.
             self.stopped_before_start.append(request.invocation_id)
+            self._report_spawn(
+                request, created=False, detail="a recorded stop won the handoff; no process created"
+            )
             return InvocationResult(
                 invocation_id=request.invocation_id,
                 outcome=InvocationOutcome.CANCELLED,
@@ -122,6 +150,12 @@ class FakeDriver:
                 error_code="cancelled",
                 error_message="the invocation was stopped before it started",
             )
+        self._report_spawn(
+            request,
+            created=True,
+            pid=None,
+            detail="offline fake driver: no child process exists; this is a scripted stand-in",
+        )
         attempt_dir = Path(request.workspace)
 
         if self._unknown_seen < self.script.unknown_invocations:

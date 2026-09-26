@@ -239,11 +239,15 @@ def test_a_recorded_authorization_from_an_earlier_build_still_loads_and_digests_
 ) -> None:
     """Read compatibility, pinned by value against a checked-in fixture.
 
-    The fixture is the old format: no ``effective_config_digest``, no ``profile_id``. It must
-    still load, and its binding digest must still be the value its consumed-allowance row is
-    keyed by. The digest is checked twice on purpose - against the pinned constant, and against
-    an independent restatement of the old formula - so a change to either the stored value or
-    the computation fails here.
+    The fixture is the old format: no ``effective_config_digest``, no ``profile_id``, no root
+    budget. It must still load, and its binding digest must still be the value its
+    consumed-allowance row is keyed by. The digest is checked twice on purpose - against the
+    pinned constant, and against an independent restatement of the old formula - so a change to
+    either the stored value or the computation fails here.
+
+    Batch E1 adds ``root_budget`` to the binding. It is asserted to be *absent in meaning* here
+    (``None``), not merely defaulted: the digest drops it while it is empty, which is what keeps
+    an already-consumed legacy approval matching its ledger row.
     """
     record = load_authorization(LEGACY_FIXTURE)
 
@@ -251,12 +255,15 @@ def test_a_recorded_authorization_from_an_earlier_build_still_loads_and_digests_
     assert record.provided_by == "user"
     assert record.binding.effective_config_digest == ""
     assert record.binding.profile_id == ""
+    assert record.binding.root_budget is None
+    assert record.root_limits is None
     assert record.binding_digest() == LEGACY_FIXTURE_DIGEST
 
     binding_document = record.binding.model_dump(mode="json")
     assert set(binding_document) == set(LEGACY_BINDING_FIELDS) | {
         "effective_config_digest",
         "profile_id",
+        "root_budget",
     }
     old_recipe = digest_of({field: binding_document[field] for field in LEGACY_BINDING_FIELDS})
     assert old_recipe == LEGACY_FIXTURE_DIGEST
@@ -334,6 +341,105 @@ def test_a_configuration_digest_separates_two_otherwise_identical_approvals(
         assert "different target" in str(excinfo.value)
     finally:
         store.close()
+
+
+def test_a_root_approval_does_not_cover_another_data_dir(
+    tmp_path: Path, project, task_spec, project_root: Path, real_request: RunRequest
+) -> None:
+    """The ledger path is part of what a root approval covers, and both directions are refused.
+
+    Why this is not merely a path check: an approval spent against one ledger would look unused
+    again if the same task could be pointed at another ``--data-dir``, which is exactly the
+    "restart or rename and get a second allowance" hole the single-use rule exists to close. The
+    other direction matters too - an artifact written *for* a root must not be spent as if it
+    were a plain approval, because then the consumption it names would be recorded nowhere.
+    """
+    from hflow.authorization import resolve_root_binding
+    from hflow.contracts import RootBudgetLimits
+
+    spec_path = tmp_path / "task.json"
+    first_dir, second_dir = tmp_path / "data-one", tmp_path / "data-two"
+    first_root = resolve_root_binding(
+        project_id=project.project_id, request=real_request, data_dir=first_dir
+    )
+    second_root = resolve_root_binding(
+        project_id=project.project_id, request=real_request, data_dir=second_dir
+    )
+    assert first_root.root_id == second_root.root_id, (
+        "the root identity must follow the task, not the ledger: otherwise a data-dir change "
+        "would also be a new root"
+    )
+    assert first_root.ledger_path != second_root.ledger_path
+    assert not first_dir.exists(), "deriving a binding must not create the database"
+
+    limits = RootBudgetLimits(max_top_level_submissions=4, max_repairs=1)
+    record = AuthorizationRecord(
+        authorization_id="AUTH-root-1",
+        user_text=USER_TEXT,
+        authorized_at="2026-09-20T00:00:00Z",
+        max_top_level_submissions=4,
+        binding=current_binding(
+            mode="m2-live-change",
+            driver="acpx-dsh",
+            project=project,
+            request=real_request,
+            spec_path=spec_path,
+            root_binding=first_root,
+        ),
+        root_limits=limits,
+    )
+
+    verify_authorization(record, expected=record.binding)  # the ledger it names is accepted
+    with pytest.raises(RefusedError) as excinfo:
+        verify_authorization(
+            record,
+            expected=current_binding(
+                mode="m2-live-change",
+                driver="acpx-dsh",
+                project=project,
+                request=real_request,
+                spec_path=spec_path,
+                root_binding=second_root,
+            ),
+        )
+    assert "root budget does not cover this run" in excinfo.value.message
+    assert "ledger_path" in excinfo.value.message
+
+    # A root artifact cannot be spent as a plain approval, and a plain approval cannot be spent
+    # as a root run: either mistake would leave the consumption unaccounted for.
+    plain = current_binding(
+        mode="m2-live-change",
+        driver="acpx-dsh",
+        project=project,
+        request=real_request,
+        spec_path=spec_path,
+    )
+    with pytest.raises(RefusedError) as excinfo:
+        verify_authorization(record, expected=plain)
+    assert "resolves no root" in excinfo.value.message
+    with pytest.raises(RefusedError) as excinfo:
+        verify_authorization(
+            AuthorizationRecord(
+                authorization_id="AUTH-plain-1",
+                user_text=USER_TEXT,
+                authorized_at="2026-09-20T00:00:00Z",
+                max_top_level_submissions=2,
+                binding=plain,
+            ),
+            expected=record.binding,
+        )
+    assert "carries no root budget binding" in excinfo.value.message
+
+    # A root approval without a ceiling is refused at load: the allowance must be part of the
+    # approval, never a default the build happens to use.
+    with pytest.raises(Exception) as excinfo:
+        AuthorizationRecord.model_validate(
+            {
+                **json.loads(record.model_dump_json()),
+                "root_limits": None,
+            }
+        )
+    assert "declares no root_limits" in str(excinfo.value)
 
 
 def test_an_unchanged_legacy_record_keeps_one_ledger_row(

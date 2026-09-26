@@ -14,6 +14,9 @@ Design rules enforced here, not by convention:
   so a late result from an old attempt cannot overwrite a newer one.
 * Large outputs are not stored: evidence keeps content hashes plus a bounded
   excerpt, so the database never becomes a log dump.
+* One dispatch transaction (batch E1): the authorization claim, the run's turn
+  reservation, the root's consumption and the invocation record commit together, or
+  none of them does.
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ import sqlite3
 import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -34,21 +38,39 @@ from .contracts import (
     CancellationReceipt,
     CheckPhase,
     DeliveryState,
+    DispatchReservation,
     EffectiveConfig,
     EvidenceRecord,
     EvidenceStatus,
+    InvocationIntent,
     InvocationOutcome,
+    InvocationStartState,
+    InvocationStateCounts,
     RefusalCode,
     ResultReceipt,
+    RootBudgetBinding,
+    RootBudgetLimits,
+    RootBudgetUsage,
     RunSummary,
+    SpawnFact,
+    SpawnKind,
     TaskSpec,
     TaskState,
     canonical_json,
     digest_of,
     json_schema,
 )
-from .ids import new_evidence_id, utc_now
-SCHEMA_VERSION = 1
+from .ids import new_attempt_id, new_evidence_id, parse_ts, utc_now
+from .migrate import (
+    MIGRATION_BACKUP_SUFFIX,
+    STORAGE_VERSION,
+    SUPPORTED_STORAGE_VERSION,
+    MigrationError,
+    StepHook,
+    effective_version,
+    migrate,
+    recorded_version,
+)
 
 #: Marks a receipt that records an offline reprocessing decision rather than the outcome of
 #: the execution it belongs to. The string lives here because both the store guard and the
@@ -79,125 +101,63 @@ def _same_offline_reprocessing(
         and receipt.candidate.fingerprint == candidate_fingerprint
     )
 
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS schema_meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
+# The schema itself lives in :mod:`hflow.migrate`, which owns the recorded storage version, the
+# pre-migration backup and the transaction each step runs in. This module decides *when* to
+# migrate (at open) and what the ledger means afterwards.
 
-CREATE TABLE IF NOT EXISTS runs (
-    run_id                TEXT PRIMARY KEY,
-    project_id            TEXT NOT NULL,
-    task_id               TEXT NOT NULL,
-    schema_version        INTEGER NOT NULL,
-    spec_digest           TEXT NOT NULL,
-    task_spec_json        TEXT NOT NULL,
-    task_revision         INTEGER NOT NULL,
-    task_state            TEXT NOT NULL,
-    phase                 TEXT,
-    delivery_state        TEXT NOT NULL DEFAULT 'NONE',
-    claimed_by            TEXT,
-    claimed_at            TEXT,
-    current_attempt_id    TEXT,
-    controller_build      TEXT NOT NULL,
-    checks_digest         TEXT NOT NULL,
-    turn_limit            INTEGER NOT NULL,
-    repair_limit          INTEGER NOT NULL,
-    turns_reserved        INTEGER NOT NULL DEFAULT 0,
-    repairs_used          INTEGER NOT NULL DEFAULT 0,
-    turns_observed        INTEGER,
-    turns_remaining       INTEGER GENERATED ALWAYS AS (turn_limit - turns_reserved) VIRTUAL,
-    block_code            TEXT,
-    block_reason          TEXT,
-    receipt_json          TEXT,
-    cancel_intent_at      TEXT,
-    cancel_receipt_json   TEXT,
-    worktree_path         TEXT,
-    worktree_state        TEXT NOT NULL DEFAULT 'NONE',
-    cleanup_intent_at     TEXT,
-    cleanup_done_at       TEXT,
-    cleanup_error         TEXT,
-    created_at            TEXT NOT NULL,
-    updated_at            TEXT NOT NULL,
-    CHECK (turns_reserved >= 0),
-    CHECK (turns_reserved <= turn_limit),
-    CHECK (repairs_used >= 0),
-    CHECK (repairs_used <= repair_limit)
-);
+#: Public contract version of the stored documents (``runs.schema_version``, ``TaskSpec`` and
+#: ``ResultReceipt``). Distinct from the storage format version in :mod:`hflow.migrate`: a new
+#: table does not change what a stored document means, and vice versa.
+SCHEMA_VERSION = 1
 
-CREATE UNIQUE INDEX IF NOT EXISTS ux_runs_spec_digest
-    ON runs (project_id, spec_digest);
 
-CREATE TABLE IF NOT EXISTS attempts (
-    attempt_id            TEXT PRIMARY KEY,
-    run_id                TEXT NOT NULL REFERENCES runs(run_id),
-    task_revision         INTEGER NOT NULL,
-    role                  TEXT NOT NULL,
-    state                 TEXT NOT NULL,
-    reservation_id        TEXT,
-    reserved_agent_turns  INTEGER NOT NULL DEFAULT 0,
-    reserved_expires_at   TEXT,
-    process_id            INTEGER,
-    process_started_at    TEXT,
-    process_identity      TEXT,
-    session_id            TEXT,
-    invocation_id         TEXT,
-    review_invocation_id  TEXT,
-    outcome               TEXT,
-    result_json           TEXT,
-    result_digest         TEXT,
-    review_json           TEXT,
-    reconcile_json        TEXT,
-    block_code            TEXT,
-    created_at            TEXT NOT NULL,
-    finished_at           TEXT,
-    UNIQUE (run_id, task_revision, role)
-);
+#: The invocation states that still block their root. Kept next to the SQL that uses them so a
+#: new state cannot be added to the contract and silently forgotten by the ledger: the contract's
+#: ``InvocationIntent.pending`` is the definition, and a test asserts the two agree.
+INVOCATION_UNRESOLVED_STATES: tuple[str, ...] = (
+    InvocationStartState.RESERVED.value,
+    InvocationStartState.REQUESTED.value,
+    InvocationStartState.STARTED.value,
+    InvocationStartState.UNKNOWN.value,
+    InvocationStartState.LAUNCH_UNKNOWN.value,
+)
 
-CREATE INDEX IF NOT EXISTS ix_attempts_run ON attempts (run_id, created_at);
 
-CREATE TABLE IF NOT EXISTS evidence (
-    evidence_id           TEXT PRIMARY KEY,
-    run_id                TEXT NOT NULL REFERENCES runs(run_id),
-    attempt_id            TEXT NOT NULL REFERENCES attempts(attempt_id),
-    kind                  TEXT NOT NULL,
-    status                TEXT NOT NULL,
-    check_id              TEXT,
-    candidate_fingerprint TEXT NOT NULL,
-    checks_digest         TEXT NOT NULL,
-    command_json          TEXT NOT NULL DEFAULT '[]',
-    exit_code             INTEGER,
-    stdout_digest         TEXT NOT NULL DEFAULT '',
-    stderr_digest         TEXT NOT NULL DEFAULT '',
-    detail                TEXT NOT NULL DEFAULT '',
-    created_at            TEXT NOT NULL
-);
+def _add_seconds(timestamp: str, seconds: int) -> str:
+    """``timestamp`` (a stored UTC string) plus ``seconds``, in the same textual form."""
+    return (
+        (parse_ts(timestamp) + timedelta(seconds=seconds)).isoformat().replace("+00:00", "Z")
+    )
 
-CREATE INDEX IF NOT EXISTS ix_evidence_run ON evidence (run_id, kind, check_id);
 
-CREATE TABLE IF NOT EXISTS run_notes (
-    note_id     TEXT PRIMARY KEY,
-    run_id      TEXT NOT NULL REFERENCES runs(run_id),
-    note        TEXT NOT NULL,
-    created_at  TEXT NOT NULL
-);
+def _invocation_from_row(row: sqlite3.Row) -> InvocationIntent:
+    """The contract view of one ledger row.
 
-CREATE INDEX IF NOT EXISTS ix_run_notes_run ON run_notes (run_id, created_at);
-
-CREATE TABLE IF NOT EXISTS authorizations (
-    authorization_id   TEXT PRIMARY KEY,
-    mode               TEXT NOT NULL,
-    binding_digest     TEXT NOT NULL,
-    user_text          TEXT NOT NULL,
-    provided_by        TEXT NOT NULL,
-    authorized_at      TEXT NOT NULL,
-    max_top_level_submissions INTEGER NOT NULL,
-    used_top_level_submissions INTEGER NOT NULL DEFAULT 0,
-    created_at         TEXT NOT NULL,
-    CHECK (used_top_level_submissions >= 0),
-    CHECK (used_top_level_submissions <= max_top_level_submissions)
-);
-"""
+    A missing ``outcome`` is reported as ``None`` rather than defaulted: "no outcome was
+    observed" and "the outcome was unknown" are different facts, and the row records the first.
+    """
+    return InvocationIntent(
+        invocation_id=str(row["invocation_id"]),
+        root_id=str(row["root_id"] or ""),
+        run_id=str(row["run_id"]),
+        attempt_id=str(row["attempt_id"]),
+        role=str(row["role"]),  # type: ignore[arg-type]
+        authorization_id=str(row["authorization_id"] or ""),
+        round=int(row["round"]),
+        state=InvocationStartState(str(row["state"])),
+        reserved_at=str(row["reserved_at"]),
+        root_used_at_reservation=int(row["root_used_at_reservation"]),
+        authorization_used_at_reservation=int(row["authorization_used_at_reservation"]),
+        is_repair=bool(row["is_repair"]),
+        launch_requested_at=row["launch_requested_at"],
+        started_at=row["started_at"],
+        process_started_at=row["process_started_at"],
+        process_pid=row["process_pid"],
+        spawn_kind=SpawnKind(str(row["spawn_kind"] or SpawnKind.UNKNOWN.value)),
+        settled_at=row["settled_at"],
+        outcome=InvocationOutcome(str(row["outcome"])) if row["outcome"] else None,
+        detail=str(row["detail"] or ""),
+    )
 
 
 class StoreError(RuntimeError):
@@ -218,7 +178,9 @@ class Store:
     instead of interleaving with them.
     """
 
-    def __init__(self, path: Path | str) -> None:
+    def __init__(
+        self, path: Path | str, *, on_migration_step: StepHook | None = None
+    ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -231,8 +193,34 @@ class Store:
             # WAL keeps a reader (`status`) from blocking the writer (`run`).
             self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.execute("PRAGMA synchronous = FULL")
+
+        # Storage versions are handled before anything else touches the file: an unknown newer
+        # version is refused with nothing written, and a known older one is snapshotted, then
+        # migrated in a single transaction (see ``hflow.migrate``).
+        try:
+            version_before, self.storage_version, self.migration_backup = migrate(
+                self.conn, self.path, on_step=on_migration_step
+            )
+            # ``version_before`` is the *effective* version - including the inferred 1 of a
+            # pre-E1 file that recorded none - so a caller can report what the file was. A file
+            # that did not exist before this call was created, not migrated: version 0 is not a
+            # migration source and reporting "migrated from 0" would be noise.
+            self.migrated_from = (
+                version_before
+                if 0 < version_before < self.storage_version
+                else None
+            )
+        except BaseException as exc:
+            # Any failure to open the ledger closes the connection: a half-open handle would
+            # keep the WAL and the file locked while the caller believes the open failed. A
+            # migration problem is reported as the store's own error; anything else (a hook that
+            # raised, an I/O failure) keeps its own type after the cleanup.
+            self.conn.close()
+            if isinstance(exc, MigrationError):
+                raise StoreError(str(exc)) from exc
+            raise
+
         with self.transaction(autocommit=True):
-            self.conn.executescript(SCHEMA_SQL)
             self.conn.execute(
                 "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
@@ -261,8 +249,9 @@ class Store:
     def transaction(self, *, autocommit: bool = False) -> Iterator[sqlite3.Connection]:
         """BEGIN IMMEDIATE ... COMMIT/ROLLBACK around one logical state change.
 
-        ``autocommit=True`` is used only for schema bootstrap, because
-        ``executescript`` would itself commit a surrounding explicit transaction.
+        ``autocommit=True`` is used only for statement batches that manage their own
+        transaction boundary (the schema digest seed, and the migrations in
+        :mod:`hflow.migrate`, which open their own and must not be nested).
         """
         with self._lock:
             if autocommit:
@@ -790,6 +779,1248 @@ class Store:
         row = self.get_run(run_id)
         return int(row["turns_remaining"])
 
+    # -- root budget ledger (batch E1) ---------------------------------------
+
+    def register_root_budget(
+        self, binding: RootBudgetBinding, limits: RootBudgetLimits
+    ) -> sqlite3.Row:
+        """Record a root's binding and its ceilings, or return the existing identical row.
+
+        A root is registered once and never re-initialised. Two ways this could otherwise leak
+        a fresh allowance, both refused here:
+
+        * the same root id with *different* limits or a different binding - an artifact could
+          ask for more than the approval that opened the root, so the recorded row stands;
+        * the same ``(project_id, repo_path, task_id)`` under a different root id - that is the
+          same task, and the unique index is what makes "a new root id" impossible rather than
+          merely discouraged.
+        """
+        now = utc_now()
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM root_budgets WHERE root_id = ?", (binding.root_id,)
+            ).fetchone()
+            if row is None:
+                clash = conn.execute(
+                    "SELECT root_id, max_top_level_submissions, max_repairs, deadline_seconds "
+                    "FROM root_budgets WHERE project_id = ? AND repo_path = ? AND task_id = ?",
+                    (binding.project_id, binding.repo_path, binding.task_id),
+                ).fetchone()
+                if clash is not None:
+                    raise StoreError(
+                        f"the task {binding.task_id} of {binding.project_id} at {binding.repo_path} "
+                        f"already has root {clash['root_id']}; this run resolves {binding.root_id} "
+                        "for the same task, and a second root would hand it a second allowance"
+                    )
+                conn.execute(
+                    """
+                    INSERT INTO root_budgets (
+                        root_id, project_id, task_id, repo_path, ledger_path,
+                        max_top_level_submissions, max_repairs, deadline_seconds,
+                        limits_digest, binding_digest, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        binding.root_id,
+                        binding.project_id,
+                        binding.task_id,
+                        binding.repo_path,
+                        binding.ledger_path,
+                        limits.max_top_level_submissions,
+                        limits.max_repairs,
+                        limits.deadline_seconds,
+                        limits.digest(),
+                        digest_of(binding.model_dump(mode="json")),
+                        now,
+                        now,
+                    ),
+                )
+            else:
+                self._check_root_limits_locked(conn, row, binding, limits)
+                if row["binding_digest"] != digest_of(binding.model_dump(mode="json")):
+                    raise StoreError(
+                        f"root {binding.root_id} is already recorded against a different binding "
+                        f"(recorded ledger {row['ledger_path']}, this run resolves "
+                        f"{binding.ledger_path}); the recorded root stands"
+                    )
+            return conn.execute(
+                "SELECT * FROM root_budgets WHERE root_id = ?", (binding.root_id,)
+            ).fetchone()
+
+    def _check_root_limits_locked(
+        self,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+        binding: RootBudgetBinding,
+        limits: RootBudgetLimits,
+    ) -> None:
+        """Refuse a root whose recorded ceilings differ from the ones just presented."""
+        recorded = RootBudgetLimits(
+            max_top_level_submissions=int(row["max_top_level_submissions"]),
+            max_repairs=int(row["max_repairs"]),
+            deadline_seconds=int(row["deadline_seconds"]),
+        )
+        if recorded.digest() != limits.digest():
+            raise StoreError(
+                f"root {row['root_id']} is recorded with limits {recorded.model_dump(mode='json')} "
+                f"but this run presents {limits.model_dump(mode='json')}. A root's ceiling is part "
+                "of the approval that opened it; changing it later is not something a run may do, "
+                "and there is no top-up path in this build."
+            )
+
+    def root_budget_row(self, root_id: str) -> sqlite3.Row | None:
+        return self._fetchone("SELECT * FROM root_budgets WHERE root_id = ?", (root_id,))
+
+    def root_budget_for_run(self, run_id: str) -> sqlite3.Row | None:
+        """This run's root row, or ``None`` for a run that is not spent against a root.
+
+        Read through ``attempts.root_id`` rather than re-deriving it: the ledger is the record
+        of what was actually charged, and a legacy run has no root at all.
+        """
+        return self._fetchone(
+            """
+            SELECT rb.* FROM root_budgets rb
+             WHERE rb.root_id = (SELECT root_id FROM attempts WHERE run_id = ? AND root_id <> ''
+                                 ORDER BY created_at LIMIT 1)
+            """,
+            (run_id,),
+        )
+
+    def root_budget_view(self, root_id: str) -> RootBudgetUsage | None:
+        """The read model over one root: recorded counters, never estimates."""
+        row = self.root_budget_row(root_id)
+        if row is None:
+            return None
+        binding = RootBudgetBinding(
+            root_id=str(row["root_id"]),
+            project_id=str(row["project_id"]),
+            repo_path=str(row["repo_path"]),
+            task_id=str(row["task_id"]),
+            ledger_path=str(row["ledger_path"]),
+        )
+        limits = RootBudgetLimits(
+            max_top_level_submissions=int(row["max_top_level_submissions"]),
+            max_repairs=int(row["max_repairs"]),
+            deadline_seconds=int(row["deadline_seconds"]),
+        )
+        return RootBudgetUsage(
+            binding=binding,
+            limits=limits,
+            used_top_level_submissions=int(row["used_top_level_submissions"]),
+            used_repairs=int(row["used_repairs"]),
+            run_ids=list(json.loads(row["run_ids_json"] or "[]")),
+            authorization_ids=list(json.loads(row["authorization_ids_json"] or "[]")),
+            first_dispatch_at=row["first_dispatch_at"],
+            deadline_at=row["deadline_at"],
+        )
+
+    # -- one dispatch, one transaction (batch E1) ----------------------------
+
+    def reserve_dispatch(
+        self,
+        *,
+        run_id: str,
+        controller_id: str,
+        invocation_id: str,
+        role: str,
+        reservation_id: str,
+        reserved_turns: int,
+        reservation_expires_at: str,
+        attempt_id: str | None = None,
+        root_binding: RootBudgetBinding | None = None,
+        root_limits: RootBudgetLimits | None = None,
+        authorization_id: str = "",
+        authorization_max: int | None = None,
+        required_loop_remaining: int = 1,
+    ) -> DispatchReservation:
+        """Reserve one top-level dispatch: every counter, in one transaction.
+
+        This is the single entry point for both roles. Before it, an implementer dispatch and a
+        review dispatch were charged in separate commits (authorization claim, turn reservation,
+        invocation registration), so a failure between them could leave an allowance spent with
+        no attempt row - or a reviewer bought for a run that then discovered it had no budget.
+        Everything below is one ``BEGIN IMMEDIATE``:
+
+        1. the run is owned by this controller, is live, and is in the phase this role belongs
+           to (an implementer dispatch only before checks, a reviewer only in ``review``);
+        2. no cancellation intent is recorded;
+        3. for a root run: the root has no unresolved invocation, is inside its deadline, and
+           has room for this submission - including its repair count;
+        4. the authorization has room and the run's turn ceiling has room;
+        5. the attempt row exists (or is created), the invocation intent is inserted, and the
+           root, authorization and run counters are incremented.
+
+        Any failure raises ``StoreError`` and rolls the whole thing back: there is no state in
+        which one counter moved and another did not.
+
+        Idempotent by ``invocation_id``: a replay returns the recorded intent with
+        ``is_new=False`` and charges nothing, so a retried call cannot start a second process.
+        A *different* invocation id for a role that already has a live or reserved invocation is
+        refused, which is what stops "a new id" from being used to dispatch twice.
+
+        ``root_binding``/``root_limits`` are ``None`` for a run that is not spent against a root
+        ledger (every legacy run, and every offline run). They cannot be supplied without an
+        ``authorization_id``: a root with nothing to bind it to is not a ledger.
+
+        What this does *not* do on the legacy path: write ``attempts.invocation_id``. That stays
+        with the controller's own stop-aware registration, because a stop racing that write is
+        coordinated there (``register_attempt_invocation_unless_stopped``). On the root path the
+        invocation row and that column are written here, in the same transaction, so a reader
+        never sees one without the other.
+        """
+        if role not in {"implementer", "reviewer", "planner"}:
+            raise StoreError(f"unknown dispatch role {role!r}")
+        with self.transaction() as conn:
+            existing = conn.execute(
+                "SELECT * FROM invocations WHERE invocation_id = ?", (invocation_id,)
+            ).fetchone()
+            if existing is not None:
+                return DispatchReservation(
+                    is_new=False,
+                    invocation=_invocation_from_row(existing),
+                    attempt_id=str(existing["attempt_id"]),
+                    role=str(existing["role"]),
+                    detail=(
+                        "this invocation id is already recorded; the recorded dispatch stands and "
+                        "the caller may only coordinate it, never start it again"
+                    ),
+                )
+
+            row = self._guard_dispatch_locked(conn, run_id, controller_id, attempt_id, role)
+
+            if root_binding is None and root_limits is None:
+                return self._reserve_legacy_locked(
+                    conn,
+                    run_id=run_id,
+                    controller_id=controller_id,
+                    role=role,
+                    reservation_id=reservation_id,
+                    reserved_turns=reserved_turns,
+                    reservation_expires_at=reservation_expires_at,
+                    authorization_id=authorization_id,
+                    authorization_max=authorization_max,
+                    attempt_id=attempt_id,
+                    row=row,
+                )
+
+            if root_binding is None or root_limits is None:
+                raise StoreError(
+                    "a root budget must be supplied with both its binding and its limits; "
+                    "charging a root without knowing its ceiling would be an unapproved spend"
+                )
+            if not authorization_id:
+                raise StoreError(
+                    "a root budget can only be charged together with an authorization: a root "
+                    "records what an approval spent, and there is no approval here"
+                )
+            if root_binding.project_id != row["project_id"]:
+                raise StoreError(
+                    f"root {root_binding.root_id} belongs to project {root_binding.project_id}, "
+                    f"not to this run's project {row['project_id']}"
+                )
+            self._check_authorization_locked(conn, authorization_id, authorization_max)
+            self._claim_authorization_locked(conn, authorization_id)
+            self._reserve_turn_locked(run_id, controller_id, turns=reserved_turns)
+            attempt = self._attempt_for_dispatch_locked(
+                conn,
+                attempt_id=attempt_id,
+                run_id=run_id,
+                task_revision=int(row["task_revision"]),
+                role=role,
+                reservation_id=reservation_id,
+                reserved_turns=reserved_turns,
+                reservation_expires_at=reservation_expires_at,
+                root_id=root_binding.root_id,
+                # Only the role that produces the candidate creates an attempt; the reviewer
+                # attaches to it.
+                create_attempt=role == "implementer",
+            )
+            round_number = self._next_round_locked(conn, root_binding.root_id)
+            is_repair = self._charge_root_locked(
+                conn,
+                root_binding=root_binding,
+                root_limits=root_limits,
+                role=role,
+                run_id=run_id,
+                authorization_id=authorization_id,
+                required_loop_remaining=int(required_loop_remaining),
+            )
+            intent = self._insert_invocation_locked(
+                conn,
+                invocation_id=invocation_id,
+                root_id=root_binding.root_id,
+                run_id=run_id,
+                attempt_id=str(attempt["attempt_id"]),
+                role=role,
+                authorization_id=authorization_id,
+                round_number=round_number,
+                is_repair=is_repair,
+            )
+            turns_after = conn.execute(
+                "SELECT turns_reserved FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            return DispatchReservation(
+                is_new=True,
+                invocation=intent,
+                attempt_id=str(attempt["attempt_id"]),
+                role=role,
+                run_turns_reserved=int(turns_after["turns_reserved"]) if turns_after else 0,
+                authorization_used=int(intent.authorization_used_at_reservation),
+                detail=f"reserved as round {round_number} of root {root_binding.root_id}",
+            )
+
+    def _reserve_legacy_locked(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        run_id: str,
+        controller_id: str,
+        role: str,
+        reservation_id: str,
+        reserved_turns: int,
+        reservation_expires_at: str,
+        authorization_id: str,
+        authorization_max: int | None,
+        attempt_id: str | None,
+        row: sqlite3.Row,
+    ) -> DispatchReservation:
+        """The pre-E1 path for a run with no root: authorization, turn and attempt together.
+
+        Still one transaction - that part is not new - but no root counter is involved and no
+        invocation row is written, because a legacy run's dispatch facts stay where they always
+        were (``attempts.invocation_id`` / ``review_invocation_id``).
+        """
+        if authorization_id:
+            self._check_authorization_locked(conn, authorization_id, authorization_max)
+            self._claim_authorization_locked(conn, authorization_id)
+        self._reserve_turn_locked(run_id, controller_id, turns=reserved_turns)
+        attempt = self._attempt_for_dispatch_locked(
+            conn,
+            attempt_id=attempt_id,
+            run_id=run_id,
+            task_revision=int(row["task_revision"]),
+            role=role,
+            reservation_id=reservation_id,
+            reserved_turns=reserved_turns,
+            reservation_expires_at=reservation_expires_at,
+            root_id="",
+            create_attempt=role == "implementer",
+        )
+        used = 0
+        if authorization_id:
+            auth_row = conn.execute(
+                "SELECT used_top_level_submissions FROM authorizations WHERE authorization_id = ?",
+                (authorization_id,),
+            ).fetchone()
+            used = int(auth_row["used_top_level_submissions"]) if auth_row else 0
+        turns_after = conn.execute(
+            "SELECT turns_reserved FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        return DispatchReservation(
+            is_new=True,
+            invocation=None,
+            attempt_id=str(attempt["attempt_id"]),
+            role=role,
+            run_turns_reserved=int(turns_after["turns_reserved"]) if turns_after else 0,
+            authorization_used=used,
+            detail="legacy dispatch: no root ledger is involved for this run",
+        )
+
+    def _guard_dispatch_locked(
+        self,
+        conn: sqlite3.Connection,
+        run_id: str,
+        controller_id: str,
+        attempt_id: str | None,
+        role: str,
+    ) -> sqlite3.Row:
+        """Ownership, liveness, stop and role/phase checks, all inside the transaction."""
+        row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        if row is None:
+            raise RunNotFound(run_id)
+        if row["claimed_by"] != controller_id:
+            raise StoreError(
+                f"cannot dispatch for {run_id}: claimed by {row['claimed_by']!r}, "
+                f"not {controller_id!r}"
+            )
+        if row["cancel_intent_at"]:
+            raise StoreError(
+                f"run {run_id} has a cancellation intent recorded at {row['cancel_intent_at']}; "
+                "no dispatch is reserved for a stopped run and no counter moves"
+            )
+        state = TaskState(row["task_state"])
+        if state in {TaskState.ACCEPTED, TaskState.BLOCKED, TaskState.CANCELLED}:
+            raise StoreError(
+                f"run {run_id} is {state.value}; a terminal run never dispatches again"
+            )
+        phase = row["phase"]
+        if role == "reviewer" and phase != CheckPhase.REVIEW.value:
+            raise StoreError(
+                f"run {run_id} is in phase {phase!r}, not {CheckPhase.REVIEW.value!r}: a review "
+                "dispatch is only reserved once the run has entered review"
+            )
+        if role == "implementer" and phase is not None:
+            raise StoreError(
+                f"run {run_id} is already in phase {phase!r}: an implementer dispatch is only "
+                "reserved before the candidate is checked"
+            )
+        live = conn.execute(
+            "SELECT attempt_id FROM attempts WHERE run_id = ? AND state IN (?, ?)",
+            (run_id, AttemptState.CREATED.value, AttemptState.ACTIVE.value),
+        ).fetchall()
+        if attempt_id is not None and any(
+            str(entry["attempt_id"]) != attempt_id for entry in live
+        ):
+            others = ", ".join(str(entry["attempt_id"]) for entry in live)
+            raise StoreError(f"refusing a second live attempt for {run_id}: {others} is active")
+        return row
+
+    def _check_authorization_locked(
+        self, conn: sqlite3.Connection, authorization_id: str, authorization_max: int | None
+    ) -> None:
+        """Refuse unless this authorization exists and has room for one more submission."""
+        row = conn.execute(
+            "SELECT * FROM authorizations WHERE authorization_id = ?", (authorization_id,)
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"unknown authorization {authorization_id}")
+        if authorization_max is not None and int(row["max_top_level_submissions"]) != int(
+            authorization_max
+        ):
+            raise StoreError(
+                f"authorization {authorization_id} is recorded with a ceiling of "
+                f"{row['max_top_level_submissions']} but this run presents {authorization_max}; "
+                "the recorded approval stands"
+            )
+        if int(row["used_top_level_submissions"]) + 1 > int(row["max_top_level_submissions"]):
+            raise StoreError(
+                f"authorization {authorization_id} is exhausted: "
+                f"{row['used_top_level_submissions']}/{row['max_top_level_submissions']} "
+                "top-level submissions used"
+            )
+
+    def _claim_authorization_locked(self, conn: sqlite3.Connection, authorization_id: str) -> None:
+        """The authorization's own gate: the UPDATE is the check, the CHECK constraint the backstop."""
+        cur = conn.execute(
+            """
+            UPDATE authorizations
+               SET used_top_level_submissions = used_top_level_submissions + 1
+             WHERE authorization_id = ?
+               AND used_top_level_submissions + 1 <= max_top_level_submissions
+            """,
+            (authorization_id,),
+        )
+        if cur.rowcount != 1:
+            raise StoreError(
+                f"authorization {authorization_id} could not be charged; nothing was reserved"
+            )
+
+    def _attempt_for_dispatch_locked(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        attempt_id: str | None,
+        run_id: str,
+        task_revision: int,
+        role: str,
+        reservation_id: str,
+        reserved_turns: int,
+        reservation_expires_at: str,
+        root_id: str,
+        create_attempt: bool = True,
+    ) -> sqlite3.Row:
+        """The attempt this dispatch belongs to: the run's own, or one created for it.
+
+        Two roles, two invocations, **one attempt**: the reviewer reviews what the implementer
+        produced on the same attempt row, which is why an implementer dispatch may not be
+        followed by a second one for the same revision (that is E2's repair attempt, and it is
+        not implemented here), and why a non-implementer dispatch must find that row rather than
+        create one.
+
+        ``create_attempt=False`` makes this a pure lookup: a role that reviews work somebody else
+        produced can never be the reason an attempt exists.
+        """
+        now = utc_now()
+        column = "invocation_id" if role == "implementer" else "review_invocation_id"
+        if role == "implementer" and not create_attempt:
+            raise StoreError(f"role {role!r} creates the attempt it dispatches; it cannot look one up")
+        if role == "implementer":
+            existing = conn.execute(
+                "SELECT * FROM attempts WHERE run_id = ? AND task_revision = ? AND role = ?",
+                (run_id, task_revision, role),
+            ).fetchone()
+            if existing is not None:
+                raise StoreError(
+                    f"run {run_id} already has an implementer attempt "
+                    f"{existing['attempt_id']} for revision {task_revision}; a second "
+                    "implementation attempt is a repair, which this build does not perform"
+                )
+            created_id = attempt_id or new_attempt_id()
+            conn.execute(
+                """
+                INSERT INTO attempts (
+                    attempt_id, run_id, task_revision, role, state, reservation_id,
+                    reserved_agent_turns, reserved_expires_at, created_at, root_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    created_id,
+                    run_id,
+                    task_revision,
+                    role,
+                    AttemptState.ACTIVE.value,
+                    reservation_id,
+                    reserved_turns,
+                    reservation_expires_at,
+                    now,
+                    root_id,
+                ),
+            )
+            conn.execute(
+                "UPDATE runs SET current_attempt_id = ?, task_state = ?, updated_at = ? WHERE run_id = ?",
+                (created_id, TaskState.RUNNING.value, now, run_id),
+            )
+            attempt_id = created_id
+        else:
+            # A review is not its own attempt. The reviewer reviews the *implementer's* attempt:
+            # the row that carries the candidate, the evidence and the frozen fingerprint. The
+            # role on the attempt is ``implementer``, so looking it up by this dispatch's role
+            # would find nothing and refuse every review.
+            existing = conn.execute(
+                "SELECT * FROM attempts WHERE run_id = ? AND task_revision = ? "
+                "ORDER BY created_at, rowid LIMIT 1",
+                (run_id, task_revision),
+            ).fetchone()
+            if existing is None:
+                raise StoreError(
+                    f"no attempt exists for run {run_id} revision {task_revision}: a {role} "
+                    "dispatch reviews an attempt that has already been recorded"
+                )
+            if not create_attempt and existing[column]:
+                # One review per attempt, whatever the caller names it. Checking only for a
+                # *pending* invocation is not enough: the first reviewer settles when its verdict
+                # is recorded, and a second id would then buy a second review of the same
+                # candidate - and overwrite the attempt's record of the first.
+                raise StoreError(
+                    f"run {run_id} revision {task_revision} already dispatched a {role} "
+                    f"invocation ({existing[column]}); this build buys one review per candidate, "
+                    "and a new invocation id does not make it a different review"
+                )
+            attempt_id = str(existing["attempt_id"])
+            if existing["root_id"] in ("", None):
+                conn.execute(
+                    "UPDATE attempts SET root_id = ? WHERE attempt_id = ?", (root_id, attempt_id)
+                )
+        row = conn.execute("SELECT * FROM attempts WHERE attempt_id = ?", (attempt_id,)).fetchone()
+        if row is None:  # pragma: no cover - the inserts above guarantee the row
+            raise StoreError(f"attempt {attempt_id} vanished inside its own transaction")
+        return row
+
+    def _next_round_locked(self, conn: sqlite3.Connection, root_id: str) -> int:
+        """The next round number of this root: a counter, not a per-run counter.
+
+        Rounds are numbered across every run and revision of the root, so two runs of the same
+        task cannot both call themselves "round 1".
+        """
+        row = conn.execute(
+            "SELECT COALESCE(MAX(round), 0) AS highest FROM invocations WHERE root_id = ?",
+            (root_id,),
+        ).fetchone()
+        return int(row["highest"]) + 1
+
+    def _charge_root_locked(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        root_binding: RootBudgetBinding,
+        root_limits: RootBudgetLimits,
+        role: str,
+        run_id: str,
+        authorization_id: str,
+        required_loop_remaining: int = 1,
+    ) -> bool:
+        """Charge the root's counters, creating the row if this is the root's first dispatch.
+
+        Returns whether this dispatch is a repair. The rules, in full:
+
+        * the root's **first** implementer dispatch is not a repair, whatever else is true;
+        * any later implementer dispatch for the same root is one - including one that arrives
+          under a new revision or a new run, because the repair allowance belongs to the task,
+          not to a run's own idea of "first attempt";
+        * a reviewer dispatch never consumes a repair;
+        * an unknown outcome never refunds anything: only this method increments, and nothing in
+          this build ever decrements a root's consumption;
+        * the root must be able to pay for the run's *whole remaining loop*
+          (``required_loop_remaining``), not merely for this one dispatch: buying an
+          implementation whose review cannot be afforded is the half-loop the ceiling check
+          refuses.
+        """
+        now = utc_now()
+        row = conn.execute(
+            "SELECT * FROM root_budgets WHERE root_id = ?", (root_binding.root_id,)
+        ).fetchone()
+        if row is None:
+            # The same task under a different root id. Checked here as well as in
+            # ``register_root_budget`` because this path can create the row, and without the
+            # check the unique index would raise a bare ``sqlite3.IntegrityError`` - a crash
+            # where every other refusal is a ``StoreError`` the controller can report.
+            clash = conn.execute(
+                "SELECT root_id FROM root_budgets WHERE project_id = ? AND repo_path = ? AND task_id = ?",
+                (root_binding.project_id, root_binding.repo_path, root_binding.task_id),
+            ).fetchone()
+            if clash is not None:
+                raise StoreError(
+                    f"the task {root_binding.task_id} of {root_binding.project_id} at "
+                    f"{root_binding.repo_path} already has root {clash['root_id']}; this run "
+                    f"resolves {root_binding.root_id} for the same task, and a second root would "
+                    "hand it a second allowance"
+                )
+            conn.execute(
+                """
+                INSERT INTO root_budgets (
+                    root_id, project_id, task_id, repo_path, ledger_path,
+                    max_top_level_submissions, max_repairs, deadline_seconds,
+                    limits_digest, binding_digest, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    root_binding.root_id,
+                    root_binding.project_id,
+                    root_binding.task_id,
+                    root_binding.repo_path,
+                    root_binding.ledger_path,
+                    root_limits.max_top_level_submissions,
+                    root_limits.max_repairs,
+                    root_limits.deadline_seconds,
+                    root_limits.digest(),
+                    digest_of(root_binding.model_dump(mode="json")),
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM root_budgets WHERE root_id = ?", (root_binding.root_id,)
+            ).fetchone()
+        else:
+            self._check_root_limits_locked(conn, row, root_binding, root_limits)
+
+        # An unresolved invocation blocks the whole root, whatever run or revision asks next.
+        # This is the "an unknown outcome does not unlock the same task" rule, enforced where
+        # the decision is actually made rather than in a pre-flight read that a sibling process
+        # could invalidate.
+        pending = conn.execute(
+            f"SELECT invocation_id, role, state FROM invocations "
+            f" WHERE root_id = ? AND state IN ({','.join('?' for _ in INVOCATION_UNRESOLVED_STATES)})"
+            f" ORDER BY reserved_at",
+            (root_binding.root_id, *INVOCATION_UNRESOLVED_STATES),
+        ).fetchall()
+        if pending:
+            first = pending[0]
+            raise StoreError(
+                f"root {root_binding.root_id} still has {len(pending)} unresolved invocation(s); "
+                f"the earliest is {first['invocation_id']} ({first['role']}, "
+                f"{first['state']}). No dispatch is reserved for this root until it is settled - "
+                "an unknown outcome is reconciled by an operator, never re-dispatched."
+            )
+
+        # --- the root's active run owns it exclusively -----------------------------------
+        # An unresolved invocation is not the only way a root is busy. Between the implementer's
+        # settlement and the release of the run - while the approved checks run, while the review
+        # is being dispatched, while a verdict is rendered - there is no pending invocation and
+        # the work is still going on. Without this check a second revision could take the same
+        # root concurrently, which is one root running two tasks: the exact thing "one active run
+        # per root" exists to prevent.
+        other_live = conn.execute(
+            """
+            SELECT run_id, task_revision, task_state FROM runs
+             WHERE run_id IN (SELECT DISTINCT run_id FROM invocations WHERE root_id = ?)
+               AND run_id <> ?
+               AND task_state NOT IN (?, ?, ?)
+             ORDER BY created_at
+            """,
+            (
+                root_binding.root_id,
+                run_id,
+                TaskState.ACCEPTED.value,
+                TaskState.BLOCKED.value,
+                TaskState.CANCELLED.value,
+            ),
+        ).fetchall()
+        if other_live:
+            other = other_live[0]
+            raise StoreError(
+                f"root {root_binding.root_id} is owned by run {other['run_id']} "
+                f"(revision {other['task_revision']}, state {other['task_state']}); that run has "
+                f"not reached a terminal state, so no dispatch is reserved for this root from run "
+                f"{run_id}. One root runs one task at a time - wait for the active run to finish, "
+                "be stopped, or be cancelled."
+            )
+
+        deadline_at = row["deadline_at"]
+        if deadline_at and parse_ts(str(deadline_at)) <= parse_ts(now):
+            raise StoreError(
+                f"root {root_binding.root_id} reached its deadline at {deadline_at}; no further "
+                "dispatch is reserved for this root"
+            )
+        # --- the whole remaining loop has to fit, not just this dispatch -------------------
+        # Admitting a revision that can afford its implementer but not its reviewer buys an
+        # implementation and then blocks - the same "half a loop, fully paid for" outcome the
+        # authorization gate already refuses. ``required_loop_remaining`` is how many top-level
+        # reservations this run must still be able to make (the one being asked for, plus the
+        # review turn a required review will need), so the ceiling is tested against that.
+        remaining_loop = max(1, int(required_loop_remaining))
+        if int(row["used_top_level_submissions"]) + remaining_loop > int(
+            row["max_top_level_submissions"]
+        ):
+            raise StoreError(
+                f"root {root_binding.root_id} cannot complete this run's loop: "
+                f"{row['used_top_level_submissions']}/{row['max_top_level_submissions']} "
+                f"top-level submissions are used and this run still needs {remaining_loop} more "
+                f"(this {role} dispatch plus the rest of the loop). No dispatch is reserved and no "
+                "counter moves - obtain a root budget large enough for the whole loop, or stop "
+                "here. There is no top-up path in this build."
+            )
+
+        try:
+            run_ids = json.loads(row["run_ids_json"] or "[]")
+            authorization_ids = json.loads(row["authorization_ids_json"] or "[]")
+        except json.JSONDecodeError:
+            run_ids, authorization_ids = [], []
+        if run_id not in run_ids:
+            run_ids.append(run_id)
+        if authorization_id not in authorization_ids:
+            authorization_ids.append(authorization_id)
+
+        implementers_before = int(
+            conn.execute(
+                "SELECT COUNT(*) AS n FROM invocations WHERE root_id = ? AND role = 'implementer'",
+                (root_binding.root_id,),
+            ).fetchone()["n"]
+        )
+        is_repair = role == "implementer" and implementers_before > 0
+        if is_repair and int(row["used_repairs"]) + 1 > int(row["max_repairs"]):
+            raise StoreError(
+                f"root {root_binding.root_id} has used its {row['max_repairs']} repair attempt(s); "
+                "this build does not buy another implementation attempt, and changing the "
+                "revision does not reset the count"
+            )
+        first_dispatch_at = row["first_dispatch_at"] or now
+        conn.execute(
+            """
+            UPDATE root_budgets
+               SET used_top_level_submissions = used_top_level_submissions + 1,
+                   used_repairs = used_repairs + ?,
+                   run_ids_json = ?,
+                   authorization_ids_json = ?,
+                   first_dispatch_at = ?,
+                   deadline_at = ?,
+                   updated_at = ?
+             WHERE root_id = ?
+            """,
+            (
+                1 if is_repair else 0,
+                canonical_json(run_ids),
+                canonical_json(authorization_ids),
+                first_dispatch_at,
+                row["deadline_at"]
+                or _add_seconds(first_dispatch_at, int(row["deadline_seconds"])),
+                now,
+                root_binding.root_id,
+            ),
+        )
+        return is_repair
+
+    def _insert_invocation_locked(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        invocation_id: str,
+        root_id: str,
+        run_id: str,
+        attempt_id: str,
+        role: str,
+        authorization_id: str,
+        round_number: int,
+        is_repair: bool,
+    ) -> InvocationIntent:
+        """Write the dispatch record, in the same transaction as the counters above."""
+        now = utc_now()
+        root_row = conn.execute(
+            "SELECT used_top_level_submissions FROM root_budgets WHERE root_id = ?", (root_id,)
+        ).fetchone()
+        auth_row = conn.execute(
+            "SELECT used_top_level_submissions FROM authorizations WHERE authorization_id = ?",
+            (authorization_id,),
+        ).fetchone()
+        conn.execute(
+            """
+            INSERT INTO invocations (
+                invocation_id, root_id, run_id, attempt_id, role, authorization_id,
+                round, is_repair, state, reserved_at,
+                root_used_at_reservation, authorization_used_at_reservation
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                invocation_id,
+                root_id,
+                run_id,
+                attempt_id,
+                role,
+                authorization_id,
+                round_number,
+                1 if is_repair else 0,
+                InvocationStartState.RESERVED.value,
+                now,
+                int(root_row["used_top_level_submissions"]) if root_row else 0,
+                int(auth_row["used_top_level_submissions"]) if auth_row else 0,
+            ),
+        )
+        # The role's invocation id stays recorded on the attempt row as well: ``cancel`` routes a
+        # stop through it, and a reader that predates the ledger still finds it. Written in this
+        # same transaction, so it can never disagree with the invocation record.
+        column = "invocation_id" if role == "implementer" else "review_invocation_id"
+        conn.execute(
+            f"UPDATE attempts SET {column} = ? WHERE attempt_id = ?", (invocation_id, attempt_id)
+        )
+        return _invocation_from_row(
+            conn.execute(
+                "SELECT * FROM invocations WHERE invocation_id = ?", (invocation_id,)
+            ).fetchone()
+        )
+
+    # -- invocation lifecycle ------------------------------------------------
+
+    def invocation(self, invocation_id: str) -> InvocationIntent | None:
+        row = self._fetchone(
+            "SELECT * FROM invocations WHERE invocation_id = ?", (invocation_id,)
+        )
+        return _invocation_from_row(row) if row is not None else None
+
+    def invocations_for(self, run_id: str) -> list[InvocationIntent]:
+        return [
+            _invocation_from_row(row)
+            for row in self._fetchall(
+                "SELECT * FROM invocations WHERE run_id = ? ORDER BY reserved_at, rowid", (run_id,)
+            )
+        ]
+
+    def invocations_for_root(self, root_id: str) -> list[InvocationIntent]:
+        return [
+            _invocation_from_row(row)
+            for row in self._fetchall(
+                "SELECT * FROM invocations WHERE root_id = ? ORDER BY reserved_at, rowid",
+                (root_id,),
+            )
+        ]
+
+    def pending_invocations(self, root_id: str) -> list[InvocationIntent]:
+        return [entry for entry in self.invocations_for_root(root_id) if entry.pending]
+
+    def mark_invocation_launch_requested(self, invocation_id: str) -> bool:
+        """Record that the controller is about to ask a driver to launch this invocation.
+
+        Deliberately *not* a start. The last moment at which "no process exists" is certainly true
+        is this one, so recording a request here is honest; recording a start here is not, because
+        the driver may still win a stop in its own gate and create nothing. The process fact comes
+        from the driver through :meth:`record_invocation_spawn`.
+
+        A crash after this and before any spawn report leaves ``REQUESTED``: a launch that may
+        have been asked for, with no process known. That keeps the root blocked without claiming
+        work began.
+        """
+        with self.transaction() as conn:
+            cur = conn.execute(
+                """
+                UPDATE invocations
+                   SET state = ?, launch_requested_at = ?
+                 WHERE invocation_id = ? AND state = ?
+                """,
+                (
+                    InvocationStartState.REQUESTED.value,
+                    utc_now(),
+                    invocation_id,
+                    InvocationStartState.RESERVED.value,
+                ),
+            )
+            if cur.rowcount == 1:
+                return True
+            # A legacy row (storage v2) has no launch_requested_at and may already be STARTED;
+            # the request still has to be recorded, but the state it carries is not downgraded.
+            cur = conn.execute(
+                """
+                UPDATE invocations SET launch_requested_at = ?
+                 WHERE invocation_id = ? AND launch_requested_at IS NULL
+                """,
+                (utc_now(), invocation_id),
+            )
+            return cur.rowcount == 1
+
+    def record_invocation_spawn(self, fact: SpawnFact) -> bool:
+        """Record what a driver observed at the moment its launch decision was final.
+
+        Three separate facts come out of this, and the whole point is that they are separate:
+
+        * ``created`` says the **launch happened**. It sets ``started_at`` and the ``started``
+          state, whatever the launch physically creates;
+        * ``pid`` says an **operating-system child exists**. Only that fills
+          ``process_started_at``/``process_pid``, and only that is counted as a process;
+        * ``spawn_kind`` says what this driver's launch creates. The offline driver reports
+          ``no_process``: its work happens, no child appears, and a process count must not
+          invent one.
+
+        ``created=False`` records ``NOT_STARTED`` - a launch that did not happen, whether a stop
+        won the gate or the client failed to start. The consumption stays either way: the
+        reservation was committed before this fact was knowable.
+
+        A report never downgrades a row that has already gone further (a settled or unknown
+        invocation), and a later "nothing happened" cannot unrecord a launch that did.
+        """
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT state, started_at, process_started_at FROM invocations WHERE invocation_id = ?",
+                (fact.invocation_id,),
+            ).fetchone()
+            if row is None:
+                raise StoreError(f"unknown invocation {fact.invocation_id}")
+            now = utc_now()
+            current = InvocationStartState(str(row["state"]))
+            if current in {InvocationStartState.SETTLED, InvocationStartState.UNKNOWN}:
+                return False
+            if fact.created:
+                process_started_at = now if fact.pid is not None else None
+                conn.execute(
+                    """
+                    UPDATE invocations
+                       SET state = ?, started_at = ?, launch_requested_at =
+                               COALESCE(launch_requested_at, ?),
+                           process_started_at = COALESCE(?, process_started_at),
+                           process_pid = COALESCE(?, process_pid),
+                           spawn_kind = ?,
+                           detail = ?
+                     WHERE invocation_id = ?
+                    """,
+                    (
+                        InvocationStartState.STARTED.value,
+                        now,
+                        now,
+                        process_started_at,
+                        fact.pid,
+                        fact.spawn_kind.value,
+                        fact.detail[:1000],
+                        fact.invocation_id,
+                    ),
+                )
+                return True
+            if current is InvocationStartState.NOT_STARTED:
+                return False  # already recorded as never launched; keep the first reason
+            if row["started_at"] is not None or row["process_started_at"] is not None:
+                # A launch is already recorded. A later "nothing happened" cannot unrecord it:
+                # the earlier report is a fact and this one is a contradiction, not a correction.
+                conn.execute(
+                    "UPDATE invocations SET detail = ? WHERE invocation_id = ?",
+                    (
+                        f"a later spawn report contradicted the recorded launch "
+                        f"({fact.detail[:400]}); the recorded launch stands",
+                        fact.invocation_id,
+                    ),
+                )
+                return False
+            conn.execute(
+                """
+                UPDATE invocations
+                   SET state = ?, started_at = NULL, process_started_at = NULL,
+                       process_pid = NULL, spawn_kind = ?,
+                       launch_requested_at = COALESCE(launch_requested_at, ?),
+                       detail = ?
+                 WHERE invocation_id = ?
+                """,
+                (
+                    InvocationStartState.NOT_STARTED.value,
+                    fact.spawn_kind.value,
+                    now,
+                    fact.detail[:1000],
+                    fact.invocation_id,
+                ),
+            )
+            return True
+
+    def mark_invocation_started(
+        self, invocation_id: str, *, process_created: bool = True, pid: int | None = None
+    ) -> bool:
+        """Record a launch that happened, without a driver-reported spawn fact.
+
+        Kept for store-level callers and for a driver that does not implement the spawn report.
+        The controller does **not** use it on the launch path: it records a launch *request*
+        before asking a driver and takes the launch and process facts from the driver's report,
+        because assuming that asking means launching is the error this split exists to prevent.
+
+        ``process_created`` is what decides the process fact: a caller that knows no child exists
+        (the offline path) must pass ``process_created=False``, which records the launch without
+        claiming a process. The default is the conservative one for a caller that says nothing -
+        it is a *fact* claim, so the caller has to make it deliberately.
+        """
+        now = utc_now()
+        with self.transaction() as conn:
+            cur = conn.execute(
+                """
+                UPDATE invocations
+                   SET state = ?, started_at = ?,
+                       launch_requested_at = COALESCE(launch_requested_at, ?),
+                       process_started_at = COALESCE(?, process_started_at),
+                       process_pid = COALESCE(?, process_pid),
+                       spawn_kind = ?
+                 WHERE invocation_id = ? AND state IN (?, ?)
+                """,
+                (
+                    InvocationStartState.STARTED.value,
+                    now,
+                    now,
+                    now if process_created else None,
+                    pid,
+                    SpawnKind.PROCESS.value if process_created else SpawnKind.NO_PROCESS.value,
+                    invocation_id,
+                    InvocationStartState.RESERVED.value,
+                    InvocationStartState.REQUESTED.value,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def settle_invocation(
+        self, invocation_id: str, *, outcome: InvocationOutcome | None, detail: str = ""
+    ) -> None:
+        """Close an invocation with an observed outcome. Never decrements a counter.
+
+        ``None`` (or ``OUTCOME_UNKNOWN``) records ``UNKNOWN``, which keeps blocking the root: the
+        consumption stays because a provider may have been billed, and there is no automatic
+        refund, retry or prompt replay anywhere in this build.
+
+        A ``NOT_STARTED`` invocation is **not** downgraded to ``SETTLED``. That state records a
+        fact - no process was ever handed to a driver - and a later driver-side ``cancelled``
+        observation cannot undo it: the process the driver is reporting on did not exist. The
+        outcome is still recorded, so a reader sees both "never launched" and what was reported.
+        """
+        state = (
+            InvocationStartState.UNKNOWN
+            if outcome is None or outcome is InvocationOutcome.OUTCOME_UNKNOWN
+            else InvocationStartState.SETTLED
+        )
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT state FROM invocations WHERE invocation_id = ?", (invocation_id,)
+            ).fetchone()
+            if row is None:
+                raise StoreError(f"unknown invocation {invocation_id}")
+            if row["state"] == InvocationStartState.NOT_STARTED.value:
+                conn.execute(
+                    """
+                    UPDATE invocations SET outcome = ?, detail = ?
+                     WHERE invocation_id = ? AND state = ?
+                    """,
+                    (
+                        outcome.value if outcome is not None else None,
+                        detail[:1000],
+                        invocation_id,
+                        InvocationStartState.NOT_STARTED.value,
+                    ),
+                )
+                return
+            conn.execute(
+                """
+                UPDATE invocations
+                   SET state = ?, outcome = ?, settled_at = ?, detail = ?
+                 WHERE invocation_id = ?
+                """,
+                (
+                    state.value,
+                    outcome.value if outcome is not None else None,
+                    utc_now(),
+                    detail[:1000],
+                    invocation_id,
+                ),
+            )
+
+    def mark_launch_unresolved(self, invocation_id: str, detail: str) -> None:
+        """Record that a launch was requested and nobody can say whether it happened.
+
+        The state that keeps a root blocked without claiming anything: no launch is recorded, no
+        process is counted, and the entry stays pending until an operator reconciles it. Used when
+        a stop is confirmed after the request and before any spawn report - including a forced
+        stop of a process that really existed, which is precisely why an empty timestamp cannot be
+        read as "nothing was launched".
+
+        **Idempotent, and that matters for the ordering it is used in.** A run can reach this
+        state twice: ``reconcile`` closes an interrupted launch this way, and a stop that is
+        confirmed afterwards settles the same invocation again. The second call must not raise -
+        the run really was stopped, and a public ``cancel`` that blows up after writing the
+        receipt reports a failure that did not happen. Only the detail is refreshed; the state,
+        the consumption and the "not re-dispatched" boundary are unchanged.
+
+        A row that already recorded a *launch* is refused rather than rewritten: a known launch is
+        not an unknown one, and this method exists to avoid merging them.
+        """
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT state FROM invocations WHERE invocation_id = ?", (invocation_id,)
+            ).fetchone()
+            if row is None:
+                raise StoreError(f"unknown invocation {invocation_id}")
+            current = InvocationStartState(str(row["state"]))
+            if current is InvocationStartState.LAUNCH_UNKNOWN:
+                conn.execute(
+                    "UPDATE invocations SET detail = ? WHERE invocation_id = ? AND state = ?",
+                    (
+                        detail[:1000],
+                        invocation_id,
+                        InvocationStartState.LAUNCH_UNKNOWN.value,
+                    ),
+                )
+                return
+            if current not in {
+                InvocationStartState.REQUESTED,
+                InvocationStartState.RESERVED,
+            }:
+                raise StoreError(
+                    f"invocation {invocation_id} recorded a launch (state {current.value}); a "
+                    "known launch is not an unresolved one, and its recorded state stands"
+                )
+            conn.execute(
+                """
+                UPDATE invocations SET state = ?, detail = ?
+                 WHERE invocation_id = ? AND state IN (?, ?)
+                """,
+                (
+                    InvocationStartState.LAUNCH_UNKNOWN.value,
+                    detail[:1000],
+                    invocation_id,
+                    InvocationStartState.REQUESTED.value,
+                    InvocationStartState.RESERVED.value,
+                ),
+            )
+
+    def mark_invocation_not_started(self, invocation_id: str, detail: str) -> None:
+        """Record a reservation that provably never reached a launch.
+
+        The allowance is **kept**: this is a fact about what happened, not a refund. It only stops
+        a run that never launched anything from looking like a run that did. Applied from
+        ``RESERVED`` (no driver was asked) and from ``REQUESTED`` (a driver was asked and reported
+        creating nothing); a row that has gone further is left alone.
+        """
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE invocations
+                   SET state = ?, detail = ?
+                 WHERE invocation_id = ? AND state IN (?, ?)
+                """,
+                (
+                    InvocationStartState.NOT_STARTED.value,
+                    detail[:1000],
+                    invocation_id,
+                    InvocationStartState.RESERVED.value,
+                    InvocationStartState.REQUESTED.value,
+                ),
+            )
+
+    def mark_unsettled_invocations_unknown(self, run_id: str, detail: str) -> int:
+        """Close the loop on a controller that died mid-dispatch.
+
+        Two outcomes, because the ledger knows two different things:
+
+        * a process was created (``started_at`` set) -> ``UNKNOWN``: work really began and its
+          result was never observed, so it blocks until an operator reconciles;
+        * a launch was only *requested* -> ``LAUNCH_UNKNOWN``: a transport call may have been made
+          and no process is known. It still blocks (the spend is unresolvable without looking),
+          but it is not counted as ``ever_started``, because no process was ever reported.
+
+        A row that a driver explicitly reported as creating nothing stays ``NOT_STARTED``: nothing
+        is unknown about it, and inventing an unknown would block the root for no reason.
+        """
+        with self.transaction() as conn:
+            launched = conn.execute(
+                """
+                UPDATE invocations
+                   SET state = ?, detail = ?
+                 WHERE run_id = ? AND state = ? AND started_at IS NOT NULL
+                """,
+                (
+                    InvocationStartState.UNKNOWN.value,
+                    detail[:1000],
+                    run_id,
+                    InvocationStartState.STARTED.value,
+                ),
+            )
+            # Everything with no recorded launch is a requested-but-unconfirmed one: a launch may
+            # have happened, so the root stays blocked, and no process is known, so no process
+            # count may include it.
+            launch_only = conn.execute(
+                """
+                UPDATE invocations
+                   SET state = ?, detail = ?
+                 WHERE run_id = ? AND state IN (?, ?) AND started_at IS NULL
+                """,
+                (
+                    InvocationStartState.LAUNCH_UNKNOWN.value,
+                    detail[:1000],
+                    run_id,
+                    InvocationStartState.REQUESTED.value,
+                    InvocationStartState.RESERVED.value,
+                ),
+            )
+            return int(launched.rowcount + launch_only.rowcount)
+
+    def unstarted_invocations(self, run_id: str) -> list[InvocationIntent]:
+        """Invocations whose allowance was charged but for which no process was reported.
+
+        This is the read a report uses to keep reservations, launches and processes apart: a
+        ``RESERVED``, ``REQUESTED`` or ``NOT_STARTED`` entry is a consumed allowance with no known
+        child, never a call.
+        """
+        return [
+            entry
+            for entry in self.invocations_for(run_id)
+            if entry.started_at is None
+        ]
+
+    def invocation_state_counts(self, run_id: str) -> InvocationStateCounts:
+        """Per-state counts, plus the process facts, in one statement (one snapshot, no skew).
+
+        ``processes`` comes from ``process_started_at`` - what a driver reported about the
+        machine - and never from a state or a result. That is the whole point of the split: an
+        offline invocation that completed in-process is ``settled`` with ``no_process``, and a
+        request whose report never arrived is ``launch_unknown`` with nothing.
+        """
+        rows = self._fetchall(
+            """
+            SELECT state, COUNT(*) AS n,
+                   SUM(CASE WHEN process_started_at IS NOT NULL THEN 1 ELSE 0 END) AS with_process,
+                   SUM(CASE WHEN spawn_kind = ? THEN 1 ELSE 0 END) AS childless
+              FROM invocations WHERE run_id = ? GROUP BY state
+            """,
+            (SpawnKind.NO_PROCESS.value, run_id),
+        )
+        counts = InvocationStateCounts()
+        for row in rows:
+            state = InvocationStartState(str(row["state"]))
+            number = int(row["n"])
+            counts.processes += int(row["with_process"])
+            counts.childless_launches += int(row["childless"])
+            if state is InvocationStartState.RESERVED:
+                counts.reserved = number
+            elif state is InvocationStartState.REQUESTED:
+                counts.requested = number
+            elif state is InvocationStartState.STARTED:
+                counts.started = number
+            elif state is InvocationStartState.NOT_STARTED:
+                counts.not_started = number
+            elif state is InvocationStartState.SETTLED:
+                counts.settled = number
+            elif state is InvocationStartState.LAUNCH_UNKNOWN:
+                counts.launch_unknown = number
+            else:
+                counts.unknown = number
+        counts.open = counts.reserved + counts.requested + counts.started
+        return counts
+
     # -- attempts ------------------------------------------------------------
 
     def open_attempt(self, run_id: str) -> sqlite3.Row | None:
@@ -1185,8 +2416,29 @@ class Store:
 
     # -- authorizations -------------------------------------------------------
 
+    #: Authorization fields that may never change for a reused ``authorization_id``. A binding
+    #: digest alone is not enough: the user's own words, the provenance and the ceiling are
+    #: immutable parts of an approval too, and rewriting one of them while keeping the id would
+    #: silently turn a spent artifact into a differently-worded or larger one.
+    _AUTHORIZATION_IMMUTABLE_FIELDS = (
+        "user_text",
+        "provided_by",
+        "authorized_at",
+        "max_top_level_submissions",
+        "mode",
+        # Where the *record* came from. Without this, a synthesized offline record and a real
+        # user artifact could swap places under one id while the binding digest stayed equal.
+        "origin",
+    )
+
     def register_authorization(self, record: dict[str, Any]) -> sqlite3.Row:
-        """Record a one-shot user authorization, or return the existing identical record."""
+        """Record a one-shot user authorization, or return the existing identical record.
+
+        Re-using an ``authorization_id`` is only allowed when nothing that defines the approval
+        changed - not only the binding digest but the verbatim user text, the provenance, the
+        timestamp and the ceiling. The existing row is never overwritten, so a consumed
+        authorization cannot be revived by editing its file.
+        """
         with self.transaction() as conn:
             existing = conn.execute(
                 "SELECT * FROM authorizations WHERE authorization_id = ?",
@@ -1198,13 +2450,25 @@ class Store:
                         f"authorization {record['authorization_id']} already exists bound to a "
                         "different target; refusing to reuse it"
                     )
+                changed = [
+                    field
+                    for field in self._AUTHORIZATION_IMMUTABLE_FIELDS
+                    if field in existing.keys() and existing[field] != record.get(field)
+                ]
+                if changed:
+                    raise StoreError(
+                        f"authorization {record['authorization_id']} already exists with different "
+                        f"immutable field(s) {changed}; an approval is not edited in place - the "
+                        "recorded one stands"
+                    )
                 return existing
             conn.execute(
                 """
                 INSERT INTO authorizations (
                     authorization_id, mode, binding_digest, user_text, provided_by,
-                    authorized_at, max_top_level_submissions, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    authorized_at, max_top_level_submissions, created_at,
+                    root_id, root_budget_json, root_limits_json, origin
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record["authorization_id"],
@@ -1215,6 +2479,14 @@ class Store:
                     record["authorized_at"],
                     int(record["max_top_level_submissions"]),
                     utc_now(),
+                    str(record.get("root_id", "") or ""),
+                    str(record.get("root_budget_json", "") or ""),
+                    str(record.get("root_limits_json", "") or ""),
+                    # Persisted, not just carried in memory: a record's origin that survives only
+                    # until the process exits is not a recorded fact. ``user_artifact`` is the
+                    # default for a caller that does not say - the shape every artifact had before
+                    # this field existed.
+                    str(record.get("origin", "user_artifact") or "user_artifact"),
                 ),
             )
             return conn.execute(

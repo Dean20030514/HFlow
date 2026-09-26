@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .contracts import (
     CapabilityState,
@@ -28,6 +29,11 @@ from .contracts import (
     canonical_json,
     json_schema,
 )
+
+if TYPE_CHECKING:  # imported for annotations only: authorization.py is not a CLI dependency
+    from .authorization import AuthorizationBinding, AuthorizationRecord
+    from .contracts import RootBudgetLimits
+
 from .controller import Controller, RunOutcome, inspect_run
 from .drivers.fake import FakeDriver, FakeScript
 from .drivers.acpx_dsh import DriverSetupError
@@ -377,10 +383,21 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     binding it prints is what an approval *would* have to cover; producing the approval itself
     is the user's action, and `creates_authorization` is pinned to false so that promise is
     checkable rather than asserted.
+
+    With `--root-budget-file` the preview also reports the root this run would be spent
+    against. That is still zero-write: the ledger path is computed, never created or opened.
     """
-    from .prepare import build_prepare_report, render_prepare_text, resolve_run
+    from .prepare import (
+        build_prepare_report,
+        load_root_budget_plan,
+        render_prepare_text,
+        resolve_run,
+    )
 
     data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
+    root_plan = (
+        load_root_budget_plan(Path(args.root_budget_file)) if args.root_budget_file else None
+    )
     resolved = resolve_run(
         task_path=Path(args.task),
         project_root=Path(args.project_root),
@@ -391,7 +408,9 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         base_commit=args.base_commit,
         workspace_mode=args.workspace,
     )
-    report = build_prepare_report(resolved, authorization_mode=args.authorization_mode)
+    report = build_prepare_report(
+        resolved, authorization_mode=args.authorization_mode, root_budget_plan=root_plan
+    )
     if args.json:
         print(canonical_json(report.model_dump(mode="json")))
     else:
@@ -400,6 +419,52 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     # refuse on has to reach the exit code: the admission gate *and* the dispatch gate. A
     # preview that reported success for a task a run refuses would be worse than no preview.
     return EXIT_OK if resolved.ready_to_dispatch else EXIT_REFUSED
+
+
+#: Recorded on the in-memory artifact an offline root run charges its dispatches to. It is
+#: deliberately explicit: a record that read as a user approval which never happened would be a
+#: false statement in the ledger, and the ledger is the place those statements are read from.
+OFFLINE_ROOT_APPROVAL_TEXT = (
+    "OFFLINE FAKE DRIVER - NOT A USER APPROVAL. This run reaches no model. The record exists "
+    "only because every charge against a root budget must name the artifact that bought it; "
+    "`hflow run` minted it for the offline driver. It binds driver 'fake' and cannot authorize "
+    "a real transport. Pass --authorization-file to charge an offline root run to your own "
+    "artifact instead."
+)
+
+
+def offline_root_authorization(
+    *, binding: AuthorizationBinding, limits: RootBudgetLimits
+) -> AuthorizationRecord:
+    """The labelled record an offline root run charges its dispatches to.
+
+    ``store.reserve_dispatch`` refuses a root charge with no authorization id, on purpose: a root
+    allowance nobody approved must not be spendable. The offline fake driver reaches no model and
+    therefore has no approval to give, so the CLI mints one that says exactly that - it names the
+    fake driver in its binding and carries a ``user_text`` stating it is not an approval. A real
+    driver never reaches this path: it needs an artifact and is refused without one.
+    """
+    from .authorization import AuthorizationRecord
+    from .ids import new_id, utc_now
+
+    return AuthorizationRecord(
+        authorization_id=new_id("AUTH-offline"),
+        provided_by="user",
+        user_text=OFFLINE_ROOT_APPROVAL_TEXT,
+        authorized_at=utc_now(),
+        # The artifact's own ceiling is capped at 4 by the contract; the root ledger remains the
+        # real ceiling, so a smaller artifact cap cannot overspend anything.
+        max_top_level_submissions=min(4, limits.max_top_level_submissions),
+        binding=binding,
+        root_limits=limits,
+        # Not a user artifact, and the record says so in a field rather than only in prose:
+        # ``verify_authorization`` refuses this origin for any driver but the offline fake, so a
+        # sentence in ``user_text`` is no longer the only thing standing between a synthesized
+        # record and a real run. ``provided_by`` stays "user" because the contract's only
+        # provenance value is the user's - the honest statement of "nobody approved this" is
+        # this field, and the CLI never pretends otherwise.
+        origin="cli_offline_synthetic",
+    )
 
 
 def _zero_model_preflight(role_drivers: dict[str, object]):
@@ -449,7 +514,12 @@ def _zero_model_preflight(role_drivers: dict[str, object]):
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    from .prepare import resolve_machine_bindings, resolve_run, role_drivers
+    from .prepare import (
+        load_root_budget_plan,
+        resolve_machine_bindings,
+        resolve_run,
+        role_drivers,
+    )
 
     data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
 
@@ -470,6 +540,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         _write_out({"refused": True, "reason": "live_authorization_missing", "detail": message}, args.json)
         print(f"refused: {message}", file=sys.stderr)
         return EXIT_REFUSED
+    root_plan = (
+        load_root_budget_plan(Path(args.root_budget_file)) if args.root_budget_file else None
+    )
 
     resolved = resolve_run(
         task_path=Path(args.task),
@@ -515,17 +588,30 @@ def cmd_run(args: argparse.Namespace) -> int:
     # submission allowance is consumed, and it refuses rather than falling back to the fake
     # driver. A bare flag is deliberately not accepted: the same process that would run the
     # task must not be able to authorize itself with a word. The binding now covers the
-    # *effective configuration*, so approving one profile does not approve another.
+    # *effective configuration*, so approving one profile does not approve another. A root
+    # budget file extends the same artifact: the binding covers the root too, so the ledger
+    # records which approval bought each dispatch.
     authorization = None
     authorization_binding = None
-    if is_real_driver:
+    root_binding = None
+    root_limits = None
+    offline_root_note = ""
+    if is_real_driver or root_plan is not None:
         from .authorization import (
             current_binding,
             load_authorization,
+            resolve_root_binding,
             verify_authorization,
         )
 
-        authorization = load_authorization(Path(args.authorization_file))
+        if root_plan is not None:
+            # Derived, not created: the binding names the ledger, and the store creates or
+            # migrates it only when the dispatch transaction actually runs.
+            root_binding = resolve_root_binding(
+                project_id=project.project_id,
+                request=resolved.request(),
+                data_dir=data_dir,
+            )
         authorization_binding = current_binding(
             mode=args.authorization_mode,
             driver=resolved.effective.role("implementer").driver,  # type: ignore[union-attr]
@@ -533,10 +619,47 @@ def cmd_run(args: argparse.Namespace) -> int:
             request=resolved.request(),
             spec_path=task_path,
             effective=resolved.effective,
+            root_binding=root_binding,
         )
-        # Refuses with a specific mismatch list when the artifact covers a different task,
-        # project, base commit, driver, execution mode or configuration.
-        verify_authorization(authorization, expected=authorization_binding)
+        if args.authorization_file:
+            authorization = load_authorization(Path(args.authorization_file))
+            # Refuses with a specific mismatch list when the artifact covers a different task,
+            # project, base commit, driver, execution mode, configuration or root.
+            verify_authorization(authorization, expected=authorization_binding)
+        if root_plan is not None:
+            if authorization is not None:
+                root_limits = authorization.root_limits
+                # verify_authorization refused unless the artifact carries this exact root, and
+                # the contract refuses a root artifact without its ceilings, so this is never
+                # None here.
+                assert root_limits is not None
+                if root_limits != root_plan.limits:
+                    raise RefusedError(
+                        RefusalCode.RISK_DOWNGRADE,
+                        "the root budget file and the authorization disagree about this root's "
+                        f"ceilings: the file says top-level submissions "
+                        f"{root_plan.limits.max_top_level_submissions}, repairs "
+                        f"{root_plan.limits.max_repairs}, deadline "
+                        f"{root_plan.limits.deadline_seconds}s, while the authorization says "
+                        f"{root_limits.max_top_level_submissions}, {root_limits.max_repairs}, "
+                        f"{root_limits.deadline_seconds}s. One of the two files is wrong; nothing "
+                        "was dispatched and no allowance was consumed.",
+                    )
+            else:
+                # Offline only: a real driver without an artifact was refused before this point.
+                # The fake driver reaches no model, so there is no approval to ask for - but the
+                # ledger still refuses to charge a root without naming the artifact that bought
+                # it, so the run mints one that says exactly what it is.
+                root_limits = root_plan.limits
+                authorization = offline_root_authorization(
+                    binding=authorization_binding, limits=root_limits
+                )
+                offline_root_note = (
+                    "offline root run: no --authorization-file was given, so this run charged "
+                    "its dispatches to a CLI-minted record "
+                    f"({authorization.authorization_id}) whose text says it is not a user "
+                    "approval. It binds the offline fake driver and cannot authorize a real one"
+                )
 
     store = _open_store(args)
     try:
@@ -585,6 +708,11 @@ def cmd_run(args: argparse.Namespace) -> int:
             controller_id=args.controller_id,
             data_dir=data_dir,
             authorization=authorization,
+            # Batch E1: the root this run is spent against, and the ceilings the approval
+            # carried. Both are None for a run with no root budget file, which is the legacy
+            # path. The dispatch transaction is what charges them.
+            root_binding=root_binding,
+            root_limits=root_limits,
             preflight=(
                 _zero_model_preflight(drivers) if authorization is not None else None
             ),
@@ -608,6 +736,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         store.close()
 
     payload = _outcome_payload(outcome)
+    if offline_root_note:
+        notes = payload["notes"]
+        assert isinstance(notes, list)
+        notes.append(offline_root_note)
     if args.receipt_out:
         receipt = outcome.receipt
         _write_out(
@@ -632,6 +764,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(f"candidate  {drift}")
         for note in outcome.notes:
             print(f"note       {note}")
+        if offline_root_note:
+            print(f"note       {offline_root_note}")
     return _outcome_exit_code(outcome)
 
 
@@ -866,6 +1000,15 @@ def build_parser() -> argparse.ArgumentParser:
         default="m2-live-change",
         help="which authorized activity the pending binding would be for; modes are not interchangeable",
     )
+    prepare.add_argument(
+        "--root-budget-file",
+        default=None,
+        help=(
+            "JSON root budget plan ({'limits': {...}, 'note': '...'}) for a run that spends "
+            "against a root ledger. The preview derives the root binding and the ledger path; "
+            "it creates no database"
+        ),
+    )
     prepare.add_argument("--json", action="store_true")
     _add_store_args(prepare)
     prepare.set_defaults(func=cmd_prepare)
@@ -922,6 +1065,16 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["stop-trial", "m2-live-change"],
         default="m2-live-change",
         help="which authorized activity this run belongs to; modes are not interchangeable",
+    )
+    run.add_argument(
+        "--root-budget-file",
+        default=None,
+        help=(
+            "JSON root budget plan ({'limits': {...}, 'note': '...'}). Makes this run spend "
+            "against a root ledger the authorization must bind. A real driver also needs "
+            "--authorization-file with the same root; the offline driver mints a labelled "
+            "offline record instead"
+        ),
     )
     run.add_argument("--json", action="store_true")
     run.add_argument("--force", action="store_true", help="continue past admission issues (unsafe)")

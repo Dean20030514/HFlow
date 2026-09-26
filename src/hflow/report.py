@@ -13,6 +13,116 @@ def _unknown(value: object) -> str:
     return "unknown" if value is None else str(value)
 
 
+def _root_budget_lines(inspection: RunInspection) -> list[str]:
+    """The root ledger's recorded facts, or an explicit statement that there is none.
+
+    A legacy run has no root row. Printing zeros for it would read as "a ledger exists and
+    nothing was spent", which is a different and false statement: absent facts are not zeros.
+    """
+    usage = inspection.root_budget
+    if usage is None:
+        return [
+            "root budget   legacy / not recorded: this run has no root ledger row, so it has no "
+            "root ceilings, no repair counter and no root deadline. Absent, not zero"
+        ]
+    binding, limits = usage.binding, usage.limits
+    lines = [
+        f"root budget   {binding.root_id}",
+        f"  covers      project {binding.project_id}, task {binding.task_id}",
+        f"  repo        {binding.repo_path}",
+        f"  ledger      {binding.ledger_path}",
+        f"  submissions used {usage.used_top_level_submissions}/"
+        f"{limits.max_top_level_submissions} (remaining {usage.remaining})",
+        f"  repairs     used {usage.used_repairs}/{limits.max_repairs} (recorded counter; the "
+        "repair loop that would spend it is not implemented in E1)",
+    ]
+    if usage.deadline_at:
+        lines.append(
+            f"  deadline    {usage.deadline_at} (root limit {limits.deadline_seconds}s, measured "
+            f"from the first reservation at {_unknown(usage.first_dispatch_at)})"
+        )
+    else:
+        lines.append(
+            f"  deadline    none yet: the {limits.deadline_seconds}s root limit is measured from "
+            "the first reservation, and no reservation is recorded"
+        )
+    if usage.run_ids:
+        lines.append(f"  runs        {', '.join(usage.run_ids)}")
+    if usage.authorization_ids:
+        lines.append(f"  approvals   {', '.join(usage.authorization_ids)}")
+    return lines
+
+
+def _dispatch_ledger_lines(inspection: RunInspection) -> list[str]:
+    """Per-invocation role and launch state, never merged into one "invocations" number.
+
+    Four facts, deliberately kept apart: a reserved allowance is not a launch *requested*, a
+    requested launch is not a process *created*, and a created process is not an observed provider
+    model request. The ledger records the first three - the last stays ``unknown`` unless a driver
+    reported it, and is never derived from a reservation.
+    """
+    counts = inspection.invocation_counts
+    if inspection.root_budget is None and not inspection.invocations:
+        return [
+            "dispatch ledger",
+            "  legacy / not recorded: this run has no root, so no top-level dispatch record "
+            "exists and no reserved/requested/started state can be reported",
+        ]
+    lines = [
+        "dispatch ledger",
+        f"  reserved={counts.reserved} requested={counts.requested} started={counts.started} "
+        f"not_started={counts.not_started} settled={counts.settled} unknown={counts.unknown} "
+        f"launch_unknown={counts.launch_unknown}",
+        f"  processes   {counts.processes} operating-system child(ren) reported by a driver "
+        f"(ever started {counts.ever_started}); {counts.childless_launches} launch(es) ran without "
+        "one, which is what the offline driver does",
+        "  meaning     reserved = the dispatch transaction committed: allowance spent, intent "
+        "durable. Not a launch, not a process, not a model request",
+        "  meaning     requested = the controller asked a driver to launch it; nothing reported "
+        "yet. A crash here leaves launch_unknown, which blocks the root",
+        "  meaning     started = the launch happened. Whether it created a process is the separate "
+        "count above; a childless launch is still a launch",
+        "  meaning     not_started = no launch happened (a stop won the handoff, or the driver "
+        "reported none); the allowance is kept, never refunded",
+        "  meaning     settled = a recorded result was applied; unknown = a launch was never "
+        "settled, which blocks the root and is never re-dispatched",
+        "  provider model requests: unknown - no invocation row records one, and neither a "
+        "reservation nor a process is counted as one",
+    ]
+    if inspection.invocations:
+        lines.append("  invocations")
+        for invocation in inspection.invocations:
+            lines.append(
+                f"    {invocation.invocation_id}  role={invocation.role} "
+                f"state={invocation.state.value} spawn={invocation.spawn_kind.value} "
+                f"repair={invocation.is_repair} attempt={invocation.attempt_id}"
+                + (
+                    f" approval={invocation.authorization_id}"
+                    if invocation.authorization_id
+                    else ""
+                )
+            )
+            facts: list[str] = []
+            if invocation.launch_requested_at:
+                facts.append(f"launch_requested_at={invocation.launch_requested_at}")
+            if invocation.started_at:
+                facts.append(f"launched_at={invocation.started_at}")
+            if invocation.process_started_at:
+                facts.append(
+                    f"process_started_at={invocation.process_started_at} "
+                    f"pid={invocation.process_pid}"
+                )
+            if invocation.settled_at:
+                facts.append(f"settled_at={invocation.settled_at}")
+            if invocation.outcome is not None:
+                facts.append(f"outcome={invocation.outcome.value}")
+            if invocation.detail:
+                facts.append(f"detail={invocation.detail}")
+            if facts:
+                lines.append("      " + " ".join(facts))
+    return lines
+
+
 def _drift_line(inspection: RunInspection) -> str:
     """Never let a historical ACCEPTED read as verification of the current tree."""
     matches = inspection.run.workspace_matches_receipt
@@ -68,8 +178,10 @@ def status_text(inspection: RunInspection) -> str:
     reviewer = sum(1 for a in inspection.attempts if a.review_invocation_id)
     lines.append(
         f"invocations   implementer={implementer} reviewer={reviewer} "
-        "(deterministic dispatch count; billed model requests: unknown)"
+        "(attempt rows; a deterministic dispatch count, not a model-request count)"
     )
+    lines.extend(_root_budget_lines(inspection))
+    lines.extend(_dispatch_ledger_lines(inspection))
     lines.append(_drift_line(inspection))
     if run.block_code:
         lines.append(f"blocked       {run.block_code}: {run.block_reason}")
@@ -90,7 +202,10 @@ def status_text(inspection: RunInspection) -> str:
             f"  {item.evidence_id}  kind={item.kind} check={item.check_id or '-'} "
             f"status={item.status.value} exit={_unknown(item.exit_code) if item.command else '-'}"
         )
-    lines.append(f"model_calls   {inspection.model_calls_made}")
+    lines.append(
+        f"model_calls   {inspection.model_calls_made} (this command; provider-side requests are "
+        "reported by the receipt and stay unknown when not observed)"
+    )
     return "\n".join(lines)
 
 
@@ -181,6 +296,13 @@ def report_json(inspection: RunInspection) -> dict[str, object]:
         "effective_config_digest": inspection.effective_config.digest()
         if inspection.effective_config
         else None,
+        # Batch E1 ledger facts. ``None`` / empty means "not recorded for this run", which is
+        # what a legacy run has: it is not an empty ledger with zero consumption.
+        "root_budget": inspection.root_budget.model_dump(mode="json")
+        if inspection.root_budget
+        else None,
+        "invocations": [i.model_dump(mode="json") for i in inspection.invocations],
+        "invocation_counts": inspection.invocation_counts.model_dump(mode="json"),
         "model_calls_made": inspection.model_calls_made,
     }
     return payload
