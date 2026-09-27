@@ -353,3 +353,57 @@ def test_checks_digest_changes_when_approved_commands_change(project: ProjectCon
 def test_project_limits_must_be_sane() -> None:
     with pytest.raises(ValidationError):
         ProjectLimits(max_agent_turns=0)
+
+# --------------------------------------------------------------------------
+# batch E2: the repair policy is opt-in, and it does not change what a spec
+# written before it digests to
+# --------------------------------------------------------------------------
+
+
+def test_a_task_without_a_repair_policy_digests_exactly_as_it_did_before_e2(
+    task_spec: TaskSpec,
+) -> None:
+    """The compatibility rule that keeps a recorded run matching its own task file.
+
+    ``spec_digest`` is the idempotency key: every run row, authorization binding and
+    "an identical spec is a history query" lookup keys on it. Adding ``repair_policy`` must
+    therefore not move the value for a task that does not carry one - otherwise an existing run
+    would stop matching the file it was started from, which is exactly the failure a recorded
+    digest exists to detect.
+    """
+    from hflow.contracts import RepairPolicy, digest_of
+
+    assert task_spec.repair_policy is None
+    payload = task_spec.model_dump(mode="json")
+    assert "repair_policy" in payload and payload["repair_policy"] is None
+    without = {key: value for key, value in payload.items() if key != "repair_policy"}
+    assert task_spec.spec_digest() == digest_of(without), (
+        "the absent policy must be dropped from the digest payload, not serialized as null"
+    )
+
+    # Opting in *does* change the digest: a repair policy is part of what a run is.
+    opted_in = task_spec.model_copy(
+        update={"repair_policy": RepairPolicy(check_exit_codes={"unit": [1]})}
+    )
+    assert opted_in.spec_digest() != task_spec.spec_digest()
+
+
+def test_a_repair_policy_that_can_never_trigger_is_refused() -> None:
+    """An empty policy is not consent, and a zero exit code is not a failure."""
+    from hflow.contracts import RepairPolicy
+
+    with pytest.raises(ValidationError):
+        RepairPolicy()
+    with pytest.raises(ValidationError):
+        RepairPolicy(check_exit_codes={"unit": []})
+    with pytest.raises(ValidationError):
+        RepairPolicy(check_exit_codes={"unit": [0]})
+    with pytest.raises(ValidationError):
+        RepairPolicy(max_attempts=2, check_exit_codes={"unit": [1]})
+
+    policy = RepairPolicy(check_exit_codes={"unit": [1, 3]}, allow_reviewer_changes=True)
+    assert policy.business_failure_for("unit", 1)
+    assert policy.business_failure_for("unit", 3)
+    assert not policy.business_failure_for("unit", 2)
+    assert not policy.business_failure_for("other", 1)
+    assert not policy.business_failure_for("unit", None)

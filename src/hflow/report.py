@@ -33,8 +33,9 @@ def _root_budget_lines(inspection: RunInspection) -> list[str]:
         f"  ledger      {binding.ledger_path}",
         f"  submissions used {usage.used_top_level_submissions}/"
         f"{limits.max_top_level_submissions} (remaining {usage.remaining})",
-        f"  repairs     used {usage.used_repairs}/{limits.max_repairs} (recorded counter; the "
-        "repair loop that would spend it is not implemented in E1)",
+        f"  repairs     used {usage.used_repairs}/{limits.max_repairs} (the root's own counter: "
+        "a repair dispatch is charged here; whether repair was armed for a run is in that run's "
+        "repair decisions)",
     ]
     if usage.deadline_at:
         lines.append(
@@ -160,6 +161,44 @@ def _config_lines(inspection: RunInspection) -> list[str]:
     return lines
 
 
+def _repair_lines(inspection: RunInspection) -> list[str]:
+    """Every repair decision this run recorded, refusals included, or an explicit "none".
+
+    A run with no decision gets a sentence rather than an empty table: "no repair decision was
+    recorded" is a fact, and a blank section reads as a renderer that lost one. Each decision
+    carries what an operator needs to audit it - the decision, its trigger, the round, the failed
+    checks with the exit codes the policy matched, and the reason in the run's own words.
+    """
+    records = inspection.repair_records
+    if not records:
+        return ["repair        no repair decision recorded"]
+    lines = ["repair decisions"]
+    for index, record in enumerate(records, start=1):
+        header = (
+            f"  {index}  decision={record.decision.value} "
+            f"trigger={record.trigger.value if record.trigger else 'none'} round={record.round}"
+        )
+        if record.decided_at:
+            header += f" decided_at={record.decided_at}"
+        lines.append(header)
+        if record.policy_digest:
+            lines.append(f"     policy    {record.policy_digest}")
+        if record.failed_checks:
+            lines.append(
+                "     failed    "
+                + ", ".join(
+                    f"{check} exit={_unknown(record.exit_codes.get(check))}"
+                    for check in record.failed_checks
+                )
+            )
+        else:
+            lines.append(
+                "     failed    (none: this decision did not come from a failed check)"
+            )
+        lines.append(f"     reason    {record.reason or '(no reason recorded)'}")
+    return lines
+
+
 def status_text(inspection: RunInspection) -> str:
     run = inspection.run
     lines = [
@@ -191,16 +230,23 @@ def status_text(inspection: RunInspection) -> str:
     for attempt in inspection.attempts:
         lines.append(
             f"  {attempt.attempt_id}  revision={attempt.task_revision} role={attempt.role} "
-            f"state={attempt.state.value} outcome={_unknown(attempt.outcome.value if attempt.outcome else None)}"
+            f"state={attempt.state.value} outcome={_unknown(attempt.outcome.value if attempt.outcome else None)} "
+            f"repair={attempt.is_repair}"
             + (f" block={attempt.block_code}" if attempt.block_code else "")
         )
+    lines.extend(_repair_lines(inspection))
     lines.append("evidence")
     if not inspection.evidence:
         lines.append("  (none)")
     for item in inspection.evidence:
+        # The exit code is shown whenever one was recorded, not only for `command` checks: the
+        # offline runner declares a verdict and a code without running a command, and a repair
+        # decision is taken on exactly that code. Printing "-" for it would hide the fact the
+        # decision was made from, while printing "-" for a genuinely absent code (a timeout, a
+        # check that never launched) stays honest.
         lines.append(
             f"  {item.evidence_id}  kind={item.kind} check={item.check_id or '-'} "
-            f"status={item.status.value} exit={_unknown(item.exit_code) if item.command else '-'}"
+            f"status={item.status.value} exit={_unknown(item.exit_code)}"
         )
     lines.append(
         f"model_calls   {inspection.model_calls_made} (this command; provider-side requests are "
@@ -289,6 +335,9 @@ def report_json(inspection: RunInspection) -> dict[str, object]:
         "task_spec": inspection.task_spec.model_dump(mode="json"),
         "attempts": [a.model_dump(mode="json") for a in inspection.attempts],
         "evidence": [e.model_dump(mode="json") for e in inspection.evidence],
+        # Batch E2 repair decisions, refusals included. An empty list means this run recorded
+        # none, which the text form says in words rather than leaving a blank section.
+        "repair_records": [r.model_dump(mode="json") for r in inspection.repair_records],
         "receipt": inspection.receipt.model_dump(mode="json") if inspection.receipt else None,
         "effective_config": inspection.effective_config.model_dump(mode="json")
         if inspection.effective_config

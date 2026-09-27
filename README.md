@@ -149,6 +149,9 @@ hflow run      --task t.json --profile dsh-local --authorization-file auth.json 
 hflow prepare  --task t.json --profile dsh-local --root-budget-file root-budget.json
 hflow run      --task t.json --profile dsh-local --authorization-file auth.json \
                --root-budget-file root-budget.json   # spend against a root ledger (batch E1)
+hflow prepare  --task t.json --profile dsh-local --repair-policy-file repair.json
+hflow run      --task t.json --profile dsh-local --authorization-file auth.json \
+               --repair-policy-file repair.json      # opt in to ONE bounded repair (batch E2)
 hflow status   R-xxxxxxxxxx               # pure SQLite read, zero model calls
 hflow report   R-xxxxxxxxxx --json        # receipt + evidence + the config it ran under
 hflow resume   R-xxxxxxxxxx               # reconcile an interrupted attempt; never re-dispatches
@@ -167,6 +170,14 @@ cover (`creates_authorization` is pinned to `false`).
 `--profile` (or `HFLOW_PROFILE`) is the only source of per-role bindings, and `--driver` must
 agree with it when both are given. Neither present means `--driver fake`, the offline default.
 Precedence is defined once, in `profiles.requested_profile_id`.
+
+`--repair-policy-file PATH` (on `prepare` and `run`) is the explicit repair opt-in: a bare
+`RepairPolicy` document that becomes part of the effective TaskSpec - and therefore of
+`spec_digest` and the authorization binding - so the repair it arms is the repair that was
+approved. A task that already names a different policy is refused rather than one silently
+winning (the same policy written twice is fine). A missing file, a non-object or a
+contract-invalid policy is refused **before the store is opened**, so no run row, no worktree and
+no authorization is created.
 
 Runtime data (SQLite, evidence, profiles) goes to `%LOCALAPPDATA%\HFlow` on Windows or
 `$XDG_DATA_HOME/hflow` elsewhere; override with `--data-dir` or `HFLOW_DATA_DIR`.
@@ -216,13 +227,25 @@ from it (`hflow schema`). There is no second hand-written schema to drift.
   timestamp is not evidence that nothing ran - and settling that same unresolved launch twice (a
   reconcile followed by a confirmed stop) is idempotent, so a stop that really happened never
   fails to report itself.
-  What the root may spend is recorded and enforced; what it may *repair* is only recorded:
-  `max_repairs` is not a working repair loop (see "Not implemented"). A root charge is always
+  What the root may spend is recorded and enforced; `max_repairs` is a **ceiling, not a switch**.
+  A repair happens only when the task carries an explicit `repair_policy` (batch E2; see "Not
+  implemented"), it is bought only by a clean, declared business check failure or a substantive
+  reviewer rejection, and one run can never buy a second one. A root charge is always
   recorded with the artifact that bought it, so a root run needs one: a real driver needs your
   `--authorization-file`, while the offline fake driver - which reaches no model and has no
   approval to give - gets a CLI-computed record whose id starts `AUTH-offline`, whose `origin` is
   `cli_offline_synthetic` (a structural field, not just a sentence), and whose binding names
   `driver: fake`, so it can never authorize a real transport.
+- **A repair is classified from a stored execution fact, never from prose.** `evidence.exit_reason`
+  records *why* a check ended (`completed`, `nonzero_exit`, `timed_out`, `settlement_forced`,
+  `output_capture_error`, ...), and an automatic repair needs that reason to say the check ran to
+  completion, an exit code the task's own policy declares a business failure, and no ERROR mixed
+  into the round. An empty reason (every row written before storage v5) never repairs, a timeout or
+  a lifecycle defect is never rounded up to a business failure, and no classification reads the
+  `verification_failed` string or a log keyword. Every decision, refusals included, is stored as a
+  `RepairRecord`, the repair is its own `attempts` row marked `is_repair`, and the schema itself
+  allows one first attempt and one repair attempt per run, revision and role - a third implementer
+  cannot be inserted even by a bug.
 - Identical TaskSpec does not buy a second worker turn. Note what that means: the reply
   is the **historical** run, and `status`/`report` print a `candidate` line saying whether
   the scoped files still match the fingerprint that run was accepted at. A historical
@@ -284,17 +307,45 @@ from it (`hflow schema`). There is no second hand-written schema to drift.
 
 ## Not implemented (do not assume otherwise)
 
-Not built: cooperative (protocol) cancellation on the selected launch path; **automatic repair** -
-E1's root ledger and its single dispatch transaction exist (`--root-budget-file`, the
-`root_budgets`/`invocations` rows, the `reserved`/`requested`/`started`/`not_started`/`settled`/
-`unknown`/`launch_unknown` states and the separate process facts reported by `status`/`report`),
-and a root's `max_repairs` counter is recorded and enforced, but the E2 repair
-loop that would spend it does not exist: nothing re-dispatches an implementer after a failed
-check or a `changes_requested`, and no `hflow repair` command exists. Integration/publish
-delivery; reuse-research automation; teams and native subagents; real billing observation; metrics
-against a direct-DSH baseline. A reviewer's answer is read as text and decoded against the
-contract - the harness is not asked for structured output, and no model is ever asked to repair a
-malformed verdict.
+**Automatic repair (batch E2) exists in exactly one bounded form.** What it does: when a task
+carries a `repair_policy` (`--repair-policy-file` on `prepare`/`run`, or the field in the task
+file), one failed round may be followed by **one** second implementer attempt, on the same
+revision, starting from the frozen candidate, followed by fresh checks (never the first round's
+rows) and a fresh independent review. It is bought by exactly two triggers - a check the policy
+declares a *business* failure (`check_exit_codes`) whose recorded `exit_reason` says it ran to
+completion, or a substantive `changes_requested` on the current candidate with non-empty findings
+when the policy allows it. Everything else stops the run: a mixed ERROR, an **undeclared exit
+code** (a non-zero code the policy does not name never repairs), a timeout, a check that left
+descendants, an incomplete capture, a launch that never happened, a malformed review, an unknown
+outcome and a cancellation. A policy only ever classifies a failure it can see: a check id the
+project contract never runs produces no failed row, so that entry can buy nothing, and a failure
+whose id or exit code the policy does not declare is recorded as a `not_a_business_failure`
+decision naming the check, its exit code and what the policy declared for it. An evidence row
+written before storage v5 carries no observed reason and is therefore ineligible - the reason is
+never back-filled from a stored exit code. The root's `max_repairs` stays a ceiling that the
+dispatch transaction enforces; a task file that says `max_repair_cycles: 1` still opts into
+nothing.
+
+What it still is **not**, and cannot be read as more than:
+
+- **No `repair` command.** A repair is a decision taken inside one live run, never an action you
+  invoke on a finished one.
+- **No revival of a historical `BLOCKED` run.** A run ended by a verdict, a stop or a block is
+  never reopened for a second attempt.
+- **No retry of an environment or transport failure.** Only a declared business check failure or a
+  substantive reviewer rejection - once - may buy the second attempt.
+
+Offline checks never look like a real execution: `kind=fake` launches no process, so its evidence
+says `not_launched` and it can never trigger a repair. An offline test that wants the repair rule
+exercised has to *declare* the clean process exit it is modelling
+(`FakeCheckRunner(verdicts=..., exit_reasons={"unit": "nonzero_exit"})`). That is a deliberate
+modelling choice inside the offline facility, not evidence about a live harness.
+
+Not built: cooperative (protocol) cancellation on the selected launch path; a `hflow repair` or
+`hflow integrate` command; integration/publish delivery; reuse-research automation; teams and
+native subagents; real billing observation; metrics against a direct-DSH baseline. A reviewer's
+answer is read as text and decoded against the contract - the harness is not asked for structured
+output, and no model is ever asked to repair a malformed verdict.
 
 Not built around configuration either:
 

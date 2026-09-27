@@ -252,6 +252,182 @@ class DeliveryRequirement(BaseModel):
 
 
 class BudgetRequest(BaseModel):
+    """How many top-level invocations one run may buy.
+
+    ``max_repair_cycles`` keeps its historical default of 1 and **authorizes nothing**: a numeric
+    budget field is not a policy, and repairing because an old task file happens to say ``1``
+    would spend money on a behaviour nobody approved. A repair needs an explicit
+    :class:`RepairPolicy`, and E2's worst case (repair after a reviewer rejection) is covered by
+    ``max_agent_turns`` like every other dispatch.
+    """
+
+    model_config = Strict
+
+    max_agent_turns: int = 4
+    max_repair_cycles: int = 1
+
+
+# --------------------------------------------------------------------------
+# Batch E2: one bounded business repair
+# --------------------------------------------------------------------------
+#
+# A repair happens only when a task carries an explicit ``RepairPolicy``, and that policy names
+# what may trigger it: which approved checks count as a business assertion failing, with which
+# exit codes, and whether a substantive reviewer rejection qualifies. HFlow cannot read a root
+# cause out of an arbitrary process exit code, and pretending otherwise is how an environment
+# failure would get spent as if it were a bug in the candidate.
+
+
+class RepairTrigger(StrEnum):
+    """The only two things that may buy a second implementer attempt."""
+
+    BUSINESS_CHECK_FAILED = "business_check_failed"
+    REVIEW_CHANGES_REQUESTED = "review_changes_requested"
+
+
+class RepairDecision(StrEnum):
+    ALLOWED = "allowed"
+    NOT_ENABLED = "not_enabled"
+    NOT_A_BUSINESS_FAILURE = "not_a_business_failure"
+    NO_FINDINGS = "no_findings"
+    ALREADY_REPAIRED = "already_repaired"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    DEADLINE_REACHED = "deadline_reached"
+    STOP_REQUESTED = "stop_requested"
+    NO_CONTENT_CHANGE = "no_content_change"
+
+
+class CandidateIdentity(BaseModel):
+    """One frozen candidate, by every identity that matters. Kept per round.
+
+    ``git_commit``/``git_tree`` are real Git objects and ``fingerprint`` is a content hash over
+    the declared write scope: three different things, never conflated. ``parent_commit`` is the
+    candidate this round started from, which is what makes a repair's provenance readable.
+    """
+
+    model_config = Strict
+
+    round: int = 1
+    attempt_id: str = ""
+    base_commit: str = ""
+    parent_commit: str = ""
+    git_commit: str = ""
+    git_tree: str = ""
+    fingerprint: str = ""
+    paths: list[str] = Field(default_factory=list)
+    is_repair: bool = False
+    #: ``True`` when this round produced no content change against its parent. A new commit SHA
+    #: is not progress: the tree and the fingerprint are what decide.
+    unchanged_from_parent: bool = False
+
+
+class RepairPolicy(BaseModel):
+    """The task's explicit opt-in to one repair, and what may trigger it.
+
+    Deliberately not derived from ``BudgetRequest``: a numeric budget field is not a policy, and
+    silently repairing because some old task file says ``max_repair_cycles: 1`` would spend money
+    on a behaviour nobody approved.
+    """
+
+    model_config = Strict
+
+    max_attempts: int = Field(default=1, ge=1, le=1)
+    #: Check ids that may trigger a repair when they fail, and the exit codes that mean "the
+    #: business assertion this check encodes failed". A check id absent from this map never
+    #: triggers one, whatever its exit code.
+    check_exit_codes: dict[str, list[int]] = Field(default_factory=dict)
+    #: May a substantive ``changes_requested`` verdict on the current candidate buy a repair?
+    allow_reviewer_changes: bool = False
+
+    @model_validator(mode="after")
+    def _validate_policy(self) -> RepairPolicy:
+        if self.max_attempts != 1:
+            raise ValueError(
+                "this build implements exactly one bounded repair per run; max_attempts must be 1"
+            )
+        if not self.check_exit_codes and not self.allow_reviewer_changes:
+            raise ValueError(
+                "a repair policy that lists no trigger can never repair anything: name at least "
+                "one check with the exit codes that mean its business assertion failed, or allow "
+                "a reviewer's changes_requested"
+            )
+        for check_id, codes in self.check_exit_codes.items():
+            if not check_id.strip():
+                raise ValueError("check ids in a repair policy must be non-empty")
+            if not codes:
+                raise ValueError(
+                    f"check {check_id!r} lists no exit codes: name the code(s) that mean its "
+                    "business assertion failed, because not every non-zero exit is one"
+                )
+            if any(code == 0 for code in codes):
+                raise ValueError(
+                    f"check {check_id!r} lists exit code 0 as a failure; a passing check is not a "
+                    "repair trigger"
+                )
+        return self
+
+    def business_failure_for(self, check_id: str, exit_code: int | None) -> bool:
+        """Is this check's outcome a business assertion failure under the policy?"""
+        if exit_code is None:
+            return False
+        return exit_code in self.check_exit_codes.get(check_id, [])
+
+    def digest(self) -> str:
+        return digest_of(self.model_dump(mode="json"))
+
+
+class RepairRecord(BaseModel):
+    """What the run decided about repairing, and why. Written once, never rewritten.
+
+    A refusal is as much a fact as a repair: "we did not repair because the check that failed is
+    an error, not a business assertion" is the answer an operator needs, and a swallowed reason
+    would leave the run looking arbitrary.
+    """
+
+    model_config = Strict
+
+    decision: RepairDecision
+    trigger: RepairTrigger | None = None
+    reason: str = ""
+    policy_digest: str = ""
+    failed_checks: list[str] = Field(default_factory=list)
+    exit_codes: dict[str, int | None] = Field(default_factory=dict)
+    round: int = 0
+    decided_at: str = ""
+
+
+class RepairContext(BaseModel):
+    """The structured input a repair attempt is given. Rendered into the packet, never invented.
+
+    It carries what the *first* attempt cannot know: which candidate it is starting from, and
+    exactly what failed about it. It is not a research brief and not a permission grant - the
+    write scope, the checks and the configuration are unchanged, and a log excerpt is a reference
+    rather than an instruction.
+    """
+
+    model_config = Strict
+
+    original_base_commit: str = ""
+    original_base_ref: str = ""
+    previous: CandidateIdentity | None = None
+    trigger: RepairTrigger
+    failed_checks: list[dict[str, Any]] = Field(default_factory=list)
+    findings: list[dict[str, Any]] = Field(default_factory=list)
+    remaining_turns: int = 0
+    deadline_seconds: int = 0
+    detail: str = ""
+
+
+class BudgetRequest(BaseModel):
+    """How many top-level invocations one run may buy.
+
+    ``max_repair_cycles`` keeps its historical default of 1 and **authorizes nothing**: a numeric
+    budget field is not a policy, and repairing because an old task file happens to say ``1``
+    would spend money on a behaviour nobody approved. A repair needs an explicit
+    :class:`RepairPolicy`, and E2's worst case (a repair after a reviewer rejection) is covered by
+    ``max_agent_turns`` like every other dispatch.
+    """
+
     model_config = Strict
 
     max_agent_turns: int = 4
@@ -390,6 +566,10 @@ class TaskSpec(BaseModel):
     delivery: DeliveryRequirement = Field(default_factory=DeliveryRequirement)
     budget: BudgetRequest = Field(default_factory=BudgetRequest)
     workspace: WorkspaceSpec = Field(default_factory=WorkspaceSpec)
+    #: Batch E2. Absent means no repair, whatever ``budget.max_repair_cycles`` says. Written as
+    #: ``str | None`` rather than a default instance so a spec that predates repairs digests to
+    #: exactly the value it always had and cannot be read as having opted in.
+    repair_policy: RepairPolicy | None = None
 
     @model_validator(mode="after")
     def _validate_shape(self) -> TaskSpec:
@@ -410,8 +590,20 @@ class TaskSpec(BaseModel):
         return self
 
     def spec_digest(self) -> str:
-        """Idempotency key input: identical spec text => identical digest."""
-        return digest_of(self.model_dump(mode="json"))
+        """Idempotency key input: identical spec text => identical digest.
+
+        Batch E2 adds ``repair_policy``, and a digest that changed when the field is absent would
+        be a compatibility break with teeth: every recorded run, authorization binding and
+        idempotency lookup keys on this value, so an old task file would no longer match the
+        ``spec_digest`` its run was recorded with. The key is therefore dropped while the policy is
+        absent, exactly as ``AuthorizationBinding.digest`` drops its post-batch fields - a task
+        that predates repairs digests to the value it always had, and a task that opts in digests
+        to a different one.
+        """
+        payload = self.model_dump(mode="json")
+        if payload.get("repair_policy") is None:
+            payload.pop("repair_policy", None)
+        return digest_of(payload)
 
     def required_check_ids(self) -> list[str]:
         seen: list[str] = []
@@ -993,6 +1185,31 @@ class InvocationStateCounts(BaseModel):
         return self.processes
 
 
+class RepairPlanPreview(BaseModel):
+    """What a preview can say about this task's repair plan, before any dispatch exists.
+
+    Always present, with ``enabled=False`` for a task that carries no policy: "this task plans no
+    repair" is a fact a reader needs, and an absent field would be indistinguishable from a
+    preview that forgot to compute it.
+    """
+
+    model_config = Strict
+
+    enabled: bool = False
+    #: ``RepairPolicy.digest()``, empty when there is no policy.
+    policy_digest: str = ""
+    check_exit_codes: dict[str, list[int]] = Field(default_factory=dict)
+    allow_reviewer_changes: bool = False
+    #: The trigger kinds this policy enables, as ``RepairTrigger`` values.
+    triggers: list[str] = Field(default_factory=list)
+    #: The fixed loop's dispatch count: implementer (+ reviewer).
+    single_loop_dispatches: int = 0
+    #: The worst case this run must be able to afford: I1 (+R1) + I2 (+R2). A ceiling, not a
+    #: quota - an attempt that is never needed is never bought.
+    worst_case_dispatches: int = 0
+    detail: str = ""
+
+
 class RootBudgetPreview(BaseModel):
     """What a preview can honestly say about a root, before any dispatch exists.
 
@@ -1006,9 +1223,15 @@ class RootBudgetPreview(BaseModel):
     binding: RootBudgetBinding
     limits: RootBudgetLimits
     #: Top-level dispatches one accepted delivery normally needs: implementer + reviewer.
+    #: With a repair policy this is the *worst case* instead (I1 + R1 + I2 + R2), because that is
+    #: the number the admission gates have to cover; ``single_loop_dispatches`` keeps the normal
+    #: figure visible so the two are not confused.
     required_top_level_submissions: int = 0
-    #: False in this build. A budget field existing is not the same fact as a repair loop.
+    #: False unless the task carries a repair policy. A budget field existing is not the same
+    #: fact as a repair being armed.
     repair_enabled: bool = False
+    #: The fixed loop's own dispatch count, whatever the policy says: implementer (+ reviewer).
+    single_loop_dispatches: int = 0
     detail: str = ""
 
 
@@ -1405,6 +1628,8 @@ class PrepareReport(BaseModel):
     #: ``None`` means no root: a legacy-shaped run, whose allowance is the artifact's alone.
     #: Reported as data - a preview does not mint the binding an approval would cover.
     root_budget: RootBudgetPreview | None = None
+    #: Batch E2. Always present: "this task plans no repair" is a fact, not an absent fact.
+    repair_plan: RepairPlanPreview = Field(default_factory=RepairPlanPreview)
     #: role -> what that role's input packet will contain, rendered from the same facts the
     #: controller uses. The reviewer's packet embeds the frozen candidate identity, which does
     #: not exist yet, so it is reported as rendered-at-dispatch instead of being invented here.
@@ -1427,6 +1652,12 @@ class EvidenceRecord(BaseModel):
     checks_digest: str = ""
     command: list[str] = Field(default_factory=list)
     exit_code: int | None = None
+    #: Batch E2. *Why* the check ended the way it did: ``exited``, ``timed_out``, ``killed``,
+    #: ``descendants_left``, ``not_launched``, ``collection_error``... Structured on purpose. An
+    #: automatic repair must not be decided from the ``verification_failed`` string or a log
+    #: keyword, and an evidence row that predates this field carries no fact to classify, so it
+    #: never triggers one.
+    exit_reason: str = ""
     stdout_digest: str = ""
     stderr_digest: str = ""
     detail: str = ""
@@ -1453,6 +1684,9 @@ class AttemptRecord(BaseModel):
     outcome: InvocationOutcome | None = None
     result_digest: str | None = None
     block_code: str | None = None
+    #: Batch E2: is this the repair attempt rather than the first implementation? Recorded on the
+    #: attempt itself, so a reader can tell the two rounds apart without counting rows.
+    is_repair: bool = False
     created_at: str = ""
     finished_at: str | None = None
 
@@ -1467,6 +1701,10 @@ class RunInspection(BaseModel):
     attempts: list[AttemptRecord] = Field(default_factory=list)
     evidence: list[EvidenceRecord] = Field(default_factory=list)
     receipt: ResultReceipt | None = None
+    #: Batch E2. Every repair decision this run recorded, in order, refusals included: "we did
+    #: not repair because that check failed for an environmental reason" is a fact an operator
+    #: needs, and an absent record would make the run look arbitrary.
+    repair_records: list[RepairRecord] = Field(default_factory=list)
     #: The configuration this run actually used, as recorded when the run row was created.
     #: ``None`` for a run that predates config binding: reported as "not recorded" rather
     #: than back-filled from whatever configuration happens to be current now.

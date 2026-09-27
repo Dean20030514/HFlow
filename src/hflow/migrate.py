@@ -23,14 +23,20 @@ The rules enforced here:
   and no backup is written twice.
 
 What this is not: a schema-evolution platform. There is no downgrade path (restore the
-backup instead), no partial-version support and no migration of data *between* shapes -
-E1 only ever adds.
+backup instead) and no partial-version support. Every step but one only adds; v5 rebuilds
+``attempts`` once (SQLite cannot drop the table-level UNIQUE that made a repair attempt
+impossible), with foreign-key enforcement suspended and ``PRAGMA foreign_key_check`` verified
+before the transaction commits.
 
-The E1 chain so far: v1 is the original bootstrap, v2 adds the root ledger and the invocation
+The chain so far: v1 is the original bootstrap, v2 adds the root ledger and the invocation
 record, v3 splits "a launch was requested" from "a launch happened" (and records where an
-authorization record came from), v4 adds the process facts a driver actually reports. A v2 row
-past ``reserved`` keeps its state and outcome and becomes a launch *request*; a v3 row keeps
-``spawn_kind = unknown`` because v3 recorded no driver report to inherit.
+authorization record came from), v4 adds the process facts a driver actually reports, v5 adds the
+*observed reason* a check ended (``evidence.exit_reason``), the run's repair decisions
+(``run_repair_records``) and the repair attempt's own flag (``attempts.is_repair``). A v2 row past
+``reserved`` keeps its state and outcome and becomes a launch *request*; a v3 row keeps
+``spawn_kind = unknown`` because v3 recorded no driver report to inherit; a row written before v5
+keeps an empty ``exit_reason`` and ``is_repair = 0``, because the build that wrote it observed
+neither - and batch E2's repair rule is exactly "no observation, no automatic repair".
 """
 
 from __future__ import annotations
@@ -41,9 +47,9 @@ from pathlib import Path
 
 #: Storage format version. Separate from the public contract version: the file layout can
 #: gain a table while every published contract keeps its own meaning.
-STORAGE_VERSION = 4
+STORAGE_VERSION = 5
 #: The highest storage version this build knows how to open.
-SUPPORTED_STORAGE_VERSION = 4
+SUPPORTED_STORAGE_VERSION = 5
 #: Suffix of the pre-migration snapshot, next to the database.
 MIGRATION_BACKUP_SUFFIX = ".pre-v{version}.bak"
 
@@ -265,6 +271,95 @@ _V4_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("invocations", "spawn_kind", "TEXT NOT NULL DEFAULT 'unknown'"),
 )
 
+# --------------------------------------------------------------------------
+# v5 (batch E2): the observed reason a check ended, and the run's repair decisions
+# --------------------------------------------------------------------------
+
+_V5_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("evidence", "exit_reason", "TEXT NOT NULL DEFAULT ''"),
+)
+
+_V5_SCHEMA = """
+CREATE TABLE IF NOT EXISTS run_repair_records (
+    record_id    TEXT PRIMARY KEY,
+    run_id       TEXT NOT NULL REFERENCES runs(run_id),
+    record_json  TEXT NOT NULL,
+    created_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_run_repair_records_run
+    ON run_repair_records (run_id, created_at);
+"""
+
+#: The columns ``attempts`` has immediately *before* v5: the v1 definition plus the ``root_id``
+#: v2 added. Listed (rather than read and reused blindly) so the rebuild can refuse a file whose
+#: shape it does not recognise instead of copying a column set it did not expect.
+_V5_ATTEMPTS_COLUMNS: tuple[str, ...] = (
+    "attempt_id",
+    "run_id",
+    "task_revision",
+    "role",
+    "state",
+    "reservation_id",
+    "reserved_agent_turns",
+    "reserved_expires_at",
+    "process_id",
+    "process_started_at",
+    "process_identity",
+    "session_id",
+    "invocation_id",
+    "review_invocation_id",
+    "outcome",
+    "result_json",
+    "result_digest",
+    "review_json",
+    "reconcile_json",
+    "block_code",
+    "created_at",
+    "finished_at",
+    "root_id",
+)
+
+#: v5's ``attempts``: the same columns plus ``is_repair``, and a unique key that allows exactly
+#: one first attempt and one repair attempt per (run, revision, role). The table is rebuilt rather
+#: than altered because SQLite cannot drop the table-level ``UNIQUE`` v1 declared, and that
+#: constraint is what used to make "a second implementation attempt" impossible in the schema.
+#: The rebuilt table keeps the v1 columns in the v1 order, then ``root_id``, then ``is_repair``.
+_V5_ATTEMPTS_DDL = """
+CREATE TABLE attempts_v5 (
+    attempt_id            TEXT PRIMARY KEY,
+    run_id                TEXT NOT NULL REFERENCES runs(run_id),
+    task_revision         INTEGER NOT NULL,
+    role                  TEXT NOT NULL,
+    state                 TEXT NOT NULL,
+    reservation_id        TEXT,
+    reserved_agent_turns  INTEGER NOT NULL DEFAULT 0,
+    reserved_expires_at   TEXT,
+    process_id            INTEGER,
+    process_started_at    TEXT,
+    process_identity      TEXT,
+    session_id            TEXT,
+    invocation_id         TEXT,
+    review_invocation_id  TEXT,
+    outcome               TEXT,
+    result_json           TEXT,
+    result_digest         TEXT,
+    review_json           TEXT,
+    reconcile_json        TEXT,
+    block_code            TEXT,
+    created_at            TEXT NOT NULL,
+    finished_at           TEXT,
+    root_id               TEXT NOT NULL DEFAULT '',
+    is_repair             INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (run_id, task_revision, role, is_repair)
+);
+"""
+
+#: Migration targets that rebuild a table. SQLite's recommended procedure for that runs with
+#: foreign-key enforcement suspended, and ``PRAGMA foreign_keys`` is a no-op inside a transaction,
+#: so ``migrate`` has to set it before it opens one.
+_REBUILD_TARGETS = frozenset({5})
+
 
 def _statements(script: str) -> list[str]:
     """Split a DDL script into statements without ``executescript``.
@@ -314,12 +409,21 @@ def _effective_version(conn: sqlite3.Connection) -> int:
     whose bootstrap never stamped a version: it could be v1 *or* v2, and treating a v2 file as v1
     would try to create tables that already exist (harmless) and then try to re-add columns that
     already exist (not harmless - ``ALTER TABLE ADD COLUMN`` has no ``IF NOT EXISTS``).
+
+    Newest shape first: a later version contains all the earlier columns, so checking in the other
+    order would read a v5 file as v4 and try to add a column it already has.
     """
     version = recorded_version(conn)
     if version is not None:
         return version
     if not _has_table(conn, "runs"):
         return 0
+    if (
+        _has_table(conn, "run_repair_records")
+        and _columns(conn, "evidence") >= {"exit_reason"}
+        and _columns(conn, "attempts") >= {"is_repair"}
+    ):
+        return 5
     if _columns(conn, "invocations") >= {"process_started_at", "spawn_kind"}:
         return 4
     if _columns(conn, "invocations") >= {"launch_requested_at", "started_at"}:
@@ -462,11 +566,86 @@ def _migrate_to_v4(conn: sqlite3.Connection, step: StepHook) -> None:
     step(f"v4:repair-legacy-request-timestamp:{repaired.rowcount}")
 
 
+def _migrate_to_v5(conn: sqlite3.Connection, step: StepHook) -> None:
+    """Record *why* a check ended, the run's repair decisions, and the repair attempt (batch E2).
+
+    ``evidence.exit_reason`` is what makes the E2 repair rule structural instead of textual: a
+    business failure can only be classified from a check whose reason says it ran to completion
+    and reported an exit code, never from the ``verification_failed`` string or a log keyword.
+
+    Existing rows are deliberately left with the empty default. The build that wrote them never
+    observed a reason, so they carry no fact to classify - and an empty reason is exactly what
+    makes a pre-v5 row ineligible to trigger an automatic repair. Back-filling "exited" (or any
+    other value) from the presence of an exit code would fabricate the one observation this
+    column exists to record: a stored exit code is not an observation that the process completed
+    cleanly, and the plan's rule is that a missing execution fact means no automatic repair.
+
+    ``run_repair_records`` is the run's own record of what it decided about repairing, refusals
+    included. One row per decision, stored as the ``RepairRecord`` document itself.
+    """
+    for statement in _statements(_V5_SCHEMA):
+        conn.execute(statement)
+    step("v5:repair-record-table")
+    for table, column, definition in _V5_COLUMNS:
+        if column in _columns(conn, table):
+            continue
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        step(f"v5:alter:{table}.{column}")
+    _rebuild_attempts_for_v5(conn, step)
+
+
+def _rebuild_attempts_for_v5(conn: sqlite3.Connection, step: StepHook) -> None:
+    """Rebuild ``attempts`` so a run may hold one *repair* attempt next to its first one.
+
+    v1 declared ``UNIQUE (run_id, task_revision, role)``, which makes the second implementer
+    attempt E2 needs impossible - and SQLite cannot drop a table-level UNIQUE, so the table is
+    rebuilt with SQLite's own procedure (create under a temporary name, copy, drop the old one,
+    rename the new one into place). ``migrate`` suspends foreign-key enforcement for this
+    migration and verifies ``PRAGMA foreign_key_check`` before it commits; the rename of the
+    *temporary* name is what keeps ``evidence`` and ``invocations`` pointing at ``attempts``
+    (renaming the old table out of the way would rewrite their REFERENCES clauses instead).
+
+    The unique key becomes ``(run_id, task_revision, role, is_repair)``: at most one first attempt
+    and at most one repair attempt per run, revision and role. That is the same rule the store
+    states in words, now backed by the schema - a third implementer attempt cannot be inserted
+    even by a bug. A reviewer still shares the implementer's row (it attaches through
+    ``review_invocation_id``), so this adds no reviewer rows.
+
+    Existing rows keep ``is_repair = 0``: every attempt written before this build was a first
+    attempt, and a repair is something the run recorded when it decided one - never inferred here.
+    A file whose ``attempts`` shape is not the one this step expects is refused rather than copied
+    blind, because a rebuild is the one migration where a dropped column would otherwise stay
+    invisible until much later.
+    """
+    present = [str(row[1]) for row in conn.execute("PRAGMA table_info(attempts)")]
+    if "is_repair" in present:
+        return
+    if set(present) != set(_V5_ATTEMPTS_COLUMNS):
+        raise MigrationError(
+            "cannot migrate the attempts table to storage version 5: it has an unexpected shape "
+            f"({', '.join(present)}), and this step rebuilds the table from the columns it knows. "
+            "Refusing rather than copying a column set it did not expect - no data was changed."
+        )
+    for statement in _statements(_V5_ATTEMPTS_DDL):
+        conn.execute(statement)
+    step("v5:attempts-rebuild:create")
+    columns = ", ".join(_V5_ATTEMPTS_COLUMNS)
+    conn.execute(
+        f"INSERT INTO attempts_v5 ({columns}, is_repair) SELECT {columns}, 0 FROM attempts"
+    )
+    step("v5:attempts-rebuild:copy")
+    conn.execute("DROP TABLE attempts")
+    conn.execute("ALTER TABLE attempts_v5 RENAME TO attempts")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_attempts_run ON attempts (run_id, created_at)")
+    step("v5:attempts-rebuild:rename")
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection, StepHook], None]] = {
     1: _migrate_to_v1,
     2: _migrate_to_v2,
     3: _migrate_to_v3,
     4: _migrate_to_v4,
+    5: _migrate_to_v5,
 }
 
 
@@ -490,6 +669,12 @@ def migrate(
 
     ``conn`` is expected to be in autocommit mode (``isolation_level=None``); the transaction
     is opened here so that every migration statement, including DDL, is one unit.
+
+    A migration that *rebuilds* a table (``_REBUILD_TARGETS``) needs foreign-key enforcement
+    suspended, which SQLite only honours outside a transaction. It is switched off here, before
+    the transaction opens, restored afterwards whatever happened, and compensated for inside the
+    transaction by ``PRAGMA foreign_key_check``: a rebuild that left a dangling reference rolls
+    the whole migration back instead of committing a ledger whose rows no longer resolve.
     """
     step: StepHook = on_step or (lambda _name: None)
     version = _effective_version(conn)
@@ -506,27 +691,49 @@ def migrate(
     # A file that has never been initialised has no previous state to protect, so the snapshot
     # is skipped: it would be an empty database that restores nothing.
     backup = _backup(conn, Path(database), version) if version > 0 else None
-    conn.execute("BEGIN IMMEDIATE")
+    rebuilds = any(target in _REBUILD_TARGETS for target in range(version + 1, supported + 1))
+    suspended_foreign_keys = rebuilds and bool(
+        conn.execute("PRAGMA foreign_keys").fetchone()[0]
+    )
+    if suspended_foreign_keys:
+        conn.execute("PRAGMA foreign_keys = OFF")
     try:
-        current = version
-        while current < supported:
-            migration = _MIGRATIONS.get(current + 1)
-            if migration is None:
-                raise MigrationError(
-                    f"no migration is defined from storage version {current} to {current + 1}"
-                )
-            migration(conn, step)
-            current += 1
-        conn.execute(
-            "INSERT INTO schema_meta (key, value) VALUES ('storage_version', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (str(supported),),
-        )
-        step(f"storage_version={supported}")
-    except BaseException:
-        conn.execute("ROLLBACK")
-        raise
-    conn.execute("COMMIT")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            current = version
+            while current < supported:
+                migration = _MIGRATIONS.get(current + 1)
+                if migration is None:
+                    raise MigrationError(
+                        f"no migration is defined from storage version {current} to {current + 1}"
+                    )
+                migration(conn, step)
+                current += 1
+            if suspended_foreign_keys:
+                # The check SQLite's own table-rebuild procedure prescribes: it reads the schema,
+                # not a remembered counter, so it is answerable only once every table is in place.
+                violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+                if violations:
+                    raise MigrationError(
+                        f"{database}: migrating to storage version {supported} left "
+                        f"{len(violations)} foreign-key violation(s) "
+                        f"(first: table {violations[0][0]!r}, rowid {violations[0][1]}); the whole "
+                        "migration was rolled back and the file is unchanged"
+                    )
+                step("foreign_key_check=clean")
+            conn.execute(
+                "INSERT INTO schema_meta (key, value) VALUES ('storage_version', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(supported),),
+            )
+            step(f"storage_version={supported}")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
+    finally:
+        if suspended_foreign_keys:
+            conn.execute("PRAGMA foreign_keys = ON")
     return version, supported, backup
 
 

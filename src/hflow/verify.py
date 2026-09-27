@@ -17,6 +17,7 @@ with a timeout; that limits blast radius but is not a security boundary.
 from __future__ import annotations
 
 import contextlib
+import re
 import subprocess
 import tempfile
 import threading
@@ -63,6 +64,35 @@ DESCENDANT_SETTLE_SECONDS = 2.0
 BOUNDARY_EMPTY_SECONDS = 5.0
 #: How long the direct child is given to die after the boundary killed it.
 CHILD_REAP_SECONDS = 5.0
+
+# --------------------------------------------------------------------------
+# Exit reasons: the structured execution fact a business failure is classified from
+# --------------------------------------------------------------------------
+#
+# Batch E2 may repair a candidate only after a check that "ran to completion, with a clean process
+# boundary and a trustworthy capture" failed its business assertion (plan §5.2). Which of those
+# happened is recorded as one structured string, never guessed from the ``verification_failed``
+# text or a log keyword - so the runner, the stored row and the repair gate must measure the *same*
+# strings. They are named here for exactly that reason: a rename in the runner cannot leave the
+# gate comparing against a value the runner never produces.
+
+REASON_COMPLETED = "completed"
+REASON_NONZERO_EXIT = "nonzero_exit"
+REASON_TIMED_OUT = "timed_out"
+REASON_SETTLEMENT_FORCED = "settlement_forced"
+REASON_SETTLEMENT_UNKNOWN = "settlement_unknown"
+REASON_OUTPUT_CAPTURE_ERROR = "output_capture_error"
+#: Nothing was executed, so there is no process observation at all. The offline runners report
+#: this by default, which is what keeps a fake result from ever being classified as a real
+#: business failure.
+REASON_NOT_LAUNCHED = "not_launched"
+
+#: The only reasons a business check failure may be classified from: the check ran to completion
+#: and reported an exit code. Everything else - a launch failure, a timeout, a forced or
+#: unconfirmed settlement, an incomplete capture, an empty reason on a pre-E2 row - is not an
+#: answer about the candidate, whatever exit code happens to sit beside it. The set is deliberately
+#: small: an undeclared member would let an unobserved ending buy an implementer attempt.
+CLEAN_EXIT_REASONS = frozenset({REASON_COMPLETED, REASON_NONZERO_EXIT})
 
 
 class CheckOutcome:
@@ -123,10 +153,24 @@ class CheckRunner(Protocol):
 
 
 class FakeCheckRunner:
-    """Offline runner for kind=fake. Its verdicts come from the caller, not the model."""
+    """Offline runner for kind=fake. Its verdicts come from the caller, not the model.
 
-    def __init__(self, verdicts: dict[str, EvidenceStatus] | None = None) -> None:
+    What it does *not* claim: no process is started, so there is no execution observation to
+    report. ``exit_reason`` is therefore ``not_launched`` by default, and a fake failure - however
+    it is declared - is ineligible to trigger an automatic repair. A test that wants to exercise
+    the repair gate must *declare* the execution fact it is modelling, through ``exit_reasons``
+    (``{"unit": REASON_NONZERO_EXIT}`` for a check that ran and exited non-zero). That is a
+    declared offline scenario, never a claim that a real harness produced it (AGENTS rule 7).
+    """
+
+    def __init__(
+        self,
+        verdicts: dict[str, EvidenceStatus] | None = None,
+        *,
+        exit_reasons: dict[str, str] | None = None,
+    ) -> None:
         self.verdicts = verdicts or {}
+        self.exit_reasons = dict(exit_reasons or {})
         self.calls: list[str] = []
         self.cache_hits = 0
         #: Optional side effect applied the first time each check runs. Tests use it to
@@ -148,6 +192,7 @@ class FakeCheckRunner:
             exit_code=0 if status is EvidenceStatus.PASSED else 1,
             stdout_digest=digest_of({"check": check.id, "status": status.value}),
             detail=detail,
+            exit_reason=self.exit_reasons.get(check.id, REASON_NOT_LAUNCHED),
         )
 
 
@@ -268,7 +313,7 @@ class CommandCheckRunner:
                 EvidenceStatus.ERROR,
                 detail=f"check {check.id}: its output could not be captured ({exc})",
                 command=argv,
-                exit_reason="output_capture_error",
+                exit_reason=REASON_OUTPUT_CAPTURE_ERROR,
                 environment=summary,
             )
         stdout_capture = out_sink.capture()
@@ -312,7 +357,7 @@ class CommandCheckRunner:
                         break
         if capture_failure:
             outcome.status = EvidenceStatus.ERROR
-            outcome.exit_reason = "output_capture_error"
+            outcome.exit_reason = REASON_OUTPUT_CAPTURE_ERROR
             outcome.detail += f" {capture_failure} and this is not a clean result"
         if truncated := (stdout_capture.truncated or stderr_capture.truncated):
             outcome.detail += (
@@ -628,15 +673,15 @@ class CommandCheckRunner:
                     f"check {check.id}: exit={returncode} elapsed={elapsed}s "
                     f"(timeout after {check.timeout_seconds}s)"
                 )
-                reason = "timed_out"
+                reason = REASON_TIMED_OUT
             else:
                 detail = f"check {check.id}: exit={returncode} elapsed={elapsed}s"
                 if returncode == 0 and settled == "settled":
                     status = EvidenceStatus.PASSED
-                    reason = "completed"
+                    reason = REASON_COMPLETED
                 elif returncode != 0:
                     status = EvidenceStatus.FAILED
-                    reason = "nonzero_exit"
+                    reason = REASON_NONZERO_EXIT
                 else:
                     reason = f"settlement_{settled}"
             if settled == "forced":
@@ -646,7 +691,7 @@ class CommandCheckRunner:
                     "the check left processes running after it finished; its owned boundary was "
                     "terminated, so this is a lifecycle error, not a clean result",
                 )
-                reason = "settlement_forced"
+                reason = REASON_SETTLEMENT_FORCED
             elif settled == "unknown":
                 # Distinct from the case above on purpose: no lingering process was observed
                 # here, the observation itself failed. Saying "processes were left running"
@@ -656,7 +701,7 @@ class CommandCheckRunner:
                     "the owned boundary could not be observed, so settlement is unconfirmed; an "
                     "unanswered query is not an empty process tree and this is not a clean result",
                 )
-                reason = "settlement_unknown"
+                reason = REASON_SETTLEMENT_UNKNOWN
             detail += " " + " ".join(segments)
 
         if stderr.total_bytes:
@@ -688,6 +733,9 @@ class DenyCheckRunner:
                 f"check {check.id!r} has kind {check.kind!r}, which this runtime cannot execute; "
                 "refusing rather than reporting an unverified pass"
             ),
+            # Nothing was started, and the reason says so: a refusal to run is not a check that
+            # failed its business assertion.
+            exit_reason=REASON_NOT_LAUNCHED,
         )
 
 
@@ -729,12 +777,28 @@ def verify_candidate(
     run_id: str,
     runners: CheckRunners,
     artifact_factory: Callable[[str, str], Path] | None = None,
+    force_refresh: bool = False,
+    time_budget_seconds: int | None = None,
 ) -> VerificationResult:
     """Execute every required check once for this candidate; store evidence.
 
     Reuse rule (acceptance A10): an existing passing evidence row with the same
     candidate fingerprint and checks digest is reused for cacheable checks, and
     never reused for checks marked ``cacheable=False``.
+
+    ``force_refresh=True`` re-runs every required check, including cacheable ones, even when a
+    passing row with the same fingerprint and checks digest exists. Batch E2 passes it for a
+    repaired candidate so the second round never inherits the first round's pass - "the same
+    fingerprint" is not "the same round", and a repaired candidate's evidence has to be produced
+    by an execution of *this* round. The default preserves the historical reuse rule exactly.
+
+    ``time_budget_seconds`` is what is left of the root's clock, and it caps **each** check: a
+    check must not be given its full configured timeout when the root it belongs to has less time
+    than that, because the run would then keep working past the deadline it recorded and could
+    accept a delivery that finished after it. ``None`` means no root clock is known and the
+    configured timeouts apply unchanged. When the budget is already exhausted, no process is
+    started at all: each remaining check is recorded as a timed-out error, which blocks the run
+    and can never trigger a repair.
 
     ``artifact_factory`` decides where a check's captured output is kept. The controller passes a
     run-scoped directory under its own data dir, so the log a reviewer is pointed at is a file in
@@ -750,6 +814,13 @@ def verify_candidate(
     evidence_ids: list[str] = []
     failure_details: list[str] = []
     overall = EvidenceStatus.PASSED
+    # One countdown for the whole loop, shared by every check: the root's budget is what the run
+    # has left, not what each check may spend on its own.
+    budget_deadline = (
+        time.monotonic() + float(time_budget_seconds)
+        if time_budget_seconds is not None
+        else None
+    )
 
     for check_id in required:
         check = check_map.get(check_id)
@@ -759,7 +830,7 @@ def verify_candidate(
                 f"check {check_id!r} disappeared from the project contract since admission",
             )
         reusable = None
-        if check.cacheable:
+        if check.cacheable and not force_refresh:
             for row in existing:
                 if (
                     row["check_id"] == check_id
@@ -792,7 +863,36 @@ def verify_candidate(
                 ),
                 reader_timeout_seconds=runner.reader_timeout_seconds,
             )
-        outcome = runner.run(check, project_root, check.timeout_seconds)
+        # The check gets the smaller of its own configured timeout and what the root has left. The
+        # longer of the two would let the run outlive the deadline it recorded and then accept a
+        # delivery produced after it - the deadline would be a note rather than a bound.
+        #
+        # "What the root has left" is re-read for every check, not taken once for the whole loop:
+        # each check consumes time, so a budget of 2 seconds would otherwise be handed to the first
+        # check *and* again to the second, and the pair could run for four. The countdown starts
+        # when this function was entered and is measured monotonically, so a clock correction or a
+        # long-running first check cannot silently give the later checks more time than the run has.
+        effective_timeout = int(check.timeout_seconds)
+        if budget_deadline is not None:
+            remaining_budget = budget_deadline - time.monotonic()
+            if remaining_budget < 1:
+                # Less than a whole second left: record the fact without starting a process. The
+                # reason is `timed_out`, which is deliberately *not* a clean completion, so this can
+                # never buy a repair and the run stops instead of continuing on an exhausted clock.
+                outcome = CheckOutcome(
+                    EvidenceStatus.ERROR,
+                    exit_code=None,
+                    detail=(
+                        f"check {check_id!r} was not started: the root's remaining time "
+                        f"({max(0.0, remaining_budget):.3f}s) is exhausted"
+                    ),
+                    exit_reason="timed_out",
+                )
+                effective_timeout = 0
+            else:
+                effective_timeout = min(int(check.timeout_seconds), int(remaining_budget))
+        if effective_timeout > 0:
+            outcome = runner.run(check, project_root, effective_timeout)
 
         # The evidence row carries a human-readable reason and the *readable* artifact references,
         # because "the full log is available" has to name a file a reader can open. Only the
@@ -809,6 +909,10 @@ def verify_candidate(
             check_id=check_id,
             command=outcome.command,
             exit_code=outcome.exit_code,
+            # The structured execution fact, stored as its own column: a repair decision is
+            # classified from it, never from the ``verification_failed`` text or a log keyword.
+            # An offline runner that observed nothing reports no reason, and that is honest.
+            exit_reason=outcome.exit_reason,
             stdout_digest=outcome.stdout_digest,
             stderr_digest=outcome.stderr_digest,
             detail=_detail_with_references(outcome),
@@ -876,3 +980,134 @@ def evidence_is_current(
         and row.get("checks_digest") == checks_digest
         for row in rows
     )
+
+
+# --------------------------------------------------------------------------
+# The facts a repair decision reads (batch E2)
+# --------------------------------------------------------------------------
+#
+# ``failed_check_facts`` is the one place a caller may read "what failed about this candidate"
+# from. It reads the stored row - the structured columns, not a re-derivation of the detail text -
+# and it filters by attempt *and* candidate, because round one's evidence shares the run: a query
+# by ``run_id`` alone would let a previous candidate's failure describe the current one.
+#
+# The ``artifact``/``stdout``/``stderr`` references are decoded from the detail text that
+# ``_detail_with_references`` writes. The reader lives next to the writer (rather than being
+# imported from the controller, which imports this module) so the one format has exactly one
+# definition on each side of the write.
+
+#: Field markers an evidence row's detail text uses. A reference value ends where the next marker
+#: begins - which is also what lets a path contain spaces: the path is not split on whitespace,
+#: because "C:/temp/run 1/artifact.json" is one value, not two tokens.
+_REFERENCE_MARKERS = (
+    "reason=",
+    "artifact=",
+    "stdout:",
+    "stdout=",
+    "stderr:",
+    "stderr=",
+    "env_names=",
+    "withheld_secret_like=",
+)
+
+#: The retained/total/truncated/digest shape of one stream reference. Both spellings are accepted
+#: on purpose: the evidence row writes ``stdout: 3000/3000 bytes`` (reading like a log line) and
+#: the reviewer packet writes ``stdout=3000/3000B``.
+_STREAM_REFERENCE = re.compile(
+    r"^(?P<retained>\d+)\s*/\s*(?P<total>\d+)\s*B?(?:\s*bytes)?"
+    r"\s+truncated=(?P<truncated>\w+)"
+    r"\s+digest=(?P<digest>\S+)"
+)
+
+
+def _reference_field(detail: str, field: str) -> str:
+    """One ``field=value`` (or ``field: value``) reference out of an evidence row's detail text."""
+    for marker in (f"{field}=", f"{field}:"):
+        start = detail.find(marker)
+        while start != -1:
+            # Only a marker at a field boundary counts: "reason=" inside a word is not a field.
+            if start == 0 or detail[start - 1] == " ":
+                break
+            start = detail.find(marker, start + 1)
+        if start == -1:
+            continue
+        value_start = start + len(marker)
+        end = len(detail)
+        for other in _REFERENCE_MARKERS:
+            if other == marker:
+                continue
+            position = detail.find(other, value_start)
+            if position != -1 and (position == value_start or detail[position - 1] == " "):
+                end = min(end, position)
+        return detail[value_start:end].strip()
+    return ""
+
+
+def _stream_reference(detail: str, name: str) -> dict[str, object]:
+    """The retained-bytes/truncated/digest facts for one stream, out of the detail text.
+
+    ``{}`` means the row holds no usable reference for that stream - reported as "not recorded"
+    rather than filled in with zeros a reader could mistake for a real capture.
+    """
+    value = _reference_field(detail, name)
+    if not value:
+        return {}
+    match = _STREAM_REFERENCE.match(value)
+    if match is None:
+        return {}
+    return {
+        "retained_bytes": match.group("retained"),
+        "total_bytes": match.group("total"),
+        "truncated": match.group("truncated"),
+        "digest": match.group("digest"),
+    }
+
+
+def failed_check_facts(
+    store: Store,
+    *,
+    run_id: str,
+    attempt_id: str,
+    candidate_fingerprint: str,
+    checks_digest: str,
+) -> list[dict[str, object]]:
+    """Every verification row of **this attempt and this candidate** that did not pass.
+
+    A row qualifies only when all four freshness keys match: the run, the attempt, the candidate
+    fingerprint and the checks digest. The candidate filter is the important one - a previous
+    round's failed evidence is still part of the same run, so a query by run alone would let round
+    one's failure be read as a fact about round two's candidate.
+
+    FAILED *and* ERROR rows are returned, in the order they were recorded. A caller that only saw
+    the failures could not notice that an error was mixed in, and the E2 rule is that any error in
+    the round stops the run without buying a second implementer.
+
+    Every value comes from the stored row (``exit_reason`` included - empty for a row written
+    before the reason was recorded) or from the reference block that row's own detail text
+    carries. Nothing here re-derives a reason from prose.
+    """
+    facts: list[dict[str, object]] = []
+    for row in store.evidence_for(run_id, kind="verification"):
+        if str(row["attempt_id"]) != attempt_id:
+            continue
+        if str(row["candidate_fingerprint"]) != candidate_fingerprint:
+            continue
+        if str(row["checks_digest"]) != checks_digest:
+            continue
+        if str(row["status"]) == EvidenceStatus.PASSED.value:
+            continue
+        detail = str(row["detail"] or "")
+        facts.append(
+            {
+                "check_id": str(row["check_id"] or ""),
+                "status": str(row["status"]),
+                "exit_code": row["exit_code"],
+                "exit_reason": str(row["exit_reason"] or ""),
+                "detail": detail,
+                "evidence_id": str(row["evidence_id"]),
+                "artifact": _reference_field(detail, "artifact"),
+                "stdout": _stream_reference(detail, "stdout"),
+                "stderr": _stream_reference(detail, "stderr"),
+            }
+        )
+    return facts

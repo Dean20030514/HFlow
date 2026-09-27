@@ -36,6 +36,9 @@ from .contracts import (
     ProjectConfig,
     RefusalCode,
     RefusedError,
+    RepairPlanPreview,
+    RepairPolicy,
+    RepairTrigger,
     RoleConfig,
     RootBudgetBinding,
     RootBudgetPlan,
@@ -196,6 +199,33 @@ def load_root_budget_plan(path: Path) -> RootBudgetPlan:
     return root_budget_from_plan(plan)
 
 
+def load_repair_policy(path: Path) -> RepairPolicy:
+    """Read one repair policy: a bare ``RepairPolicy`` document, never a default.
+
+    The file is the task's explicit opt-in to one bounded repair, so an unreadable, malformed or
+    unsupported document is refused rather than defaulted: a policy that came from a build default
+    would arm a behaviour nobody wrote down. Only the document is read here - whether this *scope*
+    can support the policy (an isolated worktree, a review, a run ceiling that covers the worst
+    case) is refused by ``admission`` before a dispatch exists, because that depends on the rest
+    of the task and not on this file.
+    """
+    raw = load_json_file(Path(path), what="repair policy file")
+    if not isinstance(raw, dict):
+        raise RefusedError(
+            RefusalCode.INVALID_SPEC,
+            f"repair policy file {path} must be a JSON object with the RepairPolicy fields "
+            f"(max_attempts, check_exit_codes, allow_reviewer_changes), not a JSON "
+            f"{type(raw).__name__}",
+        )
+    try:
+        return RepairPolicy.model_validate(raw)
+    except ValidationError as exc:
+        raise RefusedError(
+            RefusalCode.INVALID_SPEC,
+            f"repair policy file {path} is not a valid RepairPolicy: {exc}",
+        ) from exc
+
+
 def root_binding_for(resolved: ResolvedRun) -> RootBudgetBinding:
     """The root a run would be spent against. It computes the ledger path and opens nothing.
 
@@ -213,7 +243,10 @@ def root_binding_for(resolved: ResolvedRun) -> RootBudgetBinding:
 
 
 def root_budget_preview(
-    resolved: ResolvedRun, plan: RootBudgetPlan, *, budget: BudgetPlan
+    resolved: ResolvedRun,
+    plan: RootBudgetPlan,
+    *,
+    repair: RepairPlanPreview,
 ) -> RootBudgetPreview:
     """What a preview can honestly say about a root: what it covers, its ceilings, its clock.
 
@@ -221,15 +254,33 @@ def root_budget_preview(
     keeps ``prepare`` from having a side effect - and even a number read now could be spent by
     another process before this run reserves. Every dispatch and every counter is decided by the
     run's own transaction.
+
+    Two counts are reported rather than one, because they answer different questions: what one
+    accepted delivery normally costs (``single_loop_dispatches``) and what this run must be able
+    to afford if its repair policy is armed (``required_top_level_submissions``). Printing only
+    the larger number would read as if every delivery cost four invocations.
     """
     binding = root_binding_for(resolved)
     limits = plan.limits
+    if repair.enabled:
+        repair_clause = (
+            "This task carries a repair policy, so the run must be able to afford the worst "
+            f"case of {repair.worst_case_dispatches} top-level submission(s) "
+            "(I1 + R1 + I2 + R2) - a ceiling, not a quota: an attempt that is never needed is "
+            "never bought. One repair is the maximum, and it is spent only on a declared "
+            f"business check failure or a substantive reviewer rejection. This root allows at "
+            f"most {limits.max_top_level_submissions}"
+        )
+    else:
+        repair_clause = (
+            "No repair is planned for this task: it carries no repair policy, so the "
+            f"{limits.max_repairs}-repair counter is recorded and enforced but nothing spends "
+            "it, and the normal count is also the maximum. This root allows at most "
+            f"{limits.max_top_level_submissions}"
+        )
     detail = (
-        f"one accepted delivery needs {budget.required_turns} top-level submission(s) "
-        f"(implementer {budget.implementer_turns} + reviewer {budget.reviewer_turns}), and this "
-        f"root allows at most {limits.max_top_level_submissions}. The repair switch is OFF: E1 "
-        f"records and enforces the {limits.max_repairs}-repair counter but implements no repair "
-        f"loop, so the normal count is also the maximum this build dispatches. The "
+        f"one accepted delivery normally needs {repair.single_loop_dispatches} top-level "
+        f"submission(s) (implementer + reviewer). {repair_clause}. The "
         f"{limits.deadline_seconds}s deadline starts at the root's first successful reservation "
         f"and is recorded as deadline_at. Whether any allowance remains is decided by the run's "
         f"own dispatch transaction against {binding.ledger_path}, not by this preview"
@@ -237,8 +288,9 @@ def root_budget_preview(
     return RootBudgetPreview(
         binding=binding,
         limits=limits,
-        required_top_level_submissions=budget.required_turns,
-        repair_enabled=False,
+        required_top_level_submissions=repair.worst_case_dispatches,
+        repair_enabled=repair.enabled,
+        single_loop_dispatches=repair.single_loop_dispatches,
         detail=detail,
     )
 
@@ -248,6 +300,7 @@ def effective_spec(
     *,
     base_commit: str | None = None,
     workspace_mode: str | None = None,
+    repair_policy: RepairPolicy | None = None,
 ) -> TaskSpec:
     """Apply command-line overrides *before* admission.
 
@@ -255,17 +308,34 @@ def effective_spec(
     rendered packet and the authorization binding all describe the same task. This used to
     live in ``cmd_run``; ``prepare`` needs the identical rule or its preview would describe a
     different spec than the run it previews.
+
+    ``--repair-policy-file`` is the same kind of override, with one extra rule: a task that
+    already names a repair policy and a flag that names another are two sources disagreeing about
+    what may buy a repair, and this build refuses that rather than silently preferring one. The
+    same policy written twice is not a disagreement - comparing digests keeps the resolution
+    idempotent, so re-running an already-policied task with its own policy file works.
     """
-    if not base_commit and not workspace_mode:
+    if repair_policy is not None and spec.repair_policy is not None:
+        if repair_policy.digest() != spec.repair_policy.digest():
+            raise RefusedError(
+                RefusalCode.INVALID_SPEC,
+                "the task file names one repair policy and --repair-policy-file another (task "
+                f"{spec.repair_policy.digest()}, file {repair_policy.digest()}). Two sources "
+                "disagreeing about what may buy a repair is not something this build resolves by "
+                "preferring one: nothing was dispatched and no allowance was consumed.",
+            )
+    if not base_commit and not workspace_mode and repair_policy is None:
         return spec
-    mode = workspace_mode or spec.workspace.mode
-    overrides: dict[str, Any] = {
-        "workspace": {
+    overrides: dict[str, Any] = {}
+    if base_commit or workspace_mode:
+        mode = workspace_mode or spec.workspace.mode
+        overrides["workspace"] = {
             "mode": mode,
             "base_commit": base_commit or spec.workspace.base_commit,
             "keep": True if mode == "worktree" else spec.workspace.keep,
         }
-    }
+    if repair_policy is not None:
+        overrides["repair_policy"] = repair_policy.model_dump(mode="json")
     return TaskSpec.model_validate({**spec.model_dump(mode="json"), **overrides})
 
 
@@ -444,13 +514,19 @@ def resolve_run(
     driver: str | None = None,
     base_commit: str | None = None,
     workspace_mode: str | None = None,
+    repair_policy: RepairPolicy | None = None,
     env: Mapping[str, str] | None = None,
 ) -> ResolvedRun:
     """Resolve one task, project and machine configuration into what would be executed."""
     root = Path(project_root).resolve()
     spec_path = Path(task_path)
     spec = TaskSpec.model_validate(load_json_file(spec_path, what="task spec"))
-    spec = effective_spec(spec, base_commit=base_commit, workspace_mode=workspace_mode)
+    spec = effective_spec(
+        spec,
+        base_commit=base_commit,
+        workspace_mode=workspace_mode,
+        repair_policy=repair_policy,
+    )
 
     resolved_project_path = (
         Path(project_path) if project_path else root / ".hflow" / "project.json"
@@ -566,16 +642,113 @@ def _planned_checks(spec: TaskSpec, project: ProjectConfig) -> list[PlannedCheck
     return planned
 
 
+def repair_dispatch_counts(spec: TaskSpec, project: ProjectConfig) -> tuple[int, int]:
+    """``(the fixed loop, the worst case)`` in top-level dispatches.
+
+    The fixed loop is implementer (+ reviewer): what one accepted delivery costs. With a repair
+    policy the ceiling doubles, because the repair attempt and the review that must follow it are
+    two dispatches the first attempt cannot know about - the plan's ``I1 (+R1) + I2 (+R2)``. It is
+    the number the run's own ceiling, the root and the authorization all have to cover before I1.
+    A ceiling, not a quota: an attempt that is never needed is never bought.
+    """
+    single = 1 + (1 if spec.needs_review(project) else 0)
+    if spec.repair_policy is None:
+        return single, single
+    return single, 2 * single
+
+
+def _repair_plan_preview(resolved: ResolvedRun) -> RepairPlanPreview:
+    """The repair plan as data, with the same discipline as the root budget preview.
+
+    Present or absent, the digest of the policy an approval would cover, the triggers that are
+    enabled (check ids with their declared exit codes, and whether reviewer changes count), the
+    worst-case dispatch count - and an explicit statement of what the single repair may be spent
+    on. Nothing here promises a repair will happen: a preview cannot know whether a check will
+    fail, and a policy is a permission, not a plan to spend.
+    """
+    spec, project = resolved.spec, resolved.project
+    single, worst_case = repair_dispatch_counts(spec, project)
+    policy = spec.repair_policy
+    if policy is None:
+        return RepairPlanPreview(
+            enabled=False,
+            single_loop_dispatches=single,
+            worst_case_dispatches=worst_case,
+            detail=(
+                "no repair_policy on this task, so no repair is attempted and "
+                "budget.max_repair_cycles arms nothing - a numeric budget field is not a policy. "
+                f"The worst case stays the fixed loop of {single} top-level dispatch(es). A "
+                "repair needs an explicit policy naming the checks and exit codes that mean a "
+                "business assertion failed, or allowing a substantive reviewer rejection"
+            ),
+        )
+
+    triggers: list[str] = []
+    if policy.check_exit_codes:
+        triggers.append(RepairTrigger.BUSINESS_CHECK_FAILED.value)
+    if policy.allow_reviewer_changes:
+        triggers.append(RepairTrigger.REVIEW_CHANGES_REQUESTED.value)
+    declared = "; ".join(
+        f"{check_id} with exit code(s) {', '.join(str(code) for code in codes)}"
+        for check_id, codes in sorted(policy.check_exit_codes.items())
+    )
+    if policy.check_exit_codes and policy.allow_reviewer_changes:
+        spent_on = (
+            f"a declared business check failure ({declared}) or a substantive reviewer "
+            "changes_requested (both enabled by this policy)"
+        )
+    elif policy.check_exit_codes:
+        spent_on = (
+            f"a declared business check failure ({declared}); a reviewer changes_requested does "
+            "not qualify under this policy"
+        )
+    else:
+        spent_on = (
+            "a substantive reviewer changes_requested with usable findings; this policy declares "
+            "no check failure that may buy one"
+        )
+    detail = (
+        f"one repair is the maximum for this run. It is spent only on {spent_on}. A timeout, a "
+        "killed or uncollected check, a transport, environment or driver error, a malformed "
+        "review, an unknown outcome or an empty findings list buys no repair. A repaired "
+        "candidate is verified and independently reviewed again from scratch. The worst case is "
+        f"a ceiling, not a quota: I1{' + R1' if single > 1 else ''} + I2"
+        f"{' + R2' if single > 1 else ''} = {worst_case} top-level dispatch(es), and an attempt "
+        "that is never needed is never bought"
+    )
+    return RepairPlanPreview(
+        enabled=True,
+        policy_digest=policy.digest(),
+        check_exit_codes={key: list(value) for key, value in policy.check_exit_codes.items()},
+        allow_reviewer_changes=policy.allow_reviewer_changes,
+        triggers=triggers,
+        single_loop_dispatches=single,
+        worst_case_dispatches=worst_case,
+        detail=detail,
+    )
+
+
 def _budget_plan(resolved: ResolvedRun, roles: list[str]) -> BudgetPlan:
     spec, project = resolved.spec, resolved.project
+    single, worst_case = repair_dispatch_counts(spec, project)
     implementer = 1
     reviewer = 1 if "reviewer" in roles else 0
-    required = implementer + reviewer
+    # ``required_turns`` is what an authorization has to cover. With a repair policy armed that is
+    # the worst case, not the fixed loop: an approval that only covered I1 + R1 could not pay for
+    # the repair the task explicitly enabled, and the run would refuse it after the first attempt.
+    required = worst_case
     ceiling = min(spec.budget.max_agent_turns, project.limits.max_agent_turns)
     within = required <= ceiling
+    cycle_note = (
+        f"; one repair cycle is armed, so the worst case is {worst_case} "
+        f"(fixed loop {single} + one repair round)"
+        if spec.repair_policy is not None
+        else ""
+    )
     detail = (
-        f"implementer {implementer} + reviewer {reviewer} = {required} reserved turn(s); "
-        f"task budget {spec.budget.max_agent_turns}, project pre-authorization "
+        f"implementer {implementer} + reviewer {reviewer} = {single} reserved turn(s) for one "
+        f"accepted delivery{cycle_note}; {required} reserved turn(s) required in total, against "
+        f"task budget {spec.budget.max_agent_turns} and project pre-authorization "
         f"{project.limits.max_agent_turns}"
     )
     if not within:
@@ -586,7 +759,7 @@ def _budget_plan(resolved: ResolvedRun, roles: list[str]) -> BudgetPlan:
     return BudgetPlan(
         implementer_turns=implementer,
         reviewer_turns=reviewer,
-        repair_cycles=0,
+        repair_cycles=1 if spec.repair_policy is not None else 0,
         required_turns=required,
         task_turn_budget=spec.budget.max_agent_turns,
         project_turn_limit=project.limits.max_agent_turns,
@@ -671,12 +844,16 @@ def build_prepare_report(
 
     roles = resolved.roles
     execution_root, execution_root_is_final = resolved.execution_root()
+    repair = _repair_plan_preview(resolved)
     budget = _budget_plan(resolved, roles)
     root_preview = (
-        root_budget_preview(resolved, root_budget_plan, budget=budget)
+        root_budget_preview(resolved, root_budget_plan, repair=repair)
         if root_budget_plan is not None
         else None
     )
+    # What an approval has to cover. ``budget.required_turns`` is already the worst case when a
+    # repair policy is armed, so the artifact the preview describes covers the loop the run's own
+    # gate prices before I1 - not just its first half.
     submissions = (
         max_top_level_submissions_required
         if max_top_level_submissions_required is not None
@@ -746,6 +923,14 @@ def build_prepare_report(
             "this task does not fit its budget: it needs more reserved turns than are "
             "available, so a run refuses before dispatching anything"
         )
+    if repair.enabled:
+        notes.append(
+            f"this task carries a repair policy (digest {repair.policy_digest}): at most one "
+            "repair, spent only on a declared business check failure or a substantive reviewer "
+            f"rejection, with a worst case of {repair.worst_case_dispatches} top-level "
+            "dispatch(es) for this run. It is a ceiling, not a quota: an attempt that is never "
+            "needed is never bought"
+        )
     if root_preview is not None:
         notes.append(
             f"a root budget file was given: this run would register root "
@@ -758,11 +943,19 @@ def build_prepare_report(
             "decided by the run's own dispatch transaction against the ledger; this preview "
             "cannot promise a remaining number"
         )
-        notes.append(
-            "automatic repair is not implemented in this build (E1): the root's repair "
-            "allowance is recorded and counted, but no loop spends it until E2. A budget field "
-            "is not an implemented feature"
-        )
+        if repair.enabled:
+            notes.append(
+                f"the root's repair counter ({root_preview.limits.max_repairs}) is spent by the "
+                "repair attempt itself, and the ceiling above is what this root has to cover "
+                "before I1: a root that cannot afford it refuses the run rather than stopping "
+                "half-way"
+            )
+        else:
+            notes.append(
+                "no repair is planned for this task: it carries no repair_policy, so the root's "
+                "repair counter is recorded and enforced but nothing spends it. "
+                "budget.max_repair_cycles is a historical number and arms nothing"
+            )
         if not resolved.is_real_driver:
             notes.append(
                 "this run uses the offline fake driver, but the root budget file still makes an "
@@ -793,12 +986,51 @@ def build_prepare_report(
         write_deny=list(resolved.spec.scope.write_deny),
         checks=_planned_checks(resolved.spec, resolved.project),
         budget=budget,
+        repair_plan=repair,
         roles=roles,
         root_budget=root_preview,
         packet_preview=preview,
         authorization=pending,
         notes=notes,
     )
+
+
+def _repair_plan_lines(repair: RepairPlanPreview) -> list[str]:
+    """The repair plan in the text form: the same facts the JSON carries, no promise of a repair.
+
+    "Present or absent" is said explicitly, because ``budget.max_repair_cycles`` still reads 1 on
+    every task that predates E2 and a reader could mistake that number for an armed repair.
+    """
+    lines = ["repair plan"]
+    if not repair.enabled:
+        lines.append(
+            "  none        no repair_policy on this task: no repair is attempted, whatever "
+            f"budget.max_repair_cycles says. Worst case stays {repair.single_loop_dispatches} "
+            "top-level dispatch(es)"
+        )
+        return lines
+    lines.append(f"  enabled     policy digest {repair.policy_digest}")
+    if repair.check_exit_codes:
+        for check_id, codes in sorted(repair.check_exit_codes.items()):
+            lines.append(
+                f"  trigger     business_check_failed: {check_id} -> exit code(s) "
+                f"{', '.join(str(code) for code in codes)}"
+            )
+    else:
+        lines.append(
+            "  trigger     business_check_failed: (no check may buy a repair under this policy)"
+        )
+    lines.append(
+        "  trigger     review_changes_requested: "
+        + ("allowed" if repair.allow_reviewer_changes else "not allowed")
+    )
+    lines.append(
+        f"  maximum     one repair, worst case {repair.worst_case_dispatches} top-level "
+        f"dispatch(es) (fixed loop {repair.single_loop_dispatches} + one repair round); a "
+        "ceiling, not a quota"
+    )
+    lines.append(f"  detail      {repair.detail}")
+    return lines
 
 
 def render_prepare_text(report: PrepareReport) -> str:
@@ -860,17 +1092,19 @@ def render_prepare_text(report: PrepareReport) -> str:
     lines.append("budget")
     lines.append(
         f"  turns       require {report.budget.required_turns} "
-        f"(implementer {report.budget.implementer_turns}, reviewer {report.budget.reviewer_turns}), "
-        f"task budget {report.budget.task_turn_budget}, "
+        f"(implementer {report.budget.implementer_turns}, reviewer {report.budget.reviewer_turns}"
+        + (f", repair cycles {report.budget.repair_cycles}" if report.budget.repair_cycles else "")
+        + f"), task budget {report.budget.task_turn_budget}, "
         f"project pre-authorization {report.budget.project_turn_limit}"
     )
     lines.append(f"  fits        {report.budget.within_budget}")
+    lines.extend(_repair_plan_lines(report.repair_plan))
     lines.append("root budget")
     root = report.root_budget
     if root is None:
         lines.append(
             "  not bound   no --root-budget-file was given: this run would spend the "
-            "authorization's own allowance, with no root ledger row and no repair allowance"
+            "authorization's own allowance, with no root ledger row and no root repair counter"
         )
     else:
         lines.append(
@@ -886,13 +1120,19 @@ def render_prepare_text(report: PrepareReport) -> str:
             f"repairs {root.limits.max_repairs}, deadline {root.limits.deadline_seconds}s"
         )
         lines.append(
-            f"  needs       {root.required_top_level_submissions} top-level submission(s) for "
-            "one accepted delivery (implementer + reviewer)"
+            f"  needs       {root.required_top_level_submissions} top-level submission(s) worst "
+            f"case (fixed loop {root.single_loop_dispatches}: implementer + reviewer)"
         )
-        lines.append(
-            "  repair      OFF - not implemented in E1: the repair counter is recorded and "
-            "enforced, but no repair loop spends it, so the normal count is the maximum"
-        )
+        if root.repair_enabled:
+            lines.append(
+                "  repair      ARMED by this task's repair policy: the worst case above is a "
+                "ceiling, not a quota, and one repair is the maximum"
+            )
+        else:
+            lines.append(
+                f"  repair      none planned - this task carries no repair policy, so the "
+                f"{root.limits.max_repairs}-repair counter is recorded but nothing spends it"
+            )
         lines.append(
             f"  deadline    {root.limits.deadline_seconds}s counted from the root's first "
             "successful reservation (recorded as deadline_at), not from now"

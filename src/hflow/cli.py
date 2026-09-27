@@ -389,6 +389,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     """
     from .prepare import (
         build_prepare_report,
+        load_repair_policy,
         load_root_budget_plan,
         render_prepare_text,
         resolve_run,
@@ -397,6 +398,11 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
     root_plan = (
         load_root_budget_plan(Path(args.root_budget_file)) if args.root_budget_file else None
+    )
+    # The explicit repair opt-in, read and validated before anything is resolved. An invalid
+    # policy refuses here, with no report printed and nothing dispatched.
+    repair_policy = (
+        load_repair_policy(Path(args.repair_policy_file)) if args.repair_policy_file else None
     )
     resolved = resolve_run(
         task_path=Path(args.task),
@@ -407,6 +413,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         driver=args.driver,
         base_commit=args.base_commit,
         workspace_mode=args.workspace,
+        repair_policy=repair_policy,
     )
     report = build_prepare_report(
         resolved, authorization_mode=args.authorization_mode, root_budget_plan=root_plan
@@ -515,6 +522,7 @@ def _zero_model_preflight(role_drivers: dict[str, object]):
 
 def cmd_run(args: argparse.Namespace) -> int:
     from .prepare import (
+        load_repair_policy,
         load_root_budget_plan,
         resolve_machine_bindings,
         resolve_run,
@@ -543,6 +551,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     root_plan = (
         load_root_budget_plan(Path(args.root_budget_file)) if args.root_budget_file else None
     )
+    # The task's explicit opt-in to one bounded repair. Read here, before the spec is resolved:
+    # the policy becomes part of the effective TaskSpec, so the stored spec, its digest and the
+    # authorization binding all cover the repair the task asked for. An unreadable or unsupported
+    # document refuses before a run row, a workspace or an allowance exists.
+    repair_policy = (
+        load_repair_policy(Path(args.repair_policy_file)) if args.repair_policy_file else None
+    )
 
     resolved = resolve_run(
         task_path=Path(args.task),
@@ -553,6 +568,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         driver=args.driver,
         base_commit=args.base_commit,
         workspace_mode=args.workspace,
+        repair_policy=repair_policy,
     )
     spec = resolved.spec
     project = resolved.project
@@ -953,6 +969,26 @@ def _add_store_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_repair_policy_arg(parser: argparse.ArgumentParser) -> None:
+    """``--repair-policy-file`` on render-only and run commands: the one explicit repair opt-in.
+
+    A bare ``RepairPolicy`` document, not a task file and not an authorization. It becomes part of
+    the effective TaskSpec (and therefore of ``spec_digest`` and the authorization binding), so the
+    repair it arms is the repair that was approved - and a task that already names a policy must
+    agree with the file rather than have one of the two silently preferred.
+    """
+    parser.add_argument(
+        "--repair-policy-file",
+        default=None,
+        help=(
+            "JSON RepairPolicy document that explicitly opts this task into at most ONE bounded "
+            "repair: {'max_attempts': 1, 'check_exit_codes': {check_id: [exit codes]}, "
+            "'allow_reviewer_changes': bool}. It must fit this scope: a worktree task that is "
+            "reviewed, with a run ceiling covering the worst case of 4 top-level dispatches"
+        ),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="hflow", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1010,6 +1046,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     prepare.add_argument("--json", action="store_true")
+    _add_repair_policy_arg(prepare)
     _add_store_args(prepare)
     prepare.set_defaults(func=cmd_prepare)
 
@@ -1078,6 +1115,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--json", action="store_true")
     run.add_argument("--force", action="store_true", help="continue past admission issues (unsafe)")
+    _add_repair_policy_arg(run)
     _add_store_args(run)
     run.set_defaults(func=cmd_run)
 

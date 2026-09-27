@@ -319,6 +319,10 @@ class AcpxDshDriver:
         #: Invocations a stop has been requested for. A spawn that has not created its child yet
         #: refuses, so the stop wins the handoff; it says nothing about a child that exists.
         self._stop_requests: dict[str, bool] = {}
+        #: The wall-clock instant this invocation must be finished by, from *its own* request
+        #: deadline. The client is given the same number as a flag, but a client that hangs before
+        #: protocol startup never enforces it, so the driver has to hold it too.
+        self._invocation_deadlines: dict[str, float] = {}
         self._processes: dict[str, subprocess.Popen] = {}
         self._boundaries: dict[str, ProcessBoundary] = {}
         self._streams: dict[str, Any] = {}
@@ -586,6 +590,11 @@ class AcpxDshDriver:
 
         boundary = ProcessBoundary().open()
         argv = self._client_argv(invocation_dir, workspace, request.deadline_seconds)
+        # Recorded before the spawn gate: the deadline belongs to the invocation, and a process
+        # that is created must already be bounded by it.
+        self._invocation_deadlines[request.invocation_id] = (
+            time.monotonic() + float(request.deadline_seconds)
+        )
         handle = DriverHandle(
             invocation_id=request.invocation_id,
             attempt_id=request.attempt_id,
@@ -1012,17 +1021,38 @@ class AcpxDshDriver:
             self._results[invocation_id] = result
             return result
         process = self._processes[invocation_id]
+        # The wait is bounded by the invocation's *own* deadline as well as the driver's completion
+        # timeout: whichever comes first is when this invocation stops being allowed to run. A
+        # client that hangs before it can read its `--timeout` flag is exactly the case the flag
+        # cannot cover, and without this the run would keep waiting past the deadline it recorded.
+        wait_seconds = float(self.completion_timeout_seconds)
+        invocation_deadline = self._invocation_deadlines.get(invocation_id)
+        if invocation_deadline is not None:
+            wait_seconds = min(wait_seconds, max(0.0, invocation_deadline - time.monotonic()))
         try:
-            process.wait(timeout=self.completion_timeout_seconds)
+            process.wait(timeout=wait_seconds)
         except subprocess.TimeoutExpired:
+            # The deadline is what ran out, so the client is stopped through the managed process
+            # boundary rather than left running: the allowance is already spent, and an orphaned
+            # client would keep working on a run that has stopped waiting for it. The result stays
+            # OUTCOME_UNKNOWN - what the client might yet have produced is not observed, and calling
+            # it a failure would be as invented as calling it a success.
+            stopped, _emptied, stop_detail = self._force_stop_client(process, handle)
             result = InvocationResult(
                 invocation_id=invocation_id,
                 outcome=InvocationOutcome.OUTCOME_UNKNOWN,
                 prompt_digest=self._prompt_digests.get(invocation_id, ""),
                 agent_turns=None,
-                limitations=["completion deadline exceeded while waiting for the client"],
+                limitations=[
+                    "the invocation deadline was reached while waiting for the client; the "
+                    "managed process boundary was used to stop it",
+                    stop_detail,
+                ],
                 error_code="completion_timeout",
-                error_message="the client did not exit before the completion deadline",
+                error_message=(
+                    "the client did not exit before the invocation deadline "
+                    f"({wait_seconds:.3f}s of waiting); stopped={stopped}"
+                ),
                 raw_ref=str(handle.event_log),
             )
             self._results[invocation_id] = result
@@ -1288,22 +1318,17 @@ class AcpxDshDriver:
             "cooperative cancel is unavailable on this launch path (acpx cancel targets a "
             "persisted session's queue owner); the managed process boundary was terminated"
         )
-        if handle.dispatched:
-            # Let the client notice EOF on its own before the boundary is closed.
-            self._close_client_stdin(process)
-            try:
-                process.wait(timeout=FORCE_STOP_GRACE_SECONDS)
-            except subprocess.TimeoutExpired:
-                pass
-        if process.poll() is None:
-            boundary.terminate()
-            emptied = boundary.wait_empty(BOUNDARY_EMPTY_TIMEOUT_SECONDS)
-            stopped = emptied and process_gone(process.pid, 2.0)
-            status = "confirmed_stopped" if stopped else ("still_running" if not emptied else "unknown")
+        stopped, emptied, detail = self._force_stop_client(process, handle)
+        # The three-way status is the *boundary's* answer, not a simplification of it: an emptied
+        # boundary means the managed process tree is gone, `still_running` means it is not, and
+        # `unknown` means the boundary emptied but the process could not be confirmed gone. The
+        # forced-stop helper returns both facts so this stays exactly what it was.
+        if emptied and stopped:
+            status = "confirmed_stopped"
+        elif not emptied:
+            status = "still_running"
         else:
-            emptied = boundary.wait_empty(1.0)
-            stopped = process_gone(process.pid, 1.0)
-            status = "confirmed_stopped" if stopped else "unknown"
+            status = "unknown"
 
         receipt = CancellationReceipt(
             invocation_id=invocation_id,
@@ -1320,6 +1345,100 @@ class AcpxDshDriver:
             # Keep exit and event evidence, then release the boundary so nothing lingers.
             self._close_boundary(invocation_id)
         return receipt
+
+    def _force_stop_client(
+        self, process: subprocess.Popen, handle: DriverHandle
+    ) -> tuple[bool, bool, str]:
+        """Stop a live client through the managed process boundary. One implementation, two callers.
+
+        Used by an operator-requested stop and by an expired invocation deadline. The mechanism is
+        identical and the *meaning* is not, which is why the caller records the meaning: a stop is
+        "a human ended this", a deadline is "we stopped waiting". Neither is a cooperative protocol
+        cancel, because this launch path has no such entry point.
+
+        Returns ``(stopped, emptied, detail)``. ``stopped`` is true only when the boundary was
+        emptied *and* the process is gone; ``emptied`` is reported separately because
+        ``cancel_handle``'s three-way status distinguishes "the tree is gone" from "it is not" from
+        "emptied but unconfirmed", and collapsing those would change a stop report.
+
+        **The parent exiting is not the boundary being empty.** The whole point of the boundary is
+        that the client may have started descendants of its own, and they stay in the job after
+        their parent goes. An earlier version returned early when the parent had exited - which
+        reported ``emptied=True`` while the job still held a live child, and skipped the one action
+        that would have stopped it. Every path below therefore ends at the boundary: whether the
+        client is still running, has just exited, or had already exited before this was called, the
+        question "is anything left in the tree?" is answered by the job and by nothing else.
+        """
+        invocation_id = handle.invocation_id
+        boundary = self._boundaries.get(invocation_id)
+        if boundary is None:
+            # No boundary to consult. That is only conclusive when the process is gone as well:
+            # reporting an empty tree on the strength of a missing handle would be a guess.
+            if process.poll() is not None:
+                return (
+                    True,
+                    True,
+                    "the client had already exited and no managed boundary was recorded",
+                )
+            return False, False, "no managed process boundary was recorded for this invocation"
+
+        if handle.dispatched and process.poll() is None:
+            # Let the client notice EOF on its own before the boundary is closed. Only while it is
+            # still running: closing the input of a process that already exited is pointless, and
+            # its descendants would not see that EOF anyway.
+            self._close_client_stdin(process)
+            try:
+                process.wait(timeout=FORCE_STOP_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
+
+        # Always ask the boundary, even when the parent is already gone: a descendant can outlive
+        # it, and the job is the only thing that knows.
+        boundary.terminate()
+        emptied = boundary.wait_empty(BOUNDARY_EMPTY_TIMEOUT_SECONDS)
+        parent_gone = self._await_process_gone(process.pid)
+        stopped = bool(emptied and parent_gone)
+        exit_detail = (
+            f"client exit={process.poll()}"
+            if process.poll() is not None
+            else "client still running when the boundary was terminated"
+        )
+        return (
+            stopped,
+            bool(emptied),
+            f"boundary={handle.boundary_kind}, boundary_empty={emptied}, stopped={stopped}, "
+            f"{exit_detail}",
+        )
+
+    @staticmethod
+    def _await_process_gone(pid: int, settle_seconds: float = FORCE_STOP_GRACE_SECONDS) -> bool:
+        """Has this process reached its signalled state? Polled, not waited once.
+
+        ``process_gone`` asks whether the process *object is signalled*, which is not the same
+        question as whether the object still exists: Windows keeps a process object alive while any
+        handle to it is open, so a terminated process can still be opened and still read as alive.
+        The two are therefore stated apart rather than conflated - this method is about the signal,
+        and nothing here claims a cause for the delay.
+
+        What was measured on this machine, for a client terminated through the managed boundary: at
+        the instant the teardown returned, the job held no processes and the client's exit code
+        already read its real code (1) instead of ``STILL_ACTIVE``; an immediate un-timed check of
+        the signal said "alive"; the same check with 500 ms of patience said "gone"; and the process
+        object was no longer openable about 50 ms later. The delay is a window in which the signal
+        has not yet arrived, so a single immediate check reports a teardown that has already
+        happened as if it had not - the one direction of error this path exists to avoid: an
+        operator deciding whether to re-dispatch needs "the tree is gone", not "the tree was gone a
+        moment after I asked".
+
+        Bounded by the same grace the forced stop already uses, so an unconfirmable process keeps
+        reporting unknown rather than being waited on forever.
+        """
+        deadline = time.monotonic() + settle_seconds
+        while True:
+            if process_gone(pid, 0.05):
+                return True
+            if time.monotonic() >= deadline:
+                return False
 
     def _close_client_stdin(self, process: subprocess.Popen) -> None:
         if process.stdin is not None and not process.stdin.closed:

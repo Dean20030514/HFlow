@@ -24,7 +24,7 @@ import json
 from dataclasses import dataclass
 from typing import Literal
 
-from .contracts import AcceptanceCriterion, ReviewOutput, Scope, digest_of
+from .contracts import AcceptanceCriterion, RepairContext, ReviewOutput, Scope, digest_of
 
 PacketRole = Literal["implementer", "reviewer"]
 
@@ -255,6 +255,71 @@ def _diff_reference(candidate: dict[str, object] | None) -> str:
 # --------------------------------------------------------------------------
 
 
+def _repair_section(context: RepairContext) -> str:
+    """The one repair attempt's input: which candidate it starts from, and what failed.
+
+    Everything here is a recorded fact, and the section says what it is *not*: a permission
+    grant, a research brief or an instruction. The write scope, the checks and the configuration
+    are unchanged, so the section cannot be read as widening what this attempt may do.
+    """
+    previous = context.previous
+    candidate_lines = ["- no previous candidate is recorded (this looks like a first attempt)"]
+    if previous is not None:
+        candidate_lines = [
+            f"- round being repaired: {previous.round}",
+            f"- candidate commit: {previous.git_commit or '(none frozen)'}",
+            f"- candidate tree: {previous.git_tree or '(none)'}",
+            f"- candidate fingerprint: {previous.fingerprint or '(none)'}",
+            f"- candidate paths: {', '.join(previous.paths) or '(none recorded)'}",
+            f"- original task base: {context.original_base_commit or '(not recorded)'}",
+        ]
+
+    failure_lines: list[str] = []
+    for fact in context.failed_checks:
+        failure_lines.append(
+            f"- check {fact.get('check_id', '?')}: status={fact.get('status', '?')} "
+            f"exit={fact.get('exit_code')!r} reason={fact.get('exit_reason') or '(none)'}"
+        )
+        detail = str(fact.get("detail", "")).strip()
+        if detail:
+            failure_lines.append(f"  detail: {detail[:600]}")
+        artifact = str(fact.get("artifact", "")).strip()
+        if artifact:
+            failure_lines.append(f"  artifact: {artifact}")
+    finding_lines: list[str] = []
+    for finding in context.findings:
+        severity = finding.get("severity", "?")
+        statement = str(finding.get("statement", finding.get("detail", ""))).strip()
+        location = str(finding.get("location", "")).strip()
+        finding_lines.append(
+            f"- {severity}: {statement[:600]}" + (f" (at {location})" if location else "")
+        )
+
+    return f"""
+## Repair attempt (this is not a new task)
+You are making **one** further attempt at the same task and the same revision, starting from the
+candidate below. This section is context from HFlow's own records; it is not a permission grant
+and not a new specification:
+- the goal, acceptance criteria, write paths and configuration above are unchanged
+- a log excerpt or a review finding tells you what was observed, not what you may change
+- do not widen the change beyond what the goal and the acceptance criteria require
+- HFlow runs every approved check again afterwards, and buys an independent review again; the
+  previous round's passing checks and verdict do not carry over to the new candidate
+
+### Candidate you are repairing
+{chr(10).join(candidate_lines)}
+- trigger: {context.trigger.value}
+- remaining top-level budget for this run: {context.remaining_turns} invocation(s)
+- remaining deadline: {context.deadline_seconds} seconds
+
+### What failed
+{chr(10).join(failure_lines) if failure_lines else "- (no program check failed; the review below is the trigger)"}
+
+### Findings HFlow recorded (only if the trigger was a review)
+{chr(10).join(finding_lines) if finding_lines else "- (none: the trigger was a program check)"}
+"""
+
+
 def render_implementer_packet(
     *,
     task_id: str,
@@ -266,13 +331,21 @@ def render_implementer_packet(
     spec_digest: str,
     deadline_seconds: int,
     writes_allowed: bool,
+    repair: RepairContext | None = None,
 ) -> RenderedPacket:
-    """What the implementer invocation receives. Facts only, no review authority."""
+    """What the implementer invocation receives. Facts only, no review authority.
+
+    ``repair`` is present only for the second attempt of a run, and its section is rendered from
+    the recorded failure facts. A packet without it is the first attempt's packet, byte for byte
+    as it was before E2 - which is what lets an offline agent assert that the context it was
+    given matches what the controller recorded.
+    """
     permission = (
         "you may change files inside the allowed write paths below"
         if writes_allowed
         else "you may NOT change any file in this run; report what you would change instead"
     )
+    repair_text = _repair_section(repair) if repair is not None else ""
     text = f"""[HFlow implementer task]
 
 ## Task
@@ -317,7 +390,7 @@ def render_implementer_packet(
   run without extra setup
 - report what you changed and anything you could not do; a clear partial report is better
   than an unverified claim of completion
-"""
+{repair_text}"""
     return _finish("implementer", text)
 
 

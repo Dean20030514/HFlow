@@ -279,6 +279,85 @@ def assert_admissible(
         raise RefusedError(first.code, first.detail)
 
 
+def repair_policy_problems(
+    spec: TaskSpec, project: ProjectConfig
+) -> list[ValidationIssue]:
+    """Is this task shaped so that the repair policy it carries can be honoured at all?
+
+    Three facts decide that, and each is knowable from the spec and the contract alone - so they
+    are refused before a run row, a worktree, an authorization or a dispatch exists, rather than
+    half-way through a loop the run cannot finish. The policy itself has already been validated by
+    its own contract (``RepairPolicy``); what is checked here is whether the rest of this task is
+    shaped to carry one.
+
+    Deliberately *not* gated on ``production``: the controller honours ``spec.repair_policy``
+    whatever driver is bound, so an offline repair in place would write into the user's own
+    checkout exactly as a live one would. These are facts about the task, not about this machine.
+    """
+    issues: list[ValidationIssue] = []
+    if spec.repair_policy is None:
+        return issues
+
+    review_turns = 1 if spec.needs_review(project) else 0
+    worst_case = 2 * (1 + review_turns)
+
+    # A repair starts from the previous round's frozen candidate. Only an isolated Git worktree
+    # keeps one; an in-place run has no frozen candidate to start from and would have to repair
+    # the user's own checkout.
+    if spec.workspace.mode != "worktree":
+        issues.append(
+            ValidationIssue(
+                code=RefusalCode.SCOPE_VIOLATION,
+                detail=(
+                    "this task carries a repair_policy but workspace.mode="
+                    f"{spec.workspace.mode!r}. A repair starts from the frozen candidate of "
+                    "the previous round, which only an isolated Git worktree keeps: set "
+                    "workspace.mode='worktree' with a base commit, or drop repair_policy. "
+                    "Nothing was dispatched."
+                ),
+                location="workspace.mode",
+            )
+        )
+    # A repaired candidate must be verified and independently reviewed again, so a policy without
+    # a review has nothing that could accept the repair it buys.
+    if review_turns == 0:
+        issues.append(
+            ValidationIssue(
+                code=RefusalCode.NOT_IMPLEMENTED,
+                detail=(
+                    "this task carries a repair_policy but it will not be reviewed "
+                    f"(project.review_required={project.review_required}, task "
+                    f"review.required={spec.review.required}). A repaired candidate is "
+                    "verified and reviewed again from scratch before it can be accepted, so "
+                    "this build cannot support a repair policy without a review: require a "
+                    "review (project floor or review.required=true) or drop repair_policy. "
+                    "Nothing was dispatched."
+                ),
+                location="review.required",
+            )
+        )
+    # The run's own ceiling has to cover the whole worst-case loop: I1 (+R1) + I2 (+R2).
+    # Discovering a short ceiling after the first attempt means paying for work whose repair and
+    # review can never be bought.
+    if spec.budget.max_agent_turns < worst_case:
+        loop = "I1 + R1 + I2 + R2" if review_turns else "I1 + I2"
+        issues.append(
+            ValidationIssue(
+                code=RefusalCode.BUDGET_EXCEEDED,
+                detail=(
+                    f"this task carries a repair_policy but budget.max_agent_turns="
+                    f"{spec.budget.max_agent_turns} does not cover the worst-case repair loop "
+                    f"of {worst_case} top-level dispatch(es) ({loop}): the repair attempt and "
+                    "the review that must follow it are dispatches the first attempt cannot "
+                    f"know about. Raise budget.max_agent_turns to at least {worst_case}, or "
+                    "drop repair_policy. Nothing was dispatched."
+                ),
+                location="budget.max_agent_turns",
+            )
+        )
+    return issues
+
+
 def predictable_dispatch_problems(
     spec: TaskSpec,
     project: ProjectConfig,
@@ -305,13 +384,17 @@ def predictable_dispatch_problems(
     zero-model preflight does), whether the model will succeed, or how much authorization
     allowance is left - that depends on this run's history, and the controller checks it
     separately.
+
+    The repair-policy rules are reported for every run, offline included, because they are facts
+    about the task rather than about the machine; the rules below them are machine facts and are
+    reported only for a real delivery.
     """
+    issues: list[ValidationIssue] = list(repair_policy_problems(spec, project))
+
     if not production:
         # An offline run is not a delivery: the fake driver scripts its own change and its
-        # checks are fake by construction, so these rules would refuse every offline run.
-        return []
-
-    issues: list[ValidationIssue] = []
+        # checks are fake by construction, so the machine rules would refuse every offline run.
+        return issues
 
     # 1. A run that must change files needs a write permission that is actually on and a
     #    workspace that is not the user's own checkout. Writes off plus a non-empty write scope

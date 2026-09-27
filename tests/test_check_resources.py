@@ -34,6 +34,7 @@ from hflow.contracts import (
     AcceptanceCriterion,
     BudgetRequest,
     CheckDef,
+    CheckPhase,
     DeliveryRequirement,
     EvidenceStatus,
     ProjectConfig,
@@ -44,12 +45,13 @@ from hflow.contracts import (
     RunRequest,
     Scope,
     TaskSpec,
+    TaskState,
 )
 from hflow.controller import Controller
 from hflow.packet import render_reviewer_packet
 from hflow.drivers.fake import FakeDriver, FakeScript
 from hflow.store import Store
-from hflow.verify import CheckRunners, CommandCheckRunner, _detail_with_references
+from hflow.verify import CheckRunners, CommandCheckRunner, _detail_with_references, verify_candidate
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 CHECK_HELPER = FIXTURES / "check_helper.py"
@@ -691,3 +693,127 @@ def test_a_zero_limit_keeps_nothing_but_still_counts_and_digests(tmp_path: Path)
     assert capture.retained_bytes == 0
     assert capture.total_bytes == 11
     assert capture.truncated is True
+
+
+# --------------------------------------------------------------------------
+# 4. why a check ended reaches the stored evidence row (batch E2)
+# --------------------------------------------------------------------------
+
+
+def _seed_checking_run(
+    store: Store,
+    project: ProjectConfig,
+    spec: TaskSpec,
+    *,
+    run_id: str = "R-reason",
+    attempt_id: str = "A-reason",
+) -> str:
+    """A run in CHECKING with one live attempt: what verification records evidence against."""
+    run = store.create_run(
+        run_id=run_id,
+        project_id=project.project_id,
+        spec=spec,
+        spec_digest=spec.spec_digest(),
+        controller_build="reason-test",
+        checks_digest=project.checks_digest(),
+        turn_limit=4,
+        repair_limit=1,
+    )
+    store.claim_run(run["run_id"], "local-controller")
+    store.set_task_state(run["run_id"], [TaskState.DRAFT], TaskState.READY)
+    store.dispatch_attempt(
+        run_id=run["run_id"],
+        controller_id="local-controller",
+        attempt_id=attempt_id,
+        role="implementer",
+        reservation_id="B-reason",
+        reserved_turns=1,
+        reservation_expires_at="2999-01-01T00:00:00Z",
+    )
+    store.record_invocation(attempt_id, "I-reason")
+    store.advance_to_checking(run_id=run["run_id"], attempt_id=attempt_id, phase=CheckPhase.VERIFICATION)
+    return str(run["run_id"])
+
+
+def _reason_spec(check_ids: list[str]) -> TaskSpec:
+    return TaskSpec(
+        task_id="T-reason",
+        revision=1,
+        goal="record why each check ended",
+        acceptance=[
+            AcceptanceCriterion(id="AC-1", statement="the checks pass", check_ids=check_ids)
+        ],
+        scope=Scope(write_allow=["src/app.py"]),
+        reuse=ReuseDecision(
+            status=ReuseStatus.EXISTING_DECISION,
+            reference="project:python-stdlib-only",
+            reason="standard library only",
+        ),
+        review=ReviewRequirement(required=False),
+        delivery=DeliveryRequirement(mode="local_candidate"),
+        budget=BudgetRequest(max_agent_turns=4, max_repair_cycles=1),
+    )
+
+
+def test_the_reason_a_real_check_produced_is_stored_with_its_evidence(tmp_path: Path) -> None:
+    """The structured fact a repair is classified from: produced by the runner, stored as a column.
+
+    Two real child processes run here: one exits 0 and one exits 3. The stored rows must carry the
+    reason the runner actually produced (``completed`` / ``nonzero_exit``) - not a value re-derived
+    from the human-readable detail, which is also still there for a reader. A row whose reason came
+    from somewhere else would let a repair be decided on a fact nobody observed.
+    """
+    project_root = tmp_path / "workspace"
+    (project_root / "src").mkdir(parents=True)
+    artifact_dir = tmp_path / "artifacts"
+    project = ProjectConfig(
+        project_id="reason-records",
+        checks=[
+            CheckDef(
+                id="unit",
+                kind="command",
+                argv=[sys.executable, "-c", "print('ok')"],
+                timeout_seconds=60,
+            ),
+            CheckDef(
+                id="lint",
+                kind="command",
+                argv=[sys.executable, "-c", "raise SystemExit(3)"],
+                timeout_seconds=60,
+            ),
+        ],
+        write_deny=[".git/**", ".hflow/**"],
+        limits=ProjectLimits(max_agent_turns=4, max_repair_cycles=1),
+        review_required=False,
+    )
+    spec = _reason_spec(["unit", "lint"])
+    store = Store(tmp_path / "hflow.sqlite")
+    try:
+        run_id = _seed_checking_run(store, project, spec)
+        result = verify_candidate(
+            store=store,
+            spec=spec,
+            project=project,
+            project_root=project_root,
+            project_checks_digest=project.checks_digest(),
+            candidate_fingerprint="sha256:reason",
+            attempt_id="A-reason",
+            run_id=run_id,
+            runners=CheckRunners.offline_default(),
+            artifact_factory=lambda check_id, evidence_id: artifact_dir / check_id / evidence_id,
+        )
+        rows = {row["check_id"]: dict(row) for row in store.evidence_for(run_id, "verification")}
+        records = {record.check_id: record for record in store.evidence_records_for(run_id)}
+    finally:
+        store.close()
+
+    assert result.status == "failed", result.detail
+    assert rows["unit"]["exit_reason"] == "completed"
+    assert rows["lint"]["exit_reason"] == "nonzero_exit"
+    assert rows["lint"]["exit_code"] == 3, "the exit code is recorded as it was, not inferred"
+    # The stored column and the detail a packet reader parses say the same thing.
+    assert "reason=nonzero_exit" in rows["lint"]["detail"]
+    assert "reason=completed" in rows["unit"]["detail"]
+    assert records["lint"].exit_reason == "nonzero_exit"
+    assert records["unit"].exit_reason == "completed"
+

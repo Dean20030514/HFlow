@@ -27,6 +27,7 @@ from .authorization import AuthorizationRecord
 from .contracts import (
     AttemptState,
     CancellationReceipt,
+    CandidateIdentity,
     CandidateSnapshot,
     CheckPhase,
     DeliveryState,
@@ -44,6 +45,11 @@ from .contracts import (
     RefusalCode,
     RefusedError,
     ReconcileOutcome,
+    RepairContext,
+    RepairDecision,
+    RepairPolicy,
+    RepairRecord,
+    RepairTrigger,
     ResultReceipt,
     ReviewResult,
     RootBudgetBinding,
@@ -81,7 +87,7 @@ from .drivers.acpx_dsh import ENV_ALLOW_WRITES
 from .drivers.fake import ProcessGuard
 from .gitworkspace import IGNORED_ARTIFACT_ALLOWLIST, CandidateFreeze, GitError, GitRepo, GitStatusParseError
 from .store import RunNotFound, Store, StoreError
-from .verify import CheckRunners, verify_candidate
+from .verify import CLEAN_EXIT_REASONS, CheckRunners, failed_check_facts, verify_candidate
 from .workspace import candidate_fingerprint, changed_paths, manifest, paths_outside_scope
 
 #: How long a reservation may stay open before it is considered abandoned.
@@ -204,10 +210,10 @@ NOTE_LATE_RESULT = "late_result"
 #: transaction left them. Written after the commit, so it describes a reservation that exists
 #: rather than one that was attempted.
 NOTE_DISPATCH = "dispatch"
-#: One reserved dispatch (batch E1): its role, root, round, repair flag and start state as the
-#: transaction left them. Written after the commit, so it describes a reservation that exists
-#: rather than one that was attempted.
-NOTE_DISPATCH = "dispatch"
+#: One repair decision (batch E2) - allowed or refused, with its reason. Recorded as a structured
+#: record *and* as a note, so an operator grepping a run finds the decision where they look while
+#: `status`/`report` can still print it as a decision rather than a log line.
+NOTE_REPAIR = "repair"
 
 
 class RunOutcome:
@@ -893,13 +899,20 @@ class Controller:
         return directory
 
     def _loop_turns_required(self, spec: TaskSpec, project: ProjectConfig) -> int:
-        """How many top-level invocations the fixed loop needs: implementer (+ reviewer).
+        """How many top-level invocations this run may need, worst case.
 
-        This is the *whole* remaining loop for a fresh dispatch, not what happens to be left in
-        the run's budget. It is deliberately not a promise about the model's behaviour, only
-        about how many invocations this build will start for one accepted delivery.
+        Without a repair policy it is the fixed loop: implementer (+ reviewer). With one, the
+        worst case is the plan's four - I1 + R1 + I2 + R2 - because a repair can follow a reviewer
+        rejection, and that is the number the root, the run and the authorization all have to
+        cover before the first dispatch. An attempt that is never needed simply is not bought:
+        this is a ceiling, not a quota.
         """
-        return 2 if spec.needs_review(project) else 1
+        review_turns = 1 if spec.needs_review(project) else 0
+        if spec.repair_policy is None:
+            return 1 + review_turns
+        # I1 + (R1) + I2 + (R2): the repair attempt and the review that must follow it are the
+        # ones the first attempt cannot know about, so they are priced up front.
+        return 2 * (1 + review_turns)
 
     def _assert_allowance_for(
         self, run_id: str, spec: TaskSpec, project: ProjectConfig
@@ -986,6 +999,7 @@ class Controller:
         workspace: str,
         deadline_seconds: int,
         writes_allowed: bool,
+        repair: RepairContext | None = None,
     ) -> PreparedPacket:
         """Render the implementer packet for this run, or refuse before anything is claimed.
 
@@ -994,6 +1008,11 @@ class Controller:
         anything other than the permission the dispatch will carry would tell the worker
         something the transport does not honour - and ``prepare`` reports the same packet, so
         the preview and the dispatch have to agree byte for byte.
+
+        ``repair`` is present only for the second attempt of a run. Its section is rendered from
+        the context the repair decision recorded, so the facts an agent is handed and the facts an
+        operator reads are the same facts. An oversized packet is refused here, before the
+        dispatch transaction, so a repair that cannot be described costs nothing.
         """
         try:
             packet = self.render(render_implementer_packet)(
@@ -1006,12 +1025,13 @@ class Controller:
                 spec_digest=spec.spec_digest(),
                 deadline_seconds=deadline_seconds,
                 writes_allowed=writes_allowed,
+                repair=repair,
             )
         except PacketTooLargeError as exc:
             raise RefusedError(
                 RefusalCode.INVALID_SPEC,
-                f"the implementer input packet for this run does not fit, so nothing was "
-                f"dispatched and no allowance was consumed: {exc}",
+                f"the {'repair ' if repair is not None else ''}implementer input packet for this "
+                f"run does not fit, so nothing was dispatched and no allowance was consumed: {exc}",
             ) from exc
         return PreparedPacket(run_id=run_id, packet=packet)
 
@@ -1065,6 +1085,7 @@ class Controller:
         purpose: str,
         spec: TaskSpec,
         project: ProjectConfig,
+        is_repair: bool,
     ) -> DispatchReservation:
         """The one dispatch transaction, for both roles.
 
@@ -1075,13 +1096,13 @@ class Controller:
         built and no process is created.
 
         ``required_loop_remaining`` is what the root must still be able to afford: this dispatch
-        plus every further top-level dispatch this run needs for one accepted delivery. Passing
-        only "one more" is how a revision with an implementer's worth of allowance but no
-        reviewer's worth got admitted and then blocked with the implementation paid for.
+        plus every further top-level dispatch this run may need. With a repair policy enabled the
+        worst case is four (I1 + R1 + I2 + R2), priced from the first attempt, so a run that could
+        only ever afford half a loop is refused before anything is bought - which is the gate the
+        plan asks for, not a step discovered after the implementer has been paid.
 
-        A replay of the same ``invocation_id`` returns ``is_new=False``. The caller must then only
-        coordinate: starting the driver again would be the second dispatch this ordering exists
-        to prevent.
+        ``is_repair`` travels with the reservation so the ledger charges the root's repair counter
+        for this dispatch rather than inferring it from a count taken elsewhere.
         """
         expires_at = (
             parse_ts(utc_now()) + timedelta(seconds=self.reservation_ttl_seconds)
@@ -1109,6 +1130,7 @@ class Controller:
                     else None
                 ),
                 required_loop_remaining=needed,
+                is_repair=is_repair,
             )
         except StoreError as exc:
             raise RefusedError(self._dispatch_refusal_code(str(exc)), str(exc)) from exc
@@ -1311,18 +1333,25 @@ class Controller:
         *,
         implementer_packet: PreparedPacket | None = None,
     ) -> RunOutcome:
+        """Drive this run: at most two implementer attempts, then a verdict.
+
+        Setup happens once - the workspace, the permissions, the budget gate that covers the worst
+        case - and the per-attempt work lives in :meth:`_attempt_cycle`. The loop is bounded by the
+        plan's rule that a run buys **one** repair, and every way it can refuse to spend that
+        second attempt is recorded as a decision rather than disappearing into a log line.
+
+        Setup and cycle are split deliberately: a repair must not re-create the worktree, re-claim
+        the run or re-run the admission gates, and a second cycle must never be reachable from an
+        exception path.
+        """
         spec = request.task
         project = request.project
         project_root = Path(request.project_root)
-        attempt_id = new_attempt_id()
-        invocation_id = new_invocation_id()
-        reservation_id = new_reservation_id()
+        policy = self._repair_policy(spec, project)
 
         # --- workspace preparation (M2): an isolated worktree, or the project in place
-        # The repository and the base commit were validated before the run row existed (see
-        # ``_worktree_path``), so what remains here is the one step that cannot be predicted:
-        # actually creating the worktree. If it fails, the run blocks with no dispatch - the
-        # allowance was not claimed and no budget was reserved yet.
+        # Created once for the run, before the first dispatch: a repair reuses this worktree
+        # rather than making a second one, and nothing here is repeated per attempt.
         repo: GitRepo | None = None
         worktree: Path | None = None
         user_tree_before = ""
@@ -1371,6 +1400,561 @@ class Controller:
                 "implicitly",
             )
 
+        # The original Base is fixed before the first dispatch and never changes: it is what the
+        # final delivery diff is taken against, and what tells the repair round where it started.
+        original_base_commit = spec.workspace.base_commit or (
+            repo.resolve_commit("HEAD") if repo is not None else ""
+        )
+        original_base_ref = f"base:{spec.task_id}:{spec.revision}"
+
+        previous: CandidateIdentity | None = None
+        trigger: RepairTrigger | None = None
+        repair_context: RepairContext | None = None
+        round_number = 1
+        while True:
+            cycle = self._attempt_cycle(
+                run_id,
+                request,
+                repo=repo,
+                worktree=worktree,
+                execution_root=execution_root,
+                user_tree_before=user_tree_before,
+                dirty_target=dirty_target,
+                implementer_writes=implementer_writes,
+                implementer_packet=implementer_packet,
+                previous=previous,
+                trigger=trigger,
+                round_number=round_number,
+                original_base_commit=original_base_commit,
+                original_base_ref=original_base_ref,
+                policy=policy,
+                repair_context=repair_context,
+            )
+            if cycle.repair is None:
+                if cycle.outcome is None:  # pragma: no cover - the cycle always returns one
+                    raise RefusedError(
+                        RefusalCode.INTERNAL_ERROR,
+                        "the attempt cycle returned neither an outcome nor a repair context",
+                    )
+                return cycle.outcome
+            if round_number > 1:
+                # A second repair is not a thing this build does. The cycle only asks for a repair
+                # when it is allowed one, so this is a guard against the loop, not a policy.
+                return self._blocked(
+                    run_id,
+                    RefusalCode.BUDGET_EXHAUSTED,
+                    "the run already used its single repair; there is no second one",
+                )
+            previous = cycle.identity
+            trigger = cycle.repair.trigger
+            repair_context = cycle.repair
+            round_number += 1
+            self.store.record_note(
+                run_id,
+                f"{NOTE_REPAIR}: round {round_number} begins after "
+                f"{trigger.value if trigger else 'unknown'} (policy digest "
+                f"{policy.digest() if policy is not None else '(none)'})",
+            )
+
+
+    def _repair_policy(self, spec: TaskSpec, project: ProjectConfig) -> RepairPolicy | None:
+        """This task's explicit repair policy, or ``None`` for the ordinary single loop.
+
+        Deliberately reads only the spec. ``budget.max_repair_cycles`` is *not* consulted: it kept
+        its historical default of 1 for every task that predates E2, and treating that number as
+        consent would repair on behalf of users who never asked for one.
+
+        ``project`` is unused today and stays in the signature because the support rules that will
+        use it (worktree mode, required review) live in ``admission.predictable_dispatch_problems``
+        and are checked before a run row exists; this method answers the narrower question "did
+        this task ask for a repair at all?".
+        """
+        return spec.repair_policy
+
+    def _repairable_failure(
+        self,
+        *,
+        run_id: str,
+        policy: RepairPolicy | None,
+        round_number: int,
+        original_base_commit: str,
+        original_base_ref: str,
+        previous: CandidateIdentity | None,
+        identity: CandidateIdentity,
+        trigger_candidate: RepairTrigger,
+        failure_facts: list[dict[str, Any]],
+        findings: list[dict[str, Any]],
+        detail: str,
+    ) -> _CycleResult:
+        """Decide whether this failure may buy the run's single repair, and record the answer.
+
+        The decision is a **record**, not a conclusion: an operator has to be able to see that the
+        run did not repair because the failing check was an environment error rather than a
+        business assertion. Every refusal path below writes one row and then blocks the run; only
+        the allowed path returns a repair context.
+
+        What may trigger a repair, in full:
+
+        * a check that is in the policy, whose exit code is one the policy declares, and whose
+          structured ``exit_reason`` says the check ran to completion with a trustworthy capture;
+        * a ``changes_requested`` verdict on *this* candidate with at least one usable finding.
+
+        Everything else - an ERROR anywhere in the mix, a timeout, leftover descendants, a
+        capture failure, an undeclared exit code, a legacy evidence row with no reason, an empty
+        rejection, a cancellation, an unknown outcome - stops here without spending anything.
+        """
+
+        def refuse(decision: RepairDecision, reason: str) -> _CycleResult:
+            record = RepairRecord(
+                decision=decision,
+                trigger=trigger_candidate,
+                reason=reason,
+                policy_digest=policy.digest() if policy is not None else "",
+                failed_checks=[str(fact.get("check_id", "")) for fact in failure_facts],
+                exit_codes={
+                    str(fact.get("check_id", "")): fact.get("exit_code") for fact in failure_facts
+                },
+                round=round_number,
+                decided_at=utc_now(),
+            )
+            self._record_repair_decision(run_id, record)
+            # The block reason leads with what the failure *was*, then says why no repair was
+            # bought. An operator reading it needs both: the check's own message ("cannot
+            # execute", "acceptance is not met") is the diagnosis, and the decision is the policy
+            # outcome. Reporting only the second would hide the first.
+            if trigger_candidate is RepairTrigger.REVIEW_CHANGES_REQUESTED:
+                code = RefusalCode.REVIEW_REJECTED
+                headline = f"independent review requested changes: {detail}"
+            else:
+                code = RefusalCode.VERIFICATION_FAILED
+                headline = f"the process exited successfully but acceptance is not met: {detail}"
+            return _CycleResult(outcome=self._blocked(run_id, code, f"{headline}. {reason}"))
+
+        if policy is None:
+            return refuse(
+                RepairDecision.NOT_ENABLED,
+                "this task carries no repair policy, so the failure ends the run: a second "
+                "implementer attempt is something a task has to ask for explicitly",
+            )
+        if self._stop_recorded(run_id):
+            return refuse(
+                RepairDecision.STOP_REQUESTED,
+                "a cancellation was recorded, so no repair was bought and nothing was "
+                "re-dispatched",
+            )
+        if round_number > 1:
+            return refuse(
+                RepairDecision.ALREADY_REPAIRED,
+                "this run already used its single repair; a second one is not something this "
+                "build dispatches",
+            )
+        # The deadline is checked here as well as in the dispatch transaction: a repair that
+        # cannot finish inside the root's clock would buy an attempt only to abandon it.
+        deadline_state = self._root_deadline_state()
+        if deadline_state is not None:
+            return refuse(RepairDecision.DEADLINE_REACHED, deadline_state)
+
+        if trigger_candidate is RepairTrigger.BUSINESS_CHECK_FAILED:
+            allowed, reason = self._business_failure_allows(policy, failure_facts)
+            if not allowed:
+                return refuse(RepairDecision.NOT_A_BUSINESS_FAILURE, reason)
+            context_findings: list[dict[str, Any]] = []
+        else:
+            if not policy.allow_reviewer_changes:
+                return refuse(
+                    RepairDecision.NOT_A_BUSINESS_FAILURE,
+                    "the reviewer requested changes, but this task's repair policy does not allow "
+                    "a reviewer rejection to buy a second attempt",
+                )
+            if not findings:
+                return refuse(
+                    RepairDecision.NO_FINDINGS,
+                    "the reviewer requested changes without a usable finding, so there is nothing "
+                    "to act on: an empty rejection cannot say what to change, and guessing would "
+                    "spend an attempt on a target nobody named",
+                )
+            context_findings = findings
+
+        record = RepairRecord(
+            decision=RepairDecision.ALLOWED,
+            trigger=trigger_candidate,
+            reason=f"one repair allowed: {detail}",
+            policy_digest=policy.digest(),
+            failed_checks=[str(fact.get("check_id", "")) for fact in failure_facts],
+            exit_codes={
+                str(fact.get("check_id", "")): fact.get("exit_code") for fact in failure_facts
+            },
+            round=round_number,
+            decided_at=utc_now(),
+        )
+        self._record_repair_decision(run_id, record)
+        context = RepairContext(
+            original_base_commit=original_base_commit,
+            # The task's own base reference, threaded through so the reference a repair round is
+            # told about is the one the delivery is actually taken against. A second, differently
+            # shaped reference here would be a string that merely looks authoritative.
+            original_base_ref=original_base_ref,
+            previous=identity,
+            trigger=trigger_candidate,
+            failed_checks=failure_facts,
+            findings=context_findings,
+            remaining_turns=self._remaining_loop_turns(run_id),
+            # A repair is only ever decided inside a live run, and the root's clock starts at its
+            # first reservation - so by here a deadline exists. The fallback keeps the field an int
+            # for the packet rather than sending a repair an unmeasurable deadline.
+            deadline_seconds=self._remaining_deadline_seconds() or 0,
+            detail=detail,
+        )
+        return _CycleResult(repair=context, identity=identity)
+
+    def _business_failure_allows(
+        self, policy: RepairPolicy, failure_facts: list[dict[str, Any]]
+    ) -> tuple[bool, str]:
+        """Is *every* failure under this policy a clean, declared business assertion failure?
+
+        ``every`` is the whole point: one ERROR among three failed checks means the run does not
+        know what it is looking at, and repairing on the strength of the other two would spend an
+        attempt on a diagnosis that is not established.
+        """
+        if not failure_facts:
+            return False, (
+                "the checks did not pass but no failed check was recorded for this candidate, so "
+                "there is nothing to repair against"
+            )
+        for fact in failure_facts:
+            check_id = str(fact.get("check_id", ""))
+            status = str(fact.get("status", ""))
+            exit_code = fact.get("exit_code")
+            reason = str(fact.get("exit_reason", ""))
+            if status != EvidenceStatus.FAILED.value:
+                return False, (
+                    f"check {check_id!r} ended as {status!r}, not as a failure: an error, a "
+                    "timeout or an unsettled process is not a business assertion failing, and "
+                    "this run does not repair an environment problem"
+                )
+            if reason not in CLEAN_EXIT_REASONS:
+                return False, (
+                    f"check {check_id!r} has execution reason {reason or '(none recorded)'}, which "
+                    "does not establish that the check ran to completion with a trustworthy "
+                    "capture; without that, no repair is bought"
+                )
+            if not policy.business_failure_for(check_id, exit_code if isinstance(exit_code, int) else None):
+                declared = policy.check_exit_codes.get(check_id)
+                return False, (
+                    f"check {check_id!r} exited {exit_code!r}, which this task's repair policy "
+                    f"does not declare as a business failure (declared: {declared or 'nothing'}). "
+                    "An undeclared exit code is not a diagnosis"
+                )
+        summary = ", ".join(
+            f"{fact.get('check_id')} exit={fact.get('exit_code')}" for fact in failure_facts
+        )
+        return True, f"every failing check is a declared business failure under the policy ({summary})"
+
+    def _root_deadline_state(self) -> str | None:
+        """A human-readable reason when the root's clock has run out, else ``None``.
+
+        Read from the ledger rather than from a local timer: the deadline belongs to the root and
+        survives a restart, so a resumed controller reaches the same answer.
+        """
+        if self.root_binding is None:
+            return None
+        view = self.store.root_budget_view(self.root_binding.root_id)
+        if view is None or not view.deadline_at:
+            return None
+        if parse_ts(view.deadline_at) <= parse_ts(utc_now()):
+            return (
+                f"the root's deadline ({view.deadline_at}) has passed, so no repair is bought and "
+                "no further work is dispatched for it"
+            )
+        return None
+
+    def _capped_deadline(self, configured_seconds: int) -> int:
+        """A role's deadline: its configured value, or what is left of the root, whichever is less.
+
+        A role asked to work for longer than the root has left is being asked to work past a
+        deadline the run already recorded. Capping here is what makes the root's clock a bound on
+        the work rather than a note beside it - and it is why the reviewer's default of 900 seconds
+        is a ceiling, not a promise.
+        """
+        if self.root_binding is None:
+            return int(configured_seconds)
+        remaining = self._remaining_deadline_seconds()
+        if remaining is None:
+            # No clock has started yet. The configured value is the best honest answer, and the
+            # root's own deadline is fixed at its first reservation, before any process launches.
+            return int(configured_seconds)
+        return max(0, min(int(configured_seconds), remaining))
+
+    def _remaining_deadline_seconds(self) -> int | None:
+        """Seconds left on the root's clock, or ``None`` when no clock has started.
+
+        ``None`` and ``0`` are different facts and must not be collapsed: the deadline is recorded
+        when the root's first dispatch is reserved, so before that there is no clock to measure
+        against - the run has whatever its limits allow. Reporting that as ``0`` would tell every
+        check "no time left" and refuse work that has not started, which is the opposite of what a
+        not-yet-measured deadline means.
+        """
+        if self.root_binding is None:
+            return None
+        view = self.store.root_budget_view(self.root_binding.root_id)
+        if view is None or not view.deadline_at:
+            return None
+        remaining = (parse_ts(view.deadline_at) - parse_ts(utc_now())).total_seconds()
+        return max(0, int(remaining))
+
+    def _remaining_loop_turns(self, run_id: str) -> int:
+        """How many top-level dispatches this run may still make, from its own ceiling."""
+        row = self.store.get_run(run_id)
+        return max(0, int(row["turn_limit"]) - int(row["turns_reserved"]))
+
+    def _record_repair_decision(self, run_id: str, record: RepairRecord) -> None:
+        """Persist one repair decision and echo it into the run's notes.
+
+        Both, on purpose: the structured row is what `status`/`report` renders and what a later
+        reader can act on, and the note is what an operator grepping a run finds in place. A
+        failure to store the structured row is reported rather than swallowed, because a decision
+        nobody recorded is the state this method exists to prevent.
+        """
+        try:
+            self.store.record_repair_record(run_id, record)
+        except StoreError as exc:  # pragma: no cover - a store failure must not hide the decision
+            self.store.record_note(
+                run_id,
+                f"{NOTE_REPAIR}: the decision could not be stored structurally ({exc}); it is "
+                "recorded only in this note",
+            )
+        self.store.record_note(
+            run_id,
+            f"{NOTE_REPAIR}: decision={record.decision.value} "
+            f"trigger={record.trigger.value if record.trigger else '(none)'} "
+            f"round={record.round} checks={','.join(record.failed_checks) or '-'} "
+            f"reason={record.reason[:400]}",
+        )
+
+    def _review_findings(
+        self, run_id: str, attempt_id: str, candidate_fp: str
+    ) -> list[dict[str, Any]]:
+        """The reviewer's findings for *this* candidate, if it left any usable ones.
+
+        Read from the recorded review evidence rather than from the verdict object, so the facts a
+        repair acts on are the facts on disk. Two filters, both load-bearing:
+
+        * the **candidate and attempt** must match, which is what stops a previous round's
+          rejection from being replayed as a reason to repair the current one;
+        * the verdict recorded in that row must be ``changes_requested``, which is read from the
+          row's own payload rather than inferred from its status - a review evidence row is
+          recorded as failed for a rejection and for a wire failure alike, and only the former is
+          a finding a repair may act on.
+
+        An empty or unusable payload returns nothing, so the caller refuses rather than guessing
+        what the reviewer meant.
+        """
+        for row in self.store.evidence_for(run_id, kind="review"):
+            if row["attempt_id"] != attempt_id or row["candidate_fingerprint"] != candidate_fp:
+                continue
+            try:
+                payload = json.loads(row["detail"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("verdict") != "changes_requested":
+                # A wire failure is recorded as failed review evidence too, and it is not a
+                # rejection with findings: only a real verdict may buy a repair.
+                continue
+            findings = payload.get("findings")
+            if isinstance(findings, list) and findings:
+                return [item for item in findings if isinstance(item, dict)]
+        return []
+
+    def _reconcile_repair_workspace(
+        self, *, repo: GitRepo, worktree: Path, previous: CandidateIdentity | None
+    ) -> str | None:
+        """Confirm the worktree is the one the repair is supposed to start from.
+
+        The repair runs in the *same* isolated worktree as the first attempt, which is only safe
+        if that worktree is still exactly at the previous candidate. A drifted or dirty tree means
+        the bytes a repair would edit are not the bytes that were checked, so it is refused
+        instead: nothing is reset, nothing is overwritten, and the user's checkout is never
+        touched.
+
+        Returns a refusal reason, or ``None`` when the tree is the expected one.
+        """
+        if previous is None:
+            return None
+        if not previous.git_commit:
+            return (
+                "the previous candidate has no recorded commit, so a repair cannot establish the "
+                "tree it would be starting from"
+            )
+        try:
+            head = repo.worktree_commit(worktree)
+            tree = repo.worktree_tree(worktree)
+        except GitError as exc:
+            return f"the worktree's identity could not be read: {exc}"
+        if head != previous.git_commit:
+            return (
+                f"the worktree is at {head}, not at the previous candidate "
+                f"{previous.git_commit}: a repair would start from bytes that were never checked"
+            )
+        if previous.git_tree and tree != previous.git_tree:
+            return (
+                f"the worktree's tree is {tree}, not the checked candidate tree "
+                f"{previous.git_tree}"
+            )
+        try:
+            report = repo.status_report(worktree)
+        except GitError as exc:
+            return f"the worktree's status could not be read: {exc}"
+        blocking = report.blocking_changes
+        if blocking:
+            return (
+                "the worktree changed after the candidate was frozen ("
+                + ", ".join(blocking[:5])
+                + "); a repair is refused rather than resetting or overwriting it"
+            )
+        return None
+
+    # -- steps ---------------------------------------------------------------
+
+
+
+
+    def _attempt_cycle(
+        self,
+        run_id: str,
+        request: RunRequest,
+        *,
+        repo: GitRepo | None,
+        worktree: Path | None,
+        execution_root: Path,
+        user_tree_before: str,
+        dirty_target: bool,
+        implementer_writes: bool,
+        implementer_packet: PreparedPacket | None,
+        previous: CandidateIdentity | None,
+        trigger: RepairTrigger | None,
+        round_number: int,
+        original_base_commit: str,
+        original_base_ref: str,
+        policy: RepairPolicy | None,
+        repair_context: RepairContext | None = None,
+    ) -> _CycleResult:
+        """One implementer attempt: dispatch, launch, freeze, check, review, decide.
+
+        The parameter list is long on purpose: everything this cycle must *not* re-derive from
+        ambient state (the worktree, the original base, which round it is) is passed in, so a
+        repair round cannot quietly behave like a first round.
+        """
+
+        spec = request.task
+        project = request.project
+        project_root = Path(request.project_root)
+        reservation_id = new_reservation_id()
+        attempt_id = new_attempt_id()
+        invocation_id = new_invocation_id()
+
+        # The workspace, the run's state and the permissions were established once in
+        # ``_drive`` before this cycle was entered. Repeating any of it here would create
+        # a second worktree for a repair and re-record facts that are already the run's.
+
+        # --- a repair round reopens the run for its single new attempt --------------------
+        # Before anything is bought, the worktree must still be exactly the candidate that was
+        # checked. A drifted or dirty tree means the bytes a repair would edit are not the bytes
+        # that were verified, so it is refused rather than reset or overwritten - and this is
+        # checked *before* the dispatch, so a refusal costs nothing.
+        if previous is not None:
+            if repo is not None and worktree is not None:
+                refusal = self._reconcile_repair_workspace(
+                    repo=repo, worktree=worktree, previous=previous
+                )
+                if refusal is not None:
+                    self._record_repair_decision(
+                        run_id,
+                        RepairRecord(
+                            decision=RepairDecision.NO_CONTENT_CHANGE,
+                            trigger=trigger,
+                            reason=refusal,
+                            policy_digest=policy.digest() if policy is not None else "",
+                            round=round_number,
+                            decided_at=utc_now(),
+                        ),
+                    )
+                    return _CycleResult(
+                        outcome=self._blocked(run_id, RefusalCode.SCOPE_VIOLATION, refusal)
+                    )
+            # The run's phase still says "verification", which is correct for the round that just
+            # ended: an implementer must not be reserved behind a finished candidate. Reopening is
+            # its own recorded transition, in one transaction, and it refuses to revive a run that
+            # a stop or a terminal decision already ended - a repair is a decision taken *inside* a
+            # live run, never a way back into a finished one.
+            try:
+                self.store.reopen_for_repair(run_id, self.controller_id)
+            except StoreError as exc:
+                self._record_repair_decision(
+                    run_id,
+                    RepairRecord(
+                        decision=RepairDecision.STOP_REQUESTED,
+                        trigger=trigger,
+                        reason=str(exc),
+                        policy_digest=policy.digest() if policy is not None else "",
+                        round=round_number,
+                        decided_at=utc_now(),
+                    ),
+                )
+                return _CycleResult(outcome=self._blocked(run_id, RefusalCode.BUDGET_EXHAUSTED, str(exc)))
+
+        # The structured input of a repair attempt: the context the decision that allowed it
+        # recorded. ``None`` for a first attempt, which is why the first attempt's packet is
+        # byte-identical to what it was before E2 - and why an offline agent can tell the two
+        # rounds apart from the packet it actually received.
+        repair = repair_context
+        if previous is not None and repair is None:
+            # A repair round without the context it was allowed on is not a repair: it is an agent
+            # being asked to change a candidate it cannot see, on evidence nobody handed it. The
+            # refusal is before the dispatch transaction, so it costs nothing.
+            return _CycleResult(
+                outcome=self._blocked(
+                    run_id,
+                    RefusalCode.INTERNAL_ERROR,
+                    "a repair round was reached without the recorded repair context, so the "
+                    "attempt was refused before any dispatch instead of being sent an input that "
+                    "does not say what to repair",
+                )
+            )
+
+        # --- the packet is rendered and bounded *before* anything is bought ----------------
+        # The real input is rendered here, not after the reservation, because the packet's size is
+        # a fact about this attempt: a repair packet carries the failure facts and the previous
+        # candidate, so it can be the first packet that does not fit. Discovering that after the
+        # dispatch transaction would charge the root's submission for an attempt that never
+        # started - and the resulting refusal would have to claim nothing had been consumed while
+        # the ledger said otherwise. Rendering first makes an oversized packet an ordinary
+        # pre-dispatch refusal: no allowance moves, and the run blocks instead of raising.
+        #
+        # A packet prepared before admission (``run_task``) is reused only when the workspace it
+        # names is the workspace this run actually got *and* this is a first attempt. A repair
+        # must never reuse it: the packet has to carry the repair context, and the checked packet
+        # was rendered before any failure existed.
+        if (
+            implementer_packet is not None
+            and implementer_packet.workspace == str(execution_root)
+            and repair is None
+        ):
+            prepared = implementer_packet
+        else:
+            try:
+                prepared = self._render_implementer_packet(
+                    run_id=run_id,
+                    spec=spec,
+                    workspace=str(execution_root),
+                    deadline_seconds=self._capped_deadline(request.deadline_seconds),
+                    writes_allowed=implementer_writes,
+                    repair=repair,
+                )
+            except RefusedError as exc:
+                return _CycleResult(outcome=self._refuse(run_id, exc.code, str(exc)))
+
         # --- the one dispatch transaction: the authorization's submission, the run's turn,
         # the root's consumption and the invocation record all commit together. Every
         # predictable refusal happens before this (admission checks, the packet, the allowance
@@ -1383,12 +1967,13 @@ class Controller:
                 invocation_id=invocation_id,
                 reservation_id=reservation_id,
                 role="implementer",
-                purpose="implementer invocation",
+                purpose="repair invocation" if previous is not None else "implementer invocation",
                 spec=spec,
                 project=project,
+                is_repair=previous is not None,
             )
         except RefusedError as exc:
-            return self._refuse(run_id, exc.code, str(exc))
+            return _CycleResult(outcome=self._refuse(run_id, exc.code, str(exc)))
         attempt_id = dispatch.attempt_id
         invocation_id = (
             dispatch.invocation.invocation_id if dispatch.invocation else invocation_id
@@ -1406,22 +1991,6 @@ class Controller:
         # Recorded before the worker runs: what the workspace looked like, so a change outside
         # the declared scope is detected afterwards from two manifests rather than assumed.
         pre_manifest = manifest(execution_root)
-        # The role input packet is rendered from recorded facts and travels as one string. The
-        # driver transports it verbatim; it never rebuilds the task text.
-        #
-        # A packet prepared before admission (``run_task``) is reused only when the workspace it
-        # names is the workspace this run actually got. Any other path means the checked packet
-        # is not the packet that would be sent, so it is rendered again here and must fit.
-        if implementer_packet is not None and implementer_packet.workspace == str(execution_root):
-            prepared = implementer_packet
-        else:
-            prepared = self._render_implementer_packet(
-                run_id=run_id,
-                spec=spec,
-                workspace=str(execution_root),
-                deadline_seconds=request.deadline_seconds,
-                writes_allowed=implementer_writes,
-            )
         self.store.record_note(
             run_id,
             f"{NOTE_PACKET}: role=implementer bytes={prepared.packet.byte_length} "
@@ -1439,7 +2008,7 @@ class Controller:
             write_allow=list(spec.scope.write_allow),
             write_deny=list(spec.scope.write_deny),
             workspace=str(execution_root),
-            deadline_seconds=request.deadline_seconds,
+            deadline_seconds=self._capped_deadline(request.deadline_seconds),
             spec_digest=spec.spec_digest(),
             packet=prepared.packet.text,
             writes_allowed=implementer_writes,
@@ -1463,10 +2032,16 @@ class Controller:
             result = self.driver.start(invocation)
         except RefusedError as exc:
             self._mark_invocation_not_started(dispatch, f"refused before launch: {exc}")
-            return self._block_attempt(run_id, attempt_id, exc.code, str(exc))
+            return _CycleResult(
+                outcome=self._block_attempt(run_id, attempt_id, exc.code, str(exc))
+            )
         except Exception as exc:  # noqa: BLE001 - controller must not hot-fix a driver
             self._mark_driver_failure(dispatch, exc)
-            return self._block_attempt(run_id, attempt_id, RefusalCode.INTERNAL_ERROR, repr(exc))
+            return _CycleResult(
+                outcome=self._block_attempt(
+                    run_id, attempt_id, RefusalCode.INTERNAL_ERROR, repr(exc)
+                )
+            )
         else:
             self._confirm_driver_ran(dispatch, result)
 
@@ -1482,7 +2057,7 @@ class Controller:
                 reason="the worker's result is unknown; no re-dispatch until an operator reconciles "
                 "(plan 9.3)",
             )
-            return self._outcome_for(run_id)
+            return _CycleResult(outcome=self._outcome_for(run_id))
 
         if result.agent_turns is not None:
             self.store.set_turns_observed(run_id, result.agent_turns)
@@ -1506,11 +2081,13 @@ class Controller:
                 result=result.model_dump(mode="json"),
                 block_code=RefusalCode.INTERNAL_ERROR,
             )
-            return self._blocked(
-                run_id,
-                RefusalCode.INTERNAL_ERROR,
-                "the invocation's prompt digest does not match the rendered input packet, so the "
-                "result cannot be attributed to this task",
+            return _CycleResult(
+                outcome=self._blocked(
+                    run_id,
+                    RefusalCode.INTERNAL_ERROR,
+                    "the invocation's prompt digest does not match the rendered input packet, so "
+                    "the result cannot be attributed to this task",
+                )
             )
 
         if result.outcome is not InvocationOutcome.COMPLETED:
@@ -1528,7 +2105,7 @@ class Controller:
                 f"{result.error_message or 'no detail'}",
             )
             # Applied or already finalized by a stop: the run's own recorded state is the answer.
-            return self._outcome_for(run_id)
+            return _CycleResult(outcome=self._outcome_for(run_id))
 
         self._settle_invocation(dispatch, result.outcome, "implementer invocation completed")
         if not self._apply_result_or_stay_stopped(
@@ -1541,7 +2118,7 @@ class Controller:
             # The run was stopped while this invocation was running. Its result is recorded on
             # the attempt row and the run keeps the decision the operator made; nothing here
             # resumes the loop.
-            return self._outcome_for(run_id)
+            return _CycleResult(outcome=self._outcome_for(run_id))
 
         # --- freeze the candidate the controller actually observed -------------
         post_fingerprint = candidate_fingerprint(execution_root, spec.scope)
@@ -1549,12 +2126,14 @@ class Controller:
             changed_paths(pre_manifest, manifest(execution_root)), spec.scope
         )
         if outside:
-            return self._blocked(
-                run_id,
-                RefusalCode.SCOPE_VIOLATION,
-                "the worker changed files its TaskSpec did not authorize: "
-                + ", ".join(outside[:5])
-                + (f" (+{len(outside) - 5} more)" if len(outside) > 5 else ""),
+            return _CycleResult(
+                outcome=self._blocked(
+                    run_id,
+                    RefusalCode.SCOPE_VIOLATION,
+                    "the worker changed files its TaskSpec did not authorize: "
+                    + ", ".join(outside[:5])
+                    + (f" (+{len(outside) - 5} more)" if len(outside) > 5 else ""),
+                )
             )
 
         # Freeze an explicit Git identity for the candidate before any check runs, so the
@@ -1574,11 +2153,70 @@ class Controller:
                 ref_status = repo.ensure_candidate_ref(ref, freeze.candidate_commit)
                 self.store.record_note(run_id, f"candidate ref {ref} ({ref_status})")
             except GitError as exc:
-                return self._blocked(run_id, RefusalCode.INTERNAL_ERROR, f"candidate freeze failed: {exc}")
+                return _CycleResult(
+                    outcome=self._blocked(
+                        run_id, RefusalCode.INTERNAL_ERROR, f"candidate freeze failed: {exc}"
+                    )
+                )
             except GitStatusParseError as exc:
-                return self._blocked(run_id, RefusalCode.SCOPE_VIOLATION, f"candidate freeze refused: {exc}")
+                return _CycleResult(
+                    outcome=self._blocked(
+                        run_id, RefusalCode.SCOPE_VIOLATION, f"candidate freeze refused: {exc}"
+                    )
+                )
+
+        # The three identities a repair has to keep apart: the task's original base, the
+        # candidate this round started from, and the candidate this round produced. The *tree*
+        # and the *fingerprint* decide whether anything changed - a fresh commit SHA over an
+        # identical tree is not progress.
+        identity = CandidateIdentity(
+            round=round_number,
+            attempt_id=attempt_id,
+            base_commit=original_base_commit,
+            parent_commit=previous.git_commit if previous is not None else "",
+            git_commit=freeze.candidate_commit if freeze is not None else "",
+            git_tree=freeze.tree if freeze is not None else "",
+            fingerprint=post_fingerprint,
+            paths=list(freeze.paths) if freeze is not None else [],
+            is_repair=previous is not None,
+            unchanged_from_parent=bool(
+                previous is not None
+                and previous.fingerprint == post_fingerprint
+                and (previous.git_tree or "") == (freeze.tree if freeze is not None else "")
+            ),
+        )
+        if identity.unchanged_from_parent:
+            # No content change: the candidate tree and its scoped fingerprint are the same as
+            # the round we are repairing. Buying a reviewer for that would be paying to be told
+            # nothing happened, so the run stops here and records why.
+            decision = RepairRecord(
+                decision=RepairDecision.NO_CONTENT_CHANGE,
+                trigger=trigger,
+                reason=(
+                    "the repair attempt produced no content change: candidate tree "
+                    f"{identity.git_tree or '(none)'} and fingerprint {identity.fingerprint} are "
+                    "unchanged from the round it was repairing, so no reviewer was bought"
+                ),
+                policy_digest=policy.digest() if policy is not None else "",
+                round=round_number,
+                decided_at=utc_now(),
+            )
+            self._record_repair_decision(run_id, decision)
+            return _CycleResult(
+                outcome=self._blocked(
+                    run_id,
+                    RefusalCode.VERIFICATION_FAILED,
+                    "the repair attempt left the candidate unchanged; nothing was reviewed and "
+                    "nothing was accepted",
+                )
+            )
 
         self.store.advance_to_checking(run_id=run_id, attempt_id=attempt_id, phase=CheckPhase.VERIFICATION)
+        # The root's remaining time, read here and not at the start of the cycle: the implementer
+        # attempt consumed the clock, so what is left to check and review with is a different
+        # number from the one the attempt was given. Read from the ledger, so a restarted
+        # controller reaches the same answer instead of restarting the clock.
+        remaining_root_seconds = self._remaining_deadline_seconds()
         verification = verify_candidate(
             store=self.store,
             spec=spec,
@@ -1593,7 +2231,52 @@ class Controller:
             # log an evidence row points at is a file that still exists afterwards. It never
             # lands in the workspace under test.
             artifact_factory=self._check_artifact_dir,
+            # A repaired candidate is checked from scratch: the first round's passing rows belong
+            # to a different candidate, and reusing them would call a new delivery verified
+            # without running anything.
+            force_refresh=previous is not None,
+            # What is left of the root's clock caps every check. A check allowed to run its full
+            # configured timeout while the root has less time than that would let the run work past
+            # its own deadline and then accept the result.
+            time_budget_seconds=remaining_root_seconds,
         )
+        if remaining_root_seconds is not None and remaining_root_seconds <= 0:
+            # The clock ran out while the implementer was working. Checks were recorded as
+            # not-started errors rather than executed, so the run stops here instead of buying a
+            # reviewer for work it can no longer accept.
+            self._record_repair_decision(
+                run_id,
+                RepairRecord(
+                    decision=RepairDecision.DEADLINE_REACHED,
+                    trigger=trigger,
+                    reason=(
+                        "the root's deadline passed before this candidate could be checked, so no "
+                        "check was started, no reviewer was bought and nothing was accepted"
+                    ),
+                    policy_digest=policy.digest() if policy is not None else "",
+                    round=round_number,
+                    decided_at=utc_now(),
+                ),
+            )
+            return _CycleResult(
+                outcome=self._blocked(
+                    run_id,
+                    RefusalCode.BUDGET_EXHAUSTED,
+                    "the root's deadline passed while the implementer was working; the candidate "
+                    "was not checked and nothing was accepted",
+                )
+            )
+        failure_facts = [
+            fact
+            for fact in failed_check_facts(
+                self.store,
+                run_id=run_id,
+                attempt_id=attempt_id,
+                candidate_fingerprint=post_fingerprint,
+                checks_digest=project.checks_digest(),
+            )
+            if fact.get("status") != EvidenceStatus.PASSED.value
+        ]
 
         review = ReviewResult(status="not_run")
         if verification.status != "passed":
@@ -1604,7 +2287,7 @@ class Controller:
             # stop-aware, because the cancel can land between reading this and asking for it.
             stopped = self._advance_to_review(run_id)
             if stopped is not None:
-                return stopped
+                return _CycleResult(outcome=stopped)
             try:
                 review = self._review(
                     run_id,
@@ -1617,30 +2300,52 @@ class Controller:
                     project=project,
                 )
             except RefusedError as exc:
-                return self._blocked(run_id, exc.code, exc.message)
+                return _CycleResult(outcome=self._blocked(run_id, exc.code, exc.message))
         else:
             review = ReviewResult(status="not_required", isolation=IsolationLevel.NONE)
 
         if verification.status != "passed":
-            return self._blocked(
-                run_id,
-                RefusalCode.VERIFICATION_FAILED,
-                f"the process exited successfully but acceptance is not met: {verification.detail}",
-            )
-        if review.status == "changes_requested":
-            return self._blocked(
-                run_id,
-                RefusalCode.REVIEW_REJECTED,
-                "independent review requested changes; automatic repair is deferred to M3",
-            )
-        if review.status not in {"accepted", "not_required"}:
-            return self._blocked(
-                run_id,
-                RefusalCode.INTERNAL_ERROR,
-                f"unexpected review status {review.status!r}",
+            # The only two shapes that may buy a repair are decided here, from recorded facts:
+            # a business assertion failing under the policy, or a substantive reviewer rejection.
+            return self._repairable_failure(
+                run_id=run_id,
+                policy=policy,
+                round_number=round_number,
+                original_base_commit=original_base_commit,
+                original_base_ref=original_base_ref,
+                previous=previous,
+                identity=identity,
+                trigger_candidate=RepairTrigger.BUSINESS_CHECK_FAILED,
+                failure_facts=failure_facts,
+                findings=[],
+                detail=verification.detail,
             )
 
-        return self._accept(
+        if review.status == "changes_requested":
+            findings = self._review_findings(run_id, attempt_id, post_fingerprint)
+            return self._repairable_failure(
+                run_id=run_id,
+                policy=policy,
+                round_number=round_number,
+                original_base_commit=original_base_commit,
+                original_base_ref=original_base_ref,
+                previous=previous,
+                identity=identity,
+                trigger_candidate=RepairTrigger.REVIEW_CHANGES_REQUESTED,
+                failure_facts=[],
+                findings=findings,
+                detail="independent review requested changes",
+            )
+        if review.status not in {"accepted", "not_required"}:
+            return _CycleResult(
+                outcome=self._blocked(
+                    run_id,
+                    RefusalCode.INTERNAL_ERROR,
+                    f"unexpected review status {review.status!r}",
+                )
+            )
+
+        accepted = self._accept(
             run_id=run_id,
             attempt_id=attempt_id,
             spec=spec,
@@ -1648,16 +2353,28 @@ class Controller:
             verification=verification,
             review=review,
             observed_turns=result.agent_turns,
-            base_ref=result.candidate.base_ref if result.candidate else "",
+            # The delivery diff covers the *whole* change from the task's original base to this
+            # final candidate, so a repaired delivery cannot be read as a delivery of the last
+            # patch alone. The agent's own claim is not used for this.
+            base_ref=original_base_ref,
             limitations=list(result.limitations),
             freeze=freeze,
             repo=repo,
             target_repo_root=project_root,
             user_tree_before=user_tree_before,
             dirty_target=dirty_target,
+            identity=identity,
+            original_base_commit=original_base_commit,
         )
+        if accepted is None:
+            return _CycleResult(outcome=self._outcome_for(run_id))
+        return _CycleResult(outcome=accepted, identity=identity, review=review, accepted=True)
 
-    # -- steps ---------------------------------------------------------------
+    # -- repair (batch E2) ---------------------------------------------------
+
+
+
+
 
     def _review(
         self,
@@ -1705,6 +2422,12 @@ class Controller:
 
         # The packet is rendered *before* the submission is claimed: an input that cannot be
         # built must not consume an allowance or a budget turn.
+        #
+        # Both the attempt and the candidate are filtered on, and the attempt is the belt to the
+        # candidate's braces: a repair that produced an identical fingerprint is stopped as a
+        # no-content-change before any reviewer is bought, so today the fingerprint alone already
+        # separates the rounds. Keeping the attempt filter makes this reader agree with `_accept`,
+        # and means a future fingerprint covering fewer files cannot start mixing rounds.
         check_summaries = [
             {
                 "check_id": r["check_id"],
@@ -1721,7 +2444,9 @@ class Controller:
                 "stderr": _stream_reference(r["detail"], "stderr"),
             }
             for r in self.store.evidence_for(run_id, kind="verification")
-            if r["candidate_fingerprint"] == candidate_fp and r["checks_digest"] == checks_digest
+            if r["attempt_id"] == attempt_id
+            and r["candidate_fingerprint"] == candidate_fp
+            and r["checks_digest"] == checks_digest
         ]
         evidence_rows = [
             {
@@ -1734,7 +2459,7 @@ class Controller:
                 "candidate_fingerprint": r["candidate_fingerprint"],
             }
             for r in self.store.evidence_for(run_id, kind="verification")
-            if r["candidate_fingerprint"] == candidate_fp
+            if r["attempt_id"] == attempt_id and r["candidate_fingerprint"] == candidate_fp
         ]
         candidate_identity: dict[str, object] = {
             "fingerprint": candidate_fp,
@@ -1757,7 +2482,7 @@ class Controller:
                 workspace=str(project_root),
                 spec_digest=row["spec_digest"],
                 candidate_fingerprint=candidate_fp,
-                deadline_seconds=900,
+                deadline_seconds=self._capped_deadline(900),
                 candidate=candidate_identity,
                 verification_status=verification.status if verification else "not_run",
                 verification_detail=verification.detail if verification else "",
@@ -1796,6 +2521,9 @@ class Controller:
             # ``_drive`` always passes the project through; the default only keeps a direct
             # caller from crashing on this path, and it fails closed rather than open.
             project=project if project is not None else ProjectConfig(project_id="", checks=[]),
+            # A review is never the repair: the repair is an implementer attempt, and the root's
+            # repair counter is charged by that dispatch, not by the reviewer that follows it.
+            is_repair=False,
         )
         attempt_id = dispatch.attempt_id
         invocation_id = (
@@ -1827,7 +2555,7 @@ class Controller:
             write_allow=[],
             write_deny=list(spec.scope.write_allow),
             workspace=str(project_root),
-            deadline_seconds=900,
+            deadline_seconds=self._capped_deadline(900),
             spec_digest=row["spec_digest"],
             packet=reviewer_packet.text,
             # A reviewer is read-only, always: it checks what the implementer produced, and an
@@ -2010,9 +2738,25 @@ class Controller:
         target_repo_root: Path | None = None,
         user_tree_before: str = "",
         dirty_target: bool = False,
-    ) -> RunOutcome:
-        """Admission gate. Every field of the receipt is re-derived from stored facts."""
+        identity: CandidateIdentity | None = None,
+        original_base_commit: str = "",
+    ) -> RunOutcome | None:
+        """Admission gate. Every field of the receipt is re-derived from stored facts.
+
+        Accepts the frozen *identity of this round* so the receipt and the run's notes name the
+        candidate that was actually verified, and the task's *original base* so the delivery it
+        describes is the cumulative change a repaired run actually produced - base to final
+        candidate - rather than the last round's patch. Returns ``None`` only when the acceptance
+        could not be applied at all (a superseded attempt or a stop that won); the caller then
+        reads the run's own recorded state instead of a value invented here.
+        """
         row = self.store.get_run(run_id)
+        # The deadline is checked at acceptance as well as before each dispatch. A run can spend
+        # its last seconds inside a review that was bought in time; accepting the result would mean
+        # the recorded deadline bounded nothing at all.
+        expired = self._root_deadline_state()
+        if expired is not None:
+            return self._blocked(run_id, RefusalCode.BUDGET_EXHAUSTED, expired)
         if row["current_attempt_id"] != attempt_id:
             return self._outcome_for(
                 run_id,
@@ -2058,6 +2802,38 @@ class Controller:
                 f"applies (stale evidence: {', '.join(missing)})",
             )
 
+        # --- the delivery is cumulative, from the task's original base ----------------
+        # A repaired run's candidate contains every round's change, but the *second* round's
+        # freeze only knows the second round's parent and the paths it touched. Reporting those
+        # would hand an integration step a delivery that appears to change only the last patch,
+        # and the first round's change would be silently missing. So the delivery base is the
+        # task's original base, and the paths are the diff between that base and this candidate,
+        # computed by Git rather than accumulated in memory.
+        delivery_base = original_base_commit or (freeze.base_commit if freeze else "")
+        if freeze is not None and repo is not None and delivery_base:
+            if not repo.commit_exists(delivery_base):  # pragma: no cover - defensive
+                return self._blocked(
+                    run_id,
+                    RefusalCode.INTERNAL_ERROR,
+                    f"the task's original base {delivery_base} is not a commit in this "
+                    "repository, so the cumulative delivery diff cannot be computed",
+                )
+            try:
+                delivery_paths = repo.diff_paths(
+                    delivery_base, freeze.candidate_commit, cwd=project_root
+                )
+            except GitError as exc:
+                return self._blocked(
+                    run_id,
+                    RefusalCode.INTERNAL_ERROR,
+                    f"the cumulative delivery diff could not be computed: {exc}",
+                )
+        else:
+            # No frozen candidate or no recorded base (an in-place run, or a driver that produced
+            # no Git identity): the local paths are all that is known, and inventing a range would
+            # be worse than saying less.
+            delivery_paths = list(freeze.paths) if freeze else []
+
         receipt = ResultReceipt(
             run_id=run_id,
             task_id=spec.task_id,
@@ -2067,14 +2843,13 @@ class Controller:
             plan_digest=row["spec_digest"],
             harness_outcome=InvocationOutcome.COMPLETED,
             candidate=CandidateSnapshot(
-                base_commit=(freeze.base_commit if freeze else base_ref)
-                or f"base:{row['spec_digest'][:18]}",
+                base_commit=delivery_base or f"base:{row['spec_digest'][:18]}",
                 git_commit=freeze.candidate_commit if freeze else "",
                 git_tree=freeze.tree if freeze else "",
                 worktree=str(project_root) if freeze else "",
                 fingerprint=fresh_fingerprint,
             ),
-            candidate_paths=list(freeze.paths) if freeze else [],
+            candidate_paths=delivery_paths,
             verification=verification,
             review=review,
             task_state=TaskState.ACCEPTED,
@@ -2337,6 +3112,34 @@ class Controller:
         return workspace_drift(self.store, run_id, self.project_root)
 
 
+
+class _CycleResult:
+    """What one implementer attempt ended as, in terms the driver loop can act on.
+
+    ``outcome`` is set when the run is finished - accepted, blocked, stopped, unknown. Otherwise
+    ``repair`` says the attempt may be followed by exactly one repair, and carries the trigger and
+    the structured context that repair needs. Exactly one of the two is set, which is what keeps
+    "the run is over" and "the run may continue" from being inferred from a null somewhere.
+    """
+
+    __slots__ = ("accepted", "identity", "outcome", "repair", "review")
+
+    def __init__(
+        self,
+        *,
+        outcome: RunOutcome | None = None,
+        repair: RepairContext | None = None,
+        identity: CandidateIdentity | None = None,
+        review: ReviewResult | None = None,
+        accepted: bool = False,
+    ) -> None:
+        self.outcome = outcome
+        self.repair = repair
+        self.identity = identity
+        self.review = review
+        self.accepted = accepted
+
+
 def inspect_run(store: Store, run_id: str, *, project_root: Path | None = None) -> RunInspection:
     """Read-only projection for ``status``/``report``. Zero model calls, by design."""
     from .contracts import AttemptRecord, EvidenceRecord
@@ -2362,6 +3165,9 @@ def inspect_run(store: Store, run_id: str, *, project_root: Path | None = None) 
             outcome=InvocationOutcome(a["outcome"]) if a["outcome"] else None,
             result_digest=a["result_digest"],
             block_code=a["block_code"],
+            # Batch E2: read from the attempt's own row, so a reader can tell the first attempt
+            # from the repair attempt without counting rows or inferring it from a later round.
+            is_repair=bool(a["is_repair"]) if "is_repair" in a.keys() else False,
             created_at=a["created_at"],
             finished_at=a["finished_at"],
         )
@@ -2379,6 +3185,7 @@ def inspect_run(store: Store, run_id: str, *, project_root: Path | None = None) 
             checks_digest=e["checks_digest"],
             command=json.loads(e["command_json"]),
             exit_code=e["exit_code"],
+            exit_reason=str(e["exit_reason"]) if "exit_reason" in e.keys() else "",
             stdout_digest=e["stdout_digest"],
             stderr_digest=e["stderr_digest"],
             detail=e["detail"],
@@ -2392,6 +3199,13 @@ def inspect_run(store: Store, run_id: str, *, project_root: Path | None = None) 
     # reader could mistake for a real ledger that has not been spent yet.
     root_row = store.root_budget_for_run(run_id)
     root_usage = store.root_budget_view(str(root_row["root_id"])) if root_row is not None else None
+    # Batch E2 repair decisions: every one the run recorded, refusals included. A run that never
+    # decided anything reports an empty list, which the text projection renders as "no decision
+    # recorded" rather than as an empty table.
+    try:
+        repair_records = store.repair_records_for(run_id)
+    except AttributeError:  # pragma: no cover - the store method lands with the same batch
+        repair_records = []
     return RunInspection(
         run=_summary_from_row(row, workspace_matches_receipt=drift),
         task_spec=TaskSpec.model_validate(json.loads(row["task_spec_json"])),
@@ -2400,6 +3214,7 @@ def inspect_run(store: Store, run_id: str, *, project_root: Path | None = None) 
         receipt=ResultReceipt.model_validate(json.loads(row["receipt_json"]))
         if row["receipt_json"]
         else None,
+        repair_records=repair_records,
         effective_config=recorded_config,
         model_calls_made=0,
         root_budget=root_usage,

@@ -1,6 +1,6 @@
 # 批次 E：根预算与一次有界修复 — DSH 实施方案
 
-日期：2026-09-25。代码基线：`8d68d9b`。状态：**E1 已实施并通过离线复核；E2 未开始**。实现与验收证据见 `README.md` 的 root budget 条目、`docs/operations.md` 与 `tests/test_batch_e_*.py`；本文保留原始范围与设计，第 5 节描述的自动修复行为仍是未实现的部分。
+日期：2026-09-25。代码基线：`8d68d9b`。状态：**E1、E2 均已实施并通过离线验收**。实现与验收证据见 `README.md` 的 root budget / repair 条目、`docs/operations.md` 与 `tests/test_batch_e_*.py`（E2 行为见 `tests/test_batch_e_repair.py` 与 `tests/test_batch_e_verify.py`）；本文保留原始范围与设计。E2 只实现"一次有界业务修复"：显式 `repair_policy` 才启用，且只由已声明的业务检查失败或实质性的 reviewer 拒绝触发；E3 及以后仍未实现。离线通过不构成 live 兼容性证明。
 
 本轮用户授权是整理本机材料与推进下一批方案；不授权 live 派发。本文供后续 DSH 实施使用，不是 authorization，也不改变任何旧任务的“失败即停止”条款。新的 live 预算为 0。
 

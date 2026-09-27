@@ -343,3 +343,107 @@ def test_unknown_check_kind_blocks_rather_than_reports_success(
 def test_evidence_status_enum_is_what_the_report_shows() -> None:
     """Cheap guard: the report never invents a status string of its own."""
     assert {status.value for status in EvidenceStatus} == {"passed", "failed", "error"}
+
+
+# --------------------------------------------------------------------------
+# --repair-policy-file: one explicit opt-in, refused before anything exists
+# --------------------------------------------------------------------------
+
+
+def test_run_with_a_repair_policy_file_applies_that_policy_to_its_own_gate(
+    cli_env: dict[str, Path], project_root: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The flag reaches `run` as part of the effective spec, so its own gate refuses what it cannot carry.
+
+    The frozen-checkout rule is what makes this observable offline: the fixture task is in-place,
+    a repair policy needs the frozen candidate an isolated worktree keeps, and the message can
+    only come from the policy having been applied to the spec this run resolved.
+    """
+    policy_file = cli_env["task"].parent / "repair-policy.json"
+    policy_file.write_text(
+        json.dumps({"max_attempts": 1, "check_exit_codes": {"unit": [1]}}), encoding="utf-8"
+    )
+
+    exit_code = main(
+        [
+            "run",
+            "--task", str(cli_env["task"]),
+            "--project", str(cli_env["project"]),
+            "--project-root", str(project_root),
+            "--driver", "fake",
+            "--repair-policy-file", str(policy_file),
+            "--json",
+            "--data-dir", str(cli_env["data_dir"]),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_REFUSED, captured
+    assert "repair_policy" in captured.err, captured.err
+    assert "workspace.mode='in_place'" in captured.err, captured.err
+    assert "Nothing was dispatched" in captured.err, (
+        "the refusal must say that no dispatch and no allowance happened"
+    )
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        pytest.param({"max_attempts": 2, "check_exit_codes": {"unit": [1]}},
+                     id="more than the one repair this build implements"),
+        pytest.param({"check_exit_codes": {}}, id="no trigger at all"),
+        pytest.param({"check_exit_codes": {"unit": [0]}}, id="a passing code declared a failure"),
+        pytest.param([{"check_exit_codes": {"unit": [1]}}], id="not a RepairPolicy document"),
+    ],
+)
+def test_an_invalid_repair_policy_file_is_refused_before_a_run_row_exists(
+    cli_env: dict[str, Path],
+    project_root: Path,
+    capsys: pytest.CaptureFixture[str],
+    document: object,
+) -> None:
+    """A policy is the user's opt-in: an unreadable one is refused, never defaulted or repaired."""
+    policy_file = cli_env["task"].parent / "bad-policy.json"
+    policy_file.write_text(json.dumps(document), encoding="utf-8")
+
+    exit_code = main(
+        [
+            "run",
+            "--task", str(cli_env["task"]),
+            "--project", str(cli_env["project"]),
+            "--project-root", str(project_root),
+            "--driver", "fake",
+            "--repair-policy-file", str(policy_file),
+            "--json",
+            "--data-dir", str(cli_env["data_dir"]),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_REFUSED, captured
+    assert "repair policy file" in captured.err, captured.err
+    assert captured.out.strip() == "", "nothing was dispatched, so nothing is reported as run"
+    assert not (cli_env["data_dir"] / "hflow.sqlite").exists(), (
+        "a refused policy must be refused before the store, the run row or a workspace exists"
+    )
+
+
+def test_a_missing_repair_policy_file_is_refused_like_every_other_missing_input(
+    cli_env: dict[str, Path], project_root: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    exit_code = main(
+        [
+            "prepare",
+            "--task", str(cli_env["task"]),
+            "--project", str(cli_env["project"]),
+            "--project-root", str(project_root),
+            "--repair-policy-file", str(cli_env["task"].parent / "ghost.json"),
+            "--json",
+            "--data-dir", str(cli_env["data_dir"]),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_REFUSED, captured
+    assert "repair policy file" in captured.err and "not found" in captured.err, captured.err
+    assert not (cli_env["data_dir"] / "hflow.sqlite").exists()

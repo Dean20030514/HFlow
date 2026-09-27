@@ -323,6 +323,42 @@ class GitRepo:
     def worktree_tree(self, worktree: Path) -> str:
         return self.run("rev-parse", "HEAD^{tree}", cwd=worktree).strip()
 
+    def commit_exists(self, commit: str) -> bool:
+        """Is this commit an object in this repository?
+
+        Used where a caller must not assume a recorded SHA is still present: a base commit can be
+        named by a task file that was written against a different clone, and a delivery diff that
+        silently produced an empty path list would look like "this delivery changed nothing".
+        """
+        if not commit:
+            return False
+        completed = subprocess.run(  # noqa: S603,S607 - fixed argv, no shell
+            ["git", "cat-file", "-e", f"{commit}^{{commit}}"],
+            cwd=str(self.root),
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+            env=_base_env(),
+        )
+        return completed.returncode == 0
+
+    def diff_paths(self, base: str, candidate: str, *, cwd: Path | None = None) -> list[str]:
+        """Every path in which ``candidate`` differs from ``base``.
+
+        This is the *cumulative* change, which is what a delivery has to name: a repaired run's
+        change is the whole thing from the task's original base to the final candidate, not the
+        last round's patch. Computed by Git rather than by remembering earlier rounds, so a round
+        that changed nothing, reverted something or touched a path twice still yields one answer
+        that a reader can reproduce with the same two commits.
+        """
+        if not base or not candidate:
+            raise GitError("a delivery diff needs both a base and a candidate commit")
+        out = self.run(
+            "diff", "--name-only", "-z", f"{base}..{candidate}", cwd=cwd
+        )
+        return [path for path in out.split("\0") if path.strip()]
+
     def worktree_changes(self, worktree: Path, allow: list[str]) -> list[str]:
         """Changed paths in the worktree that the TaskSpec did not authorize.
 

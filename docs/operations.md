@@ -183,7 +183,7 @@ total. It is a JSON document with exactly two members:
 | Field | Meaning | Range |
 |---|---|---|
 | `max_top_level_submissions` | how many top-level dispatches (implementer + reviewer invocations) this root may buy in total | 1..64 |
-| `max_repairs` | how many *additional* implementer attempts the root may buy. The first implementer attempt is not a repair. **Only recorded and enforced in E1** - no repair loop spends it yet | 0..8, default 0 |
+| `max_repairs` | how many *additional* implementer attempts the root may buy. The first implementer attempt is not a repair. **A ceiling, not a switch**: the dispatch transaction enforces it, but only a task's explicit `repair_policy` may spend it (see "When a repair may happen") | 0..8, default 0 |
 | `deadline_seconds` | wall-clock ceiling measured from the root's **first successful reservation**, recorded as `deadline_at`; a later dispatch past it is refused | >= 60, default 86400 |
 | `note` | free text the user keeps in the file. Never an approval: the approval is the authorization artifact's `user_text` | - |
 
@@ -211,9 +211,10 @@ What the root file does, and what it does not:
   loaded and verified exactly like a real one. No path charges a root with an empty authorization
   id.
 - `prepare` prints the root binding, its ceilings, the normal dispatch count (implementer +
-  reviewer), the repair switch (**OFF in E1**) and the deadline, and prints the same root inside
-  the pending authorization binding, so the digest a user approves is the digest the run checks.
-  It creates nothing.
+  reviewer), the repair switch and the deadline, and prints the same root inside the pending
+  authorization binding, so the digest a user approves is the digest the run checks. The repair
+  switch is the **task's own `repair_policy`**, not the root file's `max_repairs` (see "When a
+  repair may happen"). `prepare` creates nothing.
 - One transaction reserves a dispatch: ownership, role/phase, root ownership and allowance,
   authorization allowance, the attempt row, the invocation row and every counter commit together
   or not at all. The deadline and the counters are read and written inside it, so two controllers
@@ -242,8 +243,95 @@ What the root file does, and what it does not:
   reported operating-system children, so an offline run shows zero however many times it settled.
   A run recorded before E1 has no root row and says `legacy / not recorded` - absent facts, never
   zeros.
-- Automatic repair is **not implemented**. E1 is the ledger and the one dispatch transaction; the
-  E2 loop that would spend `max_repairs` does not exist, and a budget field is not a feature.
+- Automatic repair exists only under an explicit policy and is bounded to one round: see "When a
+  repair may happen" for the two triggers, what stops it, and why an undeclared exit code never
+  repairs. E1's ledger and dispatch transaction are unchanged underneath it.
+
+## When a repair may happen (batch E2)
+
+A repair is **one** second implementer attempt inside the same run, on the same revision, starting
+from the frozen candidate, followed by fresh checks and a fresh independent review. It is never a
+`hflow repair` command, it never revives a historical `BLOCKED` run, and it never retries an
+environment or transport failure. The switch lives in the task, not in the root budget file:
+`BudgetRequest.max_repair_cycles` keeps its historical default of `1` and **authorizes nothing**.
+
+```json
+"repair_policy": {
+  "max_attempts": 1,
+  "check_exit_codes": { "unit": [1], "lint": [1, 2] },
+  "allow_reviewer_changes": true
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `max_attempts` | pinned to `1`. This build implements exactly one bounded repair per run; anything else is refused when the spec is loaded |
+| `check_exit_codes` | the check ids that may trigger a repair, and the exit codes that mean *that check's business assertion failed*. A check id absent from this map never triggers one, whatever its code |
+| `allow_reviewer_changes` | may a substantive `changes_requested` on the current candidate buy the repair? |
+
+A policy that names no trigger at all, a check with an empty code list, and exit code `0` listed as
+a failure are all refused - not defaulted. HFlow does not claim to read a root cause out of an
+arbitrary process exit code, so "every non-zero code is repairable" is not an available policy.
+
+**How the policy gets into a run.** Write it in the task file as `repair_policy`, or pass
+`--repair-policy-file PATH` to `prepare` and `run` - the same bare `RepairPolicy` document, not a
+task file and not an authorization. The flag is applied *before* admission and becomes part of the
+effective TaskSpec, so the stored spec, `spec_digest` and the authorization binding all cover the
+repair that was asked for. If the task file already names a policy and the file names a different
+one, the run is refused rather than one silently winning; the same policy written twice (compared
+by digest) is not a disagreement, so re-running a policied task with its own policy file works. A
+missing file, a non-object document or a contract-invalid policy is refused **before the store is
+opened**: no run row, no worktree and no authorization is created. Whether the *scope* can honour
+the policy at all - an isolated worktree, a review, a run ceiling covering the worst case of four
+top-level dispatches - is refused by admission, for the same reason: nothing is dispatched.
+
+**A policy only classifies a failure it can see.** A check id the project contract does not run
+never produces a failed row, so that entry cannot buy anything however it is written; and when a
+check does fail whose id or exit code the policy does not declare, `business_failure_for` returns
+false and the run records a `not_a_business_failure` decision naming the check, its exit code and
+what the policy declared for it (`declared: nothing` for an id the policy does not list). The
+decision is stored before the run blocks, so an operator can read exactly which check failed and
+why the policy did not cover it.
+
+**What a check failure must look like to trigger a repair.** All of these, from the *current*
+attempt and the *current* candidate only (a previous round's evidence is part of the same run and
+can never describe this one):
+
+1. the check's id is declared in `check_exit_codes`;
+2. its recorded exit code is listed for that id - an **undeclared exit code never repairs**,
+   however non-zero it is, and neither does a row with no exit code at all;
+3. its recorded `exit_reason` says the check *ran to completion*: `completed` or `nonzero_exit`.
+   `timed_out`, `settlement_forced` (a check that left descendants), `settlement_unknown`, an
+   incomplete capture, a launch that never happened and an **empty reason** - every evidence row
+   written before storage v5 - are all ineligible. The reason is a structured fact stored in its
+   own column; it is never back-filled from an exit code and never guessed from the
+   `verification_failed` text or a log keyword;
+4. the round contains **no ERROR row at all**. A mixed round - one declared business failure plus
+   one check that timed out, or a review that was malformed - stops the run without buying a
+   second implementer.
+
+**What a reviewer rejection must look like.** The verdict must be a valid `changes_requested` on
+the current candidate, the policy must set `allow_reviewer_changes`, and the findings must be
+non-empty. An empty `changes_requested` still stops the run: there is no target to repair, and
+HFlow does not guess one. A malformed or unbound verdict is a wire failure, not a rejection, and
+repairs nothing.
+
+**What happens after the repair.** The repair round is its own `attempts` row (`is_repair = 1`,
+same run and revision; the schema allows exactly one), and the reviewer for that round attaches to
+the run's *current* attempt, so round two's verdict can never be recorded against round one's
+candidate. Checks are fresh (the first round's passing rows are never reused for the repaired
+candidate) and the review is fresh; the root's `max_repairs` ceiling and the deadline are checked
+at every handoff, and a stop wins every handoff. A second failure, or a repair that changes no
+content, ends the run - there is no third implementer. Each decision, refusals included, is stored
+as one `RepairRecord` row in `run_repair_records` and appears in the run's inspection record, so
+"we did not repair because that check failed for an environmental reason" is readable afterwards
+instead of leaving the run looking arbitrary.
+
+**Offline checks.** `kind=fake` starts no process, so its evidence records `not_launched` and can
+never trigger a repair. An offline test that wants the repair path exercised must declare the clean
+process exit it is modelling (`FakeCheckRunner(verdicts=..., exit_reasons={"unit": "nonzero_exit"})`).
+That is a deliberate modelling choice in the offline facility, not a compatibility claim about a
+live harness.
 
 ## Where the data lives
 
@@ -258,11 +346,24 @@ What the root file does, and what it does not:
 `run`/`status`/`report` accept `--data-dir` before or after the subcommand. Runtime data
 is never written inside a project checkout, so a run cannot dirty the tree it measures.
 
-## Storage version and migrations (batch E1)
+## Storage version and migrations (batch E1, extended by E2)
 
 The database records its own **storage version**, separate from the public contract version.
-Batch E1 adds `root_budgets` and `invocations` (plus a few columns), so the file goes from
-version 1 to version 2 the first time a build that understands v2 opens it.
+Batch E1 adds `root_budgets` and `invocations` (plus a few columns); batch E2 adds
+`evidence.exit_reason` - the structured reason a check ended - the `run_repair_records` table
+that holds the run's repair decisions, and `attempts.is_repair`. The file is migrated to the
+current `migrate.STORAGE_VERSION` (5 as of E2) the first time a build that understands it opens
+it.
+
+One v5 step **rebuilds** `attempts` instead of adding to it, because v1 had declared
+`UNIQUE (run_id, task_revision, role)` and SQLite cannot drop a table-level constraint. The
+rebuilt table keeps every row and every column and replaces that key with
+`UNIQUE (run_id, task_revision, role, is_repair)`: one first attempt and at most one repair
+attempt per run, revision and role, so a third implementer attempt cannot exist even if a bug
+asked for one. Existing rows get `is_repair = 0` - every attempt written before v5 was a first
+attempt. The rebuild follows SQLite's own procedure (create, copy, drop, rename) with foreign-key
+enforcement suspended and `PRAGMA foreign_key_check` verified before the transaction commits, so
+a reference that stopped resolving rolls the migration back rather than committing.
 
 What happens on that first open:
 
@@ -296,9 +397,14 @@ cp "$data/hflow.sqlite.pre-v1.bak" "$data/hflow.sqlite"
 
 The restored file is the pre-migration state: runs, authorizations and evidence as they were at
 that moment, and **without** anything the newer build wrote afterwards (a root ledger row, an
-invocation reservation, a delivery decision recorded later). Restoring is a deliberate data loss
-of everything after the snapshot; it is the only supported rollback, and it is why the snapshot is
-never overwritten.
+invocation reservation, a delivery decision recorded later, a repair decision). Restoring is a
+deliberate data loss of everything after the snapshot; it is the only supported rollback, and it is
+why the snapshot is never overwritten.
+
+Two things the migration deliberately does **not** do: it never back-fills `evidence.exit_reason`
+for an old row (a stored exit code is not an observation that the process completed cleanly, and an
+empty reason is exactly what keeps a pre-v5 row ineligible to trigger a repair), and it never
+rewrites the reason of a row that has one.
 
 ## Reading a blocked run
 
@@ -719,7 +825,7 @@ turns         reserved 2/4, implementer self-reported 1 (a self-report, not a di
 invocations   implementer=1 reviewer=1 (attempt rows; a deterministic dispatch count, not a model-request count)
 root budget   root-1f0c... (a root run; a run with no root ledger row says "legacy / not recorded")
   submissions used 2/3 (remaining 1)
-  repairs     used 0/1 (recorded counter; the repair loop that would spend it is not implemented in E1)
+  repairs     used 0/1 (a root ceiling; a repair is spent only under the task's own repair policy)
 dispatch ledger
   reserved=0 started=1 not_started=0 settled=1 unknown=0 (total 2, ever started 2)
 candidate     workspace still matches the accepted fingerprint
@@ -825,7 +931,11 @@ cancellation intent is recorded, in the same transaction that would have written
   not a cooperative protocol cancellation (unsupported on the selected one-shot `exec` path),
   it does not follow a descendant that leaves that boundary, it exists on Windows only, and it
   says nothing about a remote model request or remote billing having stopped.
-- **No repair cycle.** Failed verification or a rejected review stops the run.
+- **Repair is bounded, explicit and narrow.** One repair per run, only under a task's
+  `repair_policy`, only from a clean declared business check failure or a substantive reviewer
+  rejection with non-empty findings, and never for a timeout, a lifecycle defect, an undeclared
+  exit code, a malformed review, an unknown outcome or a cancellation (see "When a repair may
+  happen"). It is not a `hflow repair` command, and it cannot revive a historical `BLOCKED` run.
 - **No billing observation.** Cost and token fields are `null`; do not read `null` as 0.
 - **Authorization is trusted-local.** The artifact records a human decision and bounds its
   consumption, but its provenance is not authenticated and a fresh authorization id resets the

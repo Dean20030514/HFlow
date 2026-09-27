@@ -47,6 +47,7 @@ from .contracts import (
     InvocationStartState,
     InvocationStateCounts,
     RefusalCode,
+    RepairRecord,
     ResultReceipt,
     RootBudgetBinding,
     RootBudgetLimits,
@@ -932,6 +933,7 @@ class Store:
         authorization_id: str = "",
         authorization_max: int | None = None,
         required_loop_remaining: int = 1,
+        is_repair: bool = False,
     ) -> DispatchReservation:
         """Reserve one top-level dispatch: every counter, in one transaction.
 
@@ -961,6 +963,12 @@ class Store:
         ``root_binding``/``root_limits`` are ``None`` for a run that is not spent against a root
         ledger (every legacy run, and every offline run). They cannot be supplied without an
         ``authorization_id``: a root with nothing to bind it to is not a ledger.
+
+        ``is_repair`` is the caller's own claim that this dispatch is the bounded repair round
+        (batch E2). It is only ever *added* to the ledger's own root-wide rule: a second
+        implementer invocation of a root is a repair whether or not a caller says so, and this
+        flag cannot make a repair look like a first attempt. On the legacy path there is no
+        invocation row to mark, so the claim travels in the caller's own attempt record.
 
         What this does *not* do on the legacy path: write ``attempts.invocation_id``. That stays
         with the controller's own stop-aware registration, because a stop racing that write is
@@ -1001,6 +1009,7 @@ class Store:
                     authorization_max=authorization_max,
                     attempt_id=attempt_id,
                     row=row,
+                    is_repair=is_repair,
                 )
 
             if root_binding is None or root_limits is None:
@@ -1032,11 +1041,13 @@ class Store:
                 reservation_expires_at=reservation_expires_at,
                 root_id=root_binding.root_id,
                 # Only the role that produces the candidate creates an attempt; the reviewer
-                # attaches to it.
+                # attaches to it. ``is_repair`` says which implementer attempt this is: the run's
+                # first, or the one bounded repair (batch E2).
                 create_attempt=role == "implementer",
+                is_repair=is_repair,
             )
             round_number = self._next_round_locked(conn, root_binding.root_id)
-            is_repair = self._charge_root_locked(
+            charged_as_repair = self._charge_root_locked(
                 conn,
                 root_binding=root_binding,
                 root_limits=root_limits,
@@ -1044,6 +1055,7 @@ class Store:
                 run_id=run_id,
                 authorization_id=authorization_id,
                 required_loop_remaining=int(required_loop_remaining),
+                is_repair=is_repair,
             )
             intent = self._insert_invocation_locked(
                 conn,
@@ -1054,7 +1066,7 @@ class Store:
                 role=role,
                 authorization_id=authorization_id,
                 round_number=round_number,
-                is_repair=is_repair,
+                is_repair=charged_as_repair,
             )
             turns_after = conn.execute(
                 "SELECT turns_reserved FROM runs WHERE run_id = ?", (run_id,)
@@ -1083,12 +1095,15 @@ class Store:
         authorization_max: int | None,
         attempt_id: str | None,
         row: sqlite3.Row,
+        is_repair: bool = False,
     ) -> DispatchReservation:
         """The pre-E1 path for a run with no root: authorization, turn and attempt together.
 
         Still one transaction - that part is not new - but no root counter is involved and no
         invocation row is written, because a legacy run's dispatch facts stay where they always
-        were (``attempts.invocation_id`` / ``review_invocation_id``).
+        were (``attempts.invocation_id`` / ``review_invocation_id``). ``is_repair`` still reaches
+        the attempt row here: an offline run performs the same bounded repair, it simply has no
+        root ledger to charge it to.
         """
         if authorization_id:
             self._check_authorization_locked(conn, authorization_id, authorization_max)
@@ -1105,6 +1120,7 @@ class Store:
             reservation_expires_at=reservation_expires_at,
             root_id="",
             create_attempt=role == "implementer",
+            is_repair=is_repair,
         )
         used = 0
         if authorization_id:
@@ -1228,14 +1244,18 @@ class Store:
         reservation_expires_at: str,
         root_id: str,
         create_attempt: bool = True,
+        is_repair: bool = False,
     ) -> sqlite3.Row:
         """The attempt this dispatch belongs to: the run's own, or one created for it.
 
         Two roles, two invocations, **one attempt**: the reviewer reviews what the implementer
-        produced on the same attempt row, which is why an implementer dispatch may not be
-        followed by a second one for the same revision (that is E2's repair attempt, and it is
-        not implemented here), and why a non-implementer dispatch must find that row rather than
-        create one.
+        produced on the same attempt row, which is why a non-implementer dispatch must find that
+        row rather than create one.
+
+        An implementer dispatch may be followed by exactly one *repair* attempt (batch E2) on the
+        same revision. ``is_repair`` says which of the two this dispatch is, and the lookup and the
+        insert both use it: a second first attempt is refused here, a second repair is refused by
+        the same statement and by the schema's ``UNIQUE (run_id, task_revision, role, is_repair)``.
 
         ``create_attempt=False`` makes this a pure lookup: a role that reviews work somebody else
         produced can never be the reason an attempt exists.
@@ -1246,22 +1266,24 @@ class Store:
             raise StoreError(f"role {role!r} creates the attempt it dispatches; it cannot look one up")
         if role == "implementer":
             existing = conn.execute(
-                "SELECT * FROM attempts WHERE run_id = ? AND task_revision = ? AND role = ?",
-                (run_id, task_revision, role),
+                "SELECT * FROM attempts WHERE run_id = ? AND task_revision = ? AND role = ? "
+                "AND is_repair = ?",
+                (run_id, task_revision, role, 1 if is_repair else 0),
             ).fetchone()
             if existing is not None:
+                what = "repair attempt" if is_repair else "first implementation attempt"
                 raise StoreError(
-                    f"run {run_id} already has an implementer attempt "
-                    f"{existing['attempt_id']} for revision {task_revision}; a second "
-                    "implementation attempt is a repair, which this build does not perform"
+                    f"run {run_id} already has a {what} {existing['attempt_id']} for revision "
+                    f"{task_revision}; one run buys one first attempt and at most one repair, and a "
+                    "new invocation id does not make it a different attempt"
                 )
             created_id = attempt_id or new_attempt_id()
             conn.execute(
                 """
                 INSERT INTO attempts (
                     attempt_id, run_id, task_revision, role, state, reservation_id,
-                    reserved_agent_turns, reserved_expires_at, created_at, root_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    reserved_agent_turns, reserved_expires_at, created_at, root_id, is_repair
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     created_id,
@@ -1274,6 +1296,7 @@ class Store:
                     reservation_expires_at,
                     now,
                     root_id,
+                    1 if is_repair else 0,
                 ),
             )
             conn.execute(
@@ -1286,15 +1309,34 @@ class Store:
             # the row that carries the candidate, the evidence and the frozen fingerprint. The
             # role on the attempt is ``implementer``, so looking it up by this dispatch's role
             # would find nothing and refuse every review.
-            existing = conn.execute(
-                "SELECT * FROM attempts WHERE run_id = ? AND task_revision = ? "
-                "ORDER BY created_at, rowid LIMIT 1",
-                (run_id, task_revision),
+            #
+            # Which row is resolved from ``runs.current_attempt_id`` rather than by taking the
+            # oldest row of the revision. A repaired run has two implementer attempts for one
+            # revision, and the reviewer must attach to the one the run is working on now -
+            # otherwise round two's verdict would be recorded against round one's candidate.
+            current = conn.execute(
+                "SELECT current_attempt_id FROM runs WHERE run_id = ?", (run_id,)
             ).fetchone()
+            if current is None:
+                raise RunNotFound(run_id)
+            named = str(current["current_attempt_id"] or "")
+            existing = (
+                conn.execute(
+                    "SELECT * FROM attempts WHERE attempt_id = ? AND run_id = ?", (named, run_id)
+                ).fetchone()
+                if named
+                else None
+            )
+            if existing is not None and int(existing["task_revision"]) != int(task_revision):
+                raise StoreError(
+                    f"run {run_id}: its current attempt {named} is for revision "
+                    f"{existing['task_revision']}, but this {role} dispatch is for revision "
+                    f"{task_revision}; the verdict would be recorded against another candidate"
+                )
             if existing is None:
                 raise StoreError(
-                    f"no attempt exists for run {run_id} revision {task_revision}: a {role} "
-                    "dispatch reviews an attempt that has already been recorded"
+                    f"no current attempt exists for run {run_id} revision {task_revision}: a "
+                    f"{role} dispatch reviews an attempt the run is already working on"
                 )
             if not create_attempt and existing[column]:
                 # One review per attempt, whatever the caller names it. Checking only for a
@@ -1338,15 +1380,19 @@ class Store:
         run_id: str,
         authorization_id: str,
         required_loop_remaining: int = 1,
+        is_repair: bool = False,
     ) -> bool:
         """Charge the root's counters, creating the row if this is the root's first dispatch.
 
         Returns whether this dispatch is a repair. The rules, in full:
 
-        * the root's **first** implementer dispatch is not a repair, whatever else is true;
-        * any later implementer dispatch for the same root is one - including one that arrives
-          under a new revision or a new run, because the repair allowance belongs to the task,
-          not to a run's own idea of "first attempt";
+        * the root's first implementer dispatch is not a repair, and any later implementer
+          dispatch for the same root is one - including one that arrives under a new revision or
+          a new run, because the repair allowance belongs to the task, not to a run's own idea of
+          "first attempt";
+        * a caller's ``is_repair`` is **added** to that rule and can never subtract from it: a
+          repair cannot be disguised as a first attempt, and a run that knows it is repairing is
+          charged as one even where the root-wide count alone would not say so;
         * a reviewer dispatch never consumes a repair;
         * an unknown outcome never refunds anything: only this method increments, and nothing in
           this build ever decrements a root's consumption;
@@ -1497,7 +1543,7 @@ class Store:
                 (root_binding.root_id,),
             ).fetchone()["n"]
         )
-        is_repair = role == "implementer" and implementers_before > 0
+        is_repair = bool(is_repair) or (role == "implementer" and implementers_before > 0)
         if is_repair and int(row["used_repairs"]) + 1 > int(row["max_repairs"]):
             raise StoreError(
                 f"root {root_binding.root_id} has used its {row['max_repairs']} repair attempt(s); "
@@ -2646,6 +2692,77 @@ class Store:
             )
             return int(row["repairs_used"]) + 1
 
+    def reopen_for_repair(self, run_id: str, controller_id: str) -> sqlite3.Row:
+        """Move a run back to its implementation phase for its single repair attempt.
+
+        The E1 guard is right for its own rule: an implementer is only reserved before the
+        candidate is checked, because a second implementation of the same revision used to be
+        impossible. Batch E2 makes exactly one exception, and this is the transaction that decides
+        it - the controller calls it immediately before the repair reservation, so the phase guard
+        in :meth:`_guard_dispatch_locked` sees a run that has been reopened rather than one whose
+        checks are still running.
+
+        What it refuses, and why each one is not merely a formality:
+
+        * a run another controller owns - two schedulers must not both decide to repair;
+        * a run with a recorded cancellation intent - a repair never overrides a stop, and every
+          later dispatch is refused by the same fact;
+        * a terminal run (``ACCEPTED``/``BLOCKED``/``CANCELLED``) - a repair is a decision taken
+          inside a live run, not a way to revive one a verdict already ended. That is what keeps
+          "repair" from becoming a resurrection command for a historical ``BLOCKED`` run.
+
+        What it deliberately does **not** do: it does not touch ``current_attempt_id`` (the
+        previous round's reviewer attached to that row, and acceptance reads it), it does not
+        decrement any counter, and it does not charge the repair. The single place a repair is
+        consumed stays ``reserve_dispatch(..., is_repair=True)``, which increments the root's
+        repair counter - two writers for one counter would let them disagree. ``repairs_used`` on
+        the run is not touched here either; it stays the historical per-run repair counter.
+        """
+        with self.transaction() as conn:
+            row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                raise RunNotFound(run_id)
+            if row["claimed_by"] != controller_id:
+                raise StoreError(
+                    f"cannot reopen {run_id} for a repair: it is claimed by {row['claimed_by']!r}, "
+                    f"not {controller_id!r}"
+                )
+            if row["cancel_intent_at"]:
+                raise StoreError(
+                    f"cannot reopen {run_id} for a repair: a cancellation intent was recorded at "
+                    f"{row['cancel_intent_at']}, and a repair never overrides a stop"
+                )
+            state = TaskState(row["task_state"])
+            if state in {TaskState.ACCEPTED, TaskState.BLOCKED, TaskState.CANCELLED}:
+                raise StoreError(
+                    f"cannot reopen {run_id} for a repair: the run is {state.value}, and a repair "
+                    "is only ever a decision taken inside a live run - it does not revive a run an "
+                    "acceptance, a block or a stop already ended"
+                )
+            cur = conn.execute(
+                """
+                UPDATE runs
+                   SET task_state = ?, phase = NULL, updated_at = ?
+                 WHERE run_id = ?
+                   AND cancel_intent_at IS NULL
+                   AND task_state NOT IN (?, ?, ?)
+                """,
+                (
+                    TaskState.RUNNING.value,
+                    utc_now(),
+                    run_id,
+                    TaskState.ACCEPTED.value,
+                    TaskState.BLOCKED.value,
+                    TaskState.CANCELLED.value,
+                ),
+            )
+            if cur.rowcount != 1:  # pragma: no cover - the checks above hold the same transaction
+                raise StoreError(
+                    f"run {run_id} changed while it was being reopened for a repair; nothing was "
+                    "written and no attempt may be dispatched from here"
+                )
+            return conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+
     # -- evidence ------------------------------------------------------------
 
     def record_evidence(
@@ -2661,10 +2778,18 @@ class Store:
         check_id: str = "",
         command: Sequence[str] = (),
         exit_code: int | None = None,
+        exit_reason: str = "",
         stdout_digest: str = "",
         stderr_digest: str = "",
         detail: str = "",
     ) -> EvidenceRecord:
+        """Store one observation. ``exit_reason`` is *why* it ended as it did, or empty.
+
+        The default is deliberately empty rather than a plausible value: a caller that did not
+        observe a reason must not appear to have one, because batch E2 classifies an automatic
+        repair from this field alone. An empty reason is a fact ("no reason was observed") and
+        makes the row ineligible to trigger one.
+        """
         now = utc_now()
         with self.transaction() as conn:
             conn.execute(
@@ -2672,8 +2797,8 @@ class Store:
                 INSERT INTO evidence (
                     evidence_id, run_id, attempt_id, kind, status, check_id,
                     candidate_fingerprint, checks_digest, command_json, exit_code,
-                    stdout_digest, stderr_digest, detail, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    exit_reason, stdout_digest, stderr_digest, detail, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     evidence_id,
@@ -2686,6 +2811,7 @@ class Store:
                     checks_digest,
                     canonical_json(list(command)),
                     exit_code,
+                    exit_reason,
                     stdout_digest,
                     stderr_digest,
                     detail,
@@ -2703,11 +2829,42 @@ class Store:
             checks_digest=checks_digest,
             command=list(command),
             exit_code=exit_code,
+            exit_reason=exit_reason,
             stdout_digest=stdout_digest,
             stderr_digest=stderr_digest,
             detail=detail,
             created_at=now,
         )
+
+    @staticmethod
+    def _evidence_from_row(row: sqlite3.Row) -> EvidenceRecord:
+        """The contract view of one stored evidence row.
+
+        ``exit_reason`` is read as stored, including the empty string a pre-v5 row carries: an
+        empty reason means "no reason was observed", and that is what keeps a legacy row
+        ineligible to trigger an automatic repair. It is never defaulted to something plausible.
+        """
+        return EvidenceRecord(
+            evidence_id=str(row["evidence_id"]),
+            run_id=str(row["run_id"]),
+            attempt_id=str(row["attempt_id"]),
+            kind=str(row["kind"]),  # type: ignore[arg-type]
+            status=EvidenceStatus(str(row["status"])),
+            check_id=str(row["check_id"] or ""),
+            candidate_fingerprint=str(row["candidate_fingerprint"]),
+            checks_digest=str(row["checks_digest"]),
+            command=list(json.loads(row["command_json"] or "[]")),
+            exit_code=row["exit_code"],
+            exit_reason=str(row["exit_reason"] or ""),
+            stdout_digest=str(row["stdout_digest"] or ""),
+            stderr_digest=str(row["stderr_digest"] or ""),
+            detail=str(row["detail"] or ""),
+            created_at=str(row["created_at"]),
+        )
+
+    def evidence_records_for(self, run_id: str) -> list[EvidenceRecord]:
+        """Every evidence row of this run as a validated contract object, oldest first."""
+        return [self._evidence_from_row(row) for row in self.evidence_for(run_id)]
 
     def evidence_for(self, run_id: str, kind: str | None = None) -> list[sqlite3.Row]:
         if kind is None:
@@ -2718,6 +2875,64 @@ class Store:
             "SELECT * FROM evidence WHERE run_id = ? AND kind = ? ORDER BY created_at, rowid",
             (run_id, kind),
         )
+
+    # -- repair decisions (batch E2) -----------------------------------------
+
+    def record_repair_record(self, run_id: str, record: RepairRecord) -> None:
+        """Append one repair decision to the run's own record. Never rewrites an earlier one.
+
+        A refusal is stored exactly like an ``allowed`` decision: "we did not repair because the
+        check that failed is an environment error, not a business assertion" is the answer an
+        operator needs, and a record that kept only the allowed decisions would leave the run
+        looking arbitrary.
+
+        The stored text *is* the ``RepairRecord`` document, not a paraphrase: a reader re-derives
+        the same decision from the same contract. ``decided_at`` is whatever the caller recorded
+        and is never rewritten here, and one call appends one row - a run's decisions are an
+        ordered log, not a field that the latest writer wins.
+        """
+        with self.transaction() as conn:
+            row = conn.execute("SELECT run_id FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                raise RunNotFound(run_id)
+            conn.execute(
+                """
+                INSERT INTO run_repair_records (record_id, run_id, record_json, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    new_evidence_id(),
+                    run_id,
+                    canonical_json(record.model_dump(mode="json")),
+                    utc_now(),
+                ),
+            )
+
+    def repair_records_for(self, run_id: str) -> list[RepairRecord]:
+        """Every repair decision this run recorded, in the order it recorded them.
+
+        A row that cannot be read as a ``RepairRecord`` raises instead of being skipped: these are
+        facts, and silently dropping one would make a partial list look complete.
+        """
+        records: list[RepairRecord] = []
+        for row in self._fetchall(
+            "SELECT record_json FROM run_repair_records WHERE run_id = ? "
+            "ORDER BY created_at, rowid",
+            (run_id,),
+        ):
+            try:
+                loaded = json.loads(str(row["record_json"]))
+            except json.JSONDecodeError as exc:
+                raise StoreError(
+                    f"run {run_id} has an unreadable repair record ({exc}); it is not skipped"
+                ) from exc
+            try:
+                records.append(RepairRecord.model_validate(loaded))
+            except ValidationError as exc:
+                raise StoreError(
+                    f"run {run_id} has a repair record that is not a valid RepairRecord: {exc}"
+                ) from exc
+        return records
 
     # -- read model ----------------------------------------------------------
 
