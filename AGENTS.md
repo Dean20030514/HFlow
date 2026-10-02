@@ -8,18 +8,29 @@ not restate the design; read the plan and `docs/architecture.md` when the task n
 | Concern | File |
 |---|---|
 | Every data contract (single source of truth) | `src/hflow/contracts.py` |
-| State machine, budget, acceptance, receipt, cancel intent | `src/hflow/controller.py` |
-| SQLite schema, transactions, compare-and-set, stop-conditional writes | `src/hflow/store.py` |
-| Admission rules (scope, reuse, budget, risk) | `src/hflow/admission.py` |
+| State machine, budget, acceptance, receipt, cancel intent, the one bounded repair | `src/hflow/controller.py` |
+| SQLite transactions, root ledger, `reserve_dispatch`, compare-and-set, stop-conditional writes | `src/hflow/store.py` |
+| Table DDL, numbered storage versions, backup-then-migrate | `src/hflow/migrate.py` |
+| Admission rules (scope, reuse, budget, risk, repair policy) | `src/hflow/admission.py` |
+| The one resolution `prepare` and `run` share (config, launch, binding) | `src/hflow/prepare.py` |
+| Machine profiles (per-role agent, driver, model selection) | `src/hflow/profiles.py` |
+| One-shot authorization artifacts and their binding digest | `src/hflow/authorization.py` |
+| What each role is told (input packets, 32 KiB bound) | `src/hflow/packet.py` |
+| Reviewer verdict decoding (`ReviewOutput`) | `src/hflow/review.py` |
 | Approved checks and evidence | `src/hflow/verify.py` |
+| Bounded output capture and the check environment | `src/hflow/artifacts.py` |
 | Scope containment and candidate fingerprints | `src/hflow/workspace.py` |
 | Git worktree isolation and candidate freezing | `src/hflow/gitworkspace.py` |
+| Guarded worktree release (`hflow clean`) | `src/hflow/cleanup.py` |
+| `status` / `report` text from stored facts | `src/hflow/report.py` |
+| Commands and exit codes | `src/hflow/cli.py` |
 | The one production driver (acpx → DSH ACP) | `src/hflow/drivers/acpx_dsh.py` |
 | Windows Job Object process boundary | `src/hflow/drivers/winjob.py` |
 | Neutral event projection from the client stream | `src/hflow/drivers/acp_events.py` |
 | Offline driver (tests and development) | `src/hflow/drivers/fake.py` |
 | Which driver is production | `src/hflow/drivers/selected.py` |
 | Transport decision and its evidence | `docs/adr/0001-transport.md`, `docs/m0-results.md` |
+| Root budget and bounded repair design (batch E) | `docs/batch-e-plan.md`; operator view in `docs/operations.md` |
 
 ## Rules that must not be relaxed to make a test pass
 
@@ -38,7 +49,8 @@ not restate the design; read the plan and `docs/architecture.md` when the task n
    blocks; it never re-dispatches.
 9. The agent launch argv carries only the launcher path and fixed flags. Task text, nonce,
    user content and credentials never go into a command line - they travel through stdin or
-   a controlled file.
+   a controlled file. A model id fixed in the machine profile, validated and covered by the
+   authorization digest counts as a fixed flag (`--model`; user ruling, 2026-10-02).
 10. No live model task runs without an explicit new budget from the user. Each live task
     needs its own approval; a probe file, a new experiment id or an edited authorization
     note does not create allowance.

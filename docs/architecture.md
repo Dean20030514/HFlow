@@ -3,29 +3,40 @@
 HFlow is a thin deterministic controller in front of a native coding Harness. The
 Harness does the reasoning; the controller does admission, budget, evidence, and
 delivery accounting. This document describes **what exists today**, not the target
-architecture — read the plan for that.
+architecture — read the plan for that (`docs/batch-e-plan.md` for the root budget and the
+bounded repair).
 
 It was first written at M1 and has been corrected since; where a section describes a
-capability that arrived later (the production Driver, Git worktrees, the review wire), the
-module and its evidence are named so the claim can be checked. A statement is only as strong
-as the artifact beside it: implemented code, an offline test, or a recorded live execution on
-one binding — never a neighbour's success.
+capability that arrived later (the production Driver, Git worktrees, the review wire, the batch
+E1 root ledger, the batch E2 bounded repair), the module and its evidence are named so the claim
+can be checked. A statement is only as strong as the artifact beside it: implemented code, an
+offline test, or a recorded live execution on one binding — never a neighbour's success.
 
 ## Layer map
 
 ```text
-CLI (cli.py: doctor/run/status/report/cancel/resume/clean/schema)
+CLI (cli.py: doctor/prepare/run/status/report/cancel/resume/clean/schema)
+  |
+prepare.py  the one resolution `prepare` and `run` share: task overrides, project contract,
+  |         per-role bindings (profiles.py), resolved launch, write permission, base commit
   |
 Controller (controller.py)  — finite state machine, no LLM calls
-  |-- admission.py    TaskSpec + project contract -> admit or refuse (nothing is created first)
+  |-- admission.py    TaskSpec + project contract -> admit or refuse (nothing is created first);
+  |                   the dispatch preconditions, repair-policy rules included
   |-- authorization.py  one-shot, bound, user-attested approval artifact for a real run
-  |-- store.py        SQLite: runs / attempts / evidence / authorizations, transactions, CAS
-  |-- verify.py       approved checks over a frozen candidate -> evidence
-  |-- workspace.py    scope containment, manifests, candidate fingerprints
-  |-- gitworkspace.py Git worktrees, candidate freezing, candidate refs, status parsing
+  |-- packet.py       the role input packets, rendered from stored facts, 32 KiB bound
+  |-- store.py        SQLite transactions, reserve_dispatch, compare-and-set, stop-conditional writes
+  |-- migrate.py      table DDL and numbered storage versions (v5); the tables are runs / attempts /
+  |                   evidence / run_notes / authorizations / root_budgets / invocations /
+  |                   run_repair_records
+  |-- verify.py       approved checks over a frozen candidate -> evidence (with exit_reason)
+  |-- artifacts.py    bounded output capture and the allowlisted check environment
+  |-- workspace.py    scope containment, deny rules, manifests, candidate fingerprints
+  |-- gitworkspace.py Git worktrees, base-commit resolution, candidate freezing, candidate refs
   |-- review.py       the one reviewer-answer parser, shared by the driver and replay
   |-- cleanup.py      guarded release of one run's managed worktree
   |-- report.py       status/report rendering from stored facts only
+  |-- runtime.py      the controller build id recorded into every run
   |
 HarnessDriver (contracts.HarnessDriver / LifecycleDriver)
   |-- drivers/selected.py   the single place a binding becomes a driver object
@@ -34,6 +45,19 @@ HarnessDriver (contracts.HarnessDriver / LifecycleDriver)
   |-- drivers/winjob.py     Windows Job Object process boundary
   |-- drivers/fake.py       offline driver for tests and examples
 ```
+
+Every structure is defined in `contracts.py`, except the authorization artifact
+(`AuthorizationRecord` / `AuthorizationBinding`), which lives in `authorization.py`. `hflow
+schema` generates JSON Schema for both, together with the other hand-written inputs
+(`MachineProfile`, `RootBudgetPlan`, `RepairPolicy`).
+
+`hflow cancel` and `hflow resume` do not build the driver a run was started with. They build an
+observer per role from the run's recorded effective configuration: a role recorded as the offline
+fake gets a fresh fake (which answers `unknown` for an invocation it did not start), and any
+other role - or a run with no recorded configuration, labelled `unrecorded` - gets an observer
+that holds no handle, answers a stop `unknown` and a reconcile `unknown`, and refuses to start
+anything. A controller's scratch and check artifacts go under the data directory of its own
+ledger (`<data-dir>/artifacts/...`, `<data-dir>/invocations/...`).
 
 ## State
 
@@ -47,6 +71,45 @@ No run reaches `INTEGRATED` or `PUBLISHED`: a TaskSpec asking for one of those d
 is refused at admission, before any run row exists, instead of being delivered as a local
 candidate and reported as the requested level.
 
+Each top-level invocation also has a ledger state (`invocations.state`, `InvocationStartState`),
+kept apart from the attempt state because a reservation, a launch request, a launch and a result
+are four different facts:
+
+| State | Meaning |
+|---|---|
+| `reserved` | the dispatch transaction committed: the allowance is spent and the intent is durable. Not a launch, not a process, not a model request |
+| `requested` | the controller asked a driver to launch it, and no spawn report has arrived yet |
+| `started` | the launch happened. Whether it created an operating-system child is a separate fact (`spawn_kind`, `process_pid`): the offline fake launches in-process and creates none |
+| `not_started` | no launch happened (a stop won the handoff, or the driver refused before any process). The allowance stays consumed |
+| `settled` | a result was observed and applied, with the controller's classification of it |
+| `unknown` | a launch happened and was never settled. Blocks the root; no refund, no retry, no re-dispatch |
+| `launch_unknown` | a launch was requested and the controller never learned whether it happened. Counts as no process, and blocks the root until an operator looks |
+
+`reserved`, `requested` and `started` are the **open** states. Settling is a compare-and-set from
+those three only (`store.settle_invocation`): a `not_started`, `settled`, `unknown` or
+`launch_unknown` entry is never moved by a settlement or a stop, and a refused settlement is
+recorded as a `dispatch:` run note naming the state that stands. A process count is never derived
+from a result: `processes` (and its historical alias `ever_started`) counts invocations whose
+driver reported a pid. A driver that never sends a spawn report is read from the row itself - an
+entry still `requested`, with no `started_at` and `spawn_kind=unknown`, means no report arrived;
+completed work then records a launch with `spawn_kind=unknown` and no process, and a cancelled
+result with no work records `not_started` **only when the stop was already recorded when the
+controller handed the invocation to the driver** (read after the launch request is recorded and
+before `start`), because only then did the driver's gate provably refuse. A cancelled, workless
+return after a stop recorded while the role was running is no such proof - a silent driver may
+have worked and then honoured the stop - so the entry stays `requested`: a confirmed stop then
+records `launch_unknown`, and an unconfirmed one leaves it open (blocking the root) until
+`resume` records `launch_unknown`. A driver that *raises* without a spawn report leaves
+the entry `requested` - a driver can raise after creating a process, so "no report and an
+exception" is read as an unconfirmed launch that blocks the root, never as "never started". For
+the same reason a confirmed stop records `not_started` only when no driver was ever asked; a
+launch that was requested and never reported becomes `launch_unknown`. A spawn report that
+arrives after an entry was closed as `launch_unknown` never reopens it
+(`store.record_invocation_spawn`): a reported launch records its process facts and makes the entry
+`unknown` - not `started`, which is open and could be settled into releasing the root - and a
+reported non-launch records `not_started`, the same results the closure would have reached had
+the report come first.
+
 ## Six properties the code enforces
 
 1. **Admission refuses before anything is created.** `controller.run_task` validates the
@@ -54,9 +117,16 @@ candidate and reported as the requested level.
    registered, a run row inserted, a worktree attached or a turn reserved. A refusal is an
    `exit 2` with the issues listed, and leaves no run state at all; it is a different event
    from a run that dispatches and then blocks (`exit 3`).
-2. **Budget before dispatch.** `store.dispatch_attempt` reserves the turn and records
-   the attempt in one `BEGIN IMMEDIATE` transaction. A database `CHECK` constraint
-   (`turns_reserved <= turn_limit`) backs up the logic. No reservation, no process.
+2. **Budget before dispatch.** `store.reserve_dispatch` is the one dispatch transaction of
+   batch E1, for both roles: in one `BEGIN IMMEDIATE` it checks ownership, phase, the absence of
+   a stop, the root (unresolved invocations, deadline, room for the rest of the loop, repair
+   count) and the authorization, then creates or attaches the attempt row, inserts the
+   invocation row and increments the run, root and authorization counters - or rolls all of it
+   back. Replaying the same invocation id returns the recorded intent and charges nothing.
+   Database `CHECK` constraints (`turns_reserved <= turn_limit`,
+   `used_top_level_submissions <= max_top_level_submissions`, `used_repairs <= max_repairs`)
+   back up the logic. No reservation, no process. (`store.dispatch_attempt`, the older
+   run-and-attempt-only transaction, is no longer on the production path.)
 3. **A worker cannot accept its own work.** The driver protocol returns an invocation
    outcome, an optional candidate description and an optional review verdict. It has no
    field for task state or verification. `ResultReceipt` is constructed only by
@@ -64,12 +134,65 @@ candidate and reported as the requested level.
 4. **Evidence is bound to a candidate.** Every evidence row carries the candidate
    fingerprint, the checks digest, and the exact command. Acceptance re-hashes the
    candidate; if it moved, the run blocks as `evidence_stale` (A09/A10/A11).
-5. **A late result cannot overwrite a newer attempt.** Result application is a
-   compare-and-set on `(current_attempt_id, task_revision)`; a mismatch raises and
-   changes nothing (A05).
+5. **A late result cannot overwrite a newer attempt or a stop.** Result application is a
+   compare-and-set on `(current_attempt_id, task_revision)`; a mismatch raises and changes
+   nothing (A05). Both roles follow one rule once a stop is recorded, confirmed or not: the
+   result's first write is conditional on the stop in the same statement -
+   `finish_attempt(unless_stopped=True)` for the implementer,
+   `attach_review_result_unless_stopped` for the reviewer - and the ledger entry is settled only
+   after that write succeeded. A result refused by it is a `late_result` note: the attempt and the
+   ledger entry keep the state the stop left (after an unconfirmed stop the entry stays open and
+   the root blocked until `resume` marks it `unknown`), the run keeps the stop's block, an
+   implementer's result creates no candidate commit and no `refs/hflow/candidates/*` ref, and a
+   reviewer's records no verdict, no review evidence and no process identity. A stop that commits
+   after the write keeps the applied result; for the implementer, a stop that lands after the
+   result was applied but before the freeze still prevents the freeze and the ref. When a stop
+   commits while the acceptance is being written, `finalize_acceptance` refuses the late success
+   in its own transaction, and the run is left in the stop's recorded state with no receipt.
 6. **Unknown means stop.** An interrupted invocation becomes `OUTCOME_UNKNOWN` with its
    reservation intact, the run blocks, and `resume` only reconciles. It never
-   re-dispatches (A04).
+   re-dispatches (A04). The same block follows a completion that answers no observed prompt
+   (`unbound_completion`, either role), a client whose boundary could not be confirmed empty
+   (`boundary_not_empty`), and a controller interrupted (Ctrl+C, `SystemExit`) while a driver
+   was starting or running an invocation.
+
+## Bounded repair (batch E2)
+
+One failed round may be followed by **one** second implementer attempt in the same run, on the
+same revision, starting from the frozen candidate, followed by fresh checks and a fresh
+independent review - only when the task carries an explicit `repair_policy`, and only for a
+clean, declared business check failure or a substantive reviewer rejection with at least one
+usable finding. The rules, the triggers and everything that stops a repair are in
+`docs/operations.md`, "When a repair may happen". What the architecture adds:
+
+- the repair round is its own `attempts` row (`is_repair = 1`); the schema key
+  `UNIQUE (run_id, task_revision, role, is_repair)` makes a third implementer attempt impossible
+  to insert;
+- `store.reopen_for_repair` moves the run back to its implementation phase in one transaction,
+  immediately before the repair reservation, and refuses a run another controller owns, a run
+  with a stop recorded and a terminal run - so a repair never revives a stopped or ended run;
+- three candidate identities stay apart (`CandidateIdentity`): the original base, the previous
+  round's candidate and the new candidate. The receipt's base is the original base and its paths
+  are the Git diff from that base to the final candidate, and the repair round's reviewer is
+  shown the same cumulative diff plus a labelled "this round's change";
+- every decision, refusals included, is one `RepairRecord` row in `run_repair_records`
+  (`allowed`, `not_enabled`, `not_a_business_failure`, `no_findings`, `already_repaired`,
+  `budget_exhausted`, `deadline_reached`, `stop_requested`, `no_content_change`,
+  `workspace_drift`);
+- the repair round reuses the first round's worktree only while it is exactly the previous
+  candidate (HEAD, tree, a clean status and no index entry flagged assume-unchanged or
+  skip-worktree), refusing otherwise as `workspace_drift` before anything is bought
+  (`_reconcile_repair_workspace`). Ignored files present then can only be the previous round's
+  check or review byproducts (the first freeze refused any ignored path off its allowlist). Those
+  outside what the scoped fingerprint hashes are carried: the repair's freeze accepts exactly
+  those paths, as literal entries, and the round's manifest comparison still refuses a worker
+  change to them as outside the scope; nothing is deleted, an ignored file is never staged, and
+  new ignored paths still refuse. One a previous check left inside a `write_allow` directory,
+  which the fingerprint would hash although no candidate commit holds it, would let the
+  fingerprint and the frozen commit disagree, so it refuses the repair as `workspace_drift`
+  instead;
+- a repair on a run with a real transport requires a root binding; a fully offline fake run may
+  repair rootless, charged to no root counter.
 
 ## What is deliberately absent
 
@@ -83,17 +206,55 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
 
 - **No sandbox.** `command` checks and workers run as ordinary child processes with the
   current user's rights. Scope is enforced by *detection after the fact* plus refusal to
-  accept, not by confinement, so a worker could write anywhere this user can write. No
-  credential confinement either: a check inherits the process environment, which is why the
-  approved-check runner is the only thing HFlow executes on a project's behalf.
+  accept, not by confinement, so a worker could write anywhere this user can write. The
+  detection covers the task's `write_allow`, the task's and the project's `write_deny`, and a
+  built-in deny list (`.git` and `.hflow` at the workspace root, `.acpxrc.json` at any depth):
+  a denied path blocks `scope_violation` before the freeze, even inside an allowed directory.
+  No credential confinement either: a check is given an allowlisted environment
+  (`artifacts.py`), but it runs with this user's rights and can read whatever the user can, which
+  is why the approved-check runner is the only thing HFlow executes on a project's behalf.
 - **A managed worktree is a workspace boundary, not a permission boundary.** When the
   TaskSpec sets `workspace.mode = worktree`, `gitworkspace.py` creates a detached worktree at
   a fixed base commit, the controller freezes the candidate as a real commit and keeps it
-  reachable through `refs/hflow/candidates/<run-id>/<attempt-id>`. The user's HEAD, index,
-  working files, stash and branches are not written to — but the worktree shares the source
-  repository's Git objects and admin files, and a process running as this user can still read
-  and write outside it. With `mode = in_place` a run edits the project root directly, exactly
-  as M1 did.
+  reachable through `refs/hflow/candidates/<run-id>/<attempt-id>`. The base is resolved once to
+  a SHA (`prepare.resolve_run`, bound into the authorization) and used for the worktree, every
+  round's candidate identity and the receipt, so a branch that moves during the run changes
+  nothing. The freeze first requires the worktree's HEAD to be the commit the round started from
+  (`freeze_candidate(expected_head=...)`: the original base in round one, the previous candidate
+  in a repair). A worker that ran `git commit`, `--amend`, `reset` or `checkout` moved HEAD, and
+  its commit never passed the scope and deny checks (they read the uncommitted status, which a
+  commit leaves clean), so that freeze is refused `scope_violation` rather than built on or
+  delivered. It refuses the same way, before reading the status, when an index entry is flagged
+  assume-unchanged or skip-worktree (`GitRepo.index_flagged_paths`, from `git ls-files -v`):
+  status, `git add` and the staged diff trust the index for such an entry, so the commit would
+  hold bytes the checks did not read. The flags are never cleared. It then stages each literal
+  `write_allow` entry (deletions included), refuses anything staged outside the scope or denied,
+  and refuses as incomplete if the worktree still shows a change afterwards. After the freeze -
+  before a candidate ref is written or a check runs - and again at acceptance, before a receipt
+  names the paths, the whole diff from the original base to the candidate is held to
+  `write_allow`, both `write_deny` lists and the built-in deny list. Every path list (staged paths, round and reviewer lists, `candidate_paths`) is taken with
+  `--no-renames`, so a move names its deleted source as well as its new path. Every Git command
+  that goes through `GitRepo` runs with forced configuration (`_base_env`: `GIT_CONFIG_COUNT`,
+  applied after the global, repository and worktree files, and appended to an inherited
+  `GIT_CONFIG_PARAMETERS`, which git reads after that list, so a caller's `git -c` cannot override
+  it): `core.hooksPath` set to an empty, HFlow-owned temporary directory, `core.fsmonitor=false`,
+  `commit.gpgsign=false`, `core.ignoreStat=false` and `core.sparseCheckout=false` (so HFlow's own
+  `worktree add` never checks an entry out flagged assume-unchanged or skip-worktree), plus
+  `GIT_CONFIG_NOSYSTEM=1`, `GIT_NO_REPLACE_OBJECTS=1` and a fixed identity. Inherited
+  repository-locating variables (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`,
+  `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_COMMON_DIR`, `GIT_NAMESPACE`)
+  are dropped, because every call names its repository by its working directory. The freeze commit also passes
+  `--no-verify`. No repository, user, worker or caller hook, monitor command or signer runs during
+  `worktree add`, the freeze or a ref write; the user's global config is still read for everything
+  else, and clean/smudge filters a worker configures in the shared `.git/config` are not disabled.
+  (`hflow clean`'s read-only `git worktree list` does not go through `GitRepo`.) The user's HEAD,
+  index, working files, stash and branches are not written to — but the worktree shares the
+  source repository's Git objects and admin files, and a process running as this user can still
+  read and write outside it. A `write_allow` entry that is, or passes through, a symbolic link or
+  junction in the checkout is refused at admission (a link can name a different place in the
+  worktree), and an entry that only starts escaping the worktree during a run blocks the run
+  `scope_violation` (the root is released) instead of raising. With `mode = in_place` a run edits
+  the project root directly, exactly as M1 did.
 - **The two candidate identities stay apart.** `candidate.git_commit`/`git_tree` are Git
   objects and identify what was verified; `candidate.fingerprint` is a content hash over the
   write scope and detects drift afterwards. `workspace.py` produces the fingerprint; a run
@@ -106,34 +267,74 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
   exactly that reason; there is no enforced read-only boundary.
 - **`review_isolation` is recorded from enforcement, not from claims.** A reviewer that
   says it was read-only does not change the recorded level (A08).
-- **A reviewer's verdict travels as text, not as a protocol field.** ACP's terminal prompt
-  response carries a stop reason, not HFlow's `ReviewOutput`; the verdict is an assistant
-  message. The production driver therefore reassembles the reviewer's *final* message from
-  eligible `agent_message_chunk` updates of that invocation's own session and decodes one
-  canonical `ReviewOutput` from it (`src/hflow/review.py`). Missing, malformed, ambiguous or
-  unbound output blocks as `review_protocol_error` and is recorded as failed review evidence -
-  it is never described as the reviewer requesting changes, and a verdict can never be filled
-  in on the model's behalf. Only the review invocation may produce it: an implementer whose
-  output happens to contain a verdict-shaped object still reports `review=None`.
-- **No repair cycle yet.** A rejected review or failed verification blocks the run; the
-  bounded repair cycle in the plan is not implemented.
+- **A turn is bound to its own prompt, and a verdict travels as text.** ACP's terminal prompt
+  response carries a stop reason, not HFlow's `ReviewOutput`. The production driver takes a
+  turn's stop reason only from the response whose id equals the last observed `session/prompt`
+  id: a terminal response that answers no observed prompt is `OUTCOME_UNKNOWN` /
+  `unbound_completion` for implementer and reviewer alike (no freeze, no checks, no verdict); a
+  prompt settled as `max_tokens` (or any other non-`end_turn` reason) stays `FAILED
+  stop_reason_<reason>` whatever a later response says; and `stopReason=cancelled` with no stop
+  requested for that invocation is `FAILED cancelled_unrequested`, because DSH also settles a
+  prompt as cancelled when it disposes of a session. `end_turn` is turn settlement, not success
+  - acceptance is decided by checks and review. The reviewer's verdict is reassembled from
+  eligible `agent_message_chunk` updates of that invocation's own session and decoded into one
+  canonical `ReviewOutput` (`src/hflow/review.py`). Missing, malformed or ambiguous output, or a
+  reviewer turn that `FAILED`, blocks as `review_protocol_error` and is recorded as failed review
+  evidence - it is never described as the reviewer requesting changes, and a verdict can never
+  be filled in on the model's behalf. A reviewer turn whose outcome is unknown blocks as
+  `outcome_unknown`, and its ledger entry is settled as unknown (the ledger records the
+  controller's classification, not the driver's raw outcome), so `resume` can reconcile it.
+  Only the review invocation may produce a verdict: an implementer whose output happens to
+  contain a verdict-shaped object still reports `review=None`.
 - **A stop ends local processes, and nothing more.** The production driver owns one
   invocation's process boundary (a Windows Job Object, `drivers/winjob.py`): the child is
   created suspended inside the boundary so ownership exists from its first instruction, and
   the boundary is closed after a bounded grace period. That is what `mechanism="forced"`
-  means. It is not a cooperative protocol cancellation — `acpx cancel` targets a persisted
-  session's queue owner and the selected one-shot `exec` path has none — and it is not a
-  statement about a process that leaves the job, about another platform, about a remote model
-  request, or about remote billing having stopped. A stop that cannot be confirmed stays
-  `still_running`/`unknown`, and the run blocks instead of re-dispatching.
+  means. It is not a cooperative protocol cancellation: the pinned acpx `exec` path sends
+  `session/cancel` only when its own process receives SIGINT/SIGTERM/SIGHUP, and HFlow starts the
+  client with `CREATE_NEW_PROCESS_GROUP`, which disables Ctrl+C for that group on Windows, while
+  Ctrl+Break arrives as SIGBREAK, which acpx does not handle (M0 observed a CTRL_BREAK killing the
+  client, exit `0xC000013A`, before any cancel reached the agent). That is reasoned and observed
+  once, not a delivery that was tried and measured. A client that has exited is not an empty
+  boundary: a stop asks the Job, and is `confirmed_stopped` only when the boundary is empty
+  (`forced` if this stop had to terminate leftovers, `none` if it was already empty). When the
+  client exits, `collect` terminates whatever is still in the Job, keeps the outcome and adds
+  `descendants_terminated_after_client_exit: N`; a Job that cannot be emptied makes the result
+  `OUTCOME_UNKNOWN` / `boundary_not_empty`. Each invocation's Job and its `stdout.ndjson` handle
+  are closed when its result is collected, and the controller calls the driver's optional
+  `release(invocation_id)` once a result is applied, or recorded as a late-result note (a failed
+  release is a `dispatch:` note and changes no decision). `release` never blocks on the client's
+  pipes: its reader joins are bounded (`RELEASE_JOIN_SECONDS`), and a stderr pipe whose reader is
+  still blocked - some holder of its write end outlived the teardown - is left to that daemon
+  reader, which closes it at EOF, and recorded in `driver.release_notes(invocation_id)` ("stderr
+  reader still blocked at release ..."). None of this is a statement about a process that leaves
+  the job, about another platform (off Windows the boundary is `direct_child_only` and its
+  terminate does nothing, so a forced stop or a deadline teardown does not kill even the direct
+  child), about a remote model request, or about remote billing having stopped. A stop that
+  cannot be confirmed stays `still_running`/`unknown`, and the run blocks instead of
+  re-dispatching.
 - **A stop goes to the role that is running, and both sides of a handoff are coordinated.**
   Implementer and reviewer are separate invocations (`attempts.invocation_id` /
   `attempts.review_invocation_id`) and may be separate driver objects. `Controller.cancel`
-  resolves the pair from the run's recorded `phase` - a review in progress means the reviewer's
-  invocation through `reviewer_driver` - records which role, driver and invocation were asked as
-  a run note, and reports the driver's facts. Coordination lives in the store and in the driver,
-  never in a controller read: `register_attempt_invocation_unless_stopped` and
-  `block_unless_stopped` write with `WHERE cancel_intent_at IS NULL`, and the driver's gate
+  records the intent first and then decides from the run's state as read *after* the intent: a
+  live run gets its receipt and its terminal block (`cancelled_by_operator` for a confirmed stop,
+  `outcome_unknown` otherwise) in **one** statement (`store.record_cancel_outcome`) and its
+  attempt and ledger bookkeeping afterwards, so a failure in that bookkeeping is a `dispatch:`
+  note on a run that is already terminal, and a failure of that one write leaves only the intent,
+  so a retried cancel asks the driver again and ends the run. A receipt found on a run that is
+  still live (a database written while the two were separate writes) has its block re-applied
+  without asking the driver again. A run that had already ended (`BLOCKED`, `CANCELLED`) still
+  has its last invocation asked to stop, and its receipt is recorded with
+  `run_already_ended=true`, but its block, its attempt and its ledger entries are not touched, so
+  an `outcome_unknown` run stays reconcilable (`ACCEPTED` is never reopened; nothing is asked to
+  stop there). On a rootless run the implementer's registration is conditional on the stop as
+  well, so a stop between the reservation and that registration ends the attempt `CANCELLED`
+  with no driver asked and the reserved turn spent. It resolves the pair from the run's recorded
+  `phase` - a review in progress means the reviewer's invocation through `reviewer_driver` -
+  records which role, driver and
+  invocation were asked as a run note, and reports the driver's facts. Coordination lives in
+  the store and in the driver, never in a controller read: `register_attempt_invocation_unless_stopped`
+  and `block_unless_stopped` write with `WHERE cancel_intent_at IS NULL`, and the driver's gate
   (`_gate`, a `Condition`) is held while it publishes an invocation's handle **and** creates the
   child, which *both* stop entry points - `cancel_handle` and `cancel(invocation_id)` - take to
   record their request. A missing handle is not an answer while a spawn is in flight: a stop that
@@ -145,7 +346,38 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
   wins that gate means no process is created at all (`DriverHandle.start_cancelled`, reported as
   `cancelled` with `agent_turns=0`), and a stop that loses it finds a published handle and
   terminates the process. `InvocationRequest` carries `stop_requested` so the driver asks the
-  run's state at the instant of the spawn. Reconciliation (`resume`) resolves the same way.
+  run's state at the instant of the spawn. Reconciliation (`resume`) resolves the same way. A
+  stop from another process (`hflow cancel` against a run a different controller is executing)
+  holds no handle, so it reports `unknown` and blocks the run `outcome_unknown`.
+- **The launch refuses a workspace client config.** acpx always loads `.acpxrc.json` from
+  `--cwd` and lets it override HFlow's per-invocation config, including the agent argv
+  (`workspace_client_config`). A file already in the workspace a real run starts from - the
+  project root for an in-place run (a directory listing, `_workspace_client_config`), the base
+  commit's root tree for a worktree run (`git ls-tree --name-only <base>`, no pathspec, since a
+  pathspec matches case-sensitively) - is found by `prepare.start_workspace_client_config` and
+  refused through `admission.predictable_dispatch_problems`, the one rule `prepare` and the
+  controller's dispatch gate share, before a run row, an authorization record, a reservation or a
+  process exists. One that appears later (the reviewer runs on the worktree the implementer
+  wrote) is refused inside the driver's spawn gate, before any process exists but with the
+  dispatch already reserved. Both checks match the name without regard to case among the
+  workspace root's own entries (acpx's open finds `.ACPXRC.JSON` on a case-insensitive
+  filesystem) and name the spelling they found.
+- **Every launch program is an absolute file outside the workspace.** `resolve_launch_config`
+  never falls back to a bare name: `dsh`, and `node`/`python` for a `.js`/`.py` client, are looked
+  up only on the absolute entries of the resolving environment's `PATH` (`find_on_path`, never the
+  current directory), an explicit program (`HFLOW_ACPX_NODE`, a driver argument, an argv
+  override) must be absolute, and a launcher, `dsh`, client interpreter or acpx client entry
+  inside the project root or the worktree parent directory (`prepare.launch_workspaces`) makes the
+  launch not resolvable, as does a workspace inside the `node_modules` tree the entry loads its
+  modules from (`_client_module_tree`). With `HFLOW_ACPX_CLI` unset and no copy under
+  `<data-dir>/m0/acpx`, the entry falls back to the HFlow checkout's own `.probe/acpx`, so a run
+  whose project root is the HFlow repository itself reports the launch not resolvable until
+  `HFLOW_ACPX_CLI` names an acpx installed outside it. The DSH batch shim is wrapped in the
+  absolute `%SystemRoot%\System32\cmd.exe`. The child environment (also used by the zero-model
+  preflight) always carries `NoDefaultCurrentDirectoryInExePath=1`, with every other spelling
+  removed, drops relative and empty `PATH` entries (absolute entries are passed on as they are),
+  and has `DSH_PERMISSION_MODE` / `DSH_TOOLS_MODE` removed, so neither cmd.exe (which runs the
+  shim's bare `node`) nor Node's spawn looks in the workspace first.
 - **Billing is unknown.** `provider_billed_tokens`, `provider_cost` and
   `subscription_quota_remaining` are `null` because nothing observes them. Do not read `null`
   as `0`.
@@ -166,6 +398,7 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
 | later offline reprocessing | `ACCEPTED` / `LOCAL_CANDIDATE` recorded for that same candidate from its own evidence | that the repaired parser carries the recorded verdict through the acceptance predicates. No model was called, no check re-executed, no allowance consumed |
 
 None of these rows certify cooperative cancellation, a filesystem sandbox, descendant control,
-or remote billing termination. Details and provenance:
-`docs/m2-live-acceptance-result.md`, `docs/m2-review-wire-repair.md`, `docs/m0-results.md`.
-
+model selection, or remote billing termination. Batch E1/E2 and the 2026-10-02 refinement
+(root ledger, bounded repair, launch hardening, `--model`) are offline-tested only. Details and
+provenance: `docs/m2-live-acceptance-result.md`, `docs/m2-review-wire-repair.md`,
+`docs/m0-results.md`, `docs/adr/0001-transport.md`.

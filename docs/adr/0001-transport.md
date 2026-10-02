@@ -239,3 +239,73 @@ not mean remote billing stopped.
   running. Until that is measured, HFlow may at most claim basic round-trip success.
 - `usage_update` is context usage (used/size), so the receipt keeps
   `provider_billed_tokens`, `provider_cost` and `subscription_quota_remaining` as `null`.
+
+## Addendum 2026-10-02 — upstream survey and launch hardening
+
+Appended, not a rewrite: the decision above stands (`acpx -> official DSH ACP`, one-shot
+`exec`), and no capability state in the tables above is upgraded by anything here. This addendum
+records an upstream survey made on 2026-10-02 by reading release metadata, source and
+documentation, plus what the 2026-10-02 refinement now enforces and observes. **Nothing in the
+survey was executed against real DSH or a model**; every upstream fact below is labelled
+*documented* (read in upstream source, docs or release metadata), and the two local facts are
+labelled for what they are.
+
+### acpx (documented)
+
+| Fact | Label |
+|---|---|
+| The pinned acpx 0.17.1 is tag `v0.17.1`, commit `50a47ad10a75431cbc276ec9b555d11fe1f69c84` (published 2026-09-20), the version installed at `.probe/acpx` | documented |
+| The latest release is `v0.19.4`, commit `8e396609238086dee6a407fdb3b3ac46dbdedd70` (published 2026-10-01); `v0.17.1...v0.19.4` is 179 commits | documented |
+| No acpx surface HFlow uses breaks in that range: the per-invocation config keys and `agents.<name>.argv`, `exec -f -` from stdin, the raw ACP JSON-RPC NDJSON stream under `--format json` (both directions), the exit codes, and the `ACPX_*` variables acpx reads. The changes are additive (a JSON-RPC error line for config start-up errors, a reported agent disconnect after partial output, a new `EXEC_DISABLED` code) | documented |
+| 0.18.0 fixed a read-classification bug under `approve-reads` (a permission request with no kind whose title merely contained "read" or "cat" was auto-approved); 0.19.x adds Windows descendant snapshots through PowerShell, which lengthen start-up and exit; 0.19.3/0.19.4 tolerate `{}`/non-list `set_config_option` replies | documented |
+| **The pin stays at 0.17.1** by the user's decision; the upgrade is a separate, later step that has to pass offline checks first | decision |
+| acpx always loads `<--cwd>/.acpxrc.json`; scalar settings in it beat the global config, and a project `agents.<name>` entry replaces the global agent argv. There is no flag or variable to skip or pin it: upstream issue openclaw/acpx#835 (opened 2026-09-29) is open, and not fixed in v0.19.4 | documented |
+| `exec` is wrapped in an interrupt handler: on SIGINT, SIGTERM or SIGHUP it sends `session/cancel` for the active prompt and waits up to 2.5 s before closing; SIGBREAK is not handled; `--timeout` expiry sends no `session/cancel` | documented |
+| `--timeout` bounds each phase (start, session creation, model change, each config option, the prompt) separately, not the whole call | documented |
+| The global `--model <id>` flag exists at 0.17.1: after `session/new` acpx picks the select option with category `model` (preferring id `model`; grouped options supported), sends `session/set_config_option` before `session/prompt` unless the value is already current, and refuses an unadvertised value (or an agent with no model option) with a `RUNTIME` error and no prompt sent. It also forwards the value in `session/new` `_meta.claudeCode.options.model`. The config file has no model key | documented; the behaviour against a mock agent is offline-tested |
+
+The capability table's reason for `unsupported` cooperative cancellation ("the `exec` one-shot mode
+has no queue owner") is imprecise in the light of the source: the `exec` path *does* have an
+interrupt-driven `session/cancel`. The limit is delivery: HFlow starts the client with
+`CREATE_NEW_PROCESS_GROUP`, which disables Ctrl+C for that group on Windows, Ctrl+Break reaches
+Node as SIGBREAK (unhandled), and Windows offers no external SIGTERM/SIGHUP. The M0 CTRL_BREAK
+observation (client killed, exit `0xC000013A`, no cancel reached the agent) fits that reading;
+the rest is reasoned, not measured. The state stays `unsupported`.
+
+### DSH (documented)
+
+| Fact | Label |
+|---|---|
+| Surveyed range: `dsh-v0.1.7-rc.1` = `46a7f68b0922371ce7144b668b90e377d8e799f4` (2026-09-23), `dsh-v0.1.7-rc.2` = `477b4f420553e8a52c2fbccc464d7561b239c443`, `dsh-v0.2.0-rc.1` = `4878cdabd87d4041bdaff61d04c966883b9fd07a`, `dsh-v0.2.0-rc.2` = `639ed015397290b3745d163aafe02ffee4aa3f84` (2026-09-29, npm `latest`). All four are prereleases, and the 0.2.0-rc.2 README calls DSH a developer preview that will have compatibility-breaking changes | documented |
+| Between `dsh-v0.1.7-rc.1` and `dsh-v0.2.0-rc.2` the ACP package and the `acp` app bundle change only translation files and version numbers: the ACP server source, the advertised methods (`initialize`, `authenticate`, `session/new`, `session/list`, `session/resume`, `session/close`, `session/set_config_option`, `session/prompt`, `session/cancel`) and the launcher flags (`--profile`, `--patch`, `--dump-config`, ...) are the same | documented |
+| ACP `initialize` hard-codes `agentInfo {name: "deepseek-harness-acp", version: "0.0.1"}` at every surveyed version, so the DSH version cannot be read over ACP | documented |
+| ACP removed the unstable `session/set_model` method (ACP 0.13.5); the stable model channel is a `configOptions` entry with category `model`, changed through `session/set_config_option`. DSH implements exactly that: option id `model`, value the opaque `JSON.stringify([provider, model])` (for example `["deepseek-official","deepseek-v4-pro"]`), plus a `reasoning_effort` option with category `thought_level`. DSH has no model CLI flag, environment variable or `_meta` field | documented |
+| The live catalog in "Facts observed on this machine" was observed on DSH 0.1.5; at 0.2.0 the `model` select may carry a second provider group (`deepseek-account`), and the 0.2.0-rc.2 release notes say some older model ids were removed | documented |
+| DSH maps `blocked` and `aborted` turns to `end_turn`, and can settle a prompt as `cancelled` without a client cancel (session disposal) | documented |
+| DSH's permission requests carry only a tool-call id; DSH reads its sandbox mode from `DSH_PERMISSION_MODE` (default `workspace-write`, approval `ask`) and its tools mode from `DSH_TOOLS_MODE`; its session-log upload to DeepSeek is enabled by default | documented |
+| This machine has only DeepSeek Harness Desktop 0.2.0.0 installed (bundled `dsh.cmd` shim, not on `PATH`); there is no npm-global `@deepseek-ai/dsh` and no `dsh` on `PATH`, so the npm `dsh.CMD` recorded at M0 is gone. At the time of the survey HFlow's launch resolution (`shutil.which("dsh")`) would then have fallen back to the bare name; it no longer does - it searches only absolute `PATH` entries and, with no `dsh` there, reports the launch not resolvable | observed read-only (a file-system listing; nothing was executed) |
+
+### What the 2026-10-02 refinement enforces and observes
+
+All of it is offline-tested (production driver over the Python stand-in client, and the pinned
+acpx 0.17.1 against the project's mock agent); none of it is live evidence.
+
+- **Enforced:** a workspace containing any `.acpxrc.json` entry is refused inside the spawn gate
+  before any process exists (`workspace_client_config`); the DSH batch shim is wrapped in the
+  absolute `%SystemRoot%\System32\cmd.exe` (no bare-name search of the worktree); ambient
+  `DSH_PERMISSION_MODE` and `DSH_TOOLS_MODE` are removed from the child environment; a profile's
+  validated `model_selection` other than `native_profile` is passed as the client's `--model`,
+  bound in the launch digest (a user ruling, 2026-10-02, that such a value is a fixed flag under
+  AGENTS.md rule 9); a turn's stop reason is taken only from the response to the observed
+  `session/prompt` id (otherwise `OUTCOME_UNKNOWN` / `unbound_completion`); an unrequested
+  `cancelled` is `FAILED`; a stop asks the Job Object before confirming, and descendants left
+  inside the Job after the client exits are terminated.
+- **Observed per invocation:** the `session/new` `configOptions` model entry and the
+  `thought_level` entry, outbound `session/set_config_option` and its response, and
+  `config_option_update` notifications, recorded as `model_observation` / `model_applied`.
+- **Unchanged capability states:** cooperative cancellation `unsupported` (reason corrected
+  above), model selection `documented` (a live `set_config_option` round trip has not been
+  observed, and concrete model ids for the current DSH build need an approved zero-prompt catalog
+  check first), read-only enforcement `unsupported`, billed usage `unknown`.
+- **Deferred:** binding the launch by program content rather than by path, and the acpx 0.19.x
+  upgrade.

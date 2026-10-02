@@ -1,6 +1,6 @@
 # 批次 E：根预算与一次有界修复 — DSH 实施方案
 
-日期：2026-09-25。代码基线：`8d68d9b`。状态：**E1、E2 均已实施并通过离线验收**。实现与验收证据见 `README.md` 的 root budget / repair 条目、`docs/operations.md` 与 `tests/test_batch_e_*.py`（E2 行为见 `tests/test_batch_e_repair.py` 与 `tests/test_batch_e_verify.py`）；本文保留原始范围与设计。E2 只实现"一次有界业务修复"：显式 `repair_policy` 才启用，且只由已声明的业务检查失败或实质性的 reviewer 拒绝触发；E3 及以后仍未实现。离线通过不构成 live 兼容性证明。
+日期：2026-09-25。代码基线：`8d68d9b`。状态：**E1、E2 均已实施并通过离线验收**。实现与验收证据见 `README.md` 的 root budget / repair 条目、`docs/operations.md` 与 `tests/test_batch_e_*.py`（E2 行为见 `tests/test_batch_e_repair.py` 与 `tests/test_batch_e_verify.py`）；本文保留原始范围与设计。E2 只实现"一次有界业务修复"：显式 `repair_policy` 才启用，且只由已声明的业务检查失败或实质性的 reviewer 拒绝触发；E3 及以后仍未实现。离线通过不构成 live 兼容性证明。2026-10-02 补注：§5.1 的根绑定要求与 §5.3 的修复前工作树复核如何落地，见各节注记；§9 为历史记录。
 
 本轮用户授权是整理本机材料与推进下一批方案；不授权 live 派发。本文供后续 DSH 实施使用，不是 authorization，也不改变任何旧任务的“失败即停止”条款。新的 live 预算为 0。
 
@@ -125,6 +125,8 @@ E1 验收时仍无自动修复；有预算字段不等于已执行功能。
 
 策略列出允许触发修复的 check id 及该检查约定代表“业务断言失败”的非零退出码，以及是否允许有效 reviewer changes_requested。禁止把所有非零码默认为可修。它是项目/任务显式契约，HFlow 不宣称能从任意进程退出码识别根因。
 
+> **2026-10-02 实施注记（根绑定要求的落地方式）。** E2 首版实际允许无根修复，与本节"有效根绑定"不一致（离线复核 F27）。2026-10-02 修订按以下方式落地：只要任一角色使用真实传输（非离线 fake driver），带 `repair_policy` 的任务必须同时传 `--root-budget-file`；`prepare` 在 `dispatch_preconditions` 下报告（`budget_exceeded`，location `root_budget`），`run` 在创建 run 行与授权记录之前拒绝。完全离线的 fake 运行仍可无根完成那一次有界修复，且不计入任何根修复计数。理由：真实修复的跨 revision 上限依赖根的修复计数与根时钟，无根时每个新 revision 都可再买一次修复；离线 fake 不触达模型、不需要批准，限制它只会让离线测试失去意义，而它仍受 `max_attempts=1`、`UNIQUE(run_id, task_revision, role, is_repair)` 与本 run 轮次上限约束。同时：已绑定根且启用策略时，若根的 `max_repairs` 不足以支付本次可能的修复（后续 revision 的首个实现也计为修复，故需 2），在登记根、创建 run 行与授权记录之前（因而也在 I1 之前）以 `budget_exhausted` 拒绝，改正根文件后重新提交即可被接受（`prepare` 只能报告 `max_repairs` 为 0 的情形）；无 `--root-budget-file` 的运行若同一任务已有根，在创建 run 行与授权记录之前以 `budget_exhausted` 拒绝，派发事务内再查一次作为竞态兜底。第 69 行"legacy 路径维持无修复"与第 7 节第 11 条"所有角色仍计入同一根账本"据此只对真实传输成立。
+
 最坏闭环预算预检：有修复时需覆盖 4 次顶层派发；未启用修复仍为常规 1+1。根/run/授权均不足 4 时启用修复的初次 live run 在 implementer 前拒绝，避免半途才发现不能完成审查。项目 required-review 下限照旧。
 
 | 路径 | 最大实际预留 |
@@ -150,6 +152,8 @@ Unity 的两次历史失败都属于不允许触发的分支；旧失败授权�
 同一运行保留原 TaskSpec/revision/config/检查定义及授权，增加新的 implementer attempt；不在内部悄悄改 revision。首轮失败记录保留，run 在决策时直接进入一次修复，**不先写 terminal BLOCKED 再复活**。旧 BLOCKED run 不参与此路径。
 
 复用本 run 的隔离 worktree，以上一冻结候选为修复起点；重核 HEAD、完整 tree、scope 与工作树状态。dirty/漂移则拒绝，不 reset、不覆盖。所有既有工作区管理边界继续适用。
+
+> **2026-10-02 实施注记（修复前的工作树复核）。** 复核在预留与派发之前进行（`_reconcile_repair_workspace`）：HEAD 与 tree 须仍是上一候选，`git status` 干净，且没有任何索引项带 assume-unchanged 或 skip-worktree 标志（`git ls-files -v`；带标志的项 status 看不出改动。冻结本身遇到这类标志也拒绝，HFlow 从不清除标志）。任一不满足即记 `workspace_drift`，以 `scope_violation` 阻塞，不购买修复。上一轮检查或审查留下的被忽略文件（首轮冻结已拒绝白名单外的被忽略路径，故只能是 HFlow 自己检查的副产物）分两类：在 scoped fingerprint 不哈希之处的，按字面路径带入修复轮冻结，从不暂存，worker 对它们的改动仍由 manifest 比对按越界拒绝；在 `write_allow` 目录内、fingerprint 会哈希的（例如 `write_allow: ["src"]` 下的 `src/run.log`），没有候选 commit 持有它，fingerprint 会与冻结的 commit 不一致，因此同样在购买前以 `workspace_drift` 拒绝，且不删除该文件。
 
 保留三个独立身份：原始任务 base、上一候选 parent、新候选。最终 receipt 的候选路径与交付 diff 对应**原始 base→最终候选**的累计变化，不能只交第二轮补丁。每轮 candidate ref 保留；无内容变化时以 tree/内容身份判断，不能靠新 commit SHA 假装有进展。
 
@@ -220,7 +224,9 @@ Controller 当前有按 run 取 evidence 的路径，实施时必须逐一改为
 
 选择是在现有标准库 SQLite、contracts、Controller 上增量实现。没有复用新框架的必要；本批的主要工作是接通现有事实与事务，不是重新造编排平台。
 
-## 9. 交给 DSH 的下一条指令
+## 9. 交给 DSH 的下一条指令（历史记录，已失效）
+
+> **历史记录。** 本节是 2026-09-25 写给实施方的原始指令，仅保留作来历说明，不再是待执行的指令：E1（`2edcaff`）与 E2（`0ec289c`）均已实施，2026-10-02 的修订另行修正了复核发现的缺陷。下文"不实现 E2"等约束只对当时的 E1 阶段有效。当前行为以 `README.md`、`docs/operations.md` 与测试为准。
 
 > 按 `docs/batch-e-plan.md` 先实施 E1：根绑定、同库根预算、两角色统一原子派发及历史兼容。只做离线代码和测试，不实现 E2 自动修复，不派发真实模型，不改旧 handoffs/授权/游戏仓库，不提交或推送。重点证明多个计数与 invocation 登记同事务、取消不穿透、未知不重发、跨 revision 不重置根消费，以及旧摘要保持。复用现有测试设施，结束时报告改动、真实测试输出和限制。E1 完成后再进入已定义的 E2；不要在 E1 中提前声称修复循环已实现。
 
