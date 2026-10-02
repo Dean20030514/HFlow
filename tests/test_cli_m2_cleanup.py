@@ -235,6 +235,42 @@ def test_cli_produces_a_frozen_candidate_and_reports_it(
     assert branches == ["main"], branches
 
 
+def test_cli_run_builds_the_worktree_from_the_base_it_resolved(
+    cli_project: dict[str, Path],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`run` resolves ``--base-commit main`` once and hands the controller that commit.
+
+    The branch moves right after `run` resolved it - the moment its approval is checked against -
+    and before the controller creates the worktree. Resolving the name a second time there would
+    start the run from a commit the approval never named.
+    """
+    import hflow.prepare as prepare_module
+
+    repo = cli_project["repo"]
+    start = cli_project["base"].read_text(encoding="utf-8").strip()
+    original = prepare_module.resolve_run
+
+    def resolve_then_move(**kwargs):  # noqa: ANN003, ANN202 - same signature as the original
+        resolved = original(**kwargs)
+        (repo / "user_notes.txt").write_text("the user's own work\n", encoding="utf-8")
+        _git(repo, "add", "user_notes.txt")
+        _git(repo, "commit", "-q", "-m", "user work right after run resolved its base")
+        return resolved
+
+    monkeypatch.setattr(prepare_module, "resolve_run", resolve_then_move)
+    code, _ = _run_cli(cli_project, "--base-commit", "main")
+    assert code == EXIT_OK
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["task_state"] == "ACCEPTED", payload.get("block_reason")
+    assert _git(repo, "rev-parse", "main").strip() != start, "main really moved"
+    receipt = payload["receipt"]
+    assert receipt["candidate"]["base_commit"] == start
+    assert receipt["candidate_paths"] == ["src/textkit/__init__.py"]
+    assert not (Path(receipt["candidate"]["worktree"]) / "user_notes.txt").exists()
+
+
 def test_cli_failed_candidate_is_rejected_and_kept(
     cli_project: dict[str, Path], capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
@@ -519,6 +555,65 @@ def test_clean_refuses_an_active_run(
     refused = _preview(cli_project, capsys, run_id)
     assert refused["allowed"] is False
     assert any(item["reason"] == "execution_active" for item in refused["refusals"])
+
+
+def test_cancel_of_a_run_that_already_ended_does_not_make_clean_refuse(
+    cli_project: dict[str, Path], capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """``hflow cancel`` of an ended run records an observer's ``unknown``; cleanup ignores it.
+
+    The CLI's drivers hold no handle for an invocation another process started, so a stop of a
+    run that had already ended - here ``BLOCKED/verification_failed``, attempt finished - comes
+    back ``unknown``. That answer used to become a ``stop_unconfirmed`` refusal that nothing
+    could ever lift: the workspace was cleanable before the cancel and never again after it.
+    A stop of a run that was still *live* when the intent was recorded keeps refusing.
+    """
+    bad_plan = tmp_path / "bad-plan.json"
+    bad_plan.write_text(
+        json.dumps({"src/textkit/__init__.py": SCRIPT_SOURCE + "\n# touched, not fixed\n"}),
+        encoding="utf-8",
+    )
+    code, _ = _run_cli(cli_project, plan=bad_plan)
+    assert code == EXIT_BLOCKED
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    run_id = payload["run_id"]
+    assert payload["block_code"] == "verification_failed"
+    assert _preview(cli_project, capsys, run_id)["allowed"] is True
+
+    code, receipt = _cli_json(capsys, cli_project, "cancel", run_id)
+    assert code == EXIT_OK
+    assert receipt["status"] == "unknown", "an observer cannot confirm a stop it did not perform"
+    after = _preview(cli_project, capsys, run_id)
+    assert after["allowed"] is True, after["refusals"]
+    code, again = _cli_json(capsys, cli_project, "cancel", run_id)
+    assert again == receipt, "a repeated stop returns the recorded receipt"
+    assert _preview(cli_project, capsys, run_id)["allowed"] is True
+
+
+def test_an_unconfirmed_stop_of_a_live_run_still_makes_clean_refuse(
+    cli_project: dict[str, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The other half: a stop that reached a live run and could not be confirmed keeps the scene."""
+    code, _ = _run_cli(cli_project)
+    assert code == EXIT_OK
+    run_id = json.loads(capsys.readouterr().out.strip().splitlines()[-1])["run_id"]
+
+    import sqlite3
+
+    # A run another controller is still driving: RUNNING, its attempt not yet decided.
+    connection = sqlite3.connect(str(cli_project["data"] / "hflow.sqlite"))
+    try:
+        connection.execute("UPDATE runs SET task_state = 'RUNNING' WHERE run_id = ?", (run_id,))
+        connection.commit()
+    finally:
+        connection.close()
+
+    code, receipt = _cli_json(capsys, cli_project, "cancel", run_id)
+    assert code == EXIT_OK
+    assert receipt["status"] == "unknown"
+    refused = _preview(cli_project, capsys, run_id)
+    assert refused["allowed"] is False
+    assert any(item["reason"] == "stop_unconfirmed" for item in refused["refusals"])
 
 
 def test_clean_refuses_a_missing_or_foreign_workspace(

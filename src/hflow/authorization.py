@@ -254,13 +254,19 @@ def current_binding(
     artifact must carry and ``verify_authorization`` accepts it. It stays ``None`` only when no
     root budget file was supplied, which is the legacy shape: an artifact with no root, spent
     against no ledger.
+
+    ``base_commit`` is the commit the run starts from when the request carries one
+    (``RunRequest.base_commit``, which ``prepare`` and ``run`` resolve once from the task's ref),
+    so an approval names a commit rather than a branch that can move after it was given. A
+    request without one - an in-place run, a ref that does not resolve, the historical tools -
+    binds the task's own text, as before.
     """
     binding = AuthorizationBinding(
         mode=mode,
         driver=driver,
         project_id=project.project_id,
         repo_path=str(Path(request.project_root).resolve()),
-        base_commit=request.task.workspace.base_commit,
+        base_commit=request.base_commit or request.task.workspace.base_commit,
         spec_digest=request.task.spec_digest(),
         spec_path=str(Path(spec_path).resolve()),
         roles=list(effective_roles(effective)),

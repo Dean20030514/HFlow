@@ -17,7 +17,10 @@ Each mode models one behaviour the driver must handle honestly:
                   ``messageId`` and interleaved with earlier commentary. ``STUB_REVIEW_MODE``
                   selects the reviewer's shape (``fenced``/``bare``/``invalid``/``ambiguous``/
                   ``prose``/``silent``); ``STUB_MESSAGE_IDS=0`` drops the optional
-                  ``messageId`` so the messageId-free grouping path is covered too.
+                  ``messageId`` so the messageId-free grouping path is covered too;
+                  ``STUB_TERMINAL_RESPONSES`` (and ``STUB_REVIEWER_TERMINAL_RESPONSES`` for
+                  the reviewer alone) replaces the terminal prompt response, see
+                  ``emit_terminal_responses``.
 
 Invoked as: ``python stub_acp_agent.py <mode> --task-file -`` with the prompt on stdin.
 """
@@ -144,6 +147,25 @@ def emit_thought(session_id: str, text: str, message_id: str, *, with_id: bool =
     )
 
 
+def emit_terminal_responses(*, reviewer: bool) -> None:
+    """The turn's terminal response(s): by default one ``end_turn`` answering the prompt.
+
+    The fake client sends ``session/prompt`` as request id 2. ``STUB_TERMINAL_RESPONSES``
+    replaces the default with comma-separated ``id:stopReason`` pairs, emitted in that order, so
+    a test can answer a different request id, settle the prompt and then something else, or
+    (an empty value) never settle at all. ``STUB_REVIEWER_TERMINAL_RESPONSES`` does the same for
+    the reviewer only, so a run's implementer can stay ordinary.
+    """
+    spec = os.environ.get("STUB_TERMINAL_RESPONSES", "2:end_turn")
+    if reviewer:
+        spec = os.environ.get("STUB_REVIEWER_TERMINAL_RESPONSES", spec)
+    for item in (part.strip() for part in spec.split(",")):
+        if not item:
+            continue
+        request_id, _, stop_reason = item.partition(":")
+        emit({"jsonrpc": "2.0", "id": int(request_id), "result": {"stopReason": stop_reason}})
+
+
 def verdict_document(verdict: str, detail: str) -> str:
     """The reviewer's answer, in the form the recorded reviewer actually produced."""
     payload = json.dumps(
@@ -223,7 +245,7 @@ def structured_turn(session_id: str, task: str, scratch: Path) -> int:
         emit_message_chunk(
             session_id, "The change is inside src/parser.py.", "m-2", with_id=with_ids
         )
-        emit({"jsonrpc": "2.0", "id": 2, "result": {"stopReason": "end_turn"}})
+        emit_terminal_responses(reviewer=False)
         return 0
 
     # A verdict-shaped object in text that is not the reviewer's own message: neither may
@@ -247,7 +269,7 @@ def structured_turn(session_id: str, task: str, scratch: Path) -> int:
         cut = answer.index("```json") + 3 if "```json" in answer else len(answer) // 2
         for part in (answer[:cut], answer[cut:]):
             emit_message_chunk(session_id, part, "m-5", with_id=with_ids)
-    emit({"jsonrpc": "2.0", "id": 2, "result": {"stopReason": "end_turn"}})
+    emit_terminal_responses(reviewer=True)
     return 0
 
 

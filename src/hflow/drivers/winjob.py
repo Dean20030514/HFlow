@@ -28,6 +28,7 @@ import os
 import subprocess
 import sys
 from ctypes import wintypes
+from typing import Any
 
 IS_WINDOWS = os.name == "nt"
 
@@ -325,7 +326,9 @@ def popen_in_boundary(
 
     The caller passes already-open output files rather than paths: one handle shared by the
     child (for writing) and by the parent's reader, so no second open can hide the child's
-    writes behind a stale file offset.
+    writes behind a stale file offset. The child gets its own copy of each handle when it is
+    created; the parent's copies are kept on the returned object and are the caller's to close
+    (:func:`close_output_handles`) once it no longer needs them.
     """
     flags = suspending_flags()
     try:
@@ -351,6 +354,24 @@ def popen_in_boundary(
         child.kill()
         raise
     return child
+
+
+def close_output_handles(child: subprocess.Popen) -> None:
+    """Close the parent's copies of the output files given to :func:`popen_in_boundary`.
+
+    The child received its own handles at creation, so this does not cut off its output; it
+    stops the parent from holding the files open for as long as it lives. A pipe request
+    (``subprocess.PIPE``) is not a file and is left alone - the pipe ``Popen`` made for it is the
+    caller's to close. Idempotent.
+    """
+    for name in ("_hflow_stdout", "_hflow_stderr"):
+        stream = getattr(child, name, None)
+        if stream is None or isinstance(stream, int) or getattr(stream, "closed", True):
+            continue
+        try:
+            stream.close()
+        except OSError:
+            pass
 
 
 def parent_pid(pid: int) -> int | None:

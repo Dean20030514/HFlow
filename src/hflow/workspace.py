@@ -10,12 +10,23 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import os
+from collections.abc import Iterable
 from pathlib import Path
 
 from .contracts import RefusalCode, RefusedError, Scope, digest_of
 
 # Directories that are never part of a candidate snapshot.
 _SNAPSHOT_SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", ".hflow"}
+
+#: Paths no worker may change, whatever a task or a project declares. ``.git`` and ``.hflow``
+#: hold the repository and HFlow's own state. ``.acpxrc.json`` is the client config acpx loads
+#: from its working directory over HFlow's own, and the reviewer runs in the worktree the
+#: implementer wrote, so it is denied at any depth. A bare entry also covers everything beneath
+#: it (see :func:`matches_pattern`).
+BUILTIN_WRITE_DENY: tuple[str, ...] = (".git", ".hflow", ".acpxrc.json", "**/.acpxrc.json")
+
+#: Characters that make a ``write_allow`` entry a pattern rather than a path.
+_GLOB_CHARS = ("*", "?", "[")
 
 
 def _normalize(pattern: str) -> str:
@@ -66,11 +77,23 @@ def resolve_within(root: Path, relative: str) -> Path:
 
 
 def check_scope(scope: Scope, root: Path, write_deny: list[str]) -> list[str]:
-    """Return scope problems; empty list means the declared scope is admissible."""
+    """Return scope problems; empty list means the declared scope is admissible.
+
+    ``write_allow`` entries are literal file or directory paths. The candidate freeze stages each
+    entry as a path and the scoped fingerprint reads each one as a file or a directory, so a glob
+    there would match the worker's writes while freezing and fingerprinting nothing. ``write_deny``
+    keeps its globs: it is only ever matched against changed paths.
+    """
     problems: list[str] = []
     if not scope.write_allow:
         problems.append("write_allow must list at least one path")
     for entry in scope.write_allow:
+        if any(char in entry for char in _GLOB_CHARS):
+            problems.append(
+                f"write_allow entry {entry!r} is a glob pattern; write_allow takes literal file or "
+                "directory paths (write_deny may use globs)"
+            )
+            continue
         try:
             resolve_within(root, entry)
         except RefusedError as exc:
@@ -80,6 +103,11 @@ def check_scope(scope: Scope, root: Path, write_deny: list[str]) -> list[str]:
             problems.append(f"write_allow entry {entry!r} is covered by project write_deny")
         if matches_pattern(entry, list(scope.write_deny)):
             problems.append(f"write_allow entry {entry!r} contradicts the task's own write_deny")
+        if matches_pattern(entry, list(BUILTIN_WRITE_DENY)):
+            problems.append(
+                f"write_allow entry {entry!r} is a path HFlow never lets a worker write "
+                f"({', '.join(BUILTIN_WRITE_DENY)})"
+            )
     return problems
 
 
@@ -157,11 +185,22 @@ def candidate_fingerprint(root: Path, scope: Scope) -> str:
     return digest_of(entries)
 
 
-def paths_outside_scope(changed: list[str], scope: Scope) -> list[str]:
+def paths_outside_scope(
+    changed: list[str], scope: Scope, project_deny: Iterable[str] = ()
+) -> list[str]:
     """Changed paths that the TaskSpec did not authorize.
+
+    A path is unauthorized when no ``write_allow`` entry covers it, or when any deny rule does
+    (the task's ``write_deny``, the project's, or :data:`BUILTIN_WRITE_DENY`): a denied file
+    inside an allowed directory is a violation, not part of the candidate.
 
     This is a *detection* mechanism, not a sandbox: the controller notices the write
     after the fact and refuses to accept the candidate. Real write confinement is M2
     work and is not claimed here.
     """
-    return [path for path in changed if not matches_pattern(path, scope.write_allow)]
+    deny = [*scope.write_deny, *project_deny, *BUILTIN_WRITE_DENY]
+    return [
+        path
+        for path in changed
+        if not matches_pattern(path, scope.write_allow) or matches_pattern(path, deny)
+    ]

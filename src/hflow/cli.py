@@ -1,8 +1,14 @@
-"""HFlow command line: doctor / run / status / report / cancel / resume / schema.
+"""HFlow command line.
 
-Everything here is deterministic and offline in M1. ``doctor`` never calls a model
-and never boots a DSH profile; it reports what is *known* locally and marks the
-rest ``unknown``.
+Subcommands: doctor / prepare / run / status / report / cancel / resume / schema / clean.
+
+``doctor``, ``prepare``, ``status``, ``report``, ``schema`` and ``clean`` never call a model;
+``doctor`` never boots a DSH profile either - it reports what is *known* locally and marks the
+rest ``unknown``. ``resume`` reconciles and never re-dispatches.
+
+``run`` is offline only with the ``fake`` driver (the default without a profile). With
+``--driver acpx-dsh`` or a profile that binds it, ``run`` launches the real Harness and needs a
+user authorization artifact.
 """
 
 from __future__ import annotations
@@ -17,9 +23,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .contracts import (
+    CancellationReceipt,
     CapabilityState,
     InvocationOutcome,
     ProjectConfig,
+    ReconcileOutcome,
+    ReconcileResult,
     RefusalCode,
     RefusedError,
     ResultReceipt,
@@ -37,7 +46,7 @@ if TYPE_CHECKING:  # imported for annotations only: authorization.py is not a CL
 from .controller import Controller, RunOutcome, inspect_run
 from .drivers.fake import FakeDriver, FakeScript
 from .drivers.acpx_dsh import DriverSetupError
-from .drivers.selected import default_refusal_reason, local_probe
+from .drivers.selected import FAKE_ALIASES, default_refusal_reason, local_probe
 from .paths import database_path, default_data_dir
 from . import profiles
 from .profiles import ENV_PROFILE
@@ -414,6 +423,8 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         base_commit=args.base_commit,
         workspace_mode=args.workspace,
         repair_policy=repair_policy,
+        root_bound=root_plan is not None,
+        root_limits=root_plan.limits if root_plan is not None else None,
     )
     report = build_prepare_report(
         resolved, authorization_mode=args.authorization_mode, root_budget_plan=root_plan
@@ -569,6 +580,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         base_commit=args.base_commit,
         workspace_mode=args.workspace,
         repair_policy=repair_policy,
+        root_bound=root_plan is not None,
     )
     spec = resolved.spec
     project = resolved.project
@@ -586,7 +598,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             "dispatched and no allowance was consumed; re-run when the configuration is stable.",
         )
 
-    if not resolved.admission.ok and not args.force:
+    if not resolved.admission.ok:
         _write_out(
             {
                 "refused": True,
@@ -746,6 +758,10 @@ def cmd_run(args: argparse.Namespace) -> int:
                 project_root=project_root,
                 workspace_root=project_root,
                 controller_id=args.controller_id,
+                # The commit this command resolved the base to, once, and checked the approval
+                # against: the controller starts the worktree from it instead of resolving the
+                # task's ref again after the branch may have moved.
+                base_commit=resolved.base_commit,
             )
         )
     finally:
@@ -823,17 +839,90 @@ def cmd_report(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+class _NotOwnedDriver:
+    """Answers for a run's recorded driver from a process that started none of its invocations.
+
+    ``hflow cancel`` and ``hflow resume`` run in their own process. A driver's handles are memory
+    of the process that launched the child, so whatever driver dispatched the run, this process
+    can neither stop that child nor observe it: the only true answer to both questions is
+    ``unknown``. The id is the *recorded* one, so the run's record names the driver the run
+    actually used - never an offline stand-in - and nothing here can start anything.
+    """
+
+    def __init__(self, driver_id: str) -> None:
+        self.driver_id = driver_id
+
+    def _refuse(self) -> RefusedError:
+        return RefusedError(
+            RefusalCode.NOT_IMPLEMENTED,
+            f"driver {self.driver_id} is only observed from this process; it starts nothing",
+        )
+
+    def probe(self, binding: object) -> object:
+        raise self._refuse()
+
+    def start(self, request: object) -> object:
+        raise self._refuse()
+
+    def cancel(self, invocation_id: str) -> CancellationReceipt:
+        return CancellationReceipt(
+            invocation_id=invocation_id,
+            status="unknown",
+            mechanism="none",
+            detail=(
+                f"this process did not start invocation {invocation_id} and holds no "
+                f"{self.driver_id} handle for it; nothing was stopped. The controller that owns "
+                "it must stop it, or `hflow resume` reconciles the run once that controller has "
+                "exited"
+            ),
+        )
+
+    def reconcile(self, invocation_id: str) -> ReconcileResult:
+        return ReconcileResult(
+            invocation_id=invocation_id,
+            outcome=ReconcileOutcome.UNKNOWN,
+            detail=(
+                f"this process did not start invocation {invocation_id} and holds no "
+                f"{self.driver_id} handle for it, so it cannot tell whether the work ran; "
+                "staying unknown"
+            ),
+        )
+
+
+def _observer_controller(store: Store, args: argparse.Namespace, run_id: str) -> Controller:
+    """A controller for ``cancel`` / ``resume``, answering through each role's recorded driver.
+
+    The roles are labelled from the run's recorded effective configuration. A role recorded as
+    the offline fake gets a fresh ``FakeDriver``, which reports ``unknown`` for any invocation it
+    did not start itself; every other role - a production driver, or a run whose configuration
+    was never recorded - gets :class:`_NotOwnedDriver`. Neither can confirm a stop of a process
+    another controller owns, which is the point.
+    """
+    project_root = Path(args.project_root).resolve()
+    effective = store.effective_config_for(run_id)
+    offline = FakeDriver(project_root)
+    drivers: dict[str, object] = {}
+    for role in ("implementer", "reviewer"):
+        bound = effective.role(role) if effective is not None else None
+        if bound is not None and bound.driver_id in FAKE_ALIASES:
+            drivers[role] = offline
+        else:
+            drivers[role] = _NotOwnedDriver(bound.driver_id if bound is not None else "unrecorded")
+    return Controller(
+        store,
+        drivers["implementer"],  # type: ignore[arg-type]
+        reviewer_driver=drivers["reviewer"],  # type: ignore[arg-type]
+        controller_build=controller_build(),
+        controller_id=args.controller_id,
+        effective_config=effective,
+    )
+
+
 def cmd_cancel(args: argparse.Namespace) -> int:
     store = _open_store(args)
     try:
         inspection = inspect_run(store, args.run_id)
-        project_root = Path(args.project_root).resolve()
-        controller = Controller(
-            store,
-            FakeDriver(project_root),
-            controller_build=controller_build(),
-            controller_id=args.controller_id,
-        )
+        controller = _observer_controller(store, args, inspection.run.run_id)
         receipt = controller.cancel(inspection.run.run_id)
     except RunNotFound:
         print(f"unknown run {args.run_id}", file=sys.stderr)
@@ -848,13 +937,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
     store = _open_store(args)
     try:
         observation = inspect_run(store, args.run_id)
-        project_root = Path(args.project_root).resolve()
-        controller = Controller(
-            store,
-            FakeDriver(project_root),
-            controller_build=controller_build(),
-            controller_id=args.controller_id,
-        )
+        controller = _observer_controller(store, args, observation.run.run_id)
         outcome = controller.resume(observation.run.run_id)
     except RunNotFound:
         print(f"unknown run {args.run_id}", file=sys.stderr)
@@ -936,10 +1019,20 @@ def cmd_schema(args: argparse.Namespace) -> int:
     """Print the generated JSON Schema. Generated, never a second hand-written copy.
 
     ``MachineProfile`` is here because a profile is a document a person writes by hand
-    (``<data-dir>/profiles/<id>.json``), and ``PrepareReport`` because its output is consumed
-    by scripts. Both are generated from the same models the loader validates against.
+    (``<data-dir>/profiles/<id>.json``), and so are ``AuthorizationRecord``
+    (``--authorization-file``), ``RootBudgetPlan`` (``--root-budget-file``) and ``RepairPolicy``
+    (``--repair-policy-file``). ``PrepareReport`` and ``CancellationReceipt`` (``hflow cancel
+    --json``) are here because their output is consumed by scripts. All are generated from the
+    same models the loaders validate against.
     """
-    from .contracts import EffectiveConfig, MachineProfile, PrepareReport
+    from .authorization import AuthorizationRecord
+    from .contracts import (
+        EffectiveConfig,
+        MachineProfile,
+        PrepareReport,
+        RepairPolicy,
+        RootBudgetPlan,
+    )
 
     models = {
         "TaskSpec": TaskSpec,
@@ -949,6 +1042,10 @@ def cmd_schema(args: argparse.Namespace) -> int:
         "MachineProfile": MachineProfile,
         "EffectiveConfig": EffectiveConfig,
         "PrepareReport": PrepareReport,
+        "AuthorizationRecord": AuthorizationRecord,
+        "RootBudgetPlan": RootBudgetPlan,
+        "RepairPolicy": RepairPolicy,
+        "CancellationReceipt": CancellationReceipt,
     }
     payload = {name: json_schema(model) for name, model in models.items()}
     print(canonical_json(payload))
@@ -1114,7 +1211,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     run.add_argument("--json", action="store_true")
-    run.add_argument("--force", action="store_true", help="continue past admission issues (unsafe)")
     _add_repair_policy_arg(run)
     _add_store_args(run)
     run.set_defaults(func=cmd_run)

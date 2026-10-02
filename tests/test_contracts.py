@@ -336,11 +336,94 @@ def test_path_resolution_refuses_junctions_and_absolute_paths(tmp_path: Path) ->
         resolve_within(root, "link/escaped.py")
 
 
+@pytest.mark.parametrize("entry", ["linked", "linked/parser.py"])
+def test_a_write_allow_entry_through_a_link_is_refused_at_admission(
+    task_spec: TaskSpec, project: ProjectConfig, project_root: Path, entry: str
+) -> None:
+    """A link that stays inside the checkout still names a different place in a worktree.
+
+    Admission resolves an entry in the user's checkout; the worker writes, and HFlow freezes and
+    fingerprints, in a worktree where the same link can point anywhere - or be a plain path. An
+    entry that is or passes through a symbolic link or junction is not a literal path, so it is
+    refused before anything is dispatched rather than raising halfway through a run.
+    """
+    link = project_root / "linked"
+    try:
+        import _winapi
+
+        _winapi.CreateJunction(str(project_root / "src"), str(link))
+    except (ImportError, OSError):
+        try:
+            link.symlink_to(project_root / "src", target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("this environment cannot create directory links")
+    spec = task_spec.model_copy(update={"scope": Scope(write_allow=[entry])})
+    issues = validate_task_spec(spec, project, project_root).issues
+    assert any(
+        issue.code is RefusalCode.SCOPE_VIOLATION and "link" in issue.detail for issue in issues
+    ), issues
+
+
 def test_scope_problems_report_deny_overlap(tmp_path: Path) -> None:
     root = tmp_path / "r"
     root.mkdir()
     problems = check_scope(Scope(write_allow=[".hflow/project.json"]), root, [".hflow/**"])
     assert problems and "write_deny" in problems[0]
+
+
+@pytest.mark.parametrize("entry", ["src/**", "src/*.py", "src/parse?.py", "src/[ab].py"])
+def test_a_glob_write_allow_entry_is_refused_at_admission(
+    task_spec: TaskSpec, project: ProjectConfig, project_root: Path, entry: str
+) -> None:
+    """``write_allow`` names literal paths; a glob there matched writes but froze nothing.
+
+    The scoped fingerprint and the candidate freeze read an entry as a file or a directory, so
+    ``src/**`` covered no file at all: evidence could never go stale and the receipt named the
+    base commit with no paths while the change stayed uncommitted.
+    """
+    spec = task_spec.model_copy(
+        update={"scope": Scope(write_allow=["src/parser.py", entry])}
+    )
+    issues = validate_task_spec(spec, project, project_root).issues
+    assert any(
+        issue.code is RefusalCode.SCOPE_VIOLATION and "glob" in issue.detail and entry in issue.detail
+        for issue in issues
+    ), [issue.detail for issue in issues]
+
+
+def test_write_deny_keeps_its_globs(
+    task_spec: TaskSpec, project: ProjectConfig, project_root: Path
+) -> None:
+    """Only ``write_allow`` is literal: a deny rule is matched against changed paths, so a glob works."""
+    spec = task_spec.model_copy(
+        update={
+            "scope": Scope(
+                write_allow=["src/parser.py", "tests/test_parser.py"],
+                write_deny=["src/**/*.secret", "tests/fixtures/[ab]*"],
+            )
+        }
+    )
+    report = validate_task_spec(spec, project, project_root)
+    assert report.ok, [issue.detail for issue in report.issues]
+
+
+@pytest.mark.parametrize(
+    "entry", [".acpxrc.json", "src/.acpxrc.json", ".git/config", ".hflow/project.json"]
+)
+def test_write_allow_cannot_name_a_path_hflow_never_lets_a_worker_write(
+    task_spec: TaskSpec, project: ProjectConfig, project_root: Path, entry: str
+) -> None:
+    """The built-in deny list holds even for a project that declares no ``write_deny`` at all.
+
+    A worker write there is refused after the fact anyway, so admitting the entry would only buy
+    a turn whose candidate can never be frozen.
+    """
+    permissive = project.model_copy(update={"write_deny": []})
+    spec = task_spec.model_copy(update={"scope": Scope(write_allow=["src/parser.py", entry])})
+    issues = validate_task_spec(spec, permissive, project_root).issues
+    assert any(
+        issue.code is RefusalCode.SCOPE_VIOLATION and entry in issue.detail for issue in issues
+    ), [issue.detail for issue in issues]
 
 
 def test_checks_digest_changes_when_approved_commands_change(project: ProjectConfig) -> None:

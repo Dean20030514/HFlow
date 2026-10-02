@@ -24,17 +24,19 @@ from hflow.contracts import (
     EvidenceStatus,
     InvocationOutcome,
     InvocationRequest,
+    InvocationStartState,
     RefusalCode,
     ReviewOutput,
     RunRequest,
     TaskState,
 )
 from hflow.controller import Controller
-from hflow.drivers.acpx_dsh import AcpxDshDriver
+from hflow.drivers.fake import FakeDriver, FakeScript
 from hflow.review import REVIEW_INPUT_PREFIX
 from hflow.store import Store
 from hflow.verify import CheckRunners, FakeCheckRunner
 
+from . import test_batch_e_dispatch as dispatch_helpers
 from .test_driver_acpx_dsh import DriverHarness
 
 #: The reviewer's answer as the recorded live reviewer wrote it: prose, a code sample, then
@@ -46,12 +48,23 @@ REVIEW_GOAL = (
 IMPLEMENTER_GOAL = "Fix the empty-input crash in src/parser.py and keep valid input working"
 
 
-def structured_harness(tmp_path: Path, *, review_mode: str = "fenced", message_ids: bool = True) -> DriverHarness:
+def structured_harness(
+    tmp_path: Path,
+    *,
+    review_mode: str = "fenced",
+    message_ids: bool = True,
+    terminal_responses: str | None = None,
+    reviewer_terminal_responses: str | None = None,
+) -> DriverHarness:
     """A driver whose agent answers by role, through the production launch path.
 
     The stub's marker files are moved *outside* the workspace the controller snapshots: they
     are harness scaffolding, and leaving them inside would be refused as an out-of-scope
     write - a different failure than the one these tests are about.
+
+    ``terminal_responses`` replaces the stub's terminal prompt response with ``id:stopReason``
+    pairs (the client sends ``session/prompt`` as id 2); ``reviewer_terminal_responses`` does the
+    same for the reviewer only.
     """
     harness = DriverHarness(tmp_path, "structured")
     scratch = (tmp_path / "stub-scratch").resolve()
@@ -60,6 +73,10 @@ def structured_harness(tmp_path: Path, *, review_mode: str = "fenced", message_i
     harness.driver.extra_env["STUB_REVIEW_MODE"] = review_mode
     harness.driver.extra_env["STUB_MESSAGE_IDS"] = "1" if message_ids else "0"
     harness.driver.extra_env["STUB_IMPLEMENTER_PATH"] = "src/parser.py"
+    if terminal_responses is not None:
+        harness.driver.extra_env["STUB_TERMINAL_RESPONSES"] = terminal_responses
+    if reviewer_terminal_responses is not None:
+        harness.driver.extra_env["STUB_REVIEWER_TERMINAL_RESPONSES"] = reviewer_terminal_responses
     return harness
 
 
@@ -176,20 +193,69 @@ def test_a_non_reviewer_invocation_gets_no_review_authority(tmp_path: Path) -> N
     harness.driver.release(handle.invocation_id)
 
 
-def test_an_unmatched_terminal_response_is_unbound_not_a_verdict(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+GOALS = {"implementer": IMPLEMENTER_GOAL, "reviewer": REVIEW_GOAL}
+
+
+@pytest.mark.parametrize("role", ["implementer", "reviewer"])
+def test_a_completion_that_answers_another_request_is_unknown_for_every_role(
+    tmp_path: Path, role: str
 ) -> None:
-    """A JSON-RPC response is not task completion unless it answers *this* prompt."""
-    harness = structured_harness(tmp_path)
-    monkeypatch.setattr(
-        AcpxDshDriver, "_terminal_response_matches_prompt", lambda self, _: False
-    )
+    """A JSON-RPC response is not task completion unless it answers *this* prompt.
 
-    result, handle, _ = run_invocation(harness, "reviewer", REVIEW_GOAL)
+    The client sends ``session/prompt`` as id 2 and the stub settles id 7 instead, so nothing in
+    the stream settles this invocation's turn. That is an unknown outcome for both roles: an
+    implementer's unbound ``end_turn`` used to come back COMPLETED and be frozen, checked and
+    possibly delivered, and a reviewer's was COMPLETED with only a note attached.
+    """
+    harness = structured_harness(tmp_path, terminal_responses="7:end_turn")
 
-    assert result.outcome is InvocationOutcome.COMPLETED
+    result, handle, _ = run_invocation(harness, role, GOALS[role])
+
+    assert handle.dispatched is True, "the prompt was sent; only its answer is missing"
+    assert result.outcome is InvocationOutcome.OUTCOME_UNKNOWN
+    assert result.error_code == "unbound_completion"
     assert result.review is None
-    assert any(note.startswith("review_unbound") for note in result.limitations)
+    assert any(note.startswith("unbound_completion:") for note in result.limitations)
+    assert not any(note.startswith("review_decoded") for note in result.limitations)
+    harness.driver.release(handle.invocation_id)
+
+
+@pytest.mark.parametrize("role", ["implementer", "reviewer"])
+def test_the_prompts_own_response_settles_the_turn_not_a_later_one(
+    tmp_path: Path, role: str
+) -> None:
+    """The prompt settles as ``max_tokens``; a later ``end_turn`` for id 7 does not overrule it.
+
+    The stop reason used to be the *last* one in the stream, whatever request it answered, and the
+    binding check accepted any terminal id that matched. Together they turned this stream into a
+    clean COMPLETED with no limitation - and a reviewer's verdict was still decoded.
+    """
+    harness = structured_harness(tmp_path, terminal_responses="2:max_tokens,7:end_turn")
+
+    result, handle, _ = run_invocation(harness, role, GOALS[role])
+
+    assert result.outcome is InvocationOutcome.FAILED
+    assert result.error_code == "stop_reason_max_tokens"
+    assert result.review is None, "a turn that did not complete carries no verdict"
+    harness.driver.release(handle.invocation_id)
+
+
+@pytest.mark.parametrize("role", ["implementer", "reviewer"])
+def test_a_cancelled_turn_nobody_asked_to_stop_is_a_failure_not_a_cancellation(
+    tmp_path: Path, role: str
+) -> None:
+    """DSH also settles a prompt as ``cancelled`` when it disposes of a session on its own.
+
+    No stop was requested for this invocation, so reporting CANCELLED would describe an operator
+    action that never happened. It is the harness ending the turn: a failure, named as such.
+    """
+    harness = structured_harness(tmp_path, terminal_responses="2:cancelled")
+
+    result, handle, _ = run_invocation(harness, role, GOALS[role])
+
+    assert result.outcome is InvocationOutcome.FAILED
+    assert result.error_code == "cancelled_unrequested"
+    assert result.review is None
     harness.driver.release(handle.invocation_id)
 
 
@@ -260,17 +326,14 @@ def test_an_over_budget_answer_never_yields_a_verdict(
     harness.driver.release(handle.invocation_id)
 
 
-def test_a_turn_without_a_stop_reason_never_yields_a_verdict(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    harness = structured_harness(tmp_path)
-    monkeypatch.setattr(
-        driver_module, "summarize", lambda events: {"kinds": {}, "stop_reason": None, "dispatched": True}
-    )
+def test_a_turn_without_a_stop_reason_never_yields_a_verdict(tmp_path: Path) -> None:
+    """The reviewer writes its whole answer and exits, but nothing ever settles the prompt."""
+    harness = structured_harness(tmp_path, terminal_responses="")
 
     result, handle, _ = run_invocation(harness, "reviewer", REVIEW_GOAL)
 
     assert result.outcome is InvocationOutcome.OUTCOME_UNKNOWN
+    assert result.error_code == "no_stop_reason"
     assert result.review is None
     harness.driver.release(handle.invocation_id)
 
@@ -476,3 +539,162 @@ def test_a_verdict_cannot_override_the_controller_state(
     assert receipt.status == "confirmed_stopped"
     assert row["task_state"] == TaskState.ACCEPTED.value
     assert row["receipt_json"]
+
+
+# --------------------------------------------------------------------------
+# 4. a completion that is not bound to its prompt, as the controller and the ledger see it
+# --------------------------------------------------------------------------
+
+
+def _request(project, spec, project_root: Path) -> RunRequest:
+    return RunRequest(
+        task=spec, project=project, project_root=project_root, workspace_root=project_root
+    )
+
+
+def _run(controller: Controller, project, spec, project_root: Path):
+    return controller.run_task(_request(project, spec, project_root))
+
+
+def test_an_unbound_implementer_completion_is_never_frozen_or_checked(
+    tmp_path: Path, project, task_spec, project_root: Path
+) -> None:
+    """End to end through the production driver: the implementer's ``end_turn`` answers id 7.
+
+    It used to be reported COMPLETED, so the controller froze the tree, ran the checks and could
+    deliver it. An unknown outcome stops the run before any of that, and nothing re-dispatches.
+    """
+    harness = structured_harness(tmp_path, terminal_responses="7:end_turn")
+    controller, store, runner = controller_for(harness, tmp_path)
+    try:
+        outcome = _run(controller, project, task_spec, project_root)
+        review_evidence = store.evidence_for(outcome.run_id, "review")
+    finally:
+        for invocation_id in list(harness.driver._handles):
+            harness.driver.release(invocation_id)
+        store.close()
+
+    assert outcome.task_state is TaskState.BLOCKED
+    assert outcome.block_code is RefusalCode.OUTCOME_UNKNOWN, outcome.block_reason
+    assert outcome.receipt is None
+    assert runner.calls == [], "no check may run on a turn whose completion is unknown"
+    assert outcome.implementer_invocations == 1 and outcome.reviewer_invocations == 0
+    assert review_evidence == []
+
+
+def test_an_unbound_reviewer_completion_blocks_as_unknown_not_as_a_protocol_error(
+    tmp_path: Path, project, task_spec, project_root: Path
+) -> None:
+    """The reviewer alone answers id 7: the run is unknown, and no review evidence is invented.
+
+    ``review_protocol_error`` says the wire delivered nothing usable; here the turn's own outcome
+    is not known, which is what ``outcome_unknown`` means and what ``resume`` reconciles.
+    """
+    harness = structured_harness(tmp_path, reviewer_terminal_responses="7:end_turn")
+    controller, store, runner = controller_for(harness, tmp_path)
+    try:
+        outcome = _run(controller, project, task_spec, project_root)
+        review_evidence = store.evidence_for(outcome.run_id, "review")
+    finally:
+        for invocation_id in list(harness.driver._handles):
+            harness.driver.release(invocation_id)
+        store.close()
+
+    assert runner.calls == ["unit", "docs-check"], "the implementer's candidate was checked"
+    assert outcome.reviewer_invocations == 1
+    assert outcome.task_state is TaskState.BLOCKED
+    assert outcome.block_code is RefusalCode.OUTCOME_UNKNOWN, outcome.block_reason
+    assert outcome.receipt is None
+    assert review_evidence == [], "an unknown turn is not a failed review either"
+
+
+#: The two shapes an unbound reviewer can arrive in: the production driver's (an unknown outcome
+#: naming the cause) and that of a driver that reports the turn completed and only says, in a
+#: limitation, that the completion is unbound - the shape that used to settle the ledger as done.
+UNBOUND_REVIEWS = {
+    "driver_reports_unknown": FakeScript(
+        outcome=InvocationOutcome.OUTCOME_UNKNOWN,
+        review=None,
+        error_code="unbound_completion",
+        error_message="no response answers the observed session/prompt request",
+        limitations=["unbound_completion: no response answers the observed session/prompt"],
+    ),
+    "driver_reports_completed": FakeScript(
+        outcome=InvocationOutcome.COMPLETED,
+        review=None,
+        limitations=[
+            "review_unbound: the terminal response does not answer the observed session/prompt "
+            "request; the turn's completion is not bound to this invocation's prompt"
+        ],
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(UNBOUND_REVIEWS))
+def test_an_unbound_review_keeps_the_root_blocked_for_the_next_revision(
+    store: Store, project, task_spec, project_root: Path, tmp_path: Path, shape: str
+) -> None:
+    """The run says unknown, so the ledger says unknown, so revision 2 cannot dispatch.
+
+    The ``finally`` that closes the reviewer's ledger row used to write the driver's raw outcome.
+    For a turn the controller refuses as unknown that was ``settled/completed``: the root carried
+    nothing unresolved, ``resume`` could not reopen the row, and a new revision of the same task
+    was admitted and accepted on the root the unknown turn should have kept blocked.
+    """
+    binding = dispatch_helpers._binding(store, task_spec, project_root)
+    limits = dispatch_helpers._limits()
+    implementer = FakeDriver(
+        project_root, FakeScript(write_plan=dict(dispatch_helpers.FAKE_WRITE_PLAN))
+    )
+    first = dispatch_helpers._root_controller(
+        store,
+        implementer,
+        reviewer_driver=FakeDriver(project_root, UNBOUND_REVIEWS[shape]),
+        binding=binding,
+        limits=limits,
+        authorization=dispatch_helpers._authorization(
+            spec=task_spec, binding=binding, limits=limits, project_root=project_root
+        ),
+        data_dir=tmp_path / "data",
+    )
+
+    outcome = _run(first, project, task_spec, project_root)
+
+    assert outcome.task_state is TaskState.BLOCKED
+    assert outcome.block_code is RefusalCode.OUTCOME_UNKNOWN, outcome.block_reason
+    reviewer_rows = [row for row in store.invocations_for(outcome.run_id) if row.role == "reviewer"]
+    assert len(reviewer_rows) == 1
+    assert reviewer_rows[0].state is InvocationStartState.UNKNOWN, (
+        "the ledger must record the controller's classification, not the driver's raw outcome"
+    )
+    assert reviewer_rows[0].outcome is InvocationOutcome.OUTCOME_UNKNOWN
+    assert [row.role for row in store.pending_invocations(binding.root_id)] == ["reviewer"]
+
+    first.resume(outcome.run_id)
+    assert [row.role for row in store.pending_invocations(binding.root_id)] == ["reviewer"], (
+        "reconciling observes the unknown turn; it does not resolve it"
+    )
+
+    next_spec = task_spec.model_copy(update={"revision": 2})
+    second_driver = FakeDriver(project_root)
+    second = dispatch_helpers._root_controller(
+        store,
+        second_driver,
+        binding=binding,
+        limits=limits,
+        authorization=dispatch_helpers._authorization(
+            spec=next_spec,
+            binding=binding,
+            limits=limits,
+            project_root=project_root,
+            authorization_id="AUTH-unbound-r2",
+        ),
+        data_dir=tmp_path / "data",
+    )
+    result, refusal = dispatch_helpers._run_or_refusal(
+        second, _request(project, next_spec, project_root)
+    )
+
+    reason = str(refusal) if refusal is not None else str(result.block_reason)
+    assert second_driver.started == [], f"revision 2 dispatched past an unknown review: {reason}"
+    assert "unresolved invocation" in reason, reason

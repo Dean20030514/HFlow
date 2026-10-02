@@ -10,9 +10,14 @@ Facts baked in from the M0 probe and the installed acpx 0.17.1 bundle (not assum
 * On Windows a raw agent command *string* is rejected; the agent must be given as a
   structured argv in acpx's config file, so the driver writes a per-invocation config
   instead of passing ``--agent``.
-* ``dsh`` resolves to a ``.CMD`` shim, which ``CreateProcess`` cannot launch; the child is
-  spawned as ``cmd.exe /c cmd.exe /c <dsh> --profile acp``. The wrapper never carries task
-  text, nonce, prompt or credentials - only the fixed launcher path and profile flag.
+* ``dsh`` resolves to a ``.CMD`` shim, which ``CreateProcess`` cannot launch; the agent argv
+  is ``[<SystemRoot>\\System32\\cmd.exe, /c, <dsh>, --profile, acp]`` - one wrapper, absolute,
+  so a ``cmd.exe`` in the workspace is never picked up. acpx sees an ``.exe`` as the command
+  and spawns it directly (its own batch-shell wrapping applies only to a ``.cmd``/``.bat``
+  command), so no second ``cmd.exe /c`` is added. The wrapper never carries task text, nonce,
+  prompt or credentials - only the fixed launcher path and profile flag.
+* acpx always loads ``<--cwd>/.acpxrc.json`` and lets it override this driver's config,
+  agent argv included, with no opt-out; a workspace that has one is refused before spawn.
 * The task body goes through acpx's documented stdin path (``-f -``), then the child's
   stdin is closed so input is complete. The ACP stdin between acpx and DSH is acpx's own
   pipe and is never touched from here.
@@ -22,9 +27,17 @@ Facts baked in from the M0 probe and the installed acpx 0.17.1 bundle (not assum
   envelope. The digest of the text it was handed is reported back in the invocation result,
   so a driver that sends something other than the packet is caught. That digest is a local
   record of the input, not an acknowledgement from the agent or the model.
-* ``acpx cancel`` reaches a *queue owner* for a persisted session. One-shot ``exec`` runs
-  without a saved session, so no protocol-cancel entry point exists on this path; the
-  driver records that as ``cooperative_cancel=unsupported`` rather than pretending.
+* ``acpx cancel`` reaches a *queue owner* for a persisted session, which one-shot ``exec``
+  does not have. ``exec`` itself sends ``session/cancel`` for the active prompt when its own
+  process receives SIGINT, SIGTERM or SIGHUP - but HFlow cannot deliver those to the client:
+  it is started with ``CREATE_NEW_PROCESS_GROUP`` (Ctrl+C is disabled for that group), a
+  Ctrl+Break arrives in Node as SIGBREAK, which acpx does not handle, and Windows has no
+  external SIGTERM/SIGHUP. M0 observed a CTRL_BREAK killing the client (exit ``0xC000013A``)
+  before any cancel reached the agent. The driver therefore records the ``cancel``
+  capability as ``unsupported`` for this launcher rather than pretending.
+* ``stopReason=end_turn`` is turn settlement, not success: DSH settles blocked and aborted
+  turns as ``end_turn`` too (documented, not observed). It is reported as ``completed``;
+  acceptance is decided by the controller's checks and review, never here.
 
 Stopping therefore has one honest mechanism here: close the managed process boundary after
 a bounded grace period. That is reported as ``mechanism="forced"`` and never as a
@@ -42,9 +55,9 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from ..contracts import (
     AgentBinding,
@@ -60,6 +73,8 @@ from ..contracts import (
     NormalizedEvent,
     ReconcileOutcome,
     ReconcileResult,
+    RefusalCode,
+    RefusedError,
     SpawnFact,
     SpawnKind,
     ReviewOutput,
@@ -76,8 +91,8 @@ from ..review import (
     ReviewDecodeError,
     decode_review,
 )
-from .acp_events import project_line, summarize
-from .winjob import ProcessBoundary, popen_in_boundary, process_gone
+from .acp_events import project_line
+from .winjob import ProcessBoundary, close_output_handles, popen_in_boundary, process_gone
 
 DRIVER_ID = "acpx-dsh-acp"
 DRIVER_VERSION = "0.1.0"
@@ -109,10 +124,24 @@ CAPTURE_READ_CHUNK = 64 * 1024
 STREAM_POLL_SECONDS = 0.05
 #: How long ``collect`` waits for the reader to finish after the client exits.
 STREAM_DRAIN_TIMEOUT_SECONDS = 5.0
-#: Grace period between "please stop" and "the boundary is closed anyway".
+#: Bounded wait before the boundary is terminated anyway. Nothing asks the client to stop in
+#: between - no cancel signal can be delivered to it (see the module docstring).
 FORCE_STOP_GRACE_SECONDS = 2.0
 #: How long to wait for the boundary to report itself empty after termination.
 BOUNDARY_EMPTY_TIMEOUT_SECONDS = 10.0
+#: How long ``release`` waits for each reader thread before leaving it (and its pipe) alone.
+RELEASE_JOIN_SECONDS = 2.0
+#: DSH reads these at launch (sandbox mode and approval policy; tool set). They are removed from
+#: every child environment and never set, so an ambient value cannot widen what a role may do.
+STRIPPED_DSH_ENV = ("DSH_PERMISSION_MODE", "DSH_TOOLS_MODE")
+#: Set to ``1`` in every child environment. cmd.exe and Node's process spawn (libuv) honour it:
+#: a bare program name is then not searched for in the working directory - the workspace -
+#: before PATH.
+NO_CWD_EXE_SEARCH_ENV = "NoDefaultCurrentDirectoryInExePath"
+#: acpx's project config file name. acpx always reads ``<--cwd>/.acpxrc.json`` (no walk-up, no
+#: opt-out in 0.17.1; upstream issue #835) and lets it override the global config this driver
+#: writes - including the agent argv, which no CLI flag can override on Windows.
+WORKSPACE_CLIENT_CONFIG_NAME = ".acpxrc.json"
 #: Written around a packet so the prompt text a driver actually sent is recoverable, and so a
 #: bare ``goal`` (a direct driver call) is still traceable to the request it came from. The
 #: digest covers the prompt text alone, so this envelope cannot change what the digest means.
@@ -135,22 +164,121 @@ class DriverSetupError(RuntimeError):
     """The driver cannot be used as configured. Fail loudly, never silently degrade."""
 
 
+class ExitBoundary(NamedTuple):
+    """What an invocation's boundary held once its client was gone.
+
+    Recorded when the boundary is closed, because a closed job cannot be asked again: from then
+    on this is the only answer, and "nothing can be seen" must not be read as "nothing is there".
+    """
+
+    #: The boundary was confirmed empty.
+    emptied: bool
+    #: Processes still in the boundary after the client exited (``None``: the job could not say).
+    left_behind: int | None
+    detail: str
+
+
+def _needs_batch_wrapper(dsh_executable: str) -> bool:
+    """Whether the launcher is a Windows batch shim that ``CreateProcess`` cannot start itself."""
+    return os.name == "nt" and dsh_executable.lower().endswith((".cmd", ".bat"))
+
+
+def system_command_processor(env: Mapping[str, str]) -> Path | None:
+    """The absolute ``<SystemRoot>\\System32\\cmd.exe`` named by ``env``, or ``None``.
+
+    Never a bare ``cmd.exe``: the agent is started with the workspace as its cwd, and Node's
+    process spawn (libuv) can resolve a bare name there before ``PATH``, so a ``cmd.exe`` at the
+    worktree root could run as the launcher. The variable is looked up case-insensitively, as
+    Windows does.
+    """
+    system_root = next(
+        (value for key, value in env.items() if key.upper() == "SYSTEMROOT" and value), ""
+    )
+    if not system_root:
+        return None
+    candidate = Path(system_root) / "System32" / "cmd.exe"
+    return candidate if candidate.is_absolute() and candidate.is_file() else None
+
+
+def _env_lookup(env: Mapping[str, str], name: str) -> str:
+    """``env[name]``, matched case-insensitively on Windows as the OS does; ``""`` when unset."""
+    if os.name != "nt":
+        return env.get(name, "")
+    return next((value for key, value in env.items() if key.upper() == name.upper()), "")
+
+
+def find_on_path(name: str, env: Mapping[str, str]) -> str:
+    """The absolute file that PATH lookup finds for ``name``, or ``""``.
+
+    Only the absolute entries of ``env``'s PATH are searched - never the current directory and
+    never a relative entry. ``shutil.which`` cannot be used: on Windows it searches the current
+    directory first, even when given an explicit ``path``, and then returns a *relative* result
+    that a child would resolve against its own cwd - for the agent, the workspace. On Windows the
+    name is tried with each ``PATHEXT`` extension unless it already carries one.
+    """
+    if os.name == "nt":
+        extensions = [
+            ext for ext in (_env_lookup(env, "PATHEXT") or ".COM;.EXE;.BAT;.CMD").split(";") if ext
+        ]
+        names = (
+            [name]
+            if name.lower().endswith(tuple(ext.lower() for ext in extensions))
+            else [name + ext for ext in extensions]
+        )
+    else:
+        names = [name]
+    for entry in _env_lookup(env, "PATH").split(os.pathsep):
+        entry = entry.strip().strip('"')
+        if not entry or not Path(entry).is_absolute():
+            continue
+        for candidate_name in names:
+            candidate = Path(entry) / candidate_name
+            if candidate.is_file() and (os.name == "nt" or os.access(candidate, os.X_OK)):
+                return str(candidate)
+    return ""
+
+
+def _inside_any(program: str, roots: Sequence[Path]) -> Path | None:
+    """The first of ``roots`` that contains ``program`` (as written or with links resolved)."""
+    forms = {
+        os.path.normcase(os.path.abspath(program)),
+        os.path.normcase(os.path.realpath(program)),
+    }
+    for root in roots:
+        for root_form in {
+            os.path.normcase(os.path.abspath(root)),
+            os.path.normcase(os.path.realpath(root)),
+        }:
+            prefix = root_form.rstrip("\\/") + os.sep
+            if any(form == root_form or form.startswith(prefix) for form in forms):
+                return Path(root)
+    return None
+
+
 def build_agent_argv(
     *,
     dsh_executable: str,
     profile: str,
     override: list[str] | None = None,
+    command_processor: str = "",
 ) -> list[str]:
     """The launcher argv as a real command line, wrapped for the Windows batch shim.
 
     Only the launcher path and the fixed profile flag live here: no task text, no nonce, no
-    user content, no credentials.
+    user content, no credentials. A batch shim is wrapped in ``command_processor`` - the
+    absolute ``cmd.exe`` from :func:`system_command_processor` - and refused without one.
     """
     if override is not None:
         return list(override)
     argv = [dsh_executable, "--profile", profile]
-    if os.name == "nt" and dsh_executable.lower().endswith((".cmd", ".bat")):
-        return ["cmd.exe", "/c", *argv]
+    if _needs_batch_wrapper(dsh_executable):
+        if not command_processor or not Path(command_processor).is_absolute():
+            raise DriverSetupError(
+                f"{dsh_executable} is a batch shim and needs the absolute Windows command "
+                "processor (<SystemRoot>\\System32\\cmd.exe), which was not found; a bare "
+                "cmd.exe would be searched for in the workspace first"
+            )
+        return [command_processor, "/c", *argv]
     return argv
 
 
@@ -165,6 +293,7 @@ def resolve_launch_config(
     node_executable: str | None = None,
     agent_argv_override: list[str] | None = None,
     env: Mapping[str, str] | None = None,
+    workspaces: Sequence[Path] = (),
 ) -> LaunchConfig:
     """Resolve every fact that decides *which programs* a real invocation launches.
 
@@ -175,6 +304,17 @@ def resolve_launch_config(
 
     This is the one place the launch is decided. The driver is later built *from* the returned
     object, so nothing can re-select a different interpreter after an approval was checked.
+
+    Every program is an absolute path. ``dsh``, ``node`` and ``python`` are looked up in the
+    absolute entries of PATH only (:func:`find_on_path`), and an explicit program (an argument,
+    ``HFLOW_ACPX_NODE``, the first word of ``agent_argv_override``) must already be absolute: acpx
+    starts the agent with the workspace as its cwd, where a bare or relative name would be
+    resolved - so a file in the worktree could run as the agent. A program that is not found is
+    reported, never replaced by its bare name. ``workspaces`` are the directories the run's agent
+    works in (the project root, the worktree parent); a launch program inside one of them - the
+    launcher, ``dsh``, the client interpreter or the acpx entry it runs - is a file the agent
+    can write, and is refused the same way, as is a workspace inside the ``node_modules`` tree
+    the entry loads its modules from.
     """
     source = env if env is not None else os.environ
     resolved_data_dir = Path(data_dir)
@@ -182,26 +322,110 @@ def resolve_launch_config(
     entry = _resolve_client_entry(
         data_dir=resolved_data_dir, explicit=acpx_cli, env=source
     )
-    resolved_dsh = dsh_executable or shutil.which("dsh") or "dsh"
-    resolved_python = python_executable or shutil.which("python") or "python"
-    resolved_node = node_executable or source.get(ENV_ACPX_NODE) or shutil.which("node") or "node"
+    problems: list[str] = []
+    if entry is None:
+        problems.append(
+            "acpx CLI not found. Set HFLOW_ACPX_CLI to the acpx entry point, or install the "
+            "project-local copy the M0 probe uses. This driver never installs or upgrades it "
+            "silently."
+        )
+
+    def program(label: str, explicit: str | None, name: str, *, needed: bool) -> str:
+        """An absolute program path, or ``""`` (with a problem recorded when it is needed)."""
+        if explicit:
+            if Path(explicit).is_absolute():
+                return explicit
+            if needed:
+                problems.append(
+                    f"{label} {explicit!r} is not an absolute path. A relative program is "
+                    "resolved against the directory that starts it - for the agent, the "
+                    "workspace - so it is never used."
+                )
+            return ""
+        found = find_on_path(name, source)
+        if not found and needed:
+            problems.append(
+                f"{name} was not found on PATH (only absolute PATH entries are searched, never "
+                "the current directory). A bare name would be looked up in the workspace first, "
+                "so it is never a fallback; put it on PATH or name its absolute path."
+            )
+        return found
+
+    suffix = entry.suffix.lower() if entry is not None else ""
+    resolved_dsh = program(
+        "dsh", dsh_executable, "dsh", needed=agent_argv_override is None
+    )
+    resolved_python = program(
+        "python", python_executable, "python", needed=suffix == ".py"
+    )
+    resolved_node = program(
+        "node",
+        node_executable or source.get(ENV_ACPX_NODE),
+        "node",
+        needed=suffix in {".js", ".mjs", ".cjs"},
+    )
     # An explicit DSH home wins; otherwise the ambient one is *recorded*, because the child
     # inherits this process's environment and would use it.
     resolved_home = dsh_home or (Path(source["DSH_HOME"]) if source.get("DSH_HOME") else None)
 
-    resolvable = entry is not None
-    detail = "" if resolvable else (
-        "acpx CLI not found. Set HFLOW_ACPX_CLI to the acpx entry point, or install the "
-        "project-local copy the M0 probe uses. This driver never installs or upgrades it "
-        "silently."
-    )
+    command_processor = system_command_processor(source)
+    agent_argv: list[str] = []
+    if agent_argv_override is not None and (
+        not agent_argv_override or not Path(agent_argv_override[0]).is_absolute()
+    ):
+        problems.append(
+            f"the agent launcher {agent_argv_override[:1]!r} is not an absolute path. A relative "
+            "program is resolved in the workspace acpx starts it in, so it is never used."
+        )
+    elif agent_argv_override is not None or resolved_dsh:
+        try:
+            agent_argv = build_agent_argv(
+                dsh_executable=resolved_dsh,
+                profile=profile,
+                override=agent_argv_override,
+                command_processor=str(command_processor) if command_processor is not None else "",
+            )
+        except DriverSetupError as exc:
+            # Reported, not raised, like a missing client: the launch has no argv it may use.
+            problems.append(str(exc))
+    client_prefix = _client_prefix_for(entry, node=resolved_node, python=resolved_python)
+    if client_prefix and not client_prefix[0]:
+        client_prefix = []  # its interpreter was not resolved; the problem is already recorded
+
+    checked: set[str] = set()
+    for label, launched in (
+        ("the agent launcher", agent_argv[0] if agent_argv else ""),
+        ("dsh", resolved_dsh if agent_argv_override is None else ""),
+        ("the client interpreter", client_prefix[0] if client_prefix else ""),
+        # The script that interpreter runs. Its package root (the parent of the node_modules
+        # it lies in) contains it, so a package root inside a workspace is caught here too.
+        ("the acpx client entry", str(entry) if entry is not None else ""),
+    ):
+        if not launched or launched in checked:
+            continue
+        checked.add(launched)
+        inside = _inside_any(launched, workspaces)
+        if inside is not None:
+            problems.append(
+                f"{label} {launched} lies inside the workspace {inside}: a file the agent can "
+                "write must never run as a launch program."
+            )
+    module_tree = _client_module_tree(entry) if entry is not None else None
+    if module_tree is not None:
+        for workspace in workspaces:
+            if _inside_any(str(workspace), [module_tree]) is not None:
+                problems.append(
+                    f"the workspace {workspace} lies inside {module_tree}, the node_modules tree "
+                    f"the acpx client entry {entry} loads its modules from: a file the agent can "
+                    "write must never run as part of a launch program."
+                )
+    resolvable = not problems
+    detail = " ".join(problems)
     return LaunchConfig(
         driver_id=DRIVER_ID,
         harness="dsh",
-        agent_argv=build_agent_argv(
-            dsh_executable=resolved_dsh, profile=profile, override=agent_argv_override
-        ),
-        client_argv_prefix=_client_prefix_for(entry, node=resolved_node, python=resolved_python),
+        agent_argv=agent_argv,
+        client_argv_prefix=client_prefix,
         client_entry=str(entry) if entry is not None else "",
         node=resolved_node,
         python=resolved_python,
@@ -231,6 +455,18 @@ def _resolve_client_entry(
     return None
 
 
+def _client_module_tree(entry: Path) -> Path | None:
+    """The nearest ``node_modules`` directory enclosing ``entry``, or ``None`` for a loose file.
+
+    That is where the client's dependencies are installed and resolved from, so a workspace
+    inside it would let the agent rewrite code the client runs.
+    """
+    for parent in Path(os.path.abspath(entry)).parents:
+        if parent.name.casefold() == "node_modules":
+            return parent
+    return None
+
+
 def _client_prefix_for(entry: Path | None, *, node: str, python: str) -> list[str]:
     """Interpreter prefix for the client entry point, chosen by its kind."""
     if entry is None:
@@ -243,12 +479,46 @@ def _client_prefix_for(entry: Path | None, *, node: str, python: str) -> list[st
     return []
 
 
+def _workspace_client_config(workspace: Path) -> Path | None:
+    """The workspace's acpx project config if any entry by that name exists, else ``None``.
+
+    ``lstat`` rather than ``exists``: a file, a directory, a broken link or a junction all count,
+    because what acpx would make of any of them is not something to reason about here. The name
+    is matched without regard to case, on every filesystem: where the filesystem ignores case
+    (NTFS by default), acpx's open of ``.acpxrc.json`` finds ``.ACPXRC.JSON`` too, and refusing
+    a lookalike elsewhere is the safe side. The returned path carries the spelling found on disk.
+    Only the workspace root's own entries count; acpx does not walk into subdirectories.
+    """
+    candidate = workspace / WORKSPACE_CLIENT_CONFIG_NAME
+    try:
+        names = os.listdir(workspace)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError:
+        # Any other failure (access denied, for one) does not show the entry is absent.
+        return candidate
+    wanted = WORKSPACE_CLIENT_CONFIG_NAME.casefold()
+    for name in names:
+        if name.casefold() == wanted:
+            return workspace / name
+    try:
+        # The listing missed it; a direct lookup is the open acpx itself would make.
+        os.lstat(candidate)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError:
+        return candidate
+    return candidate
+
+
 class AcpxDshDriver:
     """One implementation, one transport. It refuses rather than guessing."""
 
     driver_id = DRIVER_ID
     driver_version = DRIVER_VERSION
-    #: True only where a real protocol-cancel entry point exists for our launch mode.
+    #: True only where HFlow can actually reach a protocol cancel for its launch mode. The pinned
+    #: ``exec`` has one (``session/cancel`` on SIGINT/SIGTERM/SIGHUP), but HFlow cannot deliver
+    #: those signals to its ``CREATE_NEW_PROCESS_GROUP`` child on Windows.
     protocol_cancel_supported = False
 
     def __init__(
@@ -325,6 +595,12 @@ class AcpxDshDriver:
         self._invocation_deadlines: dict[str, float] = {}
         self._processes: dict[str, subprocess.Popen] = {}
         self._boundaries: dict[str, ProcessBoundary] = {}
+        #: One lock per invocation for terminating, querying and closing its boundary. A stop and
+        #: ``collect`` can both reach the boundary from different threads; without this, one could
+        #: close the job while the other was still asking it whether it is empty.
+        self._teardown_locks: dict[str, threading.Lock] = {}
+        #: What each boundary held when it was closed (see ``ExitBoundary``).
+        self._exit_boundaries: dict[str, ExitBoundary] = {}
         self._streams: dict[str, Any] = {}
         self._threads: dict[str, threading.Thread] = {}
         self._stream_drained: dict[str, bool] = {}
@@ -333,8 +609,12 @@ class AcpxDshDriver:
         #: Assistant messages of each invocation, kept so a reviewer's final answer can be
         #: reassembled from the chunks that were actually observed (see ``collect``).
         self._transcripts: dict[str, AnswerTranscript] = {}
-        self._prompt_request_ids: dict[str, set[Any]] = {}
-        self._terminal_prompt_ids: dict[str, list[Any]] = {}
+        #: Request ids of the ``session/prompt`` messages observed, in stream order.
+        self._prompt_request_ids: dict[str, list[Any]] = {}
+        #: Every response that carried a ``stopReason``, as ``(id, stopReason)`` in stream order,
+        #: whatever request it answered. Which of them settles the turn is decided in
+        #: ``_prompt_response``, not by the order they arrived in.
+        self._terminal_responses: dict[str, list[tuple[Any, Any]]] = {}
         self._lines: dict[str, list[str]] = {}
         self._unparsed: dict[str, int] = {}
         self._overflow: dict[str, bool] = {}
@@ -344,6 +624,9 @@ class AcpxDshDriver:
         #: Retained stderr per invocation, so ``collect`` can report what was kept rather than
         #: implying the whole stream is on disk.
         self._stderr_captures: dict[str, StreamCapture] = {}
+        #: What ``release`` could not do, per invocation (a pipe left to a reader that is still
+        #: blocked on it). Recorded facts, not part of the already-returned result.
+        self._release_notes: dict[str, list[str]] = {}
         #: Set once the in-memory event list stopped growing: the container is bounded too, not
         #: only the retained file.
         self._events_capped: dict[str, bool] = {}
@@ -422,6 +705,18 @@ class AcpxDshDriver:
         the approval would say one thing and the process would do another. ``extra_env`` is
         subject to the same rule, because it is not a way to smuggle a different launch past
         the binding.
+
+        ``DSH_PERMISSION_MODE`` and ``DSH_TOOLS_MODE`` are removed and never set: DSH reads its
+        sandbox mode, approval policy and tool set from them at launch, so an ambient
+        ``danger-full-access`` would silently unconfine every role. Choosing a value per role is
+        not this driver's decision; inheriting one by accident is ruled out here.
+
+        ``NoDefaultCurrentDirectoryInExePath=1`` is always set, in exactly that spelling, after
+        removing every other spelling: acpx starts the agent with the workspace as its cwd, and
+        without it both cmd.exe (the DSH batch shim runs a bare ``node``) and Node's spawn look
+        in that cwd before PATH - a ``node.cmd`` the implementer wrote would then run as the
+        reviewer's agent. For the same reason a relative PATH entry, which would be resolved
+        against the workspace, is not passed on.
         """
         env = dict(os.environ)
         env.update(self.extra_env)
@@ -429,6 +724,17 @@ class AcpxDshDriver:
             env["DSH_HOME"] = self.launch.dsh_home
         else:
             env.pop("DSH_HOME", None)
+        for name in STRIPPED_DSH_ENV:
+            env.pop(name, None)
+        for key in [key for key in env if key.upper() == NO_CWD_EXE_SEARCH_ENV.upper()]:
+            del env[key]
+        env[NO_CWD_EXE_SEARCH_ENV] = "1"
+        for key in [key for key in env if key.upper() == "PATH"]:
+            env[key] = os.pathsep.join(
+                entry
+                for entry in env[key].split(os.pathsep)
+                if entry.strip() and Path(entry.strip().strip('"')).is_absolute()
+            )
         env.setdefault("PYTHONIOENCODING", "utf-8")
         return env
 
@@ -440,8 +746,12 @@ class AcpxDshDriver:
             "probe is static: no prompt, no session, no model request",
             f"acpx CLI: {self.acpx_cli}",
             f"agent argv: {self._agent_argv()}",
-            "cooperative protocol cancel: unsupported on the one-shot exec path "
-            "(acpx cancel targets a persisted session's queue owner)",
+            "cooperative protocol cancel: unsupported for this launcher (acpx cancel targets "
+            "a persisted session's queue owner; exec sends session/cancel only on "
+            "SIGINT/SIGTERM/SIGHUP, which HFlow cannot deliver to its CREATE_NEW_PROCESS_GROUP "
+            "child on Windows - Ctrl+Break arrives as SIGBREAK, which acpx does not handle)",
+            "stopReason=end_turn is turn settlement, not success: acceptance is decided by "
+            "checks and review",
         ]
         if self.dsh_home is not None:
             notes.append(f"probe DSH_HOME: {self.dsh_home}")
@@ -450,6 +760,21 @@ class AcpxDshDriver:
                 "probe DSH_HOME: none bound, so DSH_HOME is removed from the child environment "
                 "rather than inherited"
             )
+        ambient = sorted(
+            name for name in STRIPPED_DSH_ENV if name in os.environ or name in self.extra_env
+        )
+        notes.append(
+            f"DSH mode variables ({', '.join(STRIPPED_DSH_ENV)}) are never set by this driver; "
+            + (
+                f"present here and removed from the child environment: {', '.join(ambient)}"
+                if ambient
+                else "none is present here, and an ambient one would be removed"
+            )
+        )
+        notes.append(
+            "a workspace containing .acpxrc.json is refused before spawn: acpx would let it "
+            "override this driver's config, agent argv included"
+        )
         return CapabilityReport(
             driver_id=DRIVER_ID,
             driver_version=DRIVER_VERSION,
@@ -652,6 +977,30 @@ class AcpxDshDriver:
                         ),
                     )
                     return handle
+                client_config = _workspace_client_config(workspace)
+                if client_config is not None:
+                    # Checked here, at the last moment before the process exists, for every
+                    # invocation and both roles: the reviewer runs on the worktree the implementer
+                    # wrote. Nothing is created and no handle is published, so a later stop or
+                    # reconcile of this id truthfully finds that nothing was started. A file that
+                    # is already in the starting workspace is refused earlier, by admission
+                    # (``prepare.start_workspace_client_config``), while nothing is spent; one that
+                    # appears later is caught here, when this dispatch is already reserved - so the
+                    # message names the step that works then, not "submit again".
+                    boundary.close()
+                    message = (
+                        f"{client_config} exists in the workspace. acpx always loads it and lets "
+                        "it override HFlow's launch, including the agent command, so no client "
+                        "process was started. (A run that starts with one is refused at admission, "
+                        "before anything is reserved; this one was found at launch, when the "
+                        "dispatch was already reserved, so the run stays blocked.) Remove "
+                        "the file (or directory), then submit a new revision of the task: an "
+                        "identical TaskSpec returns this blocked run, and under a root budget the "
+                        "new revision's first implementer counts as a repair, so it needs a "
+                        "repair attempt left on the root."
+                    )
+                    self._report_spawn(request, created=False, pid=None, detail=message)
+                    raise RefusedError(RefusalCode.WORKSPACE_CLIENT_CONFIG, message)
                 try:
                     stdout_handle = stdout_path.open("wb")
                     child = popen_in_boundary(
@@ -694,8 +1043,8 @@ class AcpxDshDriver:
         # keeps being returned to the budget instead of growing with it.
         self._events[request.invocation_id] = []
         self._transcripts[request.invocation_id] = AnswerTranscript(role=request.role)
-        self._prompt_request_ids[request.invocation_id] = set()
-        self._terminal_prompt_ids[request.invocation_id] = []
+        self._prompt_request_ids[request.invocation_id] = []
+        self._terminal_responses[request.invocation_id] = []
         self._lines[request.invocation_id] = deque(maxlen=MAX_BUFFERED_LINES)
         self._unparsed[request.invocation_id] = 0
         self._overflow[request.invocation_id] = False
@@ -896,6 +1245,10 @@ class AcpxDshDriver:
         The child writes into a pipe, so this is an entry-point limit on what HFlow retains and on
         what the client can push: whatever exceeds the stderr share is read, counted and digested
         but not written, and the client cannot fill the disk with it.
+
+        The reader closes the pipe itself once its read loop ends. ``release`` never closes it
+        under a reader that is still blocked (see there), so this is where a pipe whose last
+        writer outlived the invocation is finally closed.
         """
         process = self._processes[invocation_id]
         cap = self.stderr_share_bytes
@@ -903,16 +1256,22 @@ class AcpxDshDriver:
             stream = process.stderr
             status = "no_stream"
             if stream is not None:
-                while True:
+                try:
+                    while True:
+                        try:
+                            chunk = stream.read(CAPTURE_READ_CHUNK)
+                        except (OSError, ValueError) as exc:
+                            status = f"read_failed: {type(exc).__name__}: {exc}"
+                            break
+                        if not chunk:
+                            status = "eof"
+                            break
+                        sink.write(chunk)
+                finally:
                     try:
-                        chunk = stream.read(CAPTURE_READ_CHUNK)
-                    except (OSError, ValueError) as exc:
-                        status = f"read_failed: {type(exc).__name__}: {exc}"
-                        break
-                    if not chunk:
-                        status = "eof"
-                        break
-                    sink.write(chunk)
+                        stream.close()
+                    except (OSError, ValueError):
+                        pass
             capture = sink.capture()
         if status != "eof" and not capture.failure_reason:
             capture.failure_reason = status
@@ -925,8 +1284,9 @@ class AcpxDshDriver:
     ) -> None:
         """Record what one wire message means for this invocation.
 
-        Three neutral facts, no policy: the dispatch marker, the session identity, and the
-        assistant text of the turn (which is where a reviewer's verdict actually travels).
+        Neutral facts, no policy: the dispatch marker and the prompt's request id, the session
+        identity, the assistant text of the turn (which is where a reviewer's verdict actually
+        travels), and each terminal response together with the request id it answered.
         """
         handle = self._handles[invocation_id]
         if message.get("method") == "session/prompt":
@@ -934,7 +1294,7 @@ class AcpxDshDriver:
             handle.dispatched_at = handle.dispatched_at or utc_now()
             request_id = message.get("id")
             if request_id is not None:
-                self._prompt_request_ids.setdefault(invocation_id, set()).add(request_id)
+                self._prompt_request_ids.setdefault(invocation_id, []).append(request_id)
         if message.get("method") == "session/update":
             params = message.get("params") if isinstance(message.get("params"), dict) else {}
             update = params.get("update") if isinstance(params.get("update"), dict) else {}
@@ -955,7 +1315,9 @@ class AcpxDshDriver:
         if isinstance(result, dict) and isinstance(result.get("sessionId"), str):
             handle.session_id = result["sessionId"]
         if isinstance(result, dict) and "stopReason" in result:
-            self._terminal_prompt_ids.setdefault(invocation_id, []).append(message.get("id"))
+            self._terminal_responses.setdefault(invocation_id, []).append(
+                (message.get("id"), result.get("stopReason"))
+            )
 
     def observe(self, handle: DriverHandle, *, poll_seconds: float = 0.1) -> Iterator[NormalizedEvent]:
         """Yield events as they arrive, until the invocation reaches a terminal state."""
@@ -997,7 +1359,12 @@ class AcpxDshDriver:
     # -- result collection ---------------------------------------------------
 
     def collect(self, handle: DriverHandle) -> InvocationResult:
-        """Fold the invocation into one result. Never invents success."""
+        """Fold the invocation into one result. Never invents success.
+
+        Every path that had a process ends with its boundary emptied and closed and the parent's
+        copy of the output file closed: a result is not returned while the invocation's process
+        tree is still running, and nothing it opened outlives it.
+        """
         invocation_id = handle.invocation_id
         if invocation_id in self._results:
             return self._results[invocation_id]
@@ -1036,8 +1403,16 @@ class AcpxDshDriver:
             # boundary rather than left running: the allowance is already spent, and an orphaned
             # client would keep working on a run that has stopped waiting for it. The result stays
             # OUTCOME_UNKNOWN - what the client might yet have produced is not observed, and calling
-            # it a failure would be as invented as calling it a success.
-            stopped, _emptied, stop_detail = self._force_stop_client(process, handle)
+            # it a failure would be as invented as calling it a success. The job is closed after the
+            # teardown whatever it reported: what it held is recorded first, and a job left open
+            # would only keep its handle - and anything the teardown missed - for the controller's
+            # whole lifetime.
+            with self._teardown_lock(invocation_id):
+                stopped, emptied, stop_detail = self._force_stop_client(process, handle)
+                self._close_boundary(
+                    invocation_id, ExitBoundary(emptied=emptied, left_behind=None, detail=stop_detail)
+                )
+            close_output_handles(process)
             result = InvocationResult(
                 invocation_id=invocation_id,
                 outcome=InvocationOutcome.OUTCOME_UNKNOWN,
@@ -1065,17 +1440,38 @@ class AcpxDshDriver:
         while not self._stream_drained.get(invocation_id) and time.monotonic() < drain_deadline:
             time.sleep(STREAM_POLL_SECONDS)
 
-        events = self._events.get(invocation_id, [])
-        summary = summarize(events)
+        # The client exiting is not the invocation being over: anything it started may still be
+        # running in the boundary, and the controller is about to fingerprint, freeze, check and
+        # review the tree that process can still change. So the boundary is emptied - and closed,
+        # with what it held recorded - before a result is returned.
+        with self._teardown_lock(invocation_id):
+            exit_boundary = self._empty_boundary_after_exit(process, handle)
+            self._close_boundary(invocation_id, exit_boundary)
+        close_output_handles(process)
+
         unparsed = self._unparsed.get(invocation_id, 0)
         oversized = self._oversized.get(invocation_id, 0)
         overflowed = self._overflow.get(invocation_id, False)
-        stop_reason = summary["stop_reason"]
+        # The stop reason is the one the prompt's own response carries, never "the last stop
+        # reason in the stream": a response to some other request settles that request, not this
+        # turn. A settled response that answers nothing observed is an unbound completion.
+        answered, stop_reason = self._prompt_response(invocation_id)
+        unbound = bool(self._terminal_responses.get(invocation_id)) and not answered
         receipt = self._receipts.get(invocation_id)
 
         if receipt is not None and receipt.status == "confirmed_stopped":
             outcome = InvocationOutcome.CANCELLED
             error_code, error_message = "cancelled", receipt.detail
+        elif not exit_boundary.emptied:
+            # Whatever the stream says, work this invocation started may still be running: a turn
+            # that settled is not a result while its process tree has not been seen to stop.
+            outcome = InvocationOutcome.OUTCOME_UNKNOWN
+            error_code = "boundary_not_empty"
+            error_message = (
+                f"the client exited {process.returncode}, but its managed boundary could not be "
+                f"confirmed empty afterwards ({exit_boundary.detail}); work it started may still "
+                "be running"
+            )
         elif overflowed:
             # Reported before "unparseable lines": cutting the stream is what makes the tail
             # unreadable, so the cause is named rather than one of its symptoms.
@@ -1091,6 +1487,13 @@ class AcpxDshDriver:
             error_message = f"{unparsed} unparseable line(s) in the client output stream"
             if oversized:
                 error_message += f" ({oversized} of them exceeded the {MAX_PENDING_LINE_BYTES} byte line cap)"
+        elif unbound:
+            # Something settled, but not this invocation's prompt: whatever the turn did, the
+            # stream does not say it finished. Unknown for every role - an implementer's unbound
+            # "completion" is no more a candidate than a reviewer's is a verdict.
+            outcome = InvocationOutcome.OUTCOME_UNKNOWN
+            error_code = "unbound_completion"
+            error_message = self._unbound_detail(invocation_id)
         elif stop_reason in {None, ""}:
             outcome = InvocationOutcome.OUTCOME_UNKNOWN
             error_code = "no_stop_reason"
@@ -1100,11 +1503,23 @@ class AcpxDshDriver:
                 else f"client exited {process.returncode} before the turn settled"
             )
         elif stop_reason == "end_turn":
+            # Turn settlement, not success: DSH settles blocked and aborted turns as end_turn too.
+            # COMPLETED says only that the turn ended; checks and review decide acceptance.
             outcome = InvocationOutcome.COMPLETED
             error_code, error_message = None, None
-        elif stop_reason == "cancelled":
+        elif stop_reason == "cancelled" and self._stop_requests.get(invocation_id):
             outcome = InvocationOutcome.CANCELLED
             error_code, error_message = "cancelled", "the harness reported stopReason=cancelled"
+        elif stop_reason == "cancelled":
+            # Nobody asked this invocation to stop. DSH also settles a prompt as cancelled when it
+            # disposes of a session on its own, so this is the harness ending the turn - a failure,
+            # not an operator's cancellation.
+            outcome = InvocationOutcome.FAILED
+            error_code = "cancelled_unrequested"
+            error_message = (
+                "the harness settled the prompt as cancelled, but no stop was requested for this "
+                "invocation"
+            )
         else:
             outcome = InvocationOutcome.FAILED
             error_code, error_message = f"stop_reason_{stop_reason}", f"turn settled as {stop_reason}"
@@ -1125,12 +1540,20 @@ class AcpxDshDriver:
                 f"client stdout exceeded the {self.max_raw_log_bytes} byte retention cap; the retained "
                 "log is a prefix, not the whole stream"
             )
+        if not exit_boundary.emptied:
+            limitations.append(f"boundary_not_empty: {exit_boundary.detail}")
+        elif exit_boundary.left_behind:
+            limitations.append(
+                f"descendants_terminated_after_client_exit: {exit_boundary.left_behind} (still in "
+                "the managed boundary after the client exited; terminated through it before this "
+                "result was returned)"
+            )
         if not handle.dispatched:
             limitations.append("no session/prompt was observed; the harness never received the task")
-        if self._terminal_response_matches_prompt(invocation_id) is False:
+        if unbound:
             limitations.append(
-                "review_unbound: the terminal response does not answer the observed session/prompt "
-                "request; the turn's completion is not bound to this invocation's prompt"
+                f"unbound_completion: {self._unbound_detail(invocation_id)}; the turn's completion "
+                "is not bound to this invocation's prompt"
             )
         review, note = self._review_output(handle, outcome)
         if note:
@@ -1153,21 +1576,44 @@ class AcpxDshDriver:
         self._results[invocation_id] = result
         return result
 
-    def _terminal_response_matches_prompt(self, invocation_id: str) -> bool:
-        """Does the terminal prompt response answer a ``session/prompt`` we observed?
+    def _prompt_response(self, invocation_id: str) -> tuple[bool, str | None]:
+        """``(answered, stop_reason)`` of the response that answers this invocation's prompt.
 
-        A JSON-RPC response is not task completion by itself; it is completion of one
-        request. The recorded runtime answers the prompt with the same id, and this keeps
-        that association rather than trusting "the stream ended".
+        A JSON-RPC response is not task completion by itself; it is completion of one request.
+        The turn's request is the observed ``session/prompt`` - the last one, if the stream
+        carried more than one - and only the response with that request's id settles it. The
+        recorded runtime answers the prompt with the same id; this keeps that association rather
+        than trusting "the stream ended" or "some stop reason arrived". JSON-RPC answers a request
+        once, so the first response with the id is its answer.
 
-        ``None`` means no prompt was observed at all, so there is nothing to bind a
-        completion to and no mismatch to report.
+        ``answered`` is False when no response carries that id, including when no prompt with an
+        id was observed at all: then there is nothing a completion could be bound to.
         """
-        prompt_ids = self._prompt_request_ids.get(invocation_id)
+        prompt_ids = self._prompt_request_ids.get(invocation_id) or []
         if not prompt_ids:
-            return None
-        terminal_ids = self._terminal_prompt_ids.get(invocation_id) or []
-        return any(request_id in prompt_ids for request_id in terminal_ids)
+            return False, None
+        prompt_id = prompt_ids[-1]
+        for response_id, stop_reason in self._terminal_responses.get(invocation_id) or []:
+            # The type is compared too: ``2``, ``2.0`` and ``True`` are equal in Python, and an id
+            # that is not echoed exactly does not answer the request.
+            if type(response_id) is type(prompt_id) and response_id == prompt_id:
+                return True, None if stop_reason is None else str(stop_reason)
+        return False, None
+
+    def _unbound_detail(self, invocation_id: str) -> str:
+        """Which ids were seen, for a completion that answers no observed prompt."""
+        prompt_ids = self._prompt_request_ids.get(invocation_id) or []
+        responses = self._terminal_responses.get(invocation_id) or []
+        response_ids = [response_id for response_id, _ in responses]
+        if not prompt_ids:
+            return (
+                f"terminal response id(s) {response_ids!r} arrived, but no session/prompt request "
+                "with an id was observed"
+            )
+        return (
+            f"no response answers the observed session/prompt request id {prompt_ids[-1]!r}; "
+            f"terminal response id(s) {response_ids!r}"
+        )
 
     def _review_output(
         self, handle: DriverHandle, outcome: InvocationOutcome
@@ -1210,9 +1656,9 @@ class AcpxDshDriver:
                 f"review_{REVIEW_MISSING}: the reviewer turn did not complete "
                 f"({outcome.value}); its text is not a verdict"
             )
-        if self._terminal_response_matches_prompt(handle.invocation_id) is False:
-            # True means matched; None means no prompt was observed, which the limitation
-            # above already states. Only a real mismatch is called out here.
+        if not self._prompt_response(handle.invocation_id)[0]:
+            # A completed outcome is only ever taken from the prompt's own response, so this holds
+            # already; it is asked again because this is the one place a verdict can come from.
             return None, (
                 f"review_{REVIEW_MISSING}: the terminal response was not matched to an observed "
                 "session/prompt request for this invocation"
@@ -1272,6 +1718,10 @@ class AcpxDshDriver:
         * the spawn first - this waits outside the held lock for the publication, then terminates
           the process it finds, reporting ``mechanism=forced``.
 
+        A client that had already exited is not a stopped invocation either: what it started can
+        still be running in the boundary, so the boundary is asked, not the client (see
+        ``_stop_exited_client``).
+
         The wait happens with the gate released and never covers the invocation's result: a stop
         is not blocked by the work it is stopping.
         """
@@ -1300,23 +1750,35 @@ class AcpxDshDriver:
                 self._receipts[invocation_id] = receipt
                 return receipt
             process = self._processes[invocation_id]
-            boundary = self._boundaries[invocation_id]
-            if process.poll() is not None:
-                receipt = CancellationReceipt(
-                    invocation_id=invocation_id,
-                    status="confirmed_stopped",
-                    mechanism="none",
-                    local_process_stopped=True,
-                    detail="the invocation had already exited when the stop was requested",
-                )
-                self._receipts[invocation_id] = receipt
-                return receipt
 
-        # No protocol-cancel entry point exists on the one-shot exec path, so the only
-        # mechanism available is the managed process boundary. Stated, not implied.
+        # Decided under the teardown lock rather than the gate: ``collect`` may be emptying and
+        # closing this boundary right now, and "has the client exited?" is only a stable question
+        # once neither side is halfway through that. The receipt is recorded before the lock is
+        # released, so a ``collect`` waiting on it reads the stop it waited for.
+        with self._teardown_lock(invocation_id):
+            previous = self._receipts.get(invocation_id)
+            if previous is not None:
+                return previous  # a concurrent stop finished while this one waited
+            if process.poll() is not None:
+                receipt = self._stop_exited_client(process, handle)
+            else:
+                receipt = self._stop_live_client(process, handle)
+            self._receipts[invocation_id] = receipt
+        return receipt
+
+    def _stop_live_client(
+        self, process: subprocess.Popen, handle: DriverHandle
+    ) -> CancellationReceipt:
+        """Stop a running client through its boundary. Called with the teardown lock held."""
+        invocation_id = handle.invocation_id
+        # The pinned exec sends session/cancel only on SIGINT/SIGTERM/SIGHUP, none of which HFlow
+        # can deliver to this client, so the only mechanism available is the managed process
+        # boundary. Stated, not implied.
         detail_prefix = (
-            "cooperative cancel is unavailable on this launch path (acpx cancel targets a "
-            "persisted session's queue owner); the managed process boundary was terminated"
+            "cooperative cancel is unavailable for this launcher (acpx cancel targets a "
+            "persisted session's queue owner; exec cancels only on SIGINT/SIGTERM/SIGHUP, which "
+            "HFlow cannot deliver to its CREATE_NEW_PROCESS_GROUP child - Ctrl+Break arrives as "
+            "SIGBREAK, which acpx does not handle); the managed process boundary was terminated"
         )
         stopped, emptied, detail = self._force_stop_client(process, handle)
         # The three-way status is the *boundary's* answer, not a simplification of it: an emptied
@@ -1340,21 +1802,118 @@ class AcpxDshDriver:
                 f"dispatched={handle.dispatched}, boundary_empty={emptied}"
             ),
         )
-        self._receipts[invocation_id] = receipt
         if status == "confirmed_stopped":
-            # Keep exit and event evidence, then release the boundary so nothing lingers.
-            self._close_boundary(invocation_id)
+            # Keep exit and event evidence, then release the boundary so nothing lingers. The
+            # client went down with its tree, so nothing was left behind after it exited.
+            self._close_boundary(
+                invocation_id, ExitBoundary(emptied=True, left_behind=0, detail=detail)
+            )
         return receipt
+
+    def _stop_exited_client(
+        self, process: subprocess.Popen, handle: DriverHandle
+    ) -> CancellationReceipt:
+        """A stop for an invocation whose client had already exited. Teardown lock held.
+
+        The parent exiting is not the boundary being empty, so this asks the boundary: whatever the
+        client left running is terminated through it, and the stop is confirmed only once the job
+        is empty. ``mechanism`` says what *this* stop did - ``forced`` when it had to kill something,
+        ``none`` when the tree was already empty, including when ``collect`` emptied it first. A
+        boundary that cannot be emptied stays open, so it can still be observed and torn down.
+        """
+        invocation_id = handle.invocation_id
+        boundary = self._boundaries.get(invocation_id)
+        was_open = boundary is not None and boundary.handle is not None
+        exit_boundary = self._empty_boundary_after_exit(process, handle)
+        if exit_boundary.emptied:
+            status = "confirmed_stopped"
+            mechanism = "forced" if was_open and exit_boundary.left_behind else "none"
+            local_process_stopped: bool | None = True
+            self._close_boundary(invocation_id, exit_boundary)
+        elif was_open:
+            status, mechanism, local_process_stopped = "still_running", "none", False
+        else:
+            # Closed earlier without being confirmed empty: kill-on-close was the last action
+            # available, and nothing observed whether it worked.
+            status, mechanism, local_process_stopped = "unknown", "none", None
+        return CancellationReceipt(
+            invocation_id=invocation_id,
+            status=status,  # type: ignore[arg-type]
+            mechanism=mechanism,  # type: ignore[arg-type]
+            local_process_stopped=local_process_stopped,
+            detail=(
+                "the invocation had already exited when the stop was requested; "
+                f"{exit_boundary.detail}; boundary={handle.boundary_kind}, "
+                f"dispatched={handle.dispatched}, boundary_empty={exit_boundary.emptied}"
+            ),
+        )
+
+    def _empty_boundary_after_exit(
+        self, process: subprocess.Popen, handle: DriverHandle
+    ) -> ExitBoundary:
+        """The client has exited: terminate what it left in the boundary and report the result.
+
+        A client that exits cleanly can still leave a tool process, a dev server or part of its
+        own bridge running in the job. This counts what is left, terminates it through the
+        boundary (the same teardown as a forced stop), and reports whether the job is now empty.
+        It does not close the boundary; the caller decides that. Called with the teardown lock
+        held.
+
+        A boundary that is already closed cannot be asked again, so the answer recorded when it
+        was closed is returned instead - and a closed boundary with no record is not reported
+        empty.
+        """
+        invocation_id = handle.invocation_id
+        boundary = self._boundaries.get(invocation_id)
+        if boundary is None or boundary.handle is None:
+            recorded = self._exit_boundaries.get(invocation_id)
+            if recorded is not None:
+                return recorded
+            if boundary is not None and boundary.kind == "direct_child_only":
+                # No Job Object on this platform: the boundary *is* the direct child, and its exit
+                # is all it can observe. The kind is stated; nothing is claimed about descendants.
+                return ExitBoundary(
+                    emptied=True,
+                    left_behind=0,
+                    detail=f"boundary={boundary.kind}: the client exited; descendants are not tracked",
+                )
+            return ExitBoundary(
+                emptied=False,
+                left_behind=None,
+                detail=(
+                    "the boundary was closed before anything confirmed it empty; whether the "
+                    "client left a process running is unknown"
+                ),
+            )
+        left_behind = boundary.active_processes()
+        if left_behind == 0:
+            return ExitBoundary(
+                emptied=True,
+                left_behind=0,
+                detail=f"boundary={boundary.kind} was empty after the client exited",
+            )
+        _stopped, emptied, stop_detail = self._force_stop_client(process, handle)
+        counted = (
+            f"{left_behind} process(es) were still in the boundary after the client exited"
+            if left_behind is not None
+            else "the boundary could not report how many processes it held after the client exited"
+        )
+        return ExitBoundary(
+            emptied=bool(emptied), left_behind=left_behind, detail=f"{counted}; {stop_detail}"
+        )
 
     def _force_stop_client(
         self, process: subprocess.Popen, handle: DriverHandle
     ) -> tuple[bool, bool, str]:
-        """Stop a live client through the managed process boundary. One implementation, two callers.
+        """Stop a client's process tree through the managed boundary. One implementation.
 
-        Used by an operator-requested stop and by an expired invocation deadline. The mechanism is
-        identical and the *meaning* is not, which is why the caller records the meaning: a stop is
-        "a human ended this", a deadline is "we stopped waiting". Neither is a cooperative protocol
-        cancel, because this launch path has no such entry point.
+        Used by an operator-requested stop, by an expired invocation deadline, and when a client
+        exited but left processes in its boundary. The mechanism is identical and the *meaning* is
+        not, which is why the caller records the meaning: a stop is "a human ended this", a
+        deadline is "we stopped waiting", the last is "the invocation is over, its leftovers are
+        not". None is a cooperative protocol cancel: the pinned ``exec`` cancels only on
+        SIGINT/SIGTERM/SIGHUP, which HFlow cannot deliver to this client (see the module
+        docstring).
 
         Returns ``(stopped, emptied, detail)``. ``stopped`` is true only when the boundary was
         emptied *and* the process is gone; ``emptied`` is reported separately because
@@ -1383,9 +1942,10 @@ class AcpxDshDriver:
             return False, False, "no managed process boundary was recorded for this invocation"
 
         if handle.dispatched and process.poll() is None:
-            # Let the client notice EOF on its own before the boundary is closed. Only while it is
-            # still running: closing the input of a process that already exited is pointless, and
-            # its descendants would not see that EOF anyway.
+            # A bounded wait, not a request: the client's stdin was already closed once the task
+            # was written (``start_handle``), so there is no EOF left to send and nothing here asks
+            # it to stop. A client that is about to exit on its own gets this long before the
+            # boundary is terminated. The close is a defensive no-op for that already-closed pipe.
             self._close_client_stdin(process)
             try:
                 process.wait(timeout=FORCE_STOP_GRACE_SECONDS)
@@ -1447,10 +2007,23 @@ class AcpxDshDriver:
             except OSError:
                 pass
 
-    def _close_boundary(self, invocation_id: str) -> None:
+    def _teardown_lock(self, invocation_id: str) -> threading.Lock:
+        """The lock that serializes this invocation's boundary teardown (see ``__init__``)."""
+        return self._teardown_locks.setdefault(invocation_id, threading.Lock())
+
+    def _close_boundary(self, invocation_id: str, record: ExitBoundary | None = None) -> None:
+        """Close the boundary, keeping ``record`` as what it held when it was closed.
+
+        Only the first close of an open boundary records: once closed it cannot be asked again,
+        so a later caller must not overwrite what was actually observed. Closing an already
+        closed boundary does nothing.
+        """
         boundary = self._boundaries.get(invocation_id)
-        if boundary is not None:
-            boundary.close()
+        if boundary is None:
+            return
+        if record is not None and boundary.handle is not None:
+            self._exit_boundaries.setdefault(invocation_id, record)
+        boundary.close()
 
     # -- reconcile -----------------------------------------------------------
 
@@ -1550,29 +2123,60 @@ class AcpxDshDriver:
     # -- shutdown ------------------------------------------------------------
 
     def release(self, invocation_id: str) -> None:
-        """Drop an invocation: close its boundary, pipes and log handles.
+        """Drop an invocation: close its boundary, pipes and log handles. Safe to call again.
 
         If the process is somehow still alive this terminates it through the boundary. That
         is a cleanup of a *managed* process, not a cancellation claim, so it never writes a
-        receipt - a stop that was not confirmed stays unconfirmed.
+        receipt - a stop that was not confirmed stays unconfirmed. Recorded facts (result,
+        receipt, events, what the boundary held) are kept, so a later stop or reconcile still
+        answers from them.
+
+        It never blocks on the client's pipes. Every reader join is bounded, and a stream whose
+        reader is still alive afterwards is not closed here: ``BufferedReader.close`` takes the
+        lock the blocked ``read`` holds, so it would wait until every holder of the pipe's write
+        end exits - a client the boundary could not run down, or any holder outside it, would hang
+        the controller after it already recorded the outcome. That stream is left to its (daemon)
+        reader, which closes it on EOF or error, and the fact is kept in ``release_notes``.
         """
         process = self._processes.get(invocation_id)
         boundary = self._boundaries.get(invocation_id)
-        if process is not None and process.poll() is None and boundary is not None:
-            boundary.terminate()
-        self._close_boundary(invocation_id)
+        with self._teardown_lock(invocation_id):
+            if process is not None and process.poll() is None and boundary is not None:
+                boundary.terminate()
+            self._close_boundary(invocation_id)
+        stderr_reader = self._threads.get(f"{invocation_id}:stderr")
         for name in (invocation_id, f"{invocation_id}:stderr"):
             thread = self._threads.get(name)
             if thread is not None and thread.is_alive():
-                thread.join(timeout=2.0)
+                thread.join(timeout=RELEASE_JOIN_SECONDS)
         if process is not None:
-            for stream in (process.stdout, process.stderr, process.stdin):
+            close_output_handles(process)
+            # stdin first: closing a writer never waits on a reader. Then the output pipes, but
+            # only those no live reader is blocked on.
+            for stream in (process.stdin, process.stdout, process.stderr):
                 if stream is None or getattr(stream, "closed", False):
+                    continue
+                if (
+                    stream is process.stderr
+                    and stderr_reader is not None
+                    and stderr_reader.is_alive()
+                ):
+                    note = (
+                        "stderr reader still blocked at release; the pipe is left to it and is "
+                        "closed when its last writer exits"
+                    )
+                    notes = self._release_notes.setdefault(invocation_id, [])
+                    if note not in notes:
+                        notes.append(note)
                     continue
                 try:
                     stream.close()
-                except OSError:
+                except (OSError, ValueError):
                     pass
+
+    def release_notes(self, invocation_id: str) -> list[str]:
+        """What ``release`` left undone for this invocation (empty when it closed everything)."""
+        return list(self._release_notes.get(invocation_id, []))
 
     def events(self, invocation_id: str) -> list[NormalizedEvent]:
         return list(self._events.get(invocation_id, []))

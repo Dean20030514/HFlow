@@ -15,12 +15,13 @@ Two invariants are worth reading the code for:
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import re
 from datetime import timedelta
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Any, Callable, Protocol
 
 from .admission import predictable_dispatch_problems, validate_task_spec
 from .authorization import AuthorizationRecord
@@ -57,7 +58,9 @@ from .contracts import (
     RunInspection,
     RunRequest,
     RunSummary,
+    Scope,
     SpawnFact,
+    SpawnKind,
     SpawnReporter,
     TaskSpec,
     TaskState,
@@ -80,15 +83,21 @@ from .packet import (
     render_reviewer_packet,
 )
 from .paths import default_data_dir
-from .prepare import resolve_permissions
+from .prepare import resolve_permissions, start_workspace_client_config
 from .review import REVIEW_MISSING, review_input_error
 from .drivers.base import assert_driver_shape
 from .drivers.acpx_dsh import ENV_ALLOW_WRITES
 from .drivers.fake import ProcessGuard
 from .gitworkspace import IGNORED_ARTIFACT_ALLOWLIST, CandidateFreeze, GitError, GitRepo, GitStatusParseError
-from .store import RunNotFound, Store, StoreError
+from .store import INVOCATION_OPEN_STATES, RunNotFound, Store, StoreError
 from .verify import CLEAN_EXIT_REASONS, CheckRunners, failed_check_facts, verify_candidate
-from .workspace import candidate_fingerprint, changed_paths, manifest, paths_outside_scope
+from .workspace import (
+    candidate_fingerprint,
+    changed_paths,
+    expand_scope,
+    manifest,
+    paths_outside_scope,
+)
 
 #: How long a reservation may stay open before it is considered abandoned.
 RESERVATION_TTL_SECONDS = 1800
@@ -103,14 +112,17 @@ class PreparedPacket:
     The workspace is kept next to the packet so ``_drive`` can tell whether the packet it was
     handed describes the workspace the run actually got: if the path changed (a lost insert
     race, a different worktree), the packet is re-rendered rather than sent under a stale path.
+    ``deadline_seconds`` is the deadline the packet states, kept for the same reason: a packet
+    whose stated deadline is not the one the invocation is given is re-rendered, never sent.
     """
 
-    __slots__ = ("packet", "run_id", "workspace")
+    __slots__ = ("deadline_seconds", "packet", "run_id", "workspace")
 
-    def __init__(self, *, run_id: str, packet: RenderedPacket) -> None:
+    def __init__(self, *, run_id: str, packet: RenderedPacket, deadline_seconds: int) -> None:
         self.run_id = run_id
         self.packet = packet
         self.workspace = _packet_workspace(packet)
+        self.deadline_seconds = int(deadline_seconds)
 
 
 def _packet_workspace(packet: RenderedPacket) -> str:
@@ -314,7 +326,12 @@ def workspace_drift(store: Store, run_id: str, project_root: Path) -> bool | Non
         if not recorded or not Path(recorded).exists():
             return None
         root = Path(recorded)
-    return candidate_fingerprint(root, spec.scope) == receipt.candidate.fingerprint
+    try:
+        return candidate_fingerprint(root, spec.scope) == receipt.candidate.fingerprint
+    except RefusedError:
+        # A scoped entry now resolves outside the workspace: the accepted content can no longer
+        # be read where it was frozen, which is drift, not a reason for ``status`` to fail.
+        return False
 
 
 class PreflightCheck(Protocol):
@@ -392,7 +409,11 @@ class Controller:
         #: Scratch root a driver may use for invocation-scoped state. Deliberately outside
         #: the project checkout: scaffolding in the workspace would show up as a candidate
         #: change and dirty the tree under test.
-        self.data_dir = Path(data_dir) if data_dir else default_data_dir()
+        #:
+        #: Without an explicit one it is the directory of this run's own ledger, so check
+        #: artifacts stay next to the database that references them. The platform default is
+        #: only for a ledger that has no directory (an in-memory store).
+        self.data_dir = Path(data_dir) if data_dir else self._ledger_data_dir(store)
         #: Recorded isolation for reviews. The driver cannot raise it by claiming so.
         self.review_isolation = review_isolation
         #: The configuration this run was resolved with, recorded against the run so `status`
@@ -404,6 +425,14 @@ class Controller:
         self.project_root: Path | None = None
         assert_driver_shape(driver)
         assert_driver_shape(self.reviewer_driver)
+
+    @staticmethod
+    def _ledger_data_dir(store: Store) -> Path:
+        """The data dir a ledger file implies (``<data_dir>/hflow.sqlite``), else the default."""
+        path = getattr(store, "path", None)
+        if path is None or str(path) == ":memory:":
+            return default_data_dir()
+        return Path(path).parent
 
     def _infer_production(self) -> bool:
         """Can this controller execute a real approved check at all?
@@ -485,6 +514,7 @@ class Controller:
             # the existing run instead of opening a second one. Only the turns this run still
             # needs are asked for, because its first dispatch may already have been paid for.
             self._assert_allowance_for(run_id, spec, project)
+            self._assert_root_repair_allowance(run_id, spec)
             if not self.store.claim_run(run_id, self.controller_id):
                 raise RefusedError(
                     RefusalCode.RUN_CLAIMED_BY_OTHER,
@@ -499,22 +529,38 @@ class Controller:
         # placeholder path would let a packet pass this check and then fail after an allowance
         # had been claimed - the exact gap this ordering closes.
         run_id = new_run_id()
-        repo, worktree_root = self._worktree_path(run_id, spec)
+        repo, worktree_root = self._worktree_path(run_id, spec, request.base_commit)
         implementer_packet = self._render_implementer_packet(
             run_id=run_id,
             spec=spec,
             workspace=str(worktree_root) if worktree_root is not None else str(project_root),
-            deadline_seconds=request.deadline_seconds,
+            # The deadline the first invocation will actually be given (capped by the root), so
+            # the worker is never told it has more time than is enforced.
+            deadline_seconds=self._capped_deadline(request.deadline_seconds),
             writes_allowed=resolve_permissions(spec)[0],
         )
+        # Every refusal that can be decided by reading runs before anything is written, so a
+        # refused run records nothing: no root row, no authorization, no run row. A root row
+        # written first would lock the root at the ceilings the run was refused for (there is no
+        # top-up path), and a run row would turn an identical resubmission into a history query
+        # returning the blocked run - either way the refusal's own advice could not work.
+        self._assert_dispatch_preconditions(
+            spec, project, request.deadline_seconds, base_commit=request.base_commit
+        )
+        self._assert_allowance_for(run_id, spec, project)
+        if self.root_binding is not None:
+            # A root recorded with other ceilings (or another root for this task) is reported as
+            # that, before the repair gate reads the recorded ceilings.
+            self._check_root_registration()
+        else:
+            self._assert_no_root_for_task(spec, project)
+        self._assert_root_repair_allowance(run_id, spec)
         # The root is registered before the run row exists: its ceilings are an admission
         # precondition, and refusing them after the run row was written would leave a run
-        # pointing at a root nothing agreed to. Registration is idempotent, so this is one call
-        # on purpose - two would be a reader's puzzle, not an extra guarantee.
+        # pointing at a root nothing agreed to. Registration repeats the read-only check inside
+        # its own transaction, so a concurrent registration is still refused here.
         if self.root_binding is not None:
             self._register_root_budget()
-        self._assert_dispatch_preconditions(spec, project, request.deadline_seconds)
-        self._assert_allowance_for(run_id, spec, project)
 
         # --- real-run gate: the artifact is recorded first, then the zero-model preflight.
         # Nothing expensive happens for an unauthorized real run - no credential read, no
@@ -631,8 +677,9 @@ class Controller:
         """
         closed = self.store.mark_unsettled_invocations_unknown(
             run_id,
-            "the controller did not observe a result for this invocation; reconciled by an "
-            "operator. The consumption stands and this root does not re-dispatch.",
+            "no result was applied for this invocation - none was observed, or one arrived after "
+            "the run's stop and is recorded as a late_result note; reconciled by an operator. "
+            "The consumption stands and this root does not re-dispatch.",
         )
         attempt = self.store.open_attempt(run_id)
         if attempt is None:
@@ -653,103 +700,283 @@ class Controller:
     def cancel(self, run_id: str) -> CancellationReceipt:
         """Request a stop: record the intent first, then ask the driver, then believe facts.
 
-        Idempotent: a recorded intent plus a recorded receipt short-circuits. No prompt is
-        sent, no budget is charged, and a confirmed stop is reported as a *local process*
-        fact - never as a successful protocol cancellation or a known business result.
+        Idempotent: a recorded receipt short-circuits once the run has ended. No prompt is sent,
+        no budget is charged, and a confirmed stop is reported as a *local process* fact - never
+        as a successful protocol cancellation or a known business result.
 
         The stop is routed to the role that is actually running. Both roles are separate
         invocations, and a machine profile may bind them to separate driver objects, so the
         invocation id and the driver are resolved together from stored facts rather than
         assumed to be the implementer's.
+
+        What the stop may change depends on the run's state once the intent is durable:
+
+        * a **live** run ends here. Its receipt and its terminal block - ``cancelled_by_operator``
+          for a confirmed stop, ``outcome_unknown`` for one that was not - are written in *one*
+          statement (``record_cancel_outcome``), *before* the attempt and ledger bookkeeping.
+          The receipt is what makes a repeated ``cancel`` return early, so it never exists
+          without the block, and a failure in the bookkeeping after it becomes a run note. If
+          that one write fails, only the intent is left, and the next ``cancel`` asks again and
+          ends the run;
+        * a receipt found on a run that is **still live** (a database written while the receipt
+          and the block were separate writes) is not returned as if the stop were finished: the
+          block it implies is re-applied - with the attempt and ledger bookkeeping of a confirmed
+          stop, when it was one - and the driver is not asked again;
+        * a run that **already ended** (``BLOCKED`` or ``CANCELLED``) keeps the outcome it ended
+          with. The invocation it was on is still asked to stop - a child can outlive an unknown
+          or a failed result - and the receipt is recorded with ``run_already_ended`` set, but
+          the block is not relabelled and no ledger entry is touched: an ``unknown`` entry stays
+          for an operator's reconcile, so ``resume`` still reconciles an ``outcome_unknown`` run,
+          and a settled entry stays settled.
         """
         intent_at, existing_receipt = self.store.cancel_state(run_id)
         if existing_receipt is not None:
-            return existing_receipt
+            recorded_row = self.store.get_run(run_id)
+            if TaskState(recorded_row["task_state"]) in {
+                TaskState.ACCEPTED,
+                TaskState.BLOCKED,
+                TaskState.CANCELLED,
+            }:
+                return existing_receipt
+            return self._reapply_recorded_stop(run_id, recorded_row, existing_receipt)
         row = self.store.get_run(run_id)
         if TaskState(row["task_state"]) is TaskState.ACCEPTED:
-            # History is not rewritten: a stop request after acceptance is recorded as a fact,
-            # but it cannot un-accept a delivered candidate.
-            receipt = CancellationReceipt(
-                invocation_id="",
-                status="confirmed_stopped",
-                mechanism="none",
-                local_process_stopped=True,
-                detail="the run was already ACCEPTED and its candidate frozen; nothing was stopped "
-                "and the delivery stands",
-            )
-            self.store.record_cancel_receipt(run_id, receipt)
-            self.store.record_note(
-                run_id, "a stop was requested after acceptance; the accepted candidate is unchanged"
-            )
-            return receipt
+            return self._stop_after_acceptance(run_id)
         intent_at = self.store.record_cancel_intent(run_id)
+        # Read again now that the intent is durable. From here on the run's own block and its
+        # acceptance can no longer be written - both are conditional on this intent - so this is
+        # the state the stop decides from, not one a run thread replaced a moment ago.
+        row = self.store.get_run(run_id)
+        state = TaskState(row["task_state"])
+        if state is TaskState.ACCEPTED:
+            return self._stop_after_acceptance(run_id)
+        ended = state in {TaskState.BLOCKED, TaskState.CANCELLED}
 
         attempt = self.store.open_attempt(run_id)
         role, driver, active_invocation = self._active_invocation(row, attempt)
         if not active_invocation:
+            if ended:
+                detail = (
+                    f"the run was already {state.value} and no invocation was dispatched; "
+                    "nothing was stopped"
+                )
+            elif attempt is not None:
+                # A rootless dispatch reserves the attempt first and registers its invocation
+                # afterwards, conditionally on this stop: the stop landed in between.
+                detail = (
+                    f"the stop was recorded after attempt {attempt['attempt_id']} was reserved and "
+                    "before its invocation was registered; no process was created (the "
+                    "registration and the driver's spawn gate are both conditional on the stop); "
+                    "the reserved turn and authorization submission stay consumed"
+                )
+            else:
+                detail = "run cancelled before any invocation was dispatched"
             receipt = CancellationReceipt(
                 invocation_id="",
                 status="confirmed_stopped",
                 mechanism="none",
                 local_process_stopped=True,
-                detail="run cancelled before any invocation was dispatched",
+                detail=detail,
+                run_already_ended=ended,
             )
-            self.store.record_cancel_receipt(run_id, receipt)
-            self.store.set_blocked(
-                run_id, RefusalCode.CANCELLED_BY_OPERATOR, f"cancelled before dispatch at {intent_at}"
+            if ended:
+                self.store.record_cancel_receipt(run_id, receipt)
+                self._note_stop_of_ended_run(run_id, row)
+                return receipt
+            self.store.record_cancel_outcome(
+                run_id,
+                receipt,
+                RefusalCode.CANCELLED_BY_OPERATOR,
+                f"cancelled before dispatch at {intent_at}",
             )
+            self._finish_live_attempt(run_id, attempt, receipt)
             return receipt
 
         receipt = self._driver_cancel(driver, active_invocation)
-        self.store.record_cancel_receipt(run_id, receipt)
-        self.store.record_note(
-            run_id,
+        target_note = (
             f"{NOTE_CANCEL_TARGET}: role={role} invocation={active_invocation} "
-            f"reported={receipt.status} mechanism={receipt.mechanism}",
+            f"reported={receipt.status} mechanism={receipt.mechanism}"
         )
-        if receipt.status == "confirmed_stopped":
-            try:
-                self.store.finish_attempt(
-                    run_id=run_id,
-                    attempt_id=attempt["attempt_id"],
-                    state=AttemptState.CANCELLED,
-                    outcome=InvocationOutcome.CANCELLED,
-                    result=receipt.model_dump(mode="json"),
-                    block_code=RefusalCode.CANCELLED_BY_OPERATOR,
-                )
-            except StoreError:
-                pass  # the attempt may already be terminal; the receipt is still recorded
-            # The ledger records the same fact: the allowance this dispatch consumed stays
-            # consumed, and the invocation is closed so it does not keep the root open for
-            # nothing. A stopped invocation is not an unknown one.
-            self._settle_cancelled_invocation(run_id, active_invocation, receipt)
+        if ended:
+            receipt = receipt.model_copy(update={"run_already_ended": True})
+            self.store.record_cancel_receipt(run_id, receipt)
+            self.store.record_note(run_id, target_note)
+            self._note_stop_of_ended_run(run_id, row)
+            return receipt
+        if receipt.status != "confirmed_stopped":
+            self.store.record_cancel_outcome(
+                run_id,
+                receipt,
+                RefusalCode.OUTCOME_UNKNOWN,
+                f"stop could not be confirmed for the {role} invocation {active_invocation} "
+                f"({self._driver_label(driver, role)}): {receipt.status}; work may still be running",
+            )
+            self.store.record_note(run_id, target_note)
+            return receipt
+        self.store.record_cancel_outcome(
+            run_id,
+            receipt,
+            RefusalCode.CANCELLED_BY_OPERATOR,
+            f"stop confirmed ({receipt.mechanism}) for the {role} invocation "
+            f"{active_invocation} ({self._driver_label(driver, role)}); local execution "
+            "stopped, business result unknown",
+        )
+        self.store.record_note(run_id, target_note)
+        self._finish_confirmed_stop(run_id, attempt, active_invocation, receipt)
+        return receipt
+
+    def _reapply_recorded_stop(
+        self, run_id: str, row: object, receipt: CancellationReceipt
+    ) -> CancellationReceipt:
+        """Finish a stop whose receipt was recorded and whose block was not.
+
+        The receipt is the answer the driver already gave, so the driver is not asked again: a
+        confirmed stop blocks ``cancelled_by_operator`` and gets the attempt and ledger
+        bookkeeping of one; anything else blocks ``outcome_unknown`` and leaves both alone -
+        work may still be running, which is the state ``resume`` reconciles.
+        """
+        attempt = self.store.open_attempt(run_id)
+        role, driver, active_invocation = self._active_invocation(row, attempt)
+        invocation_id = receipt.invocation_id or active_invocation
+        confirmed = receipt.status == "confirmed_stopped"
+        if confirmed:
             self.store.set_blocked(
                 run_id,
                 RefusalCode.CANCELLED_BY_OPERATOR,
                 f"stop confirmed ({receipt.mechanism}) for the {role} invocation "
-                f"{active_invocation} ({self._driver_label(driver, role)}); local execution "
-                "stopped, business result unknown",
+                f"{invocation_id or '(none registered)'} ({self._driver_label(driver, role)}); "
+                "local execution stopped, business result unknown",
             )
         else:
             self.store.set_blocked(
                 run_id,
                 RefusalCode.OUTCOME_UNKNOWN,
-                f"stop could not be confirmed for the {role} invocation {active_invocation} "
-                f"({self._driver_label(driver, role)}): {receipt.status}; work may still be running",
+                f"stop could not be confirmed for the {role} invocation {invocation_id} "
+                f"({self._driver_label(driver, role)}): {receipt.status}; work may still be "
+                "running",
             )
+        self.store.record_note(
+            run_id,
+            f"{NOTE_CANCEL_TARGET}: the block was re-applied from the recorded receipt "
+            f"(reported={receipt.status} mechanism={receipt.mechanism}), which had been recorded "
+            "without it; the driver was not asked again",
+        )
+        if confirmed:
+            if invocation_id:
+                self._finish_confirmed_stop(run_id, attempt, invocation_id, receipt)
+            else:
+                self._finish_live_attempt(run_id, attempt, receipt)
         return receipt
+
+    def _finish_live_attempt(
+        self, run_id: str, attempt: object, receipt: CancellationReceipt
+    ) -> None:
+        """Finish an attempt a confirmed stop ended, if it is still ``CREATED`` or ``ACTIVE``.
+
+        The plain form of ``finish_attempt``: this *is* the stop's bookkeeping. A run thread
+        that finished the attempt first wins, and the receipt stands either way.
+        """
+        if attempt is None:
+            return
+        data = dict(attempt)  # type: ignore[arg-type]
+        if data.get("state") not in {AttemptState.CREATED.value, AttemptState.ACTIVE.value}:
+            return
+        try:
+            self.store.finish_attempt(
+                run_id=run_id,
+                attempt_id=str(data["attempt_id"]),
+                state=AttemptState.CANCELLED,
+                outcome=InvocationOutcome.CANCELLED,
+                result=receipt.model_dump(mode="json"),
+                block_code=RefusalCode.CANCELLED_BY_OPERATOR,
+            )
+        except StoreError:
+            pass  # the run thread finished it first; the receipt is still recorded
+
+    def _finish_confirmed_stop(
+        self,
+        run_id: str,
+        attempt: object,
+        invocation_id: str,
+        receipt: CancellationReceipt,
+    ) -> None:
+        """The attempt and ledger bookkeeping of a confirmed stop, after the run is blocked."""
+        try:
+            self.store.finish_attempt(
+                run_id=run_id,
+                attempt_id=attempt["attempt_id"],  # type: ignore[index]
+                state=AttemptState.CANCELLED,
+                outcome=InvocationOutcome.CANCELLED,
+                result=receipt.model_dump(mode="json"),
+                block_code=RefusalCode.CANCELLED_BY_OPERATOR,
+            )
+        except StoreError:
+            pass  # the attempt may already be terminal; the receipt is still recorded
+        # The ledger records the same fact: the allowance this dispatch consumed stays consumed,
+        # and the entry is closed if it is still open, so it does not keep the root blocked for
+        # nothing. A stopped invocation is not an unknown one.
+        try:
+            self._settle_cancelled_invocation(run_id, invocation_id, receipt)
+        except StoreError as exc:
+            self.store.record_note(
+                run_id,
+                f"{NOTE_DISPATCH}: the confirmed stop could not record the ledger entry of "
+                f"invocation {invocation_id} ({exc}); the run is stopped and blocked "
+                f"{RefusalCode.CANCELLED_BY_OPERATOR.value}, and the entry keeps the state it "
+                "had. An open entry keeps blocking the root, and this build has no command that "
+                "closes it for such a run: `resume` reconciles only an outcome_unknown run",
+            )
+
+    def _stop_after_acceptance(self, run_id: str) -> CancellationReceipt:
+        """Record a stop requested for an ``ACCEPTED`` run. History is not rewritten.
+
+        The request is a fact worth keeping, but it cannot un-accept a delivered candidate, and
+        nothing is asked to stop.
+        """
+        receipt = CancellationReceipt(
+            invocation_id="",
+            status="confirmed_stopped",
+            mechanism="none",
+            local_process_stopped=True,
+            detail="the run was already ACCEPTED and its candidate frozen; nothing was stopped "
+            "and the delivery stands",
+            run_already_ended=True,
+        )
+        self.store.record_cancel_receipt(run_id, receipt)
+        self.store.record_note(
+            run_id, "a stop was requested after acceptance; the accepted candidate is unchanged"
+        )
+        return receipt
+
+    def _note_stop_of_ended_run(self, run_id: str, row: object) -> None:
+        """Record that a stop reached a run that had already ended, and changed nothing."""
+        data = dict(row)  # type: ignore[arg-type]
+        self.store.record_note(
+            run_id,
+            f"a stop was requested for a run already {data.get('task_state')} "
+            f"({data.get('block_code') or 'no block code'}); the run keeps that outcome and its "
+            "ledger entries stand - a stop neither relabels nor settles a run that already ended",
+        )
 
     def _settle_cancelled_invocation(
         self, run_id: str, invocation_id: str, receipt: CancellationReceipt
     ) -> None:
-        """Close the ledger entry a confirmed stop ended.
+        """Close the ledger entry a confirmed stop ended, if that entry is still open.
 
         Only for a *confirmed* stop: an unconfirmed one stays open on purpose, because "work may
         still be running" is exactly the state that must keep blocking. The consumption is never
         returned - the allowance was committed before the process existed - so this records the
         outcome, not a refund.
 
-        Three shapes, and the difference between the last two is the whole point:
+        Only an **open** entry (``reserved``, ``requested``, ``started``) is closed. Every other
+        state already records what is known, and a local stop is not evidence against it:
+        ``not_started`` (the driver's gate reported that no launch happened - the stop won the
+        handoff), ``settled`` (a result was applied before the stop arrived), ``unknown`` and
+        ``launch_unknown`` (closed only by an operator's reconcile). Rewriting one of those
+        either invents a fact or unblocks a root that must stay blocked, so the stop leaves it and
+        records a note instead.
+
+        Three shapes for an open entry, and the difference between the last two is the point:
 
         * a launch is recorded (``started_at`` set) -> the launch happened, so the entry is
           settled as cancelled;
@@ -757,7 +984,8 @@ class Controller:
           of any driver, so ``not_started`` is a fact: the allowance bought nothing at all;
         * a launch *was* requested and no report came back -> nobody may say whether a process
           exists, and a confirmed stop of a real child is direct evidence that one did. This is
-          ``launch_unknown``: the root stays blocked and an operator reconciles it. Recording
+          ``launch_unknown``: the root stays blocked (a late spawn report can still record what
+          the driver saw, see ``Store.record_invocation_spawn``; no command closes it). Recording
           ``not_started`` here would be claiming, from an empty timestamp, that no driver was ever
           asked - which is false, and was reproduced against a real forced stop of a real pid.
         """
@@ -766,12 +994,21 @@ class Controller:
             # A legacy run: its dispatch facts live on the attempt row, and there is no ledger
             # entry to close.
             return
+        if recorded.state.value not in INVOCATION_OPEN_STATES:
+            self.store.record_note(
+                run_id,
+                f"{NOTE_DISPATCH}: the confirmed stop ({receipt.mechanism}) left invocation "
+                f"{invocation_id} {recorded.state.value}; a stop closes only an open entry, and "
+                "this one already records what is known",
+            )
+            return
         if recorded.started_at is not None:
-            self.store.settle_invocation(
+            if not self.store.settle_invocation(
                 invocation_id,
                 outcome=InvocationOutcome.CANCELLED,
                 detail=f"stop confirmed ({receipt.mechanism}) for run {run_id}",
-            )
+            ):
+                self._note_not_settled(run_id, invocation_id, InvocationOutcome.CANCELLED)
             return
         if not recorded.launch_requested:
             self.store.mark_invocation_not_started(
@@ -851,27 +1088,60 @@ class Controller:
     # -- the state machine ---------------------------------------------------
 
     def _assert_dispatch_preconditions(
-        self, spec: TaskSpec, project: ProjectConfig, deadline_seconds: int
+        self,
+        spec: TaskSpec,
+        project: ProjectConfig,
+        deadline_seconds: int,
+        *,
+        base_commit: str = "",
     ) -> None:
         """Refuse a run that is already known to be unable to finish, before anything is spent.
 
         The rules themselves live in ``admission.predictable_dispatch_problems``, which
         ``hflow prepare`` calls too: a preview that reported "admitted" for a task this gate
         would refuse would be answering a different question than the user asked. This method
-        only supplies the resolved facts - the write permission and the launches - and turns
-        the first problem into a refusal.
+        only supplies the resolved facts - the write permission, the launches, and (for a real
+        transport) whether the starting workspace at ``base_commit`` already holds the client's
+        project config - and turns the first problem into a refusal.
         """
+        real_transport = self._real_transport()
         problems = predictable_dispatch_problems(
             spec,
             project,
             production=self.production,
             implementer_writes=resolve_permissions(spec)[0],
             launches=self._resolved_launches(),
+            real_transport=real_transport,
+            root_bound=self.root_binding is not None,
+            workspace_client_config=(
+                start_workspace_client_config(spec, self.project_root, base_commit)
+                if real_transport and self.project_root is not None
+                else ""
+            ),
         )
         if problems:
             first = problems[0]
             more = f" (+{len(problems) - 1} more admission problem(s))" if len(problems) > 1 else ""
             raise RefusedError(first.code, first.detail + more)
+
+    def _real_transport(self) -> bool:
+        """Is any role dispatched to something other than the offline fake driver?
+
+        Read from the driver objects this run holds and from the resolved configuration, so a
+        driver that does not name itself, or a configuration naming a real transport, counts as
+        real. Deliberately not ``production``: that flag says whether real checks run, while the
+        repair rule that uses this answer is about where a model call can go.
+        """
+        from .drivers.selected import FAKE_ALIASES
+
+        if any(
+            getattr(driver, "driver_id", "") not in FAKE_ALIASES
+            for driver in (self.driver, self.reviewer_driver)
+        ):
+            return True
+        if self.effective_config is None:
+            return False
+        return any(entry.driver_id not in FAKE_ALIASES for entry in self.effective_config.roles)
 
     def _resolved_launches(self) -> list[LaunchConfig]:
         """The launches this run would perform, as resolved before any approval.
@@ -952,7 +1222,51 @@ class Controller:
                 "authorization for this task or reduce it to a single invocation.",
             )
 
-    def _worktree_path(self, run_id: str, spec: TaskSpec) -> tuple[GitRepo | None, Path | None]:
+    def _assert_root_repair_allowance(self, run_id: str, spec: TaskSpec) -> None:
+        """Refuse an armed repair policy the root's repair counter cannot pay for, before I1.
+
+        The worst-case gate prices top-level submissions only; the repair counter is enforced by
+        the repair's own reservation. Without this check a root with no repair left (``max_repairs``
+        defaults to 0) would buy I1 - and R1 on the reviewer path - and only then discover that
+        the repair it armed for cannot be bought.
+
+        What this run may need, read from the ledger's own rule: the repair itself, plus one more
+        when another run already dispatched an implementer on this root, because the ledger
+        charges a later revision's first implementer as a repair too. A run whose own implementer
+        is already recorded is past I1, so the repair decision checks the counter from there.
+        The dispatch transaction stays the real gate; this removes the predictable case.
+        """
+        if self.root_binding is None or self.root_limits is None or spec.repair_policy is None:
+            return
+        implementers = [
+            entry
+            for entry in self.store.invocations_for_root(self.root_binding.root_id)
+            if entry.role == "implementer"
+        ]
+        if any(entry.run_id == run_id for entry in implementers):
+            return
+        view = self.store.root_budget_view(self.root_binding.root_id)
+        used = view.used_repairs if view is not None else 0
+        limit = view.limits.max_repairs if view is not None else self.root_limits.max_repairs
+        needed = 1 + (1 if implementers else 0)
+        if used + needed > limit:
+            first = (
+                "; this revision's first implementer is itself charged as a repair, because an "
+                "earlier run already dispatched one on this root"
+                if implementers
+                else ""
+            )
+            raise RefusedError(
+                RefusalCode.BUDGET_EXHAUSTED,
+                f"root {self.root_binding.root_id} has used {used} of its {limit} repair "
+                f"attempt(s), and this task's repair policy needs {needed} more{first}. Nothing "
+                "was dispatched and no allowance was consumed; obtain a root budget whose "
+                "max_repairs covers the repair, or drop repair_policy.",
+            )
+
+    def _worktree_path(
+        self, run_id: str, spec: TaskSpec, resolved_base: str = ""
+    ) -> tuple[GitRepo | None, Path | None]:
         """Where this run's isolated worktree *would* go, without creating anything.
 
         The implementer packet contains the workspace path, and on Windows a worktree path is
@@ -963,7 +1277,8 @@ class Controller:
         Refusals that a worktree run cannot survive are raised here, before the run row exists:
         a repository that cannot be discovered, and a base commit that does not exist. Both are
         knowable without side effects, and both used to be discovered after the run (and, with
-        an authorization, after a claim).
+        an authorization, after a claim). ``resolved_base`` is the commit the caller already
+        resolved the task's base to (``RunRequest.base_commit``); it is checked the same way.
         """
         if spec.workspace.mode != "worktree":
             return None, None
@@ -977,7 +1292,9 @@ class Controller:
                 f"discovered: {exc}. Nothing was dispatched and no allowance was consumed.",
             ) from exc
         try:
-            base_commit = spec.workspace.base_commit or repo.resolve_commit("HEAD")
+            base_commit = (
+                resolved_base or spec.workspace.base_commit or repo.resolve_commit("HEAD")
+            )
         except GitError as exc:
             raise RefusedError(
                 RefusalCode.SCOPE_VIOLATION,
@@ -1033,7 +1350,7 @@ class Controller:
                 f"the {'repair ' if repair is not None else ''}implementer input packet for this "
                 f"run does not fit, so nothing was dispatched and no allowance was consumed: {exc}",
             ) from exc
-        return PreparedPacket(run_id=run_id, packet=packet)
+        return PreparedPacket(run_id=run_id, packet=packet, deadline_seconds=deadline_seconds)
 
     def _preflight_report(self) -> tuple[bool, str]:
         if self.preflight is None:
@@ -1073,6 +1390,41 @@ class Controller:
             self.store.register_root_budget(self.root_binding, self.root_limits)
         except StoreError as exc:
             raise RefusedError(RefusalCode.BUDGET_EXHAUSTED, str(exc)) from exc
+
+    def _check_root_registration(self) -> None:
+        """Refuse, without writing, a root ``_register_root_budget`` would refuse.
+
+        Asked before the repair gate, which reads the recorded ceilings: a run presenting other
+        ceilings than the recorded ones is told that, not that the recorded root has no repair.
+        """
+        assert self.root_binding is not None and self.root_limits is not None
+        try:
+            self.store.check_root_registration(self.root_binding, self.root_limits)
+        except StoreError as exc:
+            raise RefusedError(RefusalCode.BUDGET_EXHAUSTED, str(exc)) from exc
+
+    def _assert_no_root_for_task(self, spec: TaskSpec, project: ProjectConfig) -> None:
+        """Refuse a rootless run of a task that already has a root, before its run row exists.
+
+        The rootless dispatch transaction refuses the same thing, but only after ``create_run``:
+        the refusal then becomes a blocked run under this spec digest, and resubmitting the same
+        TaskSpec with ``--root-budget-file`` - the refusal's own advice - would only return it.
+        Read here, the refusal records nothing; the transaction's check stays the race backstop.
+        """
+        roots = self.store.root_ids_for_task(
+            project_id=project.project_id,
+            repo_path=str(self.project_root) if self.project_root is not None else "",
+            task_id=spec.task_id,
+        )
+        if roots:
+            raise RefusedError(
+                RefusalCode.BUDGET_EXHAUSTED,
+                f"the task {spec.task_id} of {project.project_id} has root {roots[0]} in this "
+                "ledger, and this run has no root binding: a dispatch outside the root would "
+                "step around its unresolved invocations, its live run and its ceilings. Nothing "
+                "was recorded or dispatched; pass --root-budget-file (with an authorization "
+                "covering that root) to run this task against its root.",
+            )
 
     def _reserve_dispatch(
         self,
@@ -1131,6 +1483,8 @@ class Controller:
                 ),
                 required_loop_remaining=needed,
                 is_repair=is_repair,
+                # Lets the rootless path see a root this task already has in the ledger.
+                repo_path=str(self.project_root) if self.project_root is not None else "",
             )
         except StoreError as exc:
             raise RefusedError(self._dispatch_refusal_code(str(exc)), str(exc)) from exc
@@ -1167,6 +1521,8 @@ class Controller:
             or "exhausted" in message
             or "cannot complete this run's loop" in message
             or "is owned by run" in message
+            or "repair attempt(s)" in message
+            or "pass --root-budget-file" in message
         ):
             return RefusalCode.BUDGET_EXHAUSTED
         return RefusalCode.INTERNAL_ERROR
@@ -1175,9 +1531,11 @@ class Controller:
         """The callback a driver uses to report what it observed at its spawn decision.
 
         Wired into every ``InvocationRequest`` this controller builds. A driver that calls it
-        turns "we asked for a launch" into either "a process exists" or "no process was created";
-        a driver that does not leaves the invocation ``REQUESTED``, which is reported as an
-        unconfirmed launch rather than being counted as a start.
+        turns "we asked for a launch" into either "a process exists" or "no process was created".
+        For a driver that does not, ``_confirm_driver_ran`` reads its result: completed work is
+        recorded as a launch with spawn kind unknown and no process, a cancelled result with no
+        work as ``not_started``, and anything else stays ``REQUESTED`` - an unconfirmed launch,
+        not a start.
 
         A bookkeeping failure inside the callback is swallowed on purpose: the driver is inside
         its own spawn gate, and raising there would turn a ledger problem into "the launch
@@ -1215,24 +1573,48 @@ class Controller:
     def _settle_invocation(
         self, reservation: DispatchReservation, outcome: InvocationOutcome | None, detail: str = ""
     ) -> None:
-        """Close the dispatch record with the outcome the driver reported.
+        """Close the dispatch record with the outcome the caller classified the turn as, if it is
+        still open.
+
+        That is the driver's reported outcome unless the controller concluded otherwise - a
+        reviewer turn it refuses as unknown is settled as ``OUTCOME_UNKNOWN``.
 
         Never refunds: an ``OUTCOME_UNKNOWN`` becomes ``unknown``, which keeps blocking the root
-        until an operator reconciles it. A failure to record the settlement is not allowed to
-        replace the result the caller already has - it is reported as a note instead.
+        until an operator reconciles it. The store settles only an open entry, so a result that
+        arrives after a confirmed stop already closed the entry - as ``launch_unknown`` after a
+        forced stop of an unrecorded launch, as ``settled`` after an ordinary one - leaves that
+        state as it is and is recorded as a note. (Both roles call this only after their result
+        was applied, see :meth:`_apply_result_or_stay_stopped` and :meth:`_late_review_result`; a
+        stop recorded first leaves the entry untouched.) A failure to record the settlement is not
+        allowed to replace the result the caller already has - it is reported as a note instead.
         """
         if reservation.invocation is None:
             return
+        invocation_id = reservation.invocation.invocation_id
         try:
-            self.store.settle_invocation(
-                reservation.invocation.invocation_id, outcome=outcome, detail=detail
-            )
+            settled = self.store.settle_invocation(invocation_id, outcome=outcome, detail=detail)
         except StoreError as exc:
             self.store.record_note(
                 reservation.invocation.run_id,
-                f"{NOTE_DISPATCH}: invocation {reservation.invocation.invocation_id} could not be "
+                f"{NOTE_DISPATCH}: invocation {invocation_id} could not be "
                 f"settled ({exc}); its consumption stands and the root keeps it open",
             )
+            return
+        if not settled:
+            self._note_not_settled(reservation.invocation.run_id, invocation_id, outcome)
+
+    def _note_not_settled(
+        self, run_id: str, invocation_id: str, outcome: InvocationOutcome | None
+    ) -> None:
+        """Record a settlement the ledger refused because the entry was no longer open."""
+        recorded = self.store.invocation(invocation_id)
+        state = recorded.state.value if recorded is not None else "unrecorded"
+        reported = outcome.value if outcome is not None else "no outcome"
+        self.store.record_note(
+            run_id,
+            f"{NOTE_DISPATCH}: invocation {invocation_id} was not settled as {reported}: the "
+            f"ledger already records it as {state}, and that state stands",
+        )
 
     def _mark_invocation_not_started(self, reservation: DispatchReservation, detail: str) -> None:
         """Record a reservation that provably never reached a launch. The spend is kept."""
@@ -1261,28 +1643,104 @@ class Controller:
                 f"{NOTE_DISPATCH}: the driver raised for invocation "
                 f"{reservation.invocation.invocation_id} without reporting a spawn fact "
                 f"({exc!r}); the ledger keeps it as a launch that was requested and unconfirmed, "
-                "which blocks the root until an operator reconciles it",
+                "which keeps blocking the root. This build has no command that closes it for a "
+                "run blocked by a driver failure: `resume` reconciles only an outcome_unknown run",
             )
         except StoreError:
             pass  # a broken note write must not change what the caller reports
 
+    def _record_interruption(self, run_id: str, attempt_id: str, role: str) -> None:
+        """Leave a reconcilable run when ``KeyboardInterrupt``/``SystemExit`` escapes a ``start``.
+
+        This controller will never observe the invocation's result, which is exactly the state
+        ``resume`` reconciles: the run blocks ``outcome_unknown`` (unless a stop already decided
+        it), every ledger entry still open becomes ``unknown`` or ``launch_unknown`` - so a root
+        stays blocked and nothing is refunded - and the attempt is finished as an unknown outcome.
+        The block is written first, so a failure in the bookkeeping after it still leaves a run
+        ``resume`` acts on. Every write is best effort: the interrupt is what the caller must see,
+        and a store error here must not replace it.
+
+        A hard crash (a kill, a power loss) runs none of this; such a run stays ``RUNNING``.
+        """
+        reason = (
+            f"controller interrupted during {role} invocation; its result was never observed. "
+            "No re-dispatch: `hflow resume` reconciles it"
+        )
+        try:
+            self.store.block_unless_stopped(run_id, RefusalCode.OUTCOME_UNKNOWN, reason)
+        except Exception:  # noqa: BLE001 - never mask the interrupt
+            pass
+        try:
+            self.store.mark_unsettled_invocations_unknown(run_id, reason)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.store.finish_attempt(
+                run_id=run_id,
+                attempt_id=attempt_id,
+                state=AttemptState.OUTCOME_UNKNOWN,
+                outcome=InvocationOutcome.OUTCOME_UNKNOWN,
+                result={"error": reason},
+                block_code=RefusalCode.OUTCOME_UNKNOWN,
+                unless_stopped=True,
+            )
+        except Exception:  # noqa: BLE001 - not live any more, or a stop decided it
+            pass
+
+    def _release_invocation(self, driver: HarnessDriver, run_id: str, invocation_id: str) -> None:
+        """Tell the driver an invocation's result is on record, so it can close what it opened.
+
+        Called after the result is applied, never before. ``release`` is not part of
+        :class:`HarnessDriver`, so a driver without it is simply not asked. A release that fails
+        is cleanup that failed, not a result: it is noted and changes nothing already decided.
+        """
+        if not hasattr(driver, "release"):
+            return
+        try:
+            driver.release(invocation_id)  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001 - cleanup must not rewrite a recorded decision
+            try:
+                self.store.record_note(
+                    run_id,
+                    f"{NOTE_DISPATCH}: the driver could not release invocation {invocation_id} "
+                    f"({exc!r}); its recorded result stands",
+                )
+            except StoreError:
+                pass
+
     def _confirm_driver_ran(
-        self, reservation: DispatchReservation, result: InvocationResult
+        self,
+        reservation: DispatchReservation,
+        result: InvocationResult,
+        *,
+        stop_before_launch: bool = False,
     ) -> None:
         """Decide what a driver's return means when it did not report a spawn fact.
 
         Only for a driver that does not implement ``on_spawn`` (an older or third-party one), and
         only when no report arrived: a driver that reports *has* answered, whatever its report
         says, and inferring on top of that answer would let a silent-looking return overwrite a
-        recorded "no process was created". The two readable shapes for a silent driver are:
+        recorded "no process was created". "No report arrived" is read from the row itself - still
+        ``requested``, no start time and no spawn kind - and not from ``launch_requested_at``,
+        which the controller always sets before asking a driver. The two readable shapes for a
+        silent driver are:
 
         * a completed invocation that produced work - a candidate, a review verdict or observed
-          agent turns - so a process existed and it is recorded as started;
-        * a cancelled invocation that produced no work at all, so nothing ran and it is recorded
-          as never started.
+          agent turns - so the launch happened and it is recorded as started. Whether that launch
+          created an operating-system child is not known, so no process and no spawn kind are
+          claimed for it;
+        * a cancelled invocation that produced no work at all **and** a stop that was recorded
+          before the driver was asked to launch (``stop_before_launch``, read by the caller between
+          the launch request and ``start``). Under the ``stop_requested`` contract the driver's
+          gate then refused, so nothing ran and it is recorded as never started.
 
         Anything else stays ``requested``: guessing in either direction is what produced both of
-        the bugs this replaces.
+        the bugs this replaces. In particular a cancelled, workless return after a stop recorded
+        *while the role ran* is not evidence that nothing launched - a silent driver may have
+        worked and then honoured the stop. That entry is left to the stop's own bookkeeping: a
+        confirmed stop records ``launch_unknown``, an unconfirmed one leaves it open (blocking the
+        root) for ``resume``. This method runs before the stop-conditional apply, so it must not
+        close an entry the stop decides.
         """
         if reservation.invocation is None:
             return
@@ -1290,21 +1748,39 @@ class Controller:
         current = self.store.invocation(invocation_id)
         if current is None:
             return
-        if current.started_at is not None or current.launch_requested_at is not None:
-            # A driver was asked and answered - or a process is already recorded. An inference is
-            # not evidence, and it never overrides one.
+        if (
+            current.state is not InvocationStartState.REQUESTED
+            or current.started_at is not None
+            or current.spawn_kind is not SpawnKind.UNKNOWN
+        ):
+            # A driver answered - a launch, a "nothing was created", or a row that has already
+            # gone further. An inference is not evidence, and it never overrides one.
             return
-        if current.state is InvocationStartState.NOT_STARTED:
-            return  # already reported as producing nothing
         produced_work = bool(
             result.candidate is not None or result.review is not None or result.agent_turns
         )
         if result.outcome is InvocationOutcome.COMPLETED and produced_work:
-            self.store.mark_invocation_started(invocation_id)
-        elif result.outcome is InvocationOutcome.CANCELLED and not produced_work:
+            self.store.record_invocation_spawn(
+                SpawnFact(
+                    invocation_id=invocation_id,
+                    created=True,
+                    pid=None,
+                    spawn_kind=SpawnKind.UNKNOWN,
+                    detail=(
+                        "inferred from completed work: the driver reported no spawn fact, so "
+                        "whether its launch created a process is not known"
+                    ),
+                )
+            )
+        elif (
+            result.outcome is InvocationOutcome.CANCELLED
+            and not produced_work
+            and stop_before_launch
+        ):
             self.store.mark_invocation_not_started(
                 invocation_id,
-                "the driver reported a cancelled invocation that produced no work and no process",
+                "the stop was recorded before the driver was asked to launch, and the driver "
+                "returned a cancelled invocation that produced no work and no process",
             )
 
     def _claim_submission(self, run_id: str, purpose: str) -> int:
@@ -1356,15 +1832,25 @@ class Controller:
         worktree: Path | None = None
         user_tree_before = ""
         dirty_target = False
+        # The original base, resolved to a commit exactly once, here, before the worktree exists.
+        # A ref is a name, not a base: inside the worktree 'HEAD' is the candidate itself, and a
+        # branch such as 'main' can move while the run works. Every later use - the worktree, each
+        # round's CandidateIdentity, the repair context, the delivery diff - takes this commit.
+        # ``request.base_commit`` is the commit the caller already resolved (and checked its
+        # approval against); it is used as given rather than resolved from the name again.
+        resolved_base = ""
         if spec.workspace.mode == "worktree":
+            base_name = spec.workspace.base_commit or "HEAD"
             try:
                 repo = GitRepo.discover(project_root)
                 user_tree_before = repo.user_change_fingerprint()
-                base_commit = spec.workspace.base_commit or repo.resolve_commit("HEAD")
-                worktree = repo.create_worktree(run_id, base_commit)
+                resolved_base = repo.resolve_commit(request.base_commit or base_name)
+                worktree = repo.create_worktree(run_id, resolved_base)
                 self.store.record_worktree(run_id, worktree)
             except (GitError, RefusedError) as exc:
                 return self._blocked(run_id, RefusalCode.INTERNAL_ERROR, f"git workspace failed: {exc}")
+            if base_name != resolved_base:
+                self.store.record_note(run_id, f"base {base_name!r} -> {resolved_base}")
             if repo.is_dirty():
                 # The user has uncommitted work. That is theirs: never stashed, reset or
                 # committed. It is recorded on acceptance, where the note survives; the
@@ -1402,9 +1888,8 @@ class Controller:
 
         # The original Base is fixed before the first dispatch and never changes: it is what the
         # final delivery diff is taken against, and what tells the repair round where it started.
-        original_base_commit = spec.workspace.base_commit or (
-            repo.resolve_commit("HEAD") if repo is not None else ""
-        )
+        # A worktree run uses the commit resolved above; an in-place run has no worktree base.
+        original_base_commit = resolved_base if repo is not None else spec.workspace.base_commit
         original_base_ref = f"base:{spec.task_id}:{spec.revision}"
 
         previous: CandidateIdentity | None = None
@@ -1485,6 +1970,7 @@ class Controller:
         failure_facts: list[dict[str, Any]],
         findings: list[dict[str, Any]],
         detail: str,
+        configured_deadline_seconds: int,
     ) -> _CycleResult:
         """Decide whether this failure may buy the run's single repair, and record the answer.
 
@@ -1501,7 +1987,12 @@ class Controller:
 
         Everything else - an ERROR anywhere in the mix, a timeout, leftover descendants, a
         capture failure, an undeclared exit code, a legacy evidence row with no reason, an empty
-        rejection, a cancellation, an unknown outcome - stops here without spending anything.
+        rejection, a cancellation, an unknown outcome - stops here without spending anything. So
+        does a failure that would qualify when the bound root has no repair left: that is recorded
+        as ``BUDGET_EXHAUSTED``, never as an allowed repair the reservation then refuses.
+
+        ``configured_deadline_seconds`` is the implementer's configured deadline; the repair is
+        told what it actually has - that, capped by what is left of the root's clock.
         """
 
         def refuse(decision: RepairDecision, reason: str) -> _CycleResult:
@@ -1575,6 +2066,13 @@ class Controller:
                 )
             context_findings = findings
 
+        # The root's repair counter is read here, from the ledger, rather than assumed from
+        # admission: the repair's own reservation would refuse it anyway, but only after an
+        # "allowed" decision had been recorded for a repair that could never be bought.
+        exhausted = self._root_repairs_exhausted()
+        if exhausted is not None:
+            return refuse(RepairDecision.BUDGET_EXHAUSTED, exhausted)
+
         record = RepairRecord(
             decision=RepairDecision.ALLOWED,
             trigger=trigger_candidate,
@@ -1599,10 +2097,11 @@ class Controller:
             failed_checks=failure_facts,
             findings=context_findings,
             remaining_turns=self._remaining_loop_turns(run_id),
-            # A repair is only ever decided inside a live run, and the root's clock starts at its
-            # first reservation - so by here a deadline exists. The fallback keeps the field an int
-            # for the packet rather than sending a repair an unmeasurable deadline.
-            deadline_seconds=self._remaining_deadline_seconds() or 0,
+            # The deadline the repair attempt will actually be given: on a root, its configured
+            # value capped by what the root's clock has left (the clock started at I1's
+            # reservation); for a fully offline rootless run, the configured value. Never a
+            # fallback 0 for a clock that does not exist.
+            deadline_seconds=self._capped_deadline(configured_deadline_seconds),
             detail=detail,
         )
         return _CycleResult(repair=context, identity=identity)
@@ -1650,6 +2149,23 @@ class Controller:
         )
         return True, f"every failing check is a declared business failure under the policy ({summary})"
 
+    def _root_repairs_exhausted(self) -> str | None:
+        """A human-readable reason when the bound root has no repair left, else ``None``.
+
+        ``None`` too for a rootless run: only a fully offline run gets here without a root, and
+        it has no root counter to spend (admission refuses a real transport's rootless repair).
+        """
+        if self.root_binding is None:
+            return None
+        view = self.store.root_budget_view(self.root_binding.root_id)
+        if view is None or view.used_repairs < view.limits.max_repairs:
+            return None
+        return (
+            f"root {self.root_binding.root_id} has used {view.used_repairs}/"
+            f"{view.limits.max_repairs} repair attempt(s), so no repair is bought and nothing is "
+            "re-dispatched; changing the revision does not reset the count"
+        )
+
     def _root_deadline_state(self) -> str | None:
         """A human-readable reason when the root's clock has run out, else ``None``.
 
@@ -1675,14 +2191,22 @@ class Controller:
         deadline the run already recorded. Capping here is what makes the root's clock a bound on
         the work rather than a note beside it - and it is why the reviewer's default of 900 seconds
         is a ceiling, not a promise.
+
+        Before the root's clock has started, the root's own ``deadline_seconds`` is the cap: the
+        clock starts at the first reservation with exactly that much time, so no role on this
+        root can be given more.
         """
         if self.root_binding is None:
             return int(configured_seconds)
         remaining = self._remaining_deadline_seconds()
         if remaining is None:
-            # No clock has started yet. The configured value is the best honest answer, and the
-            # root's own deadline is fixed at its first reservation, before any process launches.
-            return int(configured_seconds)
+            # No clock has started yet; it will start, at this root's first reservation, with the
+            # root's full deadline. A root not registered yet is read from this controller's limits.
+            view = self.store.root_budget_view(self.root_binding.root_id)
+            limits = view.limits if view is not None else self.root_limits
+            if limits is None:
+                return int(configured_seconds)
+            return min(int(configured_seconds), int(limits.deadline_seconds))
         return max(0, min(int(configured_seconds), remaining))
 
     def _remaining_deadline_seconds(self) -> int | None:
@@ -1746,8 +2270,10 @@ class Controller:
           recorded as failed for a rejection and for a wire failure alike, and only the former is
           a finding a repair may act on.
 
-        An empty or unusable payload returns nothing, so the caller refuses rather than guessing
-        what the reviewer meant.
+        Only *usable* findings are returned (see :meth:`_usable_finding`): a ``[{}]`` or a
+        whitespace statement is a non-empty list that still names nothing to change. An empty or
+        unusable payload returns nothing, so the caller refuses with ``NO_FINDINGS`` rather than
+        guessing what the reviewer meant.
         """
         for row in self.store.evidence_for(run_id, kind="review"):
             if row["attempt_id"] != attempt_id or row["candidate_fingerprint"] != candidate_fp:
@@ -1764,56 +2290,137 @@ class Controller:
                 continue
             findings = payload.get("findings")
             if isinstance(findings, list) and findings:
-                return [item for item in findings if isinstance(item, dict)]
+                return [
+                    item
+                    for item in findings
+                    if isinstance(item, dict) and self._usable_finding(item)
+                ]
         return []
 
+    #: Keys that label or place a finding but do not say what is wrong: a finding made only of
+    #: these (or of blank text) gives a repair nothing to act on.
+    _FINDING_BOOKKEEPING_KEYS = frozenset({"id", "severity", "status", "location", "target"})
+
+    @classmethod
+    def _usable_finding(cls, finding: dict[str, Any]) -> bool:
+        """Does this finding carry at least one non-blank text value outside the bookkeeping keys?
+
+        The reviewer contract names no finding keys, so usability is decided by content rather
+        than by a key name: any string under any other key counts, including one nested in a
+        list or an object (``"evidence": ["..."]``). Numbers and booleans alone say nothing a
+        repair could act on.
+        """
+
+        def has_text(value: Any) -> bool:
+            if isinstance(value, str):
+                return bool(value.strip())
+            if isinstance(value, dict):
+                return any(has_text(item) for item in value.values())
+            if isinstance(value, list):
+                return any(has_text(item) for item in value)
+            return False
+
+        return any(
+            has_text(value)
+            for key, value in finding.items()
+            if key not in cls._FINDING_BOOKKEEPING_KEYS
+        )
+
     def _reconcile_repair_workspace(
-        self, *, repo: GitRepo, worktree: Path, previous: CandidateIdentity | None
-    ) -> str | None:
+        self,
+        *,
+        repo: GitRepo,
+        worktree: Path,
+        previous: CandidateIdentity | None,
+        scope: Scope,
+    ) -> tuple[str | None, tuple[str, ...]]:
         """Confirm the worktree is the one the repair is supposed to start from.
 
         The repair runs in the *same* isolated worktree as the first attempt, which is only safe
         if that worktree is still exactly at the previous candidate. A drifted or dirty tree means
         the bytes a repair would edit are not the bytes that were checked, so it is refused
         instead: nothing is reset, nothing is overwritten, and the user's checkout is never
-        touched.
+        touched. A file git does not ignore that appeared after the freeze (a check's report, for
+        example) makes the tree dirty: the repair's freeze would stage it or refuse it.
 
-        Returns a refusal reason, or ``None`` when the tree is the expected one.
+        An index entry flagged assume-unchanged or skip-worktree hides changes from the status
+        read, so it is refused too.
+
+        Returns ``(refusal, carried_ignored)``: a refusal reason, or ``None`` when the tree is the
+        expected one, and the ignored paths present in the worktree now. Those can only have
+        appeared after the previous freeze (which refused any ignored path off the allowlist), so
+        they are the previous round's check and review byproducts - HFlow's own output, not the
+        worker's. The repair's freeze accepts exactly these paths, literally, and never stages
+        one. A carried path is only safe outside what the scoped fingerprint hashes: there the
+        repair round's manifest comparison refuses any worker change to it as outside the scope.
+        An ignored file the fingerprint *does* cover (one under a ``write_allow`` directory) would
+        make the fingerprint describe bytes no commit holds - it changes the fingerprint while
+        the commit stays the same, so the no-content-change guard and the evidence would no
+        longer speak about the frozen commit - and an in-scope worker edit to it would pass the
+        manifest comparison. Such a path refuses the repair here, before anything is bought.
+        Nothing is deleted to make the tree clean.
         """
         if previous is None:
-            return None
+            return None, ()
         if not previous.git_commit:
             return (
                 "the previous candidate has no recorded commit, so a repair cannot establish the "
                 "tree it would be starting from"
-            )
+            ), ()
         try:
             head = repo.worktree_commit(worktree)
             tree = repo.worktree_tree(worktree)
         except GitError as exc:
-            return f"the worktree's identity could not be read: {exc}"
+            return f"the worktree's identity could not be read: {exc}", ()
         if head != previous.git_commit:
             return (
                 f"the worktree is at {head}, not at the previous candidate "
                 f"{previous.git_commit}: a repair would start from bytes that were never checked"
-            )
+            ), ()
         if previous.git_tree and tree != previous.git_tree:
             return (
                 f"the worktree's tree is {tree}, not the checked candidate tree "
                 f"{previous.git_tree}"
-            )
+            ), ()
         try:
+            flagged = repo.index_flagged_paths(worktree)
             report = repo.status_report(worktree)
         except GitError as exc:
-            return f"the worktree's status could not be read: {exc}"
+            return f"the worktree's status could not be read: {exc}", ()
+        if flagged:
+            return (
+                "index entries are flagged assume-unchanged or skip-worktree ("
+                + ", ".join(flagged[:5])
+                + (f" (+{len(flagged) - 5} more)" if len(flagged) > 5 else "")
+                + "), so git's status cannot show whether the worktree is still the checked "
+                "candidate; a repair is refused rather than clearing them, and nothing was bought"
+            ), ()
         blocking = report.blocking_changes
         if blocking:
             return (
                 "the worktree changed after the candidate was frozen ("
                 + ", ".join(blocking[:5])
-                + "); a repair is refused rather than resetting or overwriting it"
-            )
-        return None
+                + (f" (+{len(blocking) - 5} more)" if len(blocking) > 5 else "")
+                + "), for example a file an approved check wrote that git does not ignore; a "
+                "repair is refused rather than resetting or overwriting it, and nothing was bought"
+            ), ()
+        try:
+            root = Path(os.path.realpath(worktree))
+            fingerprinted = {
+                path.relative_to(root).as_posix() for path in expand_scope(root, scope)
+            }
+        except RefusedError as exc:
+            return f"the worktree's scoped files could not be listed: {exc.message}", ()
+        covered = [path for path in report.ignored if path in fingerprinted]
+        if covered:
+            return (
+                "a previous check left ignored file(s) inside write_allow ("
+                + ", ".join(covered[:5])
+                + (f" (+{len(covered) - 5} more)" if len(covered) > 5 else "")
+                + "); the scoped fingerprint would cover bytes no candidate commit holds, so a "
+                "repair is refused rather than deleting them, and nothing was bought"
+            ), ()
+        return None, tuple(report.ignored)
 
     # -- steps ---------------------------------------------------------------
 
@@ -1863,16 +2470,19 @@ class Controller:
         # checked. A drifted or dirty tree means the bytes a repair would edit are not the bytes
         # that were verified, so it is refused rather than reset or overwritten - and this is
         # checked *before* the dispatch, so a refusal costs nothing.
+        # Ignored paths the previous round's checks left in the worktree, accepted (literally) by
+        # this round's freeze; empty for a first round, which starts from a fresh worktree.
+        carried_ignored: tuple[str, ...] = ()
         if previous is not None:
             if repo is not None and worktree is not None:
-                refusal = self._reconcile_repair_workspace(
-                    repo=repo, worktree=worktree, previous=previous
+                refusal, carried_ignored = self._reconcile_repair_workspace(
+                    repo=repo, worktree=worktree, previous=previous, scope=spec.scope
                 )
                 if refusal is not None:
                     self._record_repair_decision(
                         run_id,
                         RepairRecord(
-                            decision=RepairDecision.NO_CONTENT_CHANGE,
+                            decision=RepairDecision.WORKSPACE_DRIFT,
                             trigger=trigger,
                             reason=refusal,
                             policy_digest=policy.digest() if policy is not None else "",
@@ -1936,9 +2546,17 @@ class Controller:
         # names is the workspace this run actually got *and* this is a first attempt. A repair
         # must never reuse it: the packet has to carry the repair context, and the checked packet
         # was rendered before any failure existed.
+        #
+        # The packet states the deadline this invocation will be given, and is reused or
+        # re-rendered on that basis too: a packet rendered earlier (in ``run_task``, or a repair
+        # context decided before the checks finished) may name a longer one than is enforced now.
+        stated_deadline = self._capped_deadline(request.deadline_seconds)
+        if repair is not None and repair.deadline_seconds != stated_deadline:
+            repair = repair.model_copy(update={"deadline_seconds": stated_deadline})
         if (
             implementer_packet is not None
             and implementer_packet.workspace == str(execution_root)
+            and implementer_packet.deadline_seconds == stated_deadline
             and repair is None
         ):
             prepared = implementer_packet
@@ -1948,7 +2566,7 @@ class Controller:
                     run_id=run_id,
                     spec=spec,
                     workspace=str(execution_root),
-                    deadline_seconds=self._capped_deadline(request.deadline_seconds),
+                    deadline_seconds=stated_deadline,
                     writes_allowed=implementer_writes,
                     repair=repair,
                 )
@@ -1979,9 +2597,59 @@ class Controller:
             dispatch.invocation.invocation_id if dispatch.invocation else invocation_id
         )
         if dispatch.invocation is None:
-            # The legacy path: no ledger row, so the dispatch facts stay on the attempt row, and
-            # that write is the stop-aware one - a stop committing first must win the handoff.
-            self.store.record_invocation(attempt_id, invocation_id)
+            # The legacy path: no ledger row, so the dispatch facts stay on the attempt row. The
+            # registration is conditional on the stop, so a stop that committed after the
+            # reservation wins the handoff: nothing is registered and no driver is asked.
+            if not self.store.register_attempt_invocation_unless_stopped(
+                run_id, attempt_id, column="invocation_id", invocation_id=invocation_id
+            ):
+                reason = (
+                    "a cancellation intent was recorded between the reservation and the "
+                    "implementer's registration; no invocation was started and the reserved "
+                    "turn and authorization submission stay consumed"
+                )
+                try:
+                    self.store.finish_attempt(
+                        run_id=run_id,
+                        attempt_id=attempt_id,
+                        state=AttemptState.CANCELLED,
+                        outcome=InvocationOutcome.CANCELLED,
+                        result={"error": reason},
+                        block_code=RefusalCode.CANCELLED_BY_OPERATOR,
+                    )
+                except StoreError:
+                    pass  # the stop's own bookkeeping finished it first
+                return _CycleResult(
+                    outcome=self._blocked(run_id, RefusalCode.CANCELLED_BY_OPERATOR, reason)
+                )
+
+        # The reservation may have started the root's clock, or the clock moved on since the
+        # packet was rendered; the invocation gets what is left now, and the packet is brought
+        # into agreement with it. The value can only shrink, so the re-rendered packet is never
+        # larger than the one already checked against the bound; a refusal anyway is recorded
+        # against this reservation, which provably never reached a launch.
+        deadline_seconds = min(
+            prepared.deadline_seconds, self._capped_deadline(request.deadline_seconds)
+        )
+        if deadline_seconds != prepared.deadline_seconds:
+            try:
+                prepared = self._render_implementer_packet(
+                    run_id=run_id,
+                    spec=spec,
+                    workspace=str(execution_root),
+                    deadline_seconds=deadline_seconds,
+                    writes_allowed=implementer_writes,
+                    repair=(
+                        repair.model_copy(update={"deadline_seconds": deadline_seconds})
+                        if repair is not None
+                        else None
+                    ),
+                )
+            except RefusedError as exc:
+                self._mark_invocation_not_started(dispatch, f"refused before launch: {exc}")
+                return _CycleResult(
+                    outcome=self._block_attempt(run_id, attempt_id, exc.code, str(exc))
+                )
 
         pid, started_at, identity = ProcessGuard(self.controller_id).identity()
         self.store.record_process_identity(
@@ -2008,7 +2676,7 @@ class Controller:
             write_allow=list(spec.scope.write_allow),
             write_deny=list(spec.scope.write_deny),
             workspace=str(execution_root),
-            deadline_seconds=self._capped_deadline(request.deadline_seconds),
+            deadline_seconds=prepared.deadline_seconds,
             spec_digest=spec.spec_digest(),
             packet=prepared.packet.text,
             writes_allowed=implementer_writes,
@@ -2018,8 +2686,9 @@ class Controller:
             stop_requested=lambda: self._stop_recorded(run_id),
             # The other half of that handoff: the driver reports what it observed at its spawn
             # decision, so "a process exists" is a recorded observation. A driver that never calls
-            # it leaves this invocation `requested`, which is reported as an unconfirmed launch
-            # rather than counted as a start.
+            # it is read by `_confirm_driver_ran` instead: completed work counts as a launch (spawn
+            # kind unknown, no process), cancelled with no work as `not_started`, and anything
+            # else stays `requested` - an unconfirmed launch, not a start.
             on_spawn=self._spawn_reporter(dispatch),
         )
 
@@ -2028,6 +2697,10 @@ class Controller:
         # and nothing more - so a crash here is visible as an unconfirmed launch rather than
         # rounded up to a model call.
         self._mark_launch_requested(dispatch)
+        # Read between the launch request and the handoff: only a stop recorded by now proves the
+        # driver's gate refused, which is what lets a silent driver's empty return mean "never
+        # launched" (see ``_confirm_driver_ran``).
+        stop_before_launch = self._stop_recorded(run_id)
         try:
             result = self.driver.start(invocation)
         except RefusedError as exc:
@@ -2042,21 +2715,28 @@ class Controller:
                     run_id, attempt_id, RefusalCode.INTERNAL_ERROR, repr(exc)
                 )
             )
+        except BaseException:
+            # Ctrl+C or SystemExit: this process ends without the result. Record that before
+            # re-raising, so the run is reconcilable instead of RUNNING forever.
+            self._record_interruption(run_id, attempt_id, "implementer")
+            raise
         else:
-            self._confirm_driver_ran(dispatch, result)
+            self._confirm_driver_ran(dispatch, result, stop_before_launch=stop_before_launch)
 
         if result.outcome is InvocationOutcome.OUTCOME_UNKNOWN:
-            self._settle_invocation(dispatch, result.outcome, "driver reported an unknown outcome")
             self._apply_result_or_stay_stopped(
                 run_id=run_id,
                 attempt_id=attempt_id,
                 state=AttemptState.OUTCOME_UNKNOWN,
                 outcome=InvocationOutcome.OUTCOME_UNKNOWN,
                 result=result,
+                dispatch=dispatch,
+                settle_detail="driver reported an unknown outcome",
                 block_code=RefusalCode.OUTCOME_UNKNOWN,
                 reason="the worker's result is unknown; no re-dispatch until an operator reconciles "
                 "(plan 9.3)",
             )
+            self._release_invocation(self.driver, run_id, invocation_id)
             return _CycleResult(outcome=self._outcome_for(run_id))
 
         if result.agent_turns is not None:
@@ -2072,69 +2752,97 @@ class Controller:
                 f"{NOTE_PROMPT_DIGEST}: MISMATCH sent={result.prompt_digest} "
                 f"expected={prepared.packet.digest}",
             )
-            self._settle_invocation(dispatch, result.outcome, "prompt digest mismatch")
-            self.store.finish_attempt(
-                run_id=run_id,
-                attempt_id=attempt_id,
-                state=AttemptState.FAILED,
-                outcome=result.outcome,
-                result=result.model_dump(mode="json"),
-                block_code=RefusalCode.INTERNAL_ERROR,
-            )
-            return _CycleResult(
-                outcome=self._blocked(
-                    run_id,
-                    RefusalCode.INTERNAL_ERROR,
-                    "the invocation's prompt digest does not match the rendered input packet, so "
-                    "the result cannot be attributed to this task",
-                )
-            )
-
-        if result.outcome is not InvocationOutcome.COMPLETED:
-            self._settle_invocation(
-                dispatch, result.outcome, "driver reported a non-completed outcome"
-            )
             self._apply_result_or_stay_stopped(
                 run_id=run_id,
                 attempt_id=attempt_id,
                 state=AttemptState.FAILED,
                 outcome=result.outcome,
                 result=result,
+                dispatch=dispatch,
+                settle_detail="prompt digest mismatch",
+                block_code=RefusalCode.INTERNAL_ERROR,
+                reason="the invocation's prompt digest does not match the rendered input packet, "
+                "so the result cannot be attributed to this task",
+            )
+            self._release_invocation(self.driver, run_id, invocation_id)
+            return _CycleResult(outcome=self._outcome_for(run_id))
+
+        if result.outcome is not InvocationOutcome.COMPLETED:
+            # Settled only when applied, like every implementer result: after a stop, an entry
+            # the stop already closed - ``launch_unknown`` after a forced stop of an unrecorded
+            # launch, ``not_started`` after a stop that won the spawn gate - keeps its state, an
+            # entry an unconfirmed stop left open stays open, and this result is a note.
+            self._apply_result_or_stay_stopped(
+                run_id=run_id,
+                attempt_id=attempt_id,
+                state=AttemptState.FAILED,
+                outcome=result.outcome,
+                result=result,
+                dispatch=dispatch,
+                settle_detail="driver reported a non-completed outcome",
                 block_code=RefusalCode.DRIVER_FAILED,
                 reason=f"driver reported {result.outcome.value}: "
                 f"{result.error_message or 'no detail'}",
             )
+            self._release_invocation(self.driver, run_id, invocation_id)
             # Applied or already finalized by a stop: the run's own recorded state is the answer.
             return _CycleResult(outcome=self._outcome_for(run_id))
 
-        self._settle_invocation(dispatch, result.outcome, "implementer invocation completed")
-        if not self._apply_result_or_stay_stopped(
+        applied = self._apply_result_or_stay_stopped(
             run_id=run_id,
             attempt_id=attempt_id,
             state=AttemptState.SUCCEEDED,
             outcome=result.outcome,
             result=result,
-        ):
-            # The run was stopped while this invocation was running. Its result is recorded on
-            # the attempt row and the run keeps the decision the operator made; nothing here
-            # resumes the loop.
+            dispatch=dispatch,
+            settle_detail="implementer invocation completed",
+        )
+        self._release_invocation(self.driver, run_id, invocation_id)
+        if not applied:
+            # The run was stopped while this invocation was running. Its result is a late-result
+            # note, the attempt and the ledger entry keep the state the stop left, and the run
+            # keeps the decision the operator made; nothing here freezes or resumes the loop.
             return _CycleResult(outcome=self._outcome_for(run_id))
 
         # --- freeze the candidate the controller actually observed -------------
-        post_fingerprint = candidate_fingerprint(execution_root, spec.scope)
+        try:
+            post_fingerprint = candidate_fingerprint(execution_root, spec.scope)
+        except RefusedError as exc:
+            # A write_allow entry that resolved inside the checkout at admission now leaves the
+            # worktree (the worker replaced it with a junction or a symlink, for example). Nothing
+            # is frozen, and the run ends blocked - releasing its root - instead of raising out of
+            # ``run_task`` with the run left RUNNING.
+            return _CycleResult(
+                outcome=self._blocked(
+                    run_id,
+                    exc.code,
+                    "the worker's candidate cannot be fingerprinted inside the worktree, so "
+                    f"nothing was frozen, checked or reviewed: {exc.message}",
+                )
+            )
+        # Outside ``write_allow`` or under any deny rule (the task's, the project's, the built-in
+        # list): a denied file inside an allowed directory is refused here, before the freeze.
         outside = paths_outside_scope(
-            changed_paths(pre_manifest, manifest(execution_root)), spec.scope
+            changed_paths(pre_manifest, manifest(execution_root)), spec.scope, project.write_deny
         )
         if outside:
             return _CycleResult(
                 outcome=self._blocked(
                     run_id,
                     RefusalCode.SCOPE_VIOLATION,
-                    "the worker changed files its TaskSpec did not authorize: "
+                    "the worker changed files its TaskSpec did not authorize (outside write_allow "
+                    "or under a write_deny rule): "
                     + ", ".join(outside[:5])
                     + (f" (+{len(outside) - 5} more)" if len(outside) > 5 else ""),
                 )
             )
+
+        # A stop that landed after the result was applied still decides the run: nothing is
+        # frozen for a stopped run - no candidate commit, no retained ref - and the run keeps
+        # the state the stop recorded. Git work cannot share the stop's transaction, so this is
+        # asked at each Git step instead.
+        if self._stop_recorded(run_id):
+            return _CycleResult(outcome=self._stopped_before_freeze(run_id, attempt_id))
 
         # Freeze an explicit Git identity for the candidate before any check runs, so the
         # receipt names a commit rather than only a content fingerprint.
@@ -2145,8 +2853,51 @@ class Controller:
                     worktree,
                     list(spec.scope.write_allow),
                     f"hflow: candidate for {spec.task_id}",
-                    allow_ignored=IGNORED_ARTIFACT_ALLOWLIST,
+                    deny=[*spec.scope.write_deny, *project.write_deny],
+                    # A repair round also accepts the ignored byproducts the previous round's
+                    # checks left behind, each as a literal path (see
+                    # ``_reconcile_repair_workspace``); anything new and ignored still refuses.
+                    allow_ignored=[
+                        *IGNORED_ARTIFACT_ALLOWLIST,
+                        *(glob.escape(path) for path in carried_ignored),
+                    ],
+                    # The commit this round started from. A worker that committed, amended or
+                    # reset inside the worktree moved HEAD away from it and is refused there.
+                    expected_head=(
+                        previous.git_commit if previous is not None else original_base_commit
+                    ),
                 )
+                if self._stop_recorded(run_id):
+                    return _CycleResult(
+                        outcome=self._stopped_before_freeze(
+                            run_id, attempt_id, frozen_commit=freeze.candidate_commit
+                        )
+                    )
+                # Second guard, on Git's own answer rather than on the status the freeze read:
+                # the whole change from the task's original base to this candidate is held to
+                # the scope and every deny rule before a ref keeps it or a check runs on it.
+                cumulative_outside = paths_outside_scope(
+                    repo.diff_paths(
+                        original_base_commit, freeze.candidate_commit, cwd=project_root
+                    ),
+                    spec.scope,
+                    project.write_deny,
+                )
+                if cumulative_outside:
+                    return _CycleResult(
+                        outcome=self._blocked(
+                            run_id,
+                            RefusalCode.SCOPE_VIOLATION,
+                            "the candidate commit changes paths its TaskSpec did not authorize "
+                            "(outside write_allow or under a write_deny rule): "
+                            + ", ".join(cumulative_outside[:5])
+                            + (
+                                f" (+{len(cumulative_outside) - 5} more)"
+                                if len(cumulative_outside) > 5
+                                else ""
+                            ),
+                        )
+                    )
                 # Keep the candidate reachable independently of its worktree: a bare commit
                 # SHA is an identifier, not a retention policy.
                 ref = repo.candidate_ref(run_id, attempt_id)
@@ -2166,9 +2917,9 @@ class Controller:
                 )
 
         # The three identities a repair has to keep apart: the task's original base, the
-        # candidate this round started from, and the candidate this round produced. The *tree*
-        # and the *fingerprint* decide whether anything changed - a fresh commit SHA over an
-        # identical tree is not progress.
+        # candidate this round started from, and the candidate this round produced. The scoped
+        # *fingerprint* decides whether the checked content changed - a fresh commit SHA is not
+        # progress, and neither is a tree change the fingerprint cannot see.
         identity = CandidateIdentity(
             round=round_number,
             attempt_id=attempt_id,
@@ -2180,38 +2931,66 @@ class Controller:
             paths=list(freeze.paths) if freeze is not None else [],
             is_repair=previous is not None,
             unchanged_from_parent=bool(
-                previous is not None
-                and previous.fingerprint == post_fingerprint
-                and (previous.git_tree or "") == (freeze.tree if freeze is not None else "")
+                previous is not None and previous.fingerprint == post_fingerprint
             ),
         )
         if identity.unchanged_from_parent:
-            # No content change: the candidate tree and its scoped fingerprint are the same as
-            # the round we are repairing. Buying a reviewer for that would be paying to be told
-            # nothing happened, so the run stops here and records why.
-            decision = RepairRecord(
-                decision=RepairDecision.NO_CONTENT_CHANGE,
-                trigger=trigger,
-                reason=(
+            # No content change: the scoped fingerprint is the one of the round we are repairing.
+            # Buying a reviewer for that would be paying to be told nothing happened, so the run
+            # stops here and records why. A tree that moved anyway changed something the scope's
+            # fingerprint does not cover (denied paths are refused before the freeze), which is a
+            # violation rather than progress.
+            parent_tree = previous.git_tree if previous is not None else ""
+            if parent_tree != identity.git_tree:
+                moved = ", ".join(identity.paths[:5]) or "(no staged paths)"
+                reason = (
+                    f"the repair attempt changed the candidate tree ({parent_tree or '(none)'} -> "
+                    f"{identity.git_tree}; {moved}) but not the scoped fingerprint "
+                    f"{identity.fingerprint}: no checked content changed, and a tree change the "
+                    "fingerprint cannot see is refused as a scope violation, so no reviewer was "
+                    "bought"
+                )
+                block_code = RefusalCode.SCOPE_VIOLATION
+                block_reason = (
+                    f"the repair attempt changed the candidate tree ({moved}) but not its scoped "
+                    "fingerprint; that is not progress, and nothing was reviewed or accepted"
+                )
+            else:
+                reason = (
                     "the repair attempt produced no content change: candidate tree "
                     f"{identity.git_tree or '(none)'} and fingerprint {identity.fingerprint} are "
                     "unchanged from the round it was repairing, so no reviewer was bought"
-                ),
+                )
+                block_code = RefusalCode.VERIFICATION_FAILED
+                block_reason = (
+                    "the repair attempt left the candidate unchanged; nothing was reviewed and "
+                    "nothing was accepted"
+                )
+            decision = RepairRecord(
+                decision=RepairDecision.NO_CONTENT_CHANGE,
+                trigger=trigger,
+                reason=reason,
                 policy_digest=policy.digest() if policy is not None else "",
                 round=round_number,
                 decided_at=utc_now(),
             )
             self._record_repair_decision(run_id, decision)
+            return _CycleResult(outcome=self._blocked(run_id, block_code, block_reason))
+
+        try:
+            self.store.advance_to_checking(
+                run_id=run_id, attempt_id=attempt_id, phase=CheckPhase.VERIFICATION
+            )
+        except StoreError as exc:
+            # As in ``_advance_to_review``: a transition refused because a stop landed is the
+            # stop, reported as the run's recorded state; any other refusal blocks this run.
             return _CycleResult(
                 outcome=self._blocked(
                     run_id,
-                    RefusalCode.VERIFICATION_FAILED,
-                    "the repair attempt left the candidate unchanged; nothing was reviewed and "
-                    "nothing was accepted",
+                    RefusalCode.INTERNAL_ERROR,
+                    f"the run could not enter the checking phase: {exc}",
                 )
             )
-
-        self.store.advance_to_checking(run_id=run_id, attempt_id=attempt_id, phase=CheckPhase.VERIFICATION)
         # The root's remaining time, read here and not at the start of the cycle: the implementer
         # attempt consumed the clock, so what is left to check and review with is a different
         # number from the one the attempt was given. Read from the ledger, so a restarted
@@ -2298,6 +3077,9 @@ class Controller:
                     verification=verification,
                     freeze=freeze,
                     project=project,
+                    repo=repo,
+                    original_base_commit=original_base_commit,
+                    round_number=round_number,
                 )
             except RefusedError as exc:
                 return _CycleResult(outcome=self._blocked(run_id, exc.code, exc.message))
@@ -2319,6 +3101,7 @@ class Controller:
                 failure_facts=failure_facts,
                 findings=[],
                 detail=verification.detail,
+                configured_deadline_seconds=request.deadline_seconds,
             )
 
         if review.status == "changes_requested":
@@ -2335,6 +3118,7 @@ class Controller:
                 failure_facts=[],
                 findings=findings,
                 detail="independent review requested changes",
+                configured_deadline_seconds=request.deadline_seconds,
             )
         if review.status not in {"accepted", "not_required"}:
             return _CycleResult(
@@ -2365,9 +3149,8 @@ class Controller:
             dirty_target=dirty_target,
             identity=identity,
             original_base_commit=original_base_commit,
+            project_write_deny=list(project.write_deny),
         )
-        if accepted is None:
-            return _CycleResult(outcome=self._outcome_for(run_id))
         return _CycleResult(outcome=accepted, identity=identity, review=review, accepted=True)
 
     # -- repair (batch E2) ---------------------------------------------------
@@ -2387,6 +3170,9 @@ class Controller:
         verification: VerificationResult | None = None,
         freeze: CandidateFreeze | None = None,
         project: ProjectConfig | None = None,
+        repo: GitRepo | None = None,
+        original_base_commit: str = "",
+        round_number: int = 1,
     ) -> ReviewResult:
         """Buy the review turn, run the reviewer, then interpret its structured verdict.
 
@@ -2394,6 +3180,12 @@ class Controller:
         *program evidence the controller recorded* - never the implementer's own summary of its
         work. Those facts come from this run's rows, so a reviewer cannot be handed a plausible
         but invented candidate.
+
+        The candidate is described the way it is delivered: from the task's original base, with
+        every path changed since then and the cumulative diff. In a repair round the freeze's own
+        base is the previous round's candidate, and a reviewer shown only that patch would vote
+        on a delivery whose first round it never saw (when round one failed a check, no reviewer
+        was bought for it). That round's own patch is added, labelled, next to the whole change.
 
         Two things this deliberately does *not* do:
 
@@ -2404,7 +3196,9 @@ class Controller:
 
         It also does not *start* a reviewer for a run whose stop was already requested: the
         intent is recorded before anything is asked to stop, and buying a turn after that
-        would spend allowance and dispatch a process for a decision a human already ended.
+        would spend allowance and dispatch a process for a decision a human already ended. And a
+        reviewer result that arrives after a stop is not applied: the stop is decided in the
+        result's first write, and a late result is only a note (see :meth:`_late_review_result`).
         """
         attempt = self.store.open_attempt(run_id)
         attempt_id = attempt["attempt_id"] if attempt else ""
@@ -2467,11 +3261,35 @@ class Controller:
             "paths": list(freeze.paths) if freeze else [],
         }
         if freeze is not None:
+            base = original_base_commit or freeze.base_commit
             candidate_identity |= {
-                "base_commit": freeze.base_commit,
+                "base_commit": base,
                 "git_commit": freeze.candidate_commit,
                 "git_tree": freeze.tree,
             }
+            if base != freeze.base_commit:
+                # This round started from an earlier round's candidate, not from the base: the
+                # paths are the cumulative ones, computed by Git exactly as ``_accept`` does.
+                if repo is None:  # pragma: no cover - a freeze only exists in a worktree run
+                    raise RefusedError(
+                        RefusalCode.INTERNAL_ERROR,
+                        "a repair round's candidate has no repository to diff it against its base",
+                    )
+                try:
+                    cumulative = repo.diff_paths(base, freeze.candidate_commit, cwd=project_root)
+                except GitError as exc:
+                    raise RefusedError(
+                        RefusalCode.INTERNAL_ERROR,
+                        "the reviewer's view of the whole change could not be computed, so no "
+                        f"review was bought: {exc}",
+                    ) from exc
+                candidate_identity["paths"] = cumulative
+            if round_number > 1:
+                candidate_identity |= {
+                    "round": round_number,
+                    "round_parent_commit": freeze.base_commit,
+                    "round_paths": list(freeze.paths),
+                }
         try:
             reviewer_packet = self.render(render_reviewer_packet)(
                 task_id=spec.task_id,
@@ -2569,8 +3387,20 @@ class Controller:
             on_spawn=self._spawn_reporter(dispatch),
         )
         self._mark_launch_requested(dispatch)
+        # The same ordering fact as the implementer's: only a stop recorded before the handoff
+        # proves the driver's gate refused.
+        stop_before_launch = self._stop_recorded(run_id)
         try:
             review_invocation = self.reviewer_driver.start(review_request)
+        except RefusedError as exc:
+            # A deterministic refusal before launch (for example a workspace client config): no
+            # review was attempted, so it is reported under its own code rather than as a review
+            # protocol error, and the reservation is recorded as never started.
+            self._mark_invocation_not_started(dispatch, f"refused before launch: {exc}")
+            self.store.attach_review_result(
+                attempt_id, {"error": str(exc), "invocation_id": invocation_id}
+            )
+            raise RefusedError(exc.code, exc.message) from exc
         except Exception as exc:  # noqa: BLE001 - a broken reviewer must not become an accept
             self._mark_driver_failure(dispatch, exc)
             self.store.attach_review_result(
@@ -2580,26 +3410,62 @@ class Controller:
                 RefusalCode.REVIEW_PROTOCOL_ERROR,
                 "the review invocation could not be started, so no verdict exists: " f"{exc!r}",
             ) from exc
-        self._confirm_driver_ran(dispatch, review_invocation)
+        except BaseException:
+            self._record_interruption(run_id, attempt_id, "reviewer")
+            raise
+        self._confirm_driver_ran(
+            dispatch, review_invocation, stop_before_launch=stop_before_launch
+        )
 
         if review_invocation.outcome is InvocationOutcome.CANCELLED and self._stop_recorded(run_id):
-            # The stop won the handoff inside the driver, so no reviewer process was created.
-            # Nothing is attached to the attempt - there was no invocation - and the run keeps
-            # the stop decision it already made. The reservation is recorded as never started:
-            # its allowance stays consumed (it was committed before the handoff) and the ledger
-            # says so instead of counting a process that never existed.
-            self._mark_invocation_not_started(dispatch, "the stop won the reviewer handoff")
-            raise RefusedError(
-                RefusalCode.CANCELLED_BY_OPERATOR,
-                "the stop was seen before the reviewer process was created, so none was started "
-                "and no reviewer invocation is recorded",
-            )
+            recorded = self.store.invocation(invocation_id) if dispatch.invocation else None
+            if recorded is None or recorded.state is InvocationStartState.NOT_STARTED:
+                # The stop won the handoff inside the driver: the driver reported that no process
+                # was created, or (a silent driver) the stop was recorded before it was asked.
+                # Nothing is attached to the attempt - there was no invocation - and the run keeps
+                # the stop decision it already made. The ledger already says "never started",
+                # with the allowance still consumed (it was committed before the handoff).
+                raise RefusedError(
+                    RefusalCode.CANCELLED_BY_OPERATOR,
+                    "the stop was seen before the reviewer process was created, so none was "
+                    "started and no reviewer invocation is recorded",
+                )
+            # Otherwise the stop reached a reviewer that was already running. Its cancelled
+            # result is a late one, like any other result after a stop: handled below.
 
-        self.store.attach_review_result(attempt_id, review_invocation.model_dump(mode="json"))
+        # The stop is decided in the first write of the result, as for the implementer
+        # (``_apply_result_or_stay_stopped``). A stop recorded first - confirmed or not - makes
+        # this result a late one: it is a note, the ledger entry keeps the state the stop left
+        # (an unconfirmed stop leaves it open, so the root stays blocked) and no verdict or
+        # evidence is recorded. A stop that commits after this write keeps the applied result.
+        if not self.store.attach_review_result_unless_stopped(
+            run_id, attempt_id, review_invocation.model_dump(mode="json")
+        ):
+            raise self._late_review_result(
+                run_id=run_id,
+                attempt_id=attempt_id,
+                invocation_id=invocation_id,
+                outcome=review_invocation.outcome,
+            )
+        self._release_invocation(self.reviewer_driver, run_id, invocation_id)
         pid, started_at, identity = ProcessGuard(self.controller_id).identity()
         self.store.record_process_identity(
             attempt_id, pid=pid, started_at=started_at, identity=identity, session_id=attempt_id
         )
+        if review_invocation.outcome is InvocationOutcome.OUTCOME_UNKNOWN:
+            # Nobody knows how this turn ended - it may not even have ended. That is an unknown
+            # outcome, not a wire failure: the ledger and the run both say so, the root stays
+            # blocked, and ``resume`` reconciles it without re-dispatching.
+            self._settle_invocation(
+                dispatch, review_invocation.outcome, "review invocation outcome unknown"
+            )
+            raise RefusedError(
+                RefusalCode.OUTCOME_UNKNOWN,
+                "the review invocation's outcome is unknown "
+                f"({review_invocation.error_code or 'no code'}: "
+                f"{review_invocation.error_message or 'no detail'}); it produced no verdict and "
+                "nothing is re-dispatched",
+            )
         if review_invocation.outcome is not InvocationOutcome.COMPLETED:
             # An unfinished turn is a transport failure, not the reviewer's judgment. It is
             # reported as such; a genuine rejection requires a validated `changes_requested`.
@@ -2629,6 +3495,10 @@ class Controller:
                 "packet, so its verdict does not belong to this candidate",
             )
 
+        # The ledger records what the controller concluded about this turn, not the driver's raw
+        # outcome: a turn the controller refuses as unknown (an unbound completion) is settled as
+        # unknown, so the root stays blocked until it is reconciled.
+        settled_as = review_invocation.outcome
         try:
             review_output = review_invocation.review
             if review_output is None:
@@ -2659,14 +3529,58 @@ class Controller:
                 evidence_ids=[evidence.evidence_id],
                 checked_fingerprint=candidate_fp,
             )
+        except RefusedError as exc:
+            if exc.code is RefusalCode.OUTCOME_UNKNOWN:
+                settled_as = InvocationOutcome.OUTCOME_UNKNOWN
+            raise
         finally:
             # One close for every way out of this block, including a vanished verdict and an
             # unexpected error in the evidence write. Without it a reviewer that ran but whose
             # verdict was unusable would leave its invocation open forever, and an open
             # invocation blocks the whole root - a wedge, not a safety property.
             self._settle_invocation(
-                dispatch, review_invocation.outcome, "review invocation completed"
+                dispatch,
+                settled_as,
+                "review invocation outcome unknown"
+                if settled_as is InvocationOutcome.OUTCOME_UNKNOWN
+                else "review invocation completed",
             )
+
+    def _late_review_result(
+        self,
+        *,
+        run_id: str,
+        attempt_id: str,
+        invocation_id: str,
+        outcome: InvocationOutcome,
+    ) -> RefusedError:
+        """Record a reviewer result that arrived after the run's stop, and return the refusal.
+
+        The reviewer's half of :meth:`_apply_result_or_stay_stopped`: the result decides nothing
+        any more, so it is a ``late_result`` note. No verdict is attached, no evidence and no
+        process identity are recorded, and the ledger entry is **not settled** - after an
+        unconfirmed stop it stays open and keeps blocking the root until ``resume`` reconciles
+        it; an entry the stop already closed keeps that state, and the refused settlement is
+        noted. The driver is still released: the result is on record, as a note.
+
+        The caller raises the returned error; ``_blocked`` then keeps the block the stop recorded.
+        """
+        self.store.record_note(
+            run_id,
+            f"{NOTE_LATE_RESULT}: the {outcome.value} result of reviewer invocation "
+            f"{invocation_id} for attempt {attempt_id} arrived after the run's stop was "
+            "recorded; no verdict or evidence was recorded, the ledger entry keeps the state the "
+            "stop left, the run keeps its recorded decision and nothing is re-dispatched",
+        )
+        self._release_invocation(self.reviewer_driver, run_id, invocation_id)
+        recorded = self.store.invocation(invocation_id)
+        if recorded is not None and recorded.state.value not in INVOCATION_OPEN_STATES:
+            self._note_not_settled(run_id, invocation_id, outcome)
+        return RefusedError(
+            RefusalCode.CANCELLED_BY_OPERATOR,
+            f"the reviewer's {outcome.value} result arrived after the stop was recorded; it is "
+            "recorded as a late_result note and decides nothing",
+        )
 
     def _unusable_review(
         self,
@@ -2740,15 +3654,25 @@ class Controller:
         dirty_target: bool = False,
         identity: CandidateIdentity | None = None,
         original_base_commit: str = "",
-    ) -> RunOutcome | None:
+        project_write_deny: list[str] | None = None,
+    ) -> RunOutcome:
         """Admission gate. Every field of the receipt is re-derived from stored facts.
+
+        The delivery paths are held to the task's scope once more before a receipt names them:
+        ``project_write_deny`` carries the project's deny rules, and the task's own and the
+        built-in deny list always apply. A delivery that names a path the scope does not allow is
+        refused as a scope violation instead of being written into a receipt.
 
         Accepts the frozen *identity of this round* so the receipt and the run's notes name the
         candidate that was actually verified, and the task's *original base* so the delivery it
         describes is the cumulative change a repaired run actually produced - base to final
-        candidate - rather than the last round's patch. Returns ``None`` only when the acceptance
-        could not be applied at all (a superseded attempt or a stop that won); the caller then
-        reads the run's own recorded state instead of a value invented here.
+        candidate - rather than the last round's patch.
+
+        Always returns the run's outcome; a refusal of the acceptance write never escapes. A stop
+        can commit after the intent is read here and before ``finalize_acceptance``, which then
+        refuses the late success in its own transaction: the outcome is the state the stop
+        recorded, with no receipt. Any other refusal of that write blocks the run through the
+        stop-conditional :meth:`_blocked`.
         """
         row = self.store.get_run(run_id)
         # The deadline is checked at acceptance as well as before each dispatch. A run can spend
@@ -2784,7 +3708,16 @@ class Controller:
                 f"(intent at {row['cancel_intent_at']})",
             )
 
-        fresh_fingerprint = candidate_fingerprint(project_root, spec.scope)
+        try:
+            fresh_fingerprint = candidate_fingerprint(project_root, spec.scope)
+        except RefusedError as exc:
+            # The scope no longer resolves inside the workspace, so the verified content cannot
+            # be re-read: that is a recorded block, never an exception out of the run.
+            return self._blocked(
+                run_id,
+                exc.code,
+                f"the candidate cannot be fingerprinted again at acceptance: {exc.message}",
+            )
         evidence_rows = [dict(r) for r in self.store.evidence_for(run_id, kind="verification")]
         current_ids = {
             r["evidence_id"]
@@ -2833,6 +3766,16 @@ class Controller:
             # no Git identity): the local paths are all that is known, and inventing a range would
             # be worse than saying less.
             delivery_paths = list(freeze.paths) if freeze else []
+        undelivered = paths_outside_scope(delivery_paths, spec.scope, project_write_deny or [])
+        if undelivered:
+            return self._blocked(
+                run_id,
+                RefusalCode.SCOPE_VIOLATION,
+                "the delivery changes paths its TaskSpec did not authorize (outside write_allow "
+                "or under a write_deny rule); no receipt was written: "
+                + ", ".join(undelivered[:5])
+                + (f" (+{len(undelivered) - 5} more)" if len(undelivered) > 5 else ""),
+            )
 
         receipt = ResultReceipt(
             run_id=run_id,
@@ -2880,7 +3823,24 @@ class Controller:
             ],
         )
 
-        self.store.finalize_acceptance(run_id, receipt, checks_digest=row["checks_digest"])
+        try:
+            self.store.finalize_acceptance(run_id, receipt, checks_digest=row["checks_digest"])
+        except RunNotFound:
+            raise
+        except StoreError as exc:
+            if self._stop_recorded(run_id):
+                # A stop committed after the intent check above and before this write. The store
+                # refused the late success in the same transaction; the stop decides the state.
+                return self._outcome_for(
+                    run_id,
+                    notes=[
+                        "a stop was recorded while the acceptance was being prepared; no receipt "
+                        "was written and the run keeps the state the stop records"
+                    ],
+                )
+            return self._blocked(
+                run_id, RefusalCode.INTERNAL_ERROR, f"the acceptance could not be recorded: {exc}"
+            )
 
         # Post-acceptance facts go into the note *after* the terminal transition, because the
         # transition itself clears block_reason. The target repository's user-visible state is
@@ -2937,17 +3897,24 @@ class Controller:
         state: AttemptState,
         outcome: InvocationOutcome,
         result: InvocationResult,
+        dispatch: DispatchReservation,
+        settle_detail: str,
         block_code: RefusalCode | None = None,
         reason: str = "",
     ) -> bool:
-        """Apply one invocation result, unless the run was stopped while it was in flight.
+        """Apply one implementer result, unless the run was stopped while it was in flight.
 
-        ``True`` when the result was applied to the live attempt; ``False`` when the attempt had
-        already been finalized - a cancellation recorded first, and possibly confirmed, is
-        exactly that case. That result is then a fact about an invocation which no longer
-        decides anything: it is recorded in the run's note table and the run keeps the decision
-        already taken. A late success must not overwrite a stop, and a late answer must not
-        resurrect a run somebody stopped.
+        ``True`` when the result was applied to the live attempt, and only then is the ledger
+        entry settled with it. ``False`` when the run's stop is recorded - confirmed or not - or
+        the attempt had already been finalized. That result is then a fact about an invocation
+        which no longer decides anything: it is recorded as a ``late_result`` note and the run
+        keeps the decision already taken. A late success must not overwrite a stop, and a late
+        answer must not resurrect a run somebody stopped.
+
+        The stop is decided **in the attempt write** (``finish_attempt(unless_stopped=True)``),
+        before the ledger is touched. After an unconfirmed stop the attempt stays live and the
+        ledger entry stays open - "work may still be running" must keep blocking the root, and
+        ``resume`` reconciles both. An entry a confirmed stop already closed keeps that state.
 
         Without this, the store's compare-and-set raises ``StoreError`` on a state that is
         already correct, and the exception escapes the controller's own loop instead of the run
@@ -2961,19 +3928,52 @@ class Controller:
                 outcome=outcome,
                 result=result.model_dump(mode="json"),
                 block_code=block_code,
+                unless_stopped=True,
             )
         except StoreError as exc:
             self.store.record_note(
                 run_id,
                 f"{NOTE_LATE_RESULT}: the {outcome.value} result of invocation "
-                f"{result.invocation_id} for attempt {attempt_id} arrived after the attempt was "
-                f"finalized ({exc}); the run keeps its recorded decision and nothing is "
-                "re-dispatched",
+                f"{result.invocation_id} for attempt {attempt_id} arrived after the run's stop "
+                f"or the attempt's end was recorded ({exc}); the attempt and its ledger entry "
+                "keep the state the stop left, the run keeps its recorded decision and nothing "
+                "is re-dispatched",
             )
+            recorded = (
+                self.store.invocation(dispatch.invocation.invocation_id)
+                if dispatch.invocation is not None
+                else None
+            )
+            if recorded is not None and recorded.state.value not in INVOCATION_OPEN_STATES:
+                self._note_not_settled(run_id, recorded.invocation_id, outcome)
             return False
+        self._settle_invocation(dispatch, outcome, settle_detail)
         if block_code is not None:
             self._blocked(run_id, block_code, reason)
         return True
+    def _stopped_before_freeze(
+        self, run_id: str, attempt_id: str, *, frozen_commit: str = ""
+    ) -> RunOutcome:
+        """Report a run whose stop was recorded after its implementer result was applied.
+
+        The result stands on the attempt (it arrived before the stop), but no candidate is
+        retained for a stopped run. ``frozen_commit`` is a candidate commit made in the run's
+        worktree just before the stop was seen: it is named here so it is not mistaken for a
+        delivery, and no ``refs/hflow/candidates`` ref is created for it.
+        """
+        detail = (
+            f"candidate commit {frozen_commit} was made in the worktree before the stop was seen "
+            "and is not retained by a candidate ref"
+            if frozen_commit
+            else "no candidate was frozen"
+        )
+        self.store.record_note(
+            run_id,
+            f"a stop was recorded after the result of attempt {attempt_id} was applied; {detail}, "
+            "and the run keeps the state the stop recorded",
+        )
+        return self._outcome_for(run_id)
+
     def _blocked(self, run_id: str, code: RefusalCode, reason: str) -> RunOutcome:
         """End the loop at this block, unless a stop already decided the run's state.
 

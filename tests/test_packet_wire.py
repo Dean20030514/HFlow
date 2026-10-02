@@ -499,6 +499,56 @@ def test_reviewer_packet_carries_the_candidate_and_the_evidence(checked_factory)
     assert "Style, naming and formatting preferences are not blocking findings." in prompt.text
     # The reviewer is never handed the implementer's own account of its work.
     assert "candidate=None" not in prompt.text
+    assert "- paths changed from the base commit: src/parser.py" in prompt.text
+    assert "this round's change" not in prompt.text, "a first round has no separate round patch"
+
+
+def test_a_repair_rounds_reviewer_packet_names_both_diffs_and_stays_bounded(
+    checked_factory,
+) -> None:
+    """The cumulative change and the round's own patch are both listed, each capped at 20 paths.
+
+    A repair round's candidate can touch many files across two rounds; the packet names the first
+    twenty of each list and counts the rest, so the change's width cannot push the packet past its
+    bound or silently drop the fact that more paths exist.
+    """
+    checked = checked_factory()
+    spec = checked.task()
+    cumulative = [f"src/module_{i:03}.py" for i in range(300)]
+    prompt = render_reviewer_packet(
+        task_id=spec.task_id,
+        task_revision=spec.revision,
+        goal=spec.goal,
+        acceptance=spec.acceptance,
+        scope=spec.scope,
+        workspace="/tmp/frozen-worktree",
+        spec_digest=spec.spec_digest(),
+        candidate_fingerprint="sha256:deadbeef",
+        deadline_seconds=120,
+        candidate={
+            "fingerprint": "sha256:deadbeef",
+            "base_commit": "a" * 40,
+            "git_commit": "b" * 40,
+            "git_tree": "c" * 40,
+            "worktree": "/tmp/frozen-worktree",
+            "paths": cumulative,
+            "round": 2,
+            "round_parent_commit": "d" * 40,
+            "round_paths": cumulative[150:],
+        },
+        verification_status="passed",
+    )
+
+    text = prompt.text
+    assert f"- base commit the candidate was produced from: {'a' * 40}" in text
+    assert f"git diff {'a' * 40} {'b' * 40}" in text
+    assert "src/module_019.py (+280 more)" in text
+    assert "this round's change (repair round 2" in text
+    assert f"git diff {'d' * 40} {'b' * 40}" in text
+    assert "- paths this round changed: src/module_150.py" in text
+    assert "src/module_169.py (+130 more)" in text
+    assert "src/module_020.py" not in text and "src/module_170.py" not in text
+    assert prompt.byte_length <= 32 * 1024
 
 
 # --------------------------------------------------------------------------
@@ -870,6 +920,49 @@ def test_effective_prompt_is_the_packet_and_never_a_rebuilt_goal() -> None:
     assert sent.startswith(PROMPT_ENVELOPE + ": ")
     assert sent.endswith("the bare goal")
     assert os.linesep not in sent.split("\n", 1)[0]
+
+
+def test_rendered_packets_survive_the_clients_input_normalisation_unchanged() -> None:
+    """acpx trims the prompt and tries ``JSON.parse`` on one that starts with ``[``.
+
+    So a packet with leading or trailing whitespace reaches the agent as different text than the
+    bytes ``prompt_digest`` covers, and a packet that parses as JSON could be sent as structured
+    content blocks instead of text. Rendered packets therefore carry no surrounding whitespace
+    and never parse as JSON - for both roles, with and without optional sections.
+    """
+    scope = Scope(write_allow=["src/parser.py"], write_deny=[])
+    acceptance = [AcceptanceCriterion(id="AC1", statement="  empty input returns None  ", check_ids=["unit"])]
+    packets = [
+        render_implementer_packet(
+            task_id="T-1",
+            task_revision=1,
+            goal="  " + GOAL + "\n\n",
+            acceptance=acceptance,
+            scope=scope,
+            workspace="C:/ws",
+            spec_digest="sha256:test",
+            deadline_seconds=60,
+            writes_allowed=True,
+        ),
+        render_reviewer_packet(
+            task_id="T-1",
+            task_revision=1,
+            goal=GOAL,
+            acceptance=acceptance,
+            scope=scope,
+            workspace="C:/ws",
+            spec_digest="sha256:test",
+            candidate_fingerprint="sha256:candidate",
+            deadline_seconds=60,
+            verification_status="passed",
+            verification_detail="all checks passed\n",
+        ),
+    ]
+    for packet in packets:
+        assert packet.text == packet.text.strip(), repr(packet.text[-20:])
+        assert packet.digest == packet_digest(packet.text.strip())
+        with pytest.raises(ValueError):
+            json.loads(packet.text)
 
 
 def test_the_output_contract_note_is_the_one_the_parser_accepts() -> None:

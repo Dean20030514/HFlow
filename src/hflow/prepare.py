@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -41,6 +41,7 @@ from .contracts import (
     RepairTrigger,
     RoleConfig,
     RootBudgetBinding,
+    RootBudgetLimits,
     RootBudgetPlan,
     RootBudgetPreview,
     RunRequest,
@@ -109,13 +110,18 @@ class ResolvedRun:
     admission: ValidationReport
     #: The same pre-dispatch problems the run's own gate raises, resolved from this machine.
     dispatch_preconditions: list[ValidationIssue] = field(default_factory=list)
+    #: The worktree run's base, resolved once to a commit (see :func:`resolve_base_commit`).
+    #: Empty for an in-place run, or when the ref does not resolve here.
+    base_commit: str = ""
 
     @property
     def ready_to_dispatch(self) -> bool:
         """Would `run` get past admission and past its dispatch gate?
 
         Authorization allowance is not part of this: it depends on a run's history, so it is
-        checked when a run actually exists rather than promised here.
+        checked when a run actually exists rather than promised here. Neither is anything only the
+        ledger knows - a root's used repairs, or whether a rootless run's task already has a
+        root - because a preview does not open the database.
         """
         return self.admission.ok and not self.dispatch_preconditions
 
@@ -140,6 +146,7 @@ class ResolvedRun:
             project=self.project,
             project_root=self.project_root,
             workspace_root=self.project_root,
+            base_commit=self.base_commit,
         )
 
     def execution_root(self) -> tuple[str, bool]:
@@ -339,6 +346,99 @@ def effective_spec(
     return TaskSpec.model_validate({**spec.model_dump(mode="json"), **overrides})
 
 
+def resolve_base_commit(spec: TaskSpec, project_root: Path) -> str:
+    """The commit a worktree run starts from: ``workspace.base_commit`` (or HEAD), resolved once.
+
+    A ref such as 'HEAD' or 'main' is a name, not a base: inside the run's worktree HEAD is the
+    candidate itself, and a branch can move while the run works. So the name is resolved to a
+    commit here, once, and that commit is what the authorization binding names and what ``run``
+    hands the controller (``RunRequest.base_commit``). The task text keeps the name, so its digest
+    is unchanged; a branch that moves between ``prepare`` and ``run`` resolves to another commit,
+    and an approval written for the old one no longer matches.
+
+    Returns ``""`` for an in-place run, which has no worktree to start, and when the ref does not
+    resolve here (no repository, no such commit). Nothing is refused at this point: the run's own
+    worktree gate refuses an unresolvable base before anything is claimed, and the binding then
+    carries the task's text as it always did. Read-only: one ``rev-parse``, no ref or worktree.
+    """
+    if spec.workspace.mode != "worktree":
+        return ""
+    from .gitworkspace import GitError, GitRepo
+
+    try:
+        return GitRepo.discover(project_root).resolve_commit(spec.workspace.base_commit or "HEAD")
+    except (GitError, RefusedError):
+        return ""
+
+
+def launch_workspaces(spec: TaskSpec, project_root: Path) -> list[Path]:
+    """The directories this run's agents work in; no launch program may be a file inside one.
+
+    The project root always (an in-place run's workspace), and for a worktree run the directory
+    its worktrees are created in (``GitRepo.worktree_parent``). acpx starts the agent there, and
+    an agent can write there, so a launcher found inside would be a program the agent chose.
+    Read-only: a worktree run's repository is discovered, nothing is created.
+    """
+    roots = [Path(project_root)]
+    if spec.workspace.mode == "worktree":
+        from .gitworkspace import GitError, GitRepo
+
+        try:
+            roots.append(GitRepo.discover(project_root).worktree_parent())
+        except (GitError, RefusedError):
+            pass  # no repository: the worktree gate refuses the run before anything is claimed
+    return roots
+
+
+def start_workspace_client_config(
+    spec: TaskSpec, project_root: Path, base_commit: str = ""
+) -> str:
+    """Why the workspace this run starts in already holds acpx's project config, or ``""``.
+
+    acpx always loads ``<cwd>/.acpxrc.json`` and lets it replace the agent command, so the
+    driver refuses to launch on such a workspace - but only at its spawn gate, after the dispatch
+    was reserved, and an identical TaskSpec then returns that blocked run. When the file is
+    already in what the run starts from, it is knowable now, so admission refuses before anything
+    is spent: the project root for an in-place run, the base commit's tree for a worktree run (a
+    worktree is a checkout of that commit, so a copy the user did not commit is not in it).
+    ``base_commit`` is the resolved base (``RunRequest.base_commit``) when the caller has one.
+    The name is matched without regard to case, as the driver's spawn gate matches it: a
+    checkout on a case-insensitive filesystem holds ``.ACPXRC.JSON`` as written, and acpx's open
+    of ``.acpxrc.json`` finds it. Only the root's own entries count.
+    Read-only: one listing of the project root, or one ``ls-tree`` of the base's root.
+    """
+    from .drivers.acpx_dsh import WORKSPACE_CLIENT_CONFIG_NAME, _workspace_client_config
+
+    if spec.workspace.mode != "worktree":
+        found = _workspace_client_config(Path(project_root))
+        if found is None:
+            return ""
+        return (
+            f"{found} exists in the project root this in-place run works in; remove it (or the "
+            "directory) before submitting"
+        )
+    from .gitworkspace import GitError, GitRepo
+
+    base = base_commit or spec.workspace.base_commit or "HEAD"
+    try:
+        # No pathspec: a pathspec matches case-sensitively even with core.ignorecase. Without
+        # -r only the root's entries are listed; -z keeps names unquoted.
+        listed = GitRepo.discover(project_root).run("ls-tree", "-z", "--name-only", base)
+    except (GitError, RefusedError):
+        return ""  # no repository or no such base: the worktree gate refuses that on its own
+    wanted = WORKSPACE_CLIENT_CONFIG_NAME.casefold()
+    matched = next(
+        (name for name in listed.split("\0") if name and name.casefold() == wanted), ""
+    )
+    if not matched:
+        return ""
+    return (
+        f"{matched} is in base commit {base}, which this worktree run "
+        "starts from; commit its removal before submitting (a real run then needs an "
+        "authorization issued for the new base)"
+    )
+
+
 def resolve_permissions(
     spec: TaskSpec, env: Mapping[str, str] | None = None
 ) -> tuple[bool, bool]:
@@ -361,13 +461,15 @@ def _role_config(
     *,
     data_dir: Path,
     env: Mapping[str, str] | None,
+    workspaces: Sequence[Path] = (),
 ) -> RoleConfig:
     """One role's configuration, including the *resolved launch* for a driver that starts one.
 
     The launch is resolved here and travels with the configuration, so it is covered by
     ``EffectiveConfig.digest()`` - what an approval binds - and consumed by ``build_driver``
     afterwards rather than re-derived from the environment. That is the difference between
-    approving a configuration and approving a name.
+    approving a configuration and approving a name. The run's ``workspaces``
+    (:func:`launch_workspaces`) go into the resolution, so no launch program is a file inside them.
     """
     from .drivers.acpx_dsh import resolve_launch_config
     from .drivers.selected import resolve_driver_id
@@ -378,7 +480,9 @@ def _role_config(
         # The launcher profile a real transport starts with. It is the driver's own fixed
         # default; a profile that wants another one will need the binding to carry it, which
         # this build does not claim to support (see README, "Not implemented").
-        launch = resolve_launch_config(data_dir=data_dir, env=env)
+        launch = resolve_launch_config(
+            data_dir=data_dir, env=env, workspaces=workspaces
+        )
     return RoleConfig(
         role=role,
         agent=agent_id,
@@ -399,13 +503,16 @@ def _effective_from_profile(
     env: Mapping[str, str] | None,
     implementer_writes: bool,
     reviewer_writes: bool,
+    workspaces: Sequence[Path] = (),
 ) -> EffectiveConfig:
     return EffectiveConfig(
         source="machine_profile",
         profile_id=profile.profile_id,
         profile_digest=profile_digest(profile),
         roles=[
-            _role_config(role, agent_id, binding, data_dir=data_dir, env=env)
+            _role_config(
+                role, agent_id, binding, data_dir=data_dir, env=env, workspaces=workspaces
+            )
             for role, (agent_id, binding) in resolved.items()
         ],
         security_mode=profile.security_mode,
@@ -422,11 +529,14 @@ def _effective_from_command_line(
     env: Mapping[str, str] | None,
     implementer_writes: bool,
     reviewer_writes: bool,
+    workspaces: Sequence[Path] = (),
 ) -> EffectiveConfig:
     return EffectiveConfig(
         source="command_line",
         roles=[
-            _role_config(role, "command-line", binding, data_dir=data_dir, env=env)
+            _role_config(
+                role, "command-line", binding, data_dir=data_dir, env=env, workspaces=workspaces
+            )
             for role in RUN_ROLES
         ],
         security_mode="unknown",
@@ -516,8 +626,17 @@ def resolve_run(
     workspace_mode: str | None = None,
     repair_policy: RepairPolicy | None = None,
     env: Mapping[str, str] | None = None,
+    root_bound: bool = False,
+    root_limits: RootBudgetLimits | None = None,
 ) -> ResolvedRun:
-    """Resolve one task, project and machine configuration into what would be executed."""
+    """Resolve one task, project and machine configuration into what would be executed.
+
+    ``root_bound`` says whether this run is given a root budget (``--root-budget-file``): a repair
+    policy on a real transport needs one, and that rule is a dispatch precondition like the rest.
+    ``root_limits`` are that file's ceilings, when the caller has them: a root that cannot pay for
+    an armed repair is refused by the run before anything is recorded, so it is reported here too
+    (``root_repair_problems``).
+    """
     root = Path(project_root).resolve()
     spec_path = Path(task_path)
     spec = TaskSpec.model_validate(load_json_file(spec_path, what="task spec"))
@@ -539,6 +658,7 @@ def resolve_run(
         data_dir=data_dir, profile_id=profile_id, driver=driver, env=env
     )
     implementer_writes, reviewer_writes = resolve_permissions(spec, env)
+    workspaces = launch_workspaces(spec, root)
     if machine.profile is not None:
         effective = _effective_from_profile(
             machine.profile,
@@ -547,6 +667,7 @@ def resolve_run(
             env=env,
             implementer_writes=implementer_writes,
             reviewer_writes=reviewer_writes,
+            workspaces=workspaces,
         )
     else:
         _, binding = machine.bindings["implementer"]
@@ -556,9 +677,11 @@ def resolve_run(
             env=env,
             implementer_writes=implementer_writes,
             reviewer_writes=reviewer_writes,
+            workspaces=workspaces,
         )
 
     is_real = any(entry.driver_id != FAKE_DRIVER_ID for entry in effective.roles)
+    base = resolve_base_commit(spec, root)
     admission = validate_task_spec(spec, project, root, allow_fake_checks=not is_real)
     preconditions = predictable_dispatch_problems(
         spec,
@@ -566,7 +689,16 @@ def resolve_run(
         production=is_real,
         implementer_writes=implementer_writes,
         launches=resolved_launches(effective),
+        real_transport=is_real,
+        root_bound=root_bound,
+        workspace_client_config=(
+            start_workspace_client_config(spec, root, base)
+            if is_real
+            else ""
+        ),
     )
+    if root_limits is not None:
+        preconditions.extend(root_repair_problems(spec, root_limits))
     return ResolvedRun(
         spec=spec,
         project=project,
@@ -578,7 +710,33 @@ def resolve_run(
         effective=effective,
         admission=admission,
         dispatch_preconditions=preconditions,
+        base_commit=base,
     )
+
+
+def root_repair_problems(spec: TaskSpec, limits: RootBudgetLimits) -> list[ValidationIssue]:
+    """A root whose repair counter cannot pay for the task's armed repair policy.
+
+    The part of the controller's repair gate (``Controller._assert_root_repair_allowance``) that
+    the two files alone decide: the repair needs at least one. What the ledger adds - repairs
+    already used, and a later revision's first implementer, which the root also charges as a
+    repair - is the run's own check; a preview does not open the ledger.
+    """
+    if spec.repair_policy is None or limits.max_repairs >= 1:
+        return []
+    return [
+        ValidationIssue(
+            code=RefusalCode.BUDGET_EXHAUSTED,
+            detail=(
+                f"the root budget file allows max_repairs {limits.max_repairs}, and this task's "
+                "repair policy needs at least 1 (2 when an earlier revision already dispatched "
+                "an implementer on this root - the run checks that against the ledger). The run "
+                "refuses before anything is recorded; set max_repairs to cover the repair, or "
+                "drop repair_policy"
+            ),
+            location="root_budget",
+        )
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -899,7 +1057,8 @@ def build_prepare_report(
         "the admission result above is the same gate `hflow run` applies to this task",
         "the dispatch preconditions above are the same list the run's own gate raises; "
         "remaining authorization allowance is not checked here, because it depends on a run's "
-        "history",
+        "history; nor is anything only the ledger knows (a root's used repairs, or whether this "
+        "task already has a root, which a run without --root-budget-file is refused for)",
     ]
     if not execution_root_is_final:
         notes.append(
@@ -946,9 +1105,10 @@ def build_prepare_report(
         if repair.enabled:
             notes.append(
                 f"the root's repair counter ({root_preview.limits.max_repairs}) is spent by the "
-                "repair attempt itself, and the ceiling above is what this root has to cover "
-                "before I1: a root that cannot afford it refuses the run rather than stopping "
-                "half-way"
+                "repair attempt itself (and by a later revision's first implementer, which the "
+                "root already counts as a repair), and the ceiling above is what this root has "
+                "to cover before I1: a root that cannot afford the loop or the repair refuses "
+                "the run rather than stopping half-way"
             )
         else:
             notes.append(

@@ -7,14 +7,30 @@ never touch the real user data directory.
 from __future__ import annotations
 
 import json
+import sys
+import threading
 from pathlib import Path
 
 import pytest
 
+import hflow.drivers.acpx_dsh as acpx_dsh_module
 from hflow.cli import EXIT_BLOCKED, EXIT_OK, EXIT_REFUSED, main
-from hflow.contracts import EvidenceStatus, MachineProfile
+from hflow.contracts import (
+    EffectiveConfig,
+    EvidenceStatus,
+    InvocationOutcome,
+    InvocationRequest,
+    InvocationStartState,
+    MachineProfile,
+    RefusalCode,
+    RoleConfig,
+    RunRequest,
+)
 from hflow.report import report_json, status_text
-from hflow.controller import inspect_run
+from hflow.controller import Controller, inspect_run
+from hflow.drivers.acpx_dsh import DRIVER_ID as ACPX_DSH_DRIVER_ID
+from hflow.drivers.acpx_dsh import AcpxDshDriver
+from hflow.drivers.fake import FakeDriver
 from hflow.store import Store
 from hflow.verify import CheckRunners, FakeCheckRunner
 
@@ -293,6 +309,14 @@ def test_schema_command_prints_generated_contracts(capsys: pytest.CaptureFixture
         "MachineProfile",
         "EffectiveConfig",
         "PrepareReport",
+        # The other documents a person writes by hand: the authorization artifact
+        # (--authorization-file), the root budget plan (--root-budget-file) and the bare repair
+        # policy (--repair-policy-file). Generated from the models their loaders validate with.
+        "AuthorizationRecord",
+        "RootBudgetPlan",
+        "RepairPolicy",
+        # Output a script reads back, like PrepareReport: `hflow cancel --json`.
+        "CancellationReceipt",
     }
     receipt_schema = payload["ResultReceipt"]
     # Enums are referenced, not inlined; the definition must be present in the same document.
@@ -316,6 +340,68 @@ def test_status_text_marks_unknowns_instead_of_zeroing_them(
     receipt = payload["receipt"]
     assert receipt["usage"]["provider_cost"] is None
     assert receipt["usage"]["provider_billed_tokens"] is None
+
+
+def test_schema_covers_the_hand_written_input_documents(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Each hand-written input file has its own top-level schema, not only a nested $def."""
+    assert main(["schema"]) == EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+    authorization = payload["AuthorizationRecord"]
+    # The binding's shape is spelled out, not left as an untyped object.
+    binding_ref = authorization["properties"]["binding"]["$ref"].rsplit("/", 1)[-1]
+    assert binding_ref in authorization["$defs"]
+    assert "limits" in payload["RootBudgetPlan"]["properties"]
+    assert payload["RepairPolicy"]["title"] == "RepairPolicy"
+    assert "run_already_ended" in payload["CancellationReceipt"]["properties"]
+
+
+def test_run_has_no_force_flag(
+    cli_env: dict[str, Path], project_root: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--force`` bypassed nothing (the controller re-checks admission) and only hid the issues.
+
+    It is gone: asking for it is a usage error, not a silent no-op.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            [
+                "run",
+                "--task",
+                str(cli_env["task"]),
+                "--project",
+                str(cli_env["project"]),
+                "--project-root",
+                str(project_root),
+                "--data-dir",
+                str(cli_env["data_dir"]),
+                "--force",
+            ]
+        )
+    assert excinfo.value.code == 2
+    assert "--force" in capsys.readouterr().err
+    assert not cli_env["data_dir"].exists()
+
+
+def test_top_level_help_names_every_subcommand_and_the_live_driver(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The description prose must not claim everything is offline or omit a subcommand."""
+    import argparse
+
+    from hflow.cli import build_parser
+
+    parser = build_parser()
+    description = parser.description or ""
+    subcommands = next(
+        action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
+    ).choices
+    assert len(subcommands) == 9
+    for name in subcommands:
+        assert name in description, name
+    assert "offline in M1" not in description
+    assert "acpx-dsh" in description
 
 
 def test_unknown_check_kind_blocks_rather_than_reports_success(
@@ -447,3 +533,240 @@ def test_a_missing_repair_policy_file_is_refused_like_every_other_missing_input(
     assert exit_code == EXIT_REFUSED, captured
     assert "repair policy file" in captured.err and "not found" in captured.err, captured.err
     assert not (cli_env["data_dir"] / "hflow.sqlite").exists()
+
+
+# --------------------------------------------------------------------------
+# cancel / resume from a process that does not own the invocation
+# --------------------------------------------------------------------------
+
+
+def _recorded_config(implementer_driver: str, reviewer_driver: str) -> EffectiveConfig:
+    """An effective configuration naming one driver per role, as `hflow run` records it."""
+    return EffectiveConfig(
+        source="command_line",
+        roles=[
+            RoleConfig(
+                role="implementer", agent="dsh", harness="dsh",
+                driver=implementer_driver, driver_id=implementer_driver,
+            ),
+            RoleConfig(
+                role="reviewer", agent="dsh", harness="dsh",
+                driver=reviewer_driver, driver_id=reviewer_driver,
+            ),
+        ],
+    )
+
+
+def test_cli_cancel_never_confirms_a_production_child_it_does_not_own(
+    store: Store, project_root: Path, run_request: RunRequest, tmp_path: Path, monkeypatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`hflow cancel` runs in its own process and holds no handle to the reviewer's child.
+
+    The run is driven by another controller whose reviewer is the production driver over the
+    stub client and the ``stubborn`` agent (no model). While that child is alive, the CLI's
+    answer must be ``unknown``: nothing it can reach confirmed the stop. The run therefore blocks
+    ``outcome_unknown``, the ledger entry stays open, and the record names the recorded driver -
+    never the offline fake that used to answer ``confirmed_stopped`` for it.
+    """
+    from .test_batch_e_dispatch import _authorization, _binding, _limits
+    from .test_cancel_routing import RunningRun, _pair
+    from .test_driver_acpx_dsh import FAKE_CLIENT, STUB_AGENT
+
+    binding, limits = _binding(store, run_request.task, project_root), _limits()
+    implementer, _ = _pair(project_root)
+    reviewer = AcpxDshDriver(
+        data_dir=tmp_path / "driver",
+        acpx_cli=FAKE_CLIENT,
+        python_executable=sys.executable,
+        completion_timeout_seconds=15,
+        agent_argv_override=[sys.executable, "-u", str(STUB_AGENT), "stubborn"],
+    )
+    scratch = tmp_path / "stub-scratch"
+    scratch.mkdir()
+    reviewer.extra_env["STUB_SCRATCH_DIR"] = str(scratch)
+    runner = FakeCheckRunner()
+    owner = Controller(
+        store,
+        implementer,
+        reviewer_driver=reviewer,
+        controller_build="cli-cancel-test",
+        runners=CheckRunners({"fake": runner, "command": runner}),
+        data_dir=tmp_path / "data",
+        production=False,
+        effective_config=_recorded_config("fake", ACPX_DSH_DRIVER_ID),
+        # Root-bound, so the ledger entry the stop must not settle exists.
+        authorization=_authorization(
+            spec=run_request.task, binding=binding, limits=limits, project_root=project_root
+        ),
+        preflight=lambda: (True, "the zero-model pre-flight is not what this test measures"),
+        root_binding=binding,
+        root_limits=limits,
+    )
+    spawned = threading.Event()
+    original_popen = acpx_dsh_module.popen_in_boundary
+
+    def popen_then_signal(*args, **kwargs):  # noqa: ANN002, ANN003
+        child = original_popen(*args, **kwargs)
+        spawned.set()
+        return child
+
+    monkeypatch.setattr(acpx_dsh_module, "popen_in_boundary", popen_then_signal)
+    try:
+        with RunningRun(owner, run_request) as running:
+            assert spawned.wait(timeout=30), "the reviewer process was never created"
+            run_id = running.run_id()
+            running.wait_until(lambda: bool(reviewer._handles))
+            review_invocation = next(iter(reviewer._handles))
+
+            exit_code = main(
+                [
+                    "cancel", run_id, "--json",
+                    "--project-root", str(project_root),
+                    "--data-dir", str(tmp_path / "data"),
+                ]
+            )
+            receipt = json.loads(capsys.readouterr().out)
+            row = store.get_run(run_id)
+            entry = store.invocation(review_invocation)
+            child_alive = reviewer._processes[review_invocation].poll() is None
+
+            # The owner stops its own child; the CLI never could.
+            for handle in list(reviewer._handles.values()):
+                reviewer.cancel_handle(handle)
+
+        assert exit_code == EXIT_OK
+        assert child_alive, "the child must still be running when the CLI answers"
+        assert receipt["invocation_id"] == review_invocation
+        assert receipt["status"] == "unknown", receipt
+        assert receipt["mechanism"] == "none"
+        assert receipt["local_process_stopped"] is None, "nothing here observed the process"
+        assert row["task_state"] == "BLOCKED"
+        assert row["block_code"] == RefusalCode.OUTCOME_UNKNOWN.value, row["block_reason"]
+        assert f"driver={ACPX_DSH_DRIVER_ID}" in row["block_reason"], row["block_reason"]
+        assert "fake" not in row["block_reason"], row["block_reason"]
+        assert entry is not None and entry.state is InvocationStartState.STARTED, (
+            "an unconfirmed stop settles nothing: the entry stays open and keeps blocking"
+        )
+        assert [e.invocation_id for e in store.pending_invocations(binding.root_id)] == [
+            review_invocation
+        ]
+        assert store.get_run(run_id)["block_code"] == RefusalCode.OUTCOME_UNKNOWN.value, (
+            "the owner's late result must not relabel the stop the CLI recorded"
+        )
+        # The owner's run thread has returned by now, with whatever its force-stopped reviewer
+        # gave back (a cancelled result or a driver error, depending on where the child was
+        # stopped). Neither closes the entry or frees the root after the CLI's unconfirmed stop.
+        assert running.error is None, running.error
+        after_owner = store.invocation(review_invocation)
+        assert after_owner is not None and after_owner.state is InvocationStartState.STARTED, (
+            f"the owner's late return closed the entry: {after_owner}"
+        )
+        assert [e.invocation_id for e in store.pending_invocations(binding.root_id)] == [
+            review_invocation
+        ]
+    finally:
+        for invocation_id in list(reviewer._handles):
+            reviewer.release(invocation_id)
+
+
+def test_cli_cancel_of_an_offline_run_owned_by_another_fake_driver_is_unknown(
+    store: Store, project_root: Path, run_request: RunRequest, tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The offline fake answers only for invocations its own instance started.
+
+    The run is held inside the implementer's ``start`` of one fake driver; the CLI builds its own
+    and must not report a stop it never performed.
+    """
+    from .test_cancel_routing import RunningRun, _pair
+
+    implementer, reviewer = _pair(project_root)
+    implementer.gate = True
+    runner = FakeCheckRunner()
+    owner = Controller(
+        store,
+        implementer,
+        reviewer_driver=reviewer,
+        controller_build="cli-cancel-test",
+        runners=CheckRunners({"fake": runner, "command": runner}),
+        data_dir=tmp_path / "data",
+        production=False,
+        effective_config=_recorded_config("fake", "fake"),
+    )
+    with RunningRun(owner, run_request) as running:
+        request = running.wait_for_role(implementer, "implementer")
+        assert implementer.entered.wait(timeout=30)
+        run_id = running.run_id()
+        exit_code = main(["cancel", run_id, "--json", "--data-dir", str(tmp_path / "data")])
+        receipt = json.loads(capsys.readouterr().out)
+
+    assert exit_code == EXIT_OK
+    assert receipt["invocation_id"] == request.invocation_id
+    assert receipt["status"] == "unknown", receipt
+    assert receipt["mechanism"] == "none"
+    assert implementer.cancel_calls == [], "the CLI's own driver answered, not the owner's"
+    row = store.get_run(run_id)
+    assert row["block_code"] == RefusalCode.OUTCOME_UNKNOWN.value, row["block_reason"]
+
+
+def test_an_interrupted_controller_leaves_a_run_resume_reconciles(
+    store: Store, project_root: Path, run_request: RunRequest, tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Ctrl+C while the implementer runs: the run blocks ``outcome_unknown`` and `resume` works.
+
+    Before, the interrupt escaped with the run still ``RUNNING`` and its ledger entry
+    ``started``, and `hflow resume` answered "no-op for a run in state RUNNING".
+    """
+
+    class InterruptedDriver(FakeDriver):
+        def start(self, request):  # noqa: ANN001, ANN201 - the driver protocol's own shape
+            self.started.append(request)
+            self._report_spawn(request, created=True, detail="the invocation began")
+            raise KeyboardInterrupt
+
+    runner = FakeCheckRunner()
+    owner = Controller(
+        store,
+        InterruptedDriver(project_root),
+        controller_build="cli-resume-test",
+        runners=CheckRunners({"fake": runner, "command": runner}),
+        data_dir=tmp_path / "data",
+        production=False,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        owner.run_task(run_request)
+
+    run_id = str(store.list_runs()[0]["run_id"])
+    row = store.get_run(run_id)
+    assert row["task_state"] == "BLOCKED"
+    assert row["block_code"] == RefusalCode.OUTCOME_UNKNOWN.value
+    assert "controller interrupted during implementer invocation" in row["block_reason"]
+    attempt = store.open_attempt(run_id)
+    assert attempt["outcome"] == InvocationOutcome.OUTCOME_UNKNOWN.value
+    assert attempt["reconcile_json"] is None
+
+    exit_code = main(["resume", run_id, "--json", "--data-dir", str(tmp_path / "data")])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == EXIT_BLOCKED, payload
+    assert any("reconciled an interrupted attempt" in note for note in payload["notes"]), payload
+    reconciled = json.loads(store.open_attempt(run_id)["reconcile_json"])
+    assert reconciled["invocation_id"] == attempt["invocation_id"]
+    assert reconciled["outcome"] == "unknown"
+    assert store.get_run(run_id)["block_code"] == RefusalCode.OUTCOME_UNKNOWN.value
+
+
+def test_the_fake_driver_confirms_only_the_stops_of_its_own_invocations(
+    project_root: Path,
+) -> None:
+    owner, bystander = FakeDriver(project_root), FakeDriver(project_root)
+    request = InvocationRequest.model_construct(invocation_id="I-own", role="implementer")
+    owner.started.append(request)
+
+    assert owner.cancel("I-own").status == "confirmed_stopped"
+    foreign = bystander.cancel("I-own")
+    assert foreign.status == "unknown"
+    assert foreign.mechanism == "none"
+    assert foreign.local_process_stopped is None

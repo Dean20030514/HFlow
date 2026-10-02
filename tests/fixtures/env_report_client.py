@@ -5,8 +5,9 @@ on a driver attribute: the question is what the *process* saw. This stand-in is 
 the driver's own launch path (``readonly_client_check``), so the answer comes from a real child
 of this machine's process boundary rather than from the in-process mapping that produced it.
 
-It reports one variable - ``DSH_HOME`` - and nothing else. Dumping the whole environment into a
-test artifact would copy whatever credentials happen to be in it.
+It reports ``DSH_HOME`` and whether the two DSH mode variables (``DSH_PERMISSION_MODE``,
+``DSH_TOOLS_MODE``) are present, and nothing else. Dumping the whole environment into a test
+artifact would copy whatever credentials happen to be in it.
 
 Usage (normally spawned by the driver):
     python env_report_client.py --version
@@ -28,6 +29,8 @@ def main(argv: list[str] | None = None) -> int:
             {
                 "dsh_home_present": "DSH_HOME" in os.environ,
                 "dsh_home": os.environ.get("DSH_HOME"),
+                "dsh_permission_mode_present": "DSH_PERMISSION_MODE" in os.environ,
+                "dsh_tools_mode_present": "DSH_TOOLS_MODE" in os.environ,
             },
             separators=(",", ":"),
         )

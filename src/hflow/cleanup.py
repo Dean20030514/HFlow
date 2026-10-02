@@ -173,11 +173,31 @@ def plan_cleanup(store: Store, run_id: str) -> CleanPlan:
             f"attempt {attempt['attempt_id']} is {attempt['state']}; a stop must be confirmed first",
         )
     intent_at, cancel_receipt = store.cancel_state(run_id)
-    if intent_at and (cancel_receipt is None or cancel_receipt.status != "confirmed_stopped"):
+    # A stop that reached a run which had already ended decided nothing about it, and an
+    # ``unknown`` answer then comes from a process that holds no handle (``hflow cancel`` runs in
+    # its own process). Such a receipt neither confirms nor refutes anything, so the run keeps
+    # exactly the gates it had before the stop - an attempt still live, a run in flight. A stop
+    # that decided a *live* run, an answer that saw the work ``still_running``, and an intent
+    # with no receipt at all keep refusing.
+    stop_of_ended_run = (
+        cancel_receipt is not None
+        and cancel_receipt.run_already_ended
+        and cancel_receipt.status == "unknown"
+    )
+    if intent_at and (
+        cancel_receipt is None
+        or (cancel_receipt.status != "confirmed_stopped" and not stop_of_ended_run)
+    ):
         _refuse(
             plan,
             "stop_unconfirmed",
             "a cancellation was requested but never confirmed; the workspace must be kept",
+        )
+    elif intent_at and stop_of_ended_run:
+        plan.reasons.append(
+            "a stop was requested after this run had already ended and could not be confirmed "
+            "from the stopping process; it decided nothing about the run, so cleanup applies the "
+            "same gates as before the stop"
         )
     if str(row["task_state"]) in {TaskState.RUNNING.value, TaskState.CHECKING.value}:
         _refuse(

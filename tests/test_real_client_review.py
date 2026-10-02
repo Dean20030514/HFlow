@@ -12,6 +12,7 @@ rather than pretending the wire was verified.
 
 from __future__ import annotations
 
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -27,6 +28,8 @@ from hflow.contracts import (
     ProjectLimits,
     ReuseDecision,
     ReuseStatus,
+    RefusalCode,
+    RefusedError,
     ReviewRequirement,
     RunRequest,
     Scope,
@@ -35,6 +38,7 @@ from hflow.contracts import (
 )
 from hflow.controller import Controller
 from hflow.drivers.acpx_dsh import AcpxDshDriver
+from hflow.packet import packet_digest
 from hflow.store import Store
 from hflow.verify import CheckRunners, FakeCheckRunner
 
@@ -186,3 +190,138 @@ def test_real_client_launch_path_stays_the_production_one(tmp_path: Path) -> Non
     assert argv[0] == node, "the installed client is a Node program, not a Python script"
     assert argv[1] == str(entry)
     assert argv[-2:] == ["-f", "-"], "the task travels on stdin, never in a command line"
+
+
+def _received_prompts(wire_log: Path) -> list[str]:
+    """The prompt text the mock agent itself read, one entry per ``session/prompt``."""
+    prompts = []
+    for line in wire_log.read_text(encoding="utf-8").splitlines():
+        entry = json.loads(line)
+        message = entry["payload"]
+        if entry["dir"] == "in" and message.get("method") == "session/prompt":
+            blocks = message["params"]["prompt"]
+            assert [block["type"] for block in blocks] == ["text"], blocks
+            prompts.append(blocks[0]["text"])
+    return prompts
+
+
+def test_real_client_turn_completes_under_the_hardened_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The C1 hardening leaves the real client path working, and makes the digest exact.
+
+    An ambient ``DSH_PERMISSION_MODE``/``DSH_TOOLS_MODE`` is present in this process and is
+    removed from the child environment; both turns still complete to a receipt. And because the
+    rendered packets carry no surrounding whitespace, the text the agent received after acpx's
+    own trimming is byte-for-byte the text whose digest the driver reported.
+    """
+    _require_real_client()
+    monkeypatch.setenv("DSH_PERMISSION_MODE", "danger-full-access")
+    monkeypatch.setenv("DSH_TOOLS_MODE", "full")
+    run_dir = (tmp_path / "real-client-hardened").resolve()
+    workspace = run_dir / "ws"
+    (workspace / "src").mkdir(parents=True, exist_ok=True)
+    (workspace / "src" / "parser.py").write_text("def parse(text):\n    return text\n", encoding="utf-8")
+    wire_log = run_dir / "mock-wire.jsonl"
+
+    driver = _real_client_driver(tmp_path, run_dir, wire_log)
+    driver.extra_env["MOCK_IMPLEMENTER_PATH"] = "src/parser.py"
+    driver.extra_env["MOCK_REVIEW_MODE"] = "fenced"
+    assert "DSH_PERMISSION_MODE" not in driver._child_env(workspace)
+
+    spec, project = _spec_and_project()
+    store = Store(run_dir / "hflow.sqlite")
+    runner = FakeCheckRunner()
+    controller = Controller(
+        store,
+        driver,
+        controller_build="test-build",
+        runners=CheckRunners({"fake": runner}),
+        data_dir=run_dir / "data",
+        production=False,
+    )
+    try:
+        outcome = controller.run_task(
+            RunRequest(
+                task=spec,
+                project=project,
+                project_root=workspace,
+                workspace_root=workspace,
+                deadline_seconds=120,
+            )
+        )
+    finally:
+        for invocation_id in list(driver._handles):
+            driver.release(invocation_id)
+        store.close()
+
+    assert outcome.task_state is TaskState.ACCEPTED, outcome.block_reason
+    assert outcome.receipt is not None
+    sent = sorted(
+        path.read_bytes().decode("utf-8")
+        for path in (run_dir / "data" / "invocations").glob("*/task.txt")
+    )
+    received = sorted(_received_prompts(wire_log))
+    assert len(sent) == 2 and received == sent, "acpx must deliver the packet unchanged"
+    assert {packet_digest(text) for text in received} == {packet_digest(text) for text in sent}
+
+
+@pytest.mark.parametrize("planted", ["at_submission", "at_launch"])
+def test_real_client_is_never_launched_on_a_workspace_with_client_config(
+    tmp_path: Path, planted: str
+) -> None:
+    """A planted ``.acpxrc.json`` would replace the agent argv inside the real client.
+
+    So the real client is not started at all. A file already there when the task is submitted is
+    refused by the run gate before anything is recorded; one that appears after admission is
+    caught at the spawn gate, and the run blocks with the workspace-config code. Either way the
+    mock agent never comes up.
+    """
+    _require_real_client()
+    run_dir = (tmp_path / "real-client-acpxrc").resolve()
+    workspace = run_dir / "ws"
+    (workspace / "src").mkdir(parents=True, exist_ok=True)
+    (workspace / "src" / "parser.py").write_text("def parse(text):\n    return text\n", encoding="utf-8")
+    config = workspace / ".acpxrc.json"
+    config_text = json.dumps({"agents": {"acpx-dsh-acp": {"command": "cmd.exe"}}})
+    driver = _real_client_driver(tmp_path, run_dir, run_dir / "mock-wire.jsonl")
+    if planted == "at_submission":
+        config.write_text(config_text, encoding="utf-8")
+    else:
+        original = driver.start_handle
+
+        def start_handle(request):  # noqa: ANN001, ANN202 - the driver's own shape
+            config.write_text(config_text, encoding="utf-8")
+            return original(request)
+
+        driver.start_handle = start_handle  # type: ignore[method-assign]
+
+    spec, project = _spec_and_project()
+    store = Store(run_dir / "hflow.sqlite")
+    runner = FakeCheckRunner()
+    controller = Controller(
+        store,
+        driver,
+        controller_build="test-build",
+        runners=CheckRunners({"fake": runner}),
+        data_dir=run_dir / "data",
+        production=False,
+    )
+    request = RunRequest(
+        task=spec, project=project, project_root=workspace, workspace_root=workspace
+    )
+    try:
+        if planted == "at_submission":
+            with pytest.raises(RefusedError) as excinfo:
+                controller.run_task(request)
+            assert excinfo.value.code is RefusalCode.WORKSPACE_CLIENT_CONFIG
+            assert store.find_run_by_spec_digest(project.project_id, spec.spec_digest()) is None
+        else:
+            outcome = controller.run_task(request)
+            assert outcome.task_state is TaskState.BLOCKED
+            assert outcome.block_code is RefusalCode.WORKSPACE_CLIENT_CONFIG, outcome.block_reason
+    finally:
+        store.close()
+
+    assert driver._processes == {}
+    assert not (run_dir / "mock-ready.txt").exists(), "the mock agent must never have started"

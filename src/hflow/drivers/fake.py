@@ -197,14 +197,27 @@ class FakeDriver:
         )
 
     def cancel(self, invocation_id: str) -> CancellationReceipt:
-        """Report the stop as confirmed, because this driver starts no external process.
+        """Confirm the stop of an invocation *this instance* started; ``unknown`` for any other.
 
-        There is nothing to terminate and nothing that can survive the call, so "confirmed" is
-        the true answer *for this driver*. It is a property of the fake, not of the contract: a
-        driver that launches a process must report ``unknown`` for an invocation whose handle it
-        never published, and a test that needs that behaviour must not use this stub to get it.
+        For its own invocations there is nothing to terminate and nothing that can survive the
+        call, so "confirmed" is the true answer *for this driver*. An invocation id this instance
+        never started is a different case: it belongs to another driver object - typically one in
+        another controller process, which is where ``hflow cancel`` runs - and this instance knows
+        nothing about whether that work is still going. Reporting ``confirmed_stopped`` for it
+        would claim a stop nobody performed, so the answer is ``unknown`` with mechanism ``none``,
+        the same answer a process-launching driver gives for a handle it never published.
         """
         self.cancelled.append(invocation_id)
+        if not any(request.invocation_id == invocation_id for request in self.started):
+            return CancellationReceipt(
+                invocation_id=invocation_id,
+                status="unknown",
+                mechanism="none",
+                detail=(
+                    f"this fake driver instance never started invocation {invocation_id}; it "
+                    "cannot stop or observe work another driver object owns"
+                ),
+            )
         return CancellationReceipt(
             invocation_id=invocation_id,
             status="confirmed_stopped",

@@ -15,14 +15,16 @@ Deliberately absent: branch management, merging, rebasing, remotes, publishing, 
 
 from __future__ import annotations
 
+import atexit
 import os
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from .contracts import RefusalCode, RefusedError, digest_of
-from .workspace import matches_pattern
+from .workspace import BUILTIN_WRITE_DENY, matches_pattern
 
 #: Porcelain v1 status codes that this module refuses to interpret. Anything unmerged, or a
 #: submodule change, changes what "the paths in this worktree" even means, so the caller gets
@@ -148,9 +150,77 @@ class CandidateFreeze:
     tree_digest: str
 
 
+_EMPTY_HOOKS_DIR: str | None = None
+
+
+def _empty_hooks_dir() -> str:
+    """An empty, HFlow-owned directory that ``core.hooksPath`` names for every git call.
+
+    Created once per process with :func:`tempfile.mkdtemp` (private to the user, never inside a
+    repository or a worktree, so no worker can put a hook in it) and removed at exit.
+    """
+    global _EMPTY_HOOKS_DIR
+    if _EMPTY_HOOKS_DIR is None or not os.path.isdir(_EMPTY_HOOKS_DIR):
+        _EMPTY_HOOKS_DIR = tempfile.mkdtemp(prefix="hflow-no-hooks-")
+        atexit.register(shutil.rmtree, _EMPTY_HOOKS_DIR, ignore_errors=True)
+    return _EMPTY_HOOKS_DIR
+
+
+def _forced_config() -> tuple[tuple[str, str], ...]:
+    """Configuration forced on every git call HFlow makes.
+
+    Passed through ``GIT_CONFIG_COUNT``, which git applies after the global, repository and
+    worktree config files, so neither the user's global config nor a value a worker wrote into
+    the shared ``.git/config`` from inside its worktree overrides it:
+
+    * ``core.hooksPath`` names an empty directory, so no hook runs - not ``post-checkout`` on
+      ``worktree add``, not ``pre-commit`` / ``commit-msg`` / ``post-commit`` on the freeze, not
+      ``reference-transaction`` on any ref write;
+    * ``core.fsmonitor`` is off, so a status read never runs a configured monitor command;
+    * ``commit.gpgsign`` is off, so a freeze never waits on gpg;
+    * ``core.ignoreStat`` and ``core.sparseCheckout`` are off, so HFlow's own ``worktree add``
+      never checks entries out with the assume-unchanged or skip-worktree flag, which would hide
+      a worker's edit from the freeze (a flag set any other way refuses the freeze instead).
+
+    :func:`_base_env` also appends these to an inherited ``GIT_CONFIG_PARAMETERS``, which git
+    reads after ``GIT_CONFIG_COUNT``, so a caller's ``git -c`` cannot override them either.
+    """
+    return (
+        ("core.hooksPath", _empty_hooks_dir()),
+        ("core.fsmonitor", "false"),
+        ("commit.gpgsign", "false"),
+        ("core.ignoreStat", "false"),
+        ("core.sparseCheckout", "false"),
+    )
+
+
+#: Variables that point git at a repository, index or object store other than the one the
+#: command's ``cwd`` names. Inherited when HFlow is started from inside a git hook or alias; every
+#: HFlow call names its repository by ``cwd``, so they are dropped rather than obeyed.
+_REPOSITORY_LOCATING_ENV = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+)
+
+
+def _sq_quote(text: str) -> str:
+    """Quote ``text`` the way git's ``sq_quote`` does for ``GIT_CONFIG_PARAMETERS``."""
+    return "'" + text.replace("'", "'\\''") + "'"
+
+
 def _base_env() -> dict[str, str]:
     env = dict(os.environ)
-    # Deterministic commits: no ambient identity, no user-level hooks, no interactive prompts.
+    # Deterministic, inert git: a fixed identity (no ambient one), no system config, no
+    # interactive prompts, no replacement objects (``refs/replace`` cannot make one commit read as
+    # another), no inherited repository-locating variables, and the forced configuration above:
+    # no hooks (the repository's, the user's, a worker's or a caller's ``git -c``), no fsmonitor
+    # command, no signing, no flagged checkout. The user's global config is still read for
+    # everything else.
     env.update(
         {
             "GIT_AUTHOR_NAME": CANDIDATE_AUTHOR_NAME,
@@ -159,8 +229,30 @@ def _base_env() -> dict[str, str]:
             "GIT_COMMITTER_EMAIL": CANDIDATE_AUTHOR_EMAIL,
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
         }
     )
+    for name in _REPOSITORY_LOCATING_ENV:
+        env.pop(name, None)
+    # Appended after any ``GIT_CONFIG_COUNT`` entries the caller's environment already carries, so
+    # those still apply and these, later in the same list, win. Git reads
+    # ``GIT_CONFIG_PARAMETERS`` (what ``git -c`` exports) after that list, so when the caller
+    # carries one the forced keys are appended to it as well, again last.
+    try:
+        count = max(int(env.get("GIT_CONFIG_COUNT", "0")), 0)
+    except ValueError:
+        count = 0
+    for key, value in _forced_config():
+        env[f"GIT_CONFIG_KEY_{count}"] = key
+        env[f"GIT_CONFIG_VALUE_{count}"] = value
+        count += 1
+    env["GIT_CONFIG_COUNT"] = str(count)
+    inherited = env.get("GIT_CONFIG_PARAMETERS", "").strip()
+    if inherited:
+        forced = " ".join(
+            f"{_sq_quote(key)}={_sq_quote(value)}" for key, value in _forced_config()
+        )
+        env["GIT_CONFIG_PARAMETERS"] = f"{inherited} {forced}"
     return env
 
 
@@ -209,7 +301,11 @@ class GitRepo:
             raise GitError(f"git rev-parse {' '.join(args)} failed: {completed.stderr.strip()[:200]}")
         return completed.stdout.strip()
 
-    def run(self, *args: str, cwd: Path | None = None) -> str:
+    def run(self, *args: str, cwd: Path | None = None, literal_pathspecs: bool = False) -> str:
+        env = _base_env()
+        if literal_pathspecs:
+            # A scope entry is a path, never a pattern: '*', '?', '[' and ':(magic)' mean themselves.
+            env["GIT_LITERAL_PATHSPECS"] = "1"
         completed = subprocess.run(  # noqa: S603,S607
             ["git", *args],
             cwd=str(cwd or self.root),
@@ -217,7 +313,7 @@ class GitRepo:
             text=True,
             timeout=300,
             check=False,
-            env=_base_env(),
+            env=env,
         )
         if completed.returncode != 0:
             raise GitError(f"git {' '.join(args)} failed: {completed.stderr.strip()[:300]}")
@@ -267,18 +363,6 @@ class GitRepo:
                 "status": self.status_porcelain(),
             }
         )
-
-    def commit_exists(self, ref: str) -> bool:
-        completed = subprocess.run(  # noqa: S603,S607
-            ["git", "cat-file", "-e", f"{ref}^{{commit}}"],
-            cwd=str(self.root),
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-            env=_base_env(),
-        )
-        return completed.returncode == 0
 
     def resolve_commit(self, ref: str = "HEAD") -> str:
         return self._rev_parse(f"{ref}^{{commit}}")
@@ -354,10 +438,29 @@ class GitRepo:
         """
         if not base or not candidate:
             raise GitError("a delivery diff needs both a base and a candidate commit")
+        # ``--no-renames``: with rename detection (git's default, or whatever ``diff.renames`` the
+        # user configured) ``--name-only`` prints only the new name of a moved file, and the
+        # deleted source path would silently drop out of the change.
         out = self.run(
-            "diff", "--name-only", "-z", f"{base}..{candidate}", cwd=cwd
+            "diff", "--no-renames", "--name-only", "-z", f"{base}..{candidate}", cwd=cwd
         )
         return [path for path in out.split("\0") if path.strip()]
+
+    def index_flagged_paths(self, worktree: Path) -> list[str]:
+        """Index entries whose worktree changes git does not look at.
+
+        ``git ls-files -v`` tags an assume-unchanged entry with a lowercase letter and a
+        skip-worktree entry with ``S``. For either, status and ``git add`` trust the index instead
+        of the file, so an edit to it is invisible to every read the freeze relies on.
+        """
+        flagged: list[str] = []
+        for record in self.run("ls-files", "-v", "-z", cwd=worktree).split("\0"):
+            if len(record) < 3 or record[1] != " ":
+                continue
+            tag, path = record[0], record[2:]
+            if tag.islower() or tag == "S":
+                flagged.append(path)
+        return flagged
 
     def worktree_changes(self, worktree: Path, allow: list[str]) -> list[str]:
         """Changed paths in the worktree that the TaskSpec did not authorize.
@@ -378,19 +481,60 @@ class GitRepo:
         allow: list[str],
         message: str = "hflow: candidate",
         *,
+        deny: list[str] | None = None,
         allow_ignored: list[str] | None = None,
+        expected_head: str,
     ) -> CandidateFreeze:
         """Commit the declared paths and return the candidate's explicit identity.
 
-        Only the authorized paths are added, one by one - never ``git add -A``, so a stray
-        log, credential file or runtime artifact in the worktree cannot be collected into the
-        candidate by accident.
+        ``expected_head`` is the commit this round started from: the task's original base in the
+        first round, the previous candidate in a repair. The worktree's HEAD must still be that
+        commit. A worker that ran ``git commit``, ``--amend``, ``reset`` or ``checkout`` moved
+        HEAD, and its commit never passed through the scope and deny checks below (they read the
+        uncommitted status, which a commit leaves clean), so the freeze is refused
+        (:class:`GitStatusParseError`) rather than building on, or delivering, that commit. The
+        returned ``base_commit`` is therefore always ``expected_head``.
+
+        Only the authorized entries are staged, one by one - never a whole-worktree
+        ``git add -A``, so a stray log, credential file or runtime artifact in the worktree cannot
+        be collected into the candidate by accident. Each entry is staged with
+        ``git add -A -- <entry>`` under literal pathspecs, whether or not it still exists on disk,
+        so a listed file the worker deleted is committed as a deletion and an entry is never read
+        as a pattern.
+
+        ``deny`` carries the task's and the project's ``write_deny`` rules; the built-in deny list
+        (:data:`~hflow.workspace.BUILTIN_WRITE_DENY`) always applies on top. A changed path under
+        any of them refuses the freeze before anything is staged, so a denied change never enters
+        a candidate commit, even inside an allowed directory.
+
+        The commit must be the tree the checks are about to see. If the worktree still reports a
+        change after staging and committing, the freeze is refused as incomplete (a
+        :class:`GitError`) instead of naming a commit that lacks part of the checked change.
 
         ``allow_ignored`` lets a caller name ignored byproducts it accepts as check-generated
         noise (for example a bytecode cache). Anything ignored that is not named there makes
         the freeze refuse: ignored is not the same as disposable.
+
+        An index entry flagged assume-unchanged or skip-worktree (see
+        :meth:`index_flagged_paths`) makes status, ``git add`` and the staged diff skip that
+        file's edits, so the commit would hold old bytes while the checks read new ones. The
+        freeze is refused (:class:`GitStatusParseError`) rather than clearing the flag.
         """
-        base_commit = self.worktree_commit(worktree)
+        head = self.worktree_commit(worktree)
+        if not expected_head or head != expected_head:
+            raise GitStatusParseError(
+                f"the worker moved HEAD from {expected_head or '(no recorded start)'} to {head}; "
+                "a commit made inside the worktree is never frozen as a candidate"
+            )
+        base_commit = expected_head
+        flagged = self.index_flagged_paths(worktree)
+        if flagged:
+            raise GitStatusParseError(
+                "index flags hide worktree changes from the freeze (assume-unchanged or "
+                "skip-worktree): "
+                + ", ".join(flagged[:5])
+                + (f" (+{len(flagged) - 5} more)" if len(flagged) > 5 else "")
+            )
         report = self.status_report(worktree)
         if report.unsupported:
             raise GitStatusParseError(
@@ -410,30 +554,55 @@ class GitRepo:
             raise GitStatusParseError(
                 "worker changed unauthorised paths: " + ", ".join(outside[:5])
             )
-        added: list[str] = []
+        deny_rules = [*(deny or []), *BUILTIN_WRITE_DENY]
+        denied = [path for path in report.changed if matches_pattern(path, deny_rules)]
+        if denied:
+            raise GitStatusParseError("worker changed denied paths: " + ", ".join(denied[:5]))
         for entry in allow:
-            target = worktree / entry
-            if target.is_dir():
-                self.run("add", "--", entry, cwd=worktree)
-                added.append(entry)
-            elif target.is_file():
-                self.run("add", "--", entry, cwd=worktree)
-                added.append(entry)
+            # git refuses a pathspec that matches nothing, so an entry the worker never created
+            # (absent on disk and unknown to the index) has nothing to stage. A tracked file that
+            # was deleted is still known to the index, and staging it records the deletion.
+            known = os.path.lexists(worktree / entry) or bool(
+                self.run("ls-files", "-z", "--", entry, cwd=worktree, literal_pathspecs=True)
+            )
+            if known:
+                self.run("add", "-A", "--", entry, cwd=worktree, literal_pathspecs=True)
+        # ``--no-renames``: a staged move lists its deleted source too, so the guard below sees a
+        # denied path that was moved away, and ``paths`` names both sides.
         staged = [
             path
-            for path in self.run("diff", "--cached", "--name-only", cwd=worktree).splitlines()
+            for path in self.run(
+                "diff",
+                "--cached",
+                "--no-renames",
+                "--name-only",
+                "-z",
+                cwd=worktree,
+                literal_pathspecs=True,
+            ).split("\0")
             if path.strip()
         ]
-        if not staged:
-            return CandidateFreeze(
-                base_commit=base_commit,
-                candidate_commit=base_commit,
-                tree=self.worktree_tree(worktree),
-                paths=(),
-                serial=int(self.run("rev-list", "--count", "HEAD", cwd=worktree).strip()),
-                tree_digest=digest_of({"base": base_commit, "staged": []}),
+        # Whatever reached the index between the status read and the staging is held to the same
+        # rules: nothing outside the scope or under a deny rule is ever committed.
+        stray = [
+            path
+            for path in staged
+            if not matches_pattern(path, allow) or matches_pattern(path, deny_rules)
+        ]
+        if stray:
+            raise GitStatusParseError(
+                "refusing to commit paths outside the write scope: " + ", ".join(stray[:5])
             )
-        self.run("commit", "-q", "-m", message, cwd=worktree)
+        if staged:
+            # ``--no-verify`` on top of the empty ``core.hooksPath``: no pre-commit or commit-msg
+            # hook runs even if the forced configuration were ever lost.
+            self.run("commit", "--no-verify", "-q", "-m", message, cwd=worktree)
+        leftover = self.status_report(worktree)
+        if leftover.changed or leftover.unsupported:
+            raise GitError(
+                "freeze incomplete: the worktree still has changes the candidate commit does not "
+                "hold: " + ", ".join([*leftover.changed, *leftover.unsupported][:5])
+            )
         candidate_commit = self.worktree_commit(worktree)
         tree = self.worktree_tree(worktree)
         return CandidateFreeze(

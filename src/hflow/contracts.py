@@ -251,22 +251,6 @@ class DeliveryRequirement(BaseModel):
     mode: Literal["local_candidate", "integrated", "published"] = "local_candidate"
 
 
-class BudgetRequest(BaseModel):
-    """How many top-level invocations one run may buy.
-
-    ``max_repair_cycles`` keeps its historical default of 1 and **authorizes nothing**: a numeric
-    budget field is not a policy, and repairing because an old task file happens to say ``1``
-    would spend money on a behaviour nobody approved. A repair needs an explicit
-    :class:`RepairPolicy`, and E2's worst case (repair after a reviewer rejection) is covered by
-    ``max_agent_turns`` like every other dispatch.
-    """
-
-    model_config = Strict
-
-    max_agent_turns: int = 4
-    max_repair_cycles: int = 1
-
-
 # --------------------------------------------------------------------------
 # Batch E2: one bounded business repair
 # --------------------------------------------------------------------------
@@ -295,6 +279,9 @@ class RepairDecision(StrEnum):
     DEADLINE_REACHED = "deadline_reached"
     STOP_REQUESTED = "stop_requested"
     NO_CONTENT_CHANGE = "no_content_change"
+    #: The worktree is not the frozen candidate a repair would start from (it moved, or files
+    #: appeared after the freeze), so the repair was refused before anything was bought.
+    WORKSPACE_DRIFT = "workspace_drift"
 
 
 class CandidateIdentity(BaseModel):
@@ -316,8 +303,9 @@ class CandidateIdentity(BaseModel):
     fingerprint: str = ""
     paths: list[str] = Field(default_factory=list)
     is_repair: bool = False
-    #: ``True`` when this round produced no content change against its parent. A new commit SHA
-    #: is not progress: the tree and the fingerprint are what decide.
+    #: ``True`` when this round produced no content change against its parent: its scoped
+    #: fingerprint is the parent's. A new commit SHA is not progress, and neither is a tree change
+    #: the fingerprint cannot see - the controller refuses that one as a scope violation.
     unchanged_from_parent: bool = False
 
 
@@ -507,11 +495,15 @@ class RootBudgetLimits(BaseModel):
 
     max_top_level_submissions: int = Field(ge=1, le=64)
     #: How many *additional* implementer attempts the root may buy. The first implementer
-    #: attempt of a root is not a repair. E1 records and enforces the counter; the repair loop
-    #: that spends it is E2 and stays unimplemented here.
+    #: attempt of a root is not a repair. The in-run bounded repair (E2) spends one only when the
+    #: task carries a ``repair_policy``; without one a run never repairs. Any later implementer
+    #: dispatch on the same root - a later revision's first attempt included - is charged here
+    #: as well, whatever its policy.
     max_repairs: int = Field(default=0, ge=0, le=8)
-    #: Wall-clock ceiling measured from the root's first successful reservation. E1 refuses a
-    #: dispatch past it; it does not (yet) bound checks or settle an in-flight model call.
+    #: Wall-clock ceiling measured from the root's first successful reservation. It refuses a
+    #: dispatch (and a repair) past it, caps each invocation's deadline and each check's timeout
+    #: by what is left of it - so an in-flight call is stopped at it by its own capped deadline
+    #: - and blocks acceptance once it has passed.
     deadline_seconds: int = Field(default=24 * 60 * 60, ge=60)
 
     def digest(self) -> str:
@@ -869,9 +861,10 @@ class InvocationRequest(BaseModel):
     #: Supplied by the controller: called by the driver the moment its spawn decision is final,
     #: with what it observed (``created`` and the pid, if any). This is how "a process exists"
     #: reaches the ledger as a *driver-reported fact* instead of the controller assuming that
-    #: asking for a launch means one happened. A driver that does not call it leaves the
-    #: invocation recorded as "a launch was requested and no process is known", which is exactly
-    #: what an honest ledger should say about a driver that never reported.
+    #: asking for a launch means one happened. For a driver that does not call it, the controller
+    #: reads its result instead: completed work counts as a launch (spawn kind unknown, no
+    #: process claimed), a cancelled result with no work as never started, and anything else
+    #: stays "a launch was requested and no process is known".
     #:
     #: Excluded from JSON Schema for the same reason as ``stop_requested``: it is a live callback
     #: in the in-process hand-off, not a serializable field of a persisted contract.
@@ -919,6 +912,11 @@ class CancellationReceipt(BaseModel):
     mechanism: Literal["cooperative", "forced", "none"] = "none"
     local_process_stopped: bool | None = None
     detail: str = ""
+    #: ``True`` when the run had already ended (``BLOCKED``, ``CANCELLED`` or ``ACCEPTED``) once
+    #: the stop's intent was durable: the stop changed nothing about the run, so an unconfirmed
+    #: answer here is about finished work and does not, by itself, keep the workspace. ``False``
+    #: (the default, and what every older receipt reads as) means the stop decided a live run.
+    run_already_ended: bool = False
 
 
 class SpawnKind(StrEnum):
@@ -1444,14 +1442,20 @@ class RefusalCode(StrEnum):
     VERIFICATION_FAILED = "verification_failed"
     EVIDENCE_STALE = "evidence_stale"
     REVIEW_REJECTED = "review_rejected"
-    #: The reviewer turn produced no usable structured verdict (missing, malformed, ambiguous
-    #: or unbound to its prompt). Distinct from ``REVIEW_REJECTED`` on purpose: refusing
+    #: The reviewer turn produced no usable structured verdict (missing, malformed, ambiguous,
+    #: or a turn that did not complete). A turn whose outcome is unknown - including one whose
+    #: completion is unbound to its prompt - is ``OUTCOME_UNKNOWN`` instead. Distinct from
+    #: ``REVIEW_REJECTED`` on purpose: refusing
     #: acceptance because the *wire* failed is not the reviewer's substantive judgment, and
     #: reporting it as one would be a false statement about the review.
     REVIEW_PROTOCOL_ERROR = "review_protocol_error"
     OUTCOME_UNKNOWN = "outcome_unknown"
     DRIVER_FAILED = "driver_failed"
     CANCELLED_BY_OPERATOR = "cancelled_by_operator"
+    #: The workspace a client would be launched in carries the client's own project config
+    #: (``.acpxrc.json``). acpx always loads it from ``--cwd`` and lets it override HFlow's
+    #: launch - including the agent argv - so the launch is refused before any process exists.
+    WORKSPACE_CLIENT_CONFIG = "workspace_client_config"
     NOT_IMPLEMENTED = "not_implemented"
     INTERNAL_ERROR = "internal_error"
 
@@ -1504,6 +1508,12 @@ class RunRequest(BaseModel):
     workspace_root: Path
     deadline_seconds: int = 900
     controller_id: str = "local-controller"
+    #: The commit a worktree run starts from, already resolved by the caller from
+    #: ``task.workspace.base_commit`` (or HEAD). ``hflow run`` resolves it once, before the
+    #: authorization is checked, so the approval and the worktree name the same commit even if
+    #: the branch moves in between. Empty: the controller resolves the task's ref itself, once,
+    #: before it creates the worktree. The task text is never rewritten with it.
+    base_commit: str = ""
 
 
 class RunSummary(BaseModel):
@@ -1652,11 +1662,15 @@ class EvidenceRecord(BaseModel):
     checks_digest: str = ""
     command: list[str] = Field(default_factory=list)
     exit_code: int | None = None
-    #: Batch E2. *Why* the check ended the way it did: ``exited``, ``timed_out``, ``killed``,
-    #: ``descendants_left``, ``not_launched``, ``collection_error``... Structured on purpose. An
-    #: automatic repair must not be decided from the ``verification_failed`` string or a log
-    #: keyword, and an evidence row that predates this field carries no fact to classify, so it
-    #: never triggers one.
+    #: Batch E2. *Why* the check ended the way it did, as ``hflow.verify`` writes it: one of
+    #: its ``REASON_*`` values (``completed``, ``nonzero_exit``, ``timed_out``,
+    #: ``settlement_forced``, ``settlement_unknown``, ``output_capture_error``,
+    #: ``not_launched``), or a runner's refusal to start (``empty_argv``, ``no_artifact_dir``).
+    #: Only ``completed`` and ``nonzero_exit`` (``CLEAN_EXIT_REASONS``) are answers about the
+    #: candidate; an offline runner reports ``not_launched`` unless a test declares otherwise.
+    #: Structured on purpose. An automatic repair must not be decided from the
+    #: ``verification_failed`` string or a log keyword, and an evidence row that predates this
+    #: field (empty) carries no fact to classify, so it never triggers one.
     exit_reason: str = ""
     stdout_digest: str = ""
     stderr_digest: str = ""

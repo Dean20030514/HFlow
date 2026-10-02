@@ -131,6 +131,10 @@ def validate_task_spec(
         issues.append(
             ValidationIssue(code=RefusalCode.SCOPE_VIOLATION, detail=problem, location="scope")
         )
+    for problem in _linked_scope_entries(spec.scope.write_allow, project_root):
+        issues.append(
+            ValidationIssue(code=RefusalCode.SCOPE_VIOLATION, detail=problem, location="scope")
+        )
 
     # --- reuse admission (plan 11.1/11.3) ---------------------------------
     reuse = spec.reuse
@@ -263,6 +267,48 @@ def validate_task_spec(
     )
 
 
+def _linked_scope_entries(write_allow: Sequence[str], project_root: Path) -> list[str]:
+    """``write_allow`` entries that are, or pass through, a symbolic link or a junction.
+
+    Admission can only resolve an entry in the user's checkout, but the worker writes - and HFlow
+    freezes and fingerprints - in the run's worktree, where the same link can point somewhere
+    else entirely (a relative or absolute target means something different there) or be a plain
+    path. The freeze stages the link itself while the fingerprint reads through it, so such an
+    entry is not the literal path ``write_allow`` requires. Refusing it here costs nothing; an
+    entry that only starts escaping inside the worktree is blocked by the controller instead.
+
+    Entries that ``check_scope`` already refuses for their shape (a glob, an absolute path, a
+    parent traversal) are skipped, so one mistake is reported once. Nothing here follows a link.
+    """
+    problems: list[str] = []
+    root = Path(project_root)
+    for entry in write_allow:
+        raw = Path(entry.replace("\\", "/"))
+        if (
+            not entry.strip()
+            or any(char in entry for char in ("*", "?", "["))
+            or raw.is_absolute()
+            or raw.drive
+            or entry.startswith(("\\", "/"))
+            or ".." in raw.parts
+        ):
+            continue
+        current = root
+        for part in raw.parts:
+            current = current / part
+            if current.is_symlink() or current.is_junction():
+                linked = current.relative_to(root).as_posix()
+                problems.append(
+                    f"write_allow entry {entry!r} passes through a symbolic link or junction "
+                    f"({linked!r}); write_allow takes literal paths, and a link can name a "
+                    "different place in the run's worktree than in this checkout"
+                )
+                break
+            if not current.exists():
+                break
+    return problems
+
+
 def assert_admissible(
     spec: TaskSpec,
     project: ProjectConfig,
@@ -280,7 +326,7 @@ def assert_admissible(
 
 
 def repair_policy_problems(
-    spec: TaskSpec, project: ProjectConfig
+    spec: TaskSpec, project: ProjectConfig, *, real_transport: bool, root_bound: bool
 ) -> list[ValidationIssue]:
     """Is this task shaped so that the repair policy it carries can be honoured at all?
 
@@ -293,6 +339,12 @@ def repair_policy_problems(
     Deliberately *not* gated on ``production``: the controller honours ``spec.repair_policy``
     whatever driver is bound, so an offline repair in place would write into the user's own
     checkout exactly as a live one would. These are facts about the task, not about this machine.
+
+    A fourth fact is about the binding (plan 5.1): when any role is dispatched to a real
+    transport (``real_transport`` - anything but the offline fake driver), the repair must be
+    charged to a root (``root_bound``). Without one it would be bought outside the root's
+    cross-revision repair counter and its clock, so every new revision could buy another. A fully
+    offline run reaches no model and may still repair without a root.
     """
     issues: list[ValidationIssue] = []
     if spec.repair_policy is None:
@@ -355,6 +407,24 @@ def repair_policy_problems(
                 location="budget.max_agent_turns",
             )
         )
+    # A real transport's repair is spent against a root: its repair counter and its clock are what
+    # bound the task across revisions. The offline fake driver reaches no model, so a rootless
+    # offline repair stays allowed (and is charged to no root counter, see the store's legacy path).
+    if real_transport and not root_bound:
+        issues.append(
+            ValidationIssue(
+                code=RefusalCode.BUDGET_EXCEEDED,
+                detail=(
+                    "this task carries a repair_policy and a role is dispatched to a real "
+                    "transport, but no root budget is bound. A repair is charged to the root's "
+                    "repair counter and clock, which bound the task across revisions; without "
+                    "one each new revision could buy another. Pass --root-budget-file (with an "
+                    "authorization that covers that root), or drop repair_policy. Nothing was "
+                    "dispatched."
+                ),
+                location="root_budget",
+            )
+        )
     return issues
 
 
@@ -365,6 +435,9 @@ def predictable_dispatch_problems(
     production: bool,
     implementer_writes: bool,
     launches: Sequence[LaunchConfig] = (),
+    real_transport: bool | None = None,
+    root_bound: bool = False,
+    workspace_client_config: str = "",
 ) -> list[ValidationIssue]:
     """Problems knowable before a dispatch, from the task, the contract and this machine.
 
@@ -387,9 +460,42 @@ def predictable_dispatch_problems(
 
     The repair-policy rules are reported for every run, offline included, because they are facts
     about the task rather than about the machine; the rules below them are machine facts and are
-    reported only for a real delivery.
+    reported only for a real delivery. ``real_transport`` (whether any role is dispatched to
+    something other than the offline fake driver; ``None`` reads it from ``production``) and
+    ``root_bound`` (whether a root budget is bound to this run) feed the one repair rule that
+    depends on the binding: a real transport's repair needs a root.
+
+    ``workspace_client_config`` is the caller's finding that the workspace the run starts in
+    already holds acpx's project config (``prepare.start_workspace_client_config``; empty when it
+    does not, or when no role uses that client). It is reported for offline-checked runs too:
+    it is a fact about the client the run would launch, not about how its checks run.
     """
-    issues: list[ValidationIssue] = list(repair_policy_problems(spec, project))
+    issues: list[ValidationIssue] = list(
+        repair_policy_problems(
+            spec,
+            project,
+            real_transport=production if real_transport is None else real_transport,
+            root_bound=root_bound,
+        )
+    )
+
+    # 0. acpx would let a workspace ``.acpxrc.json`` replace the agent command, and the driver
+    #    refuses to launch there - at its spawn gate, after the dispatch was reserved, when an
+    #    identical resubmission only returns the blocked run. Already in the starting workspace,
+    #    it is refused here instead, while nothing has been spent.
+    if workspace_client_config:
+        issues.append(
+            ValidationIssue(
+                code=RefusalCode.WORKSPACE_CLIENT_CONFIG,
+                detail=(
+                    f"{workspace_client_config}. acpx always loads that file from the agent's "
+                    "workspace and lets it override HFlow's launch, including the agent command, "
+                    "so no agent may be started there. Refused before anything was dispatched or "
+                    "charged: submit again once the file is gone"
+                ),
+                location="workspace",
+            )
+        )
 
     if not production:
         # An offline run is not a delivery: the fake driver scripts its own change and its

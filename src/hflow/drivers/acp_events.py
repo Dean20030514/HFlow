@@ -158,7 +158,12 @@ def iter_lines(text: str) -> Iterator[str]:
 
 
 def summarize(events: Iterable[NormalizedEvent]) -> dict[str, object]:
-    """Small deterministic summary used by receipts and tests."""
+    """Small deterministic summary of a stream: event counts, dispatch, last stop reason.
+
+    ``stop_reason`` is the last one in the stream *whatever request it answered*, so it describes
+    the stream, never a turn's outcome. The driver takes a turn's outcome only from the response
+    to that turn's own ``session/prompt`` request.
+    """
     kinds: dict[str, int] = {}
     stop_reason: str | None = None
     dispatched = False

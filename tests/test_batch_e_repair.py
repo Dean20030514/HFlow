@@ -46,6 +46,7 @@ from hflow.contracts import (
     WorkspaceSpec,
 )
 from hflow.contracts import RefusedError
+from hflow.contracts import AttemptState, CancellationReceipt, InvocationStartState
 from hflow.controller import Controller
 from hflow.drivers.acpx_dsh import AcpxDshDriver
 from hflow.drivers.fake import FakeDriver, FakeScript
@@ -264,6 +265,8 @@ class RepairingDriver(FakeDriver):
         first_plan: dict[str, str],
         repair_plan: dict[str, str],
         review: ReviewOutput | None = None,
+        first_remove: list[str] | None = None,
+        repair_remove: list[str] | None = None,
     ) -> None:
         super().__init__(
             project_root,
@@ -275,6 +278,8 @@ class RepairingDriver(FakeDriver):
         )
         self.first_plan = dict(first_plan)
         self.repair_plan = dict(repair_plan)
+        self.first_remove = list(first_remove or [])
+        self.repair_remove = list(repair_remove or [])
         self.labels: list[str] = []
         self.packets: list[str] = []
 
@@ -283,17 +288,22 @@ class RepairingDriver(FakeDriver):
         self.labels.append(f"{request.role}{'-repair' if is_repair else ''}")
         self.packets.append(request.packet)
         # The plan for *this* implementer invocation: the first one changes nothing, the repair
-        # one applies the fix.
+        # one applies the fix. Deletions are per round too; a reviewer never deletes anything.
         if request.role == "implementer":
             self.script.write_plan = dict(self.repair_plan if is_repair else self.first_plan)
+            self.script.remove_plan = list(self.repair_remove if is_repair else self.first_remove)
+        else:
+            self.script.remove_plan = []
         return super().start(request)
 
 
 def _root_setup(store: Store, *, spec: TaskSpec, project_root: Path, max_submissions: int = 4):
     """A registered root plus its artifact: the shape a real run has since batch E1.
 
-    E2's repair is only reachable through the root ledger - a root charge names the artifact that
-    bought it - so an end-to-end test has to set one up. The ledger path is the store's own file,
+    A real transport's repair is only admitted with a root binding (plan 5.1; a fully offline
+    fake-driver run may still repair without one), so these tests exercise the root path a real
+    run takes - and a root charge names the artifact that bought it, so an end-to-end test has to
+    set one up. The ledger path is the store's own file,
     so the binding and the record cannot drift apart, and the artifact's ceiling is what the
     worst-case gate is measured against.
     """
@@ -559,6 +569,77 @@ def test_a_reviewer_rejection_buys_one_repair_and_four_dispatches(
         store.close()
 
 
+def _repair_packet_with(findings: list[dict[str, object]]) -> str:
+    """Render the implementer packet of a review-triggered repair carrying *findings*."""
+    from hflow.contracts import RepairContext
+    from hflow.packet import render_implementer_packet
+
+    return render_implementer_packet(
+        task_id="T-REPAIR",
+        task_revision=1,
+        goal="Make the approved check pass",
+        acceptance=[AcceptanceCriterion(id="AC-1", statement="unit passes", check_ids=["unit"])],
+        scope=Scope(write_allow=["src/parser.py"]),
+        workspace="/work",
+        spec_digest="sha256:test",
+        deadline_seconds=60,
+        writes_allowed=True,
+        repair=RepairContext(
+            trigger=RepairTrigger.REVIEW_CHANGES_REQUESTED,
+            findings=findings,
+            remaining_turns=2,
+            deadline_seconds=60,
+        ),
+    ).text
+
+
+@pytest.mark.parametrize(
+    "finding",
+    [
+        # The plan 16.5 shape: only ``location`` of these keys was rendered before.
+        {
+            "id": "R1-F1",
+            "location": "src/parser.py:42",
+            "impact": "parse(None) raises instead of returning ''",
+            "evidence": "unit test test_none_input fails with TypeError",
+            "required_fix": "add a None guard before the split",
+        },
+        # A conforming reviewer is free to choose its own keys.
+        {
+            "severity": "high",
+            "file": "src/parser.py",
+            "issue": "parse(None) must return ''",
+            "suggestion": "add a None guard",
+        },
+    ],
+    ids=["plan-16-5", "free-form-keys"],
+)
+def test_the_repair_packet_renders_every_key_of_a_finding(finding: dict[str, object]) -> None:
+    """The repair attempt acts on the packet alone, so no key of a finding may be dropped."""
+    from hflow.contracts import canonical_json
+
+    text = _repair_packet_with([finding])
+    section = text.split("### Findings HFlow recorded", 1)[1]
+    assert f"- {canonical_json(finding)}" in section, section
+    for key, value in finding.items():
+        assert f'"{key}"' in section and str(value) in section, (key, section)
+
+
+def test_an_oversize_finding_value_is_truncated_with_an_explicit_marker() -> None:
+    """A long value is capped with a marker that says how much was cut, never silently."""
+    from hflow.packet import MAX_FINDING_VALUE_BYTES
+
+    long_fix = "x" * (MAX_FINDING_VALUE_BYTES + 1234)
+    text = _repair_packet_with(
+        [{"severity": "major", "statement": "short and kept", "required_fix": long_fix}]
+    )
+    section = text.split("### Findings HFlow recorded", 1)[1]
+    assert "short and kept" in section
+    assert long_fix not in section
+    assert "x" * MAX_FINDING_VALUE_BYTES + "…[truncated 1234 bytes]" in section, section
+    assert len(text.encode("utf-8")) <= 32 * 1024
+
+
 # --------------------------------------------------------------------------
 # 10 and 11. what must NOT buy a second attempt
 # --------------------------------------------------------------------------
@@ -625,10 +706,30 @@ def test_an_undeclared_exit_code_never_buys_a_repair(
         store.close()
 
 
+@pytest.mark.parametrize(
+    "findings",
+    [
+        [],
+        [{}],
+        [{"severity": ""}],
+        [{"statement": "  "}],
+        # Only bookkeeping keys: an id, a severity and a place name no defect to act on.
+        [{"id": "F1", "severity": "high", "status": "open", "location": "src/parser.py:3",
+          "target": "src/parser.py"}],
+        [{}, {"detail": "\n\t"}],
+    ],
+    ids=["empty-list", "empty-object", "blank-severity", "blank-statement", "metadata-only",
+         "several-blank"],
+)
 def test_an_empty_reviewer_rejection_never_buys_a_repair(
-    tmp_path: Path, sample_repo: Path
+    tmp_path: Path, sample_repo: Path, findings: list[dict[str, object]]
 ) -> None:
-    """A rejection with no usable finding says nothing to change, so nothing is bought."""
+    """A rejection with no usable finding says nothing to change, so nothing is bought.
+
+    "Usable" means at least one non-blank text value outside the bookkeeping keys (id, severity,
+    status, location, target). An empty object or a whitespace statement is still a non-empty
+    list, and it must not pay for a second implementer and a second reviewer.
+    """
     store = Store(tmp_path / "hflow.sqlite")
     project = _project()
     base = _git(sample_repo, "rev-parse", "HEAD").strip()
@@ -640,7 +741,9 @@ def test_an_empty_reviewer_rejection_never_buys_a_repair(
             if request.role != "reviewer":
                 return result
             return result.model_copy(
-                update={"review": ReviewOutput(verdict="changes_requested", findings=[])}
+                update={
+                    "review": ReviewOutput(verdict="changes_requested", findings=list(findings))
+                }
             )
 
     driver = RepairingDriver(
@@ -772,6 +875,936 @@ def test_the_final_candidate_carries_the_whole_change_from_the_original_base(
         assert diff.split() == ["src/parser.py"]
         # The first round's candidate ref survives, so the intermediate state is still reachable.
         assert _git(sample_repo, "for-each-ref", "--format=%(refname)", "refs/hflow/").strip()
+    finally:
+        store.close()
+
+
+# --------------------------------------------------------------------------
+# 11b. a stop that could not be confirmed, then the implementer's late COMPLETED
+# --------------------------------------------------------------------------
+
+
+class StopThenCompleteDriver(RepairingDriver):
+    """An implementer that is past its spawn when an unconfirmable stop arrives, then completes.
+
+    The order is the production one (``AcpxDshDriver`` asks ``stop_requested`` only inside its
+    spawn gate): the fake reports its spawn and does the work, *then* the operator's stop is
+    recorded - through the real ``Controller.cancel`` - and only after that does ``start`` return
+    its ``COMPLETED`` result. ``cancel`` reports ``unknown``, the answer of a driver that cannot
+    confirm the process boundary emptied (or that does not own the handle).
+    """
+
+    def __init__(self, *args, stop_round: int, **kwargs) -> None:  # noqa: ANN002, ANN003
+        super().__init__(*args, **kwargs)
+        #: 1 stops the first implementer (I1), 2 stops the repair (I2).
+        self.stop_round = stop_round
+        self.controller: Controller | None = None
+        self.receipt: CancellationReceipt | None = None
+        self.stopped_attempt = ""
+
+    def start(self, request):  # noqa: ANN001 - Protocol shape
+        result = super().start(request)
+        implementer_round = sum(label.startswith("implementer") for label in self.labels)
+        if request.role == "implementer" and implementer_round == self.stop_round:
+            assert self.controller is not None
+            self.stopped_attempt = request.attempt_id
+            self.receipt = self.controller.cancel(request.run_id)
+        return result
+
+    def cancel(self, invocation_id: str) -> CancellationReceipt:
+        self.cancelled.append(invocation_id)
+        return CancellationReceipt(
+            invocation_id=invocation_id,
+            status="unknown",
+            mechanism="none",
+            local_process_stopped=False,
+            detail="offline stand-in: the process boundary could not confirm the stop",
+        )
+
+
+@pytest.mark.parametrize(
+    ("mode", "stop_round"),
+    [("in_place", 1), ("worktree", 1), ("worktree", 2)],
+    ids=["in_place-I1", "worktree-I1", "worktree-I2"],
+)
+def test_a_late_completed_after_an_unconfirmed_stop_changes_nothing(
+    tmp_path: Path, sample_repo: Path, mode: str, stop_round: int
+) -> None:
+    """AGENTS rules 4 and 8: the stop decided the run; the late success is only a note.
+
+    The repair round (I2) exists only in worktree mode - admission refuses a ``repair_policy`` on
+    an in-place task - so the in-place case is a first attempt without a policy.
+
+    Before the fix the late ``COMPLETED`` settled the ledger entry as completed (unblocking the
+    root while the block said "work may still be running"), marked the attempt ``SUCCEEDED``,
+    froze a candidate commit and a ``refs/hflow/candidates`` ref after the stop, and then raised
+    ``StoreError`` out of ``run_task`` from the transition into ``CHECKING``.
+    """
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    spec = _spec(policy=_policy() if mode == "worktree" else None, base_commit=base, mode=mode)
+    driver = StopThenCompleteDriver(
+        sample_repo,
+        # Stopped in round 1, I1 writes the fix, so a freeze would have something to commit.
+        # Stopped in round 2, I1 changes nothing, so ``unit`` fails once with its declared code
+        # and buys the repair, which writes the fix.
+        first_plan={"src/parser.py": FIXED_SOURCE} if stop_round == 1 else {},
+        repair_plan={"src/parser.py": FIXED_SOURCE},
+        stop_round=stop_round,
+    )
+    controller = _controller(
+        store, project_root=sample_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": FailingOnceThenPassing()}),
+    )
+    driver.controller = controller
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=sample_repo))
+        assert driver.receipt is not None and driver.receipt.status == "unknown"
+        assert outcome.task_state is TaskState.BLOCKED, outcome
+        assert outcome.block_code is RefusalCode.OUTCOME_UNKNOWN, outcome.block_reason
+
+        attempts = store.attempts_for(outcome.run_id)
+        assert len(attempts) == stop_round
+        stopped = attempts[-1]
+        assert stopped["attempt_id"] == driver.stopped_attempt
+        assert bool(stopped["is_repair"]) is (stop_round == 2)
+        assert stopped["state"] == AttemptState.ACTIVE.value, (
+            "the late result was applied to an attempt a stop had already decided: "
+            f"{stopped['state']} {stopped['outcome']}"
+        )
+
+        entries = [entry for entry in store.invocations_for(outcome.run_id)
+                   if entry.attempt_id == driver.stopped_attempt]
+        assert len(entries) == 1
+        assert entries[0].state is InvocationStartState.STARTED, (
+            "an unconfirmed stop keeps the entry open, so it keeps blocking the root until resume "
+            f"marks it unknown: {entries[0].model_dump(mode='json')}"
+        )
+
+        notes = store.notes_for(outcome.run_id)
+        late = [note for note in notes if note.startswith("late_result")]
+        assert len(late) == 1 and "completed" in late[0] and driver.stopped_attempt in late[0], notes
+
+        # Nothing was frozen for the stopped attempt: no candidate ref, no commit after the stop.
+        refs = _git(sample_repo, "for-each-ref", "--format=%(refname)", "refs/hflow/candidates")
+        assert driver.stopped_attempt not in refs, refs
+        assert not any(note.startswith("candidate ref") and driver.stopped_attempt in note
+                       for note in notes), notes
+        if mode == "worktree":
+            # Only round 1's candidate of an I2 stop is retained (it changed nothing, so it is the
+            # base itself); the stopped attempt's change is in the worktree and was not committed.
+            assert len(refs.split()) == stop_round - 1, refs
+            worktree = Path(store.get_run(outcome.run_id)["worktree_path"])
+            assert _git(worktree, "log", "--format=%s", f"{base}..HEAD").strip() == ""
+            assert "if text is None" in (worktree / "src" / "parser.py").read_text(encoding="utf-8")
+        else:
+            assert refs.strip() == ""
+
+        # ``resume`` still reconciles: the open entry becomes unknown, nothing is re-dispatched.
+        dispatched = list(driver.labels)
+        resumed = controller.resume(outcome.run_id)
+        assert resumed.block_code is RefusalCode.OUTCOME_UNKNOWN
+        assert driver.labels == dispatched
+        entry = store.invocation(entries[0].invocation_id)
+        assert entry is not None and entry.state is InvocationStartState.UNKNOWN
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("seam", ["settle_invocation", "advance_to_checking"])
+def test_a_stop_after_the_result_was_applied_freezes_nothing_more_and_returns(
+    tmp_path: Path, sample_repo: Path, monkeypatch, seam: str
+) -> None:
+    """The other order: the result is applied first, then the unconfirmed stop lands.
+
+    The result stands - it arrived before the stop - but the stop still decides the run.
+    Landing before the freeze (``settle_invocation`` seam), no candidate commit and no ref is
+    made; landing after it (``advance_to_checking`` seam), the refused transition into
+    ``CHECKING`` is the stop, and ``run_task`` returns the recorded block instead of raising.
+    """
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    spec = _spec(policy=_policy(), base_commit=base)
+    driver = StopThenCompleteDriver(
+        sample_repo,
+        first_plan={"src/parser.py": FIXED_SOURCE},
+        repair_plan={},
+        stop_round=0,  # the driver itself never stops; the seam does
+    )
+    controller = _controller(
+        store, project_root=sample_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": FailingOnceThenPassing(fail_first=None)}),
+    )
+    driver.controller = controller
+    original = getattr(store, seam)
+    receipts: list[CancellationReceipt] = []
+
+    def stop_first(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202 - the wrapped method's shape
+        if not receipts:
+            run_id = str(store.list_runs()[0]["run_id"])
+            receipts.append(controller.cancel(run_id))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, seam, stop_first)
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=sample_repo))
+        assert [receipt.status for receipt in receipts] == ["unknown"]
+        assert outcome.task_state is TaskState.BLOCKED, outcome
+        assert outcome.block_code is RefusalCode.OUTCOME_UNKNOWN, outcome.block_reason
+        (attempt,) = store.attempts_for(outcome.run_id)
+        assert attempt["state"] == AttemptState.SUCCEEDED.value, "applied before the stop"
+        assert driver.labels == ["implementer"], "no check or reviewer follows a stop"
+        refs = _git(sample_repo, "for-each-ref", "--format=%(refname)", "refs/hflow/candidates")
+        if seam == "settle_invocation":
+            assert refs.strip() == ""
+            worktree = Path(store.get_run(outcome.run_id)["worktree_path"])
+            assert _git(worktree, "log", "--format=%s", f"{base}..HEAD").strip() == ""
+            assert any("no candidate was frozen" in note for note in store.notes_for(outcome.run_id))
+        else:
+            assert attempt["attempt_id"] in refs, "frozen before the stop, so it is retained"
+    finally:
+        store.close()
+
+
+# --------------------------------------------------------------------------
+# the frozen candidate is the tree that was checked: deletions, write_deny, the stop rule
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def scoped_repo(tmp_path: Path) -> Path:
+    """The sample project plus a second module and a file the task's scope will deny."""
+    repo = tmp_path / "scoped"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src" / "parser.py").write_text(
+        "def parse(text):\n    return text\n", encoding="utf-8"
+    )
+    (repo / "src" / "a.py").write_text("LEGACY = True\n", encoding="utf-8")
+    (repo / "src" / "secret.txt").write_text("original secret\n", encoding="utf-8")
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "sample project with a denied file inside src")
+    return repo
+
+
+def _scoped_spec(
+    base: str,
+    *,
+    allow: list[str],
+    deny: list[str] | None = None,
+    policy: RepairPolicy | None = None,
+) -> TaskSpec:
+    return _spec(policy=policy, base_commit=base).model_copy(
+        update={"scope": Scope(write_allow=allow, write_deny=[".hflow/**", *(deny or [])])}
+    )
+
+
+def _run_worktree(repo: Path, run_id: str) -> Path:
+    """Where the controller put this run's worktree (beside the repository, by run id)."""
+    return repo.parent / f"{repo.name}.hflow-worktrees" / run_id
+
+
+def _commits_touching(repo: Path, path: str) -> list[str]:
+    """Every commit reachable from any ref - candidate refs included - that changed ``path``."""
+    return _git(repo, "log", "--all", "--format=%H", "--", path).split()
+
+
+@pytest.mark.parametrize(
+    "write_plan",
+    [{}, {"src/parser.py": FIXED_SOURCE}],
+    ids=["deletion-only", "delete-plus-modify"],
+)
+def test_a_deleted_listed_file_is_frozen_into_the_candidate(
+    tmp_path: Path, scoped_repo: Path, write_plan: dict[str, str]
+) -> None:
+    """The deletion the checks saw is in the commit the receipt names.
+
+    The freeze used to stage an entry only while it existed on disk, so an exactly-listed file
+    the worker deleted stayed in the commit: the receipt named a tree that still held the file
+    while the checks and the reviewer ran on one that did not.
+    """
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(scoped_repo, "rev-parse", "HEAD").strip()
+    spec = _scoped_spec(base, allow=["src/parser.py", "src/a.py"])
+    driver = RepairingDriver(
+        scoped_repo, first_plan=write_plan, repair_plan={}, first_remove=["src/a.py"]
+    )
+    controller = _controller(
+        store, project_root=scoped_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": FailingOnceThenPassing(fail_first=None)}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=scoped_repo))
+        assert outcome.task_state is TaskState.ACCEPTED, outcome.block_reason
+        receipt = outcome.receipt
+        assert receipt is not None
+        commit = receipt.candidate.git_commit
+        assert commit != base, "a deletion is a change, so the candidate is a new commit"
+        assert "src/a.py" not in _git(scoped_repo, "ls-tree", "-r", "--name-only", commit).split()
+        assert set(receipt.candidate_paths) == {"src/a.py", *write_plan}
+        worktree = Path(receipt.candidate.worktree)
+        assert _git(worktree, "status", "--porcelain").strip() == "", (
+            "the freeze must leave nothing of the checked change outside the commit"
+        )
+    finally:
+        store.close()
+
+
+def test_a_repair_round_that_only_deletes_a_listed_file_is_a_new_candidate(
+    tmp_path: Path, scoped_repo: Path
+) -> None:
+    """A repair whose one change is a deletion must not be delivered under round one's commit."""
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(scoped_repo, "rev-parse", "HEAD").strip()
+    spec = _scoped_spec(base, allow=["src/parser.py", "src/a.py"], policy=_policy())
+    driver = RepairingDriver(
+        scoped_repo,
+        first_plan={"src/parser.py": FIXED_SOURCE},
+        repair_plan={},
+        repair_remove=["src/a.py"],
+    )
+    controller = _controller(
+        store, project_root=scoped_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": FailingOnceThenPassing()}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=scoped_repo))
+        assert outcome.task_state is TaskState.ACCEPTED, outcome.block_reason
+        assert [entry.role for entry in store.invocations_for(outcome.run_id)] == [
+            "implementer", "implementer", "reviewer",
+        ]
+        receipt = outcome.receipt
+        assert receipt is not None
+        commit = receipt.candidate.git_commit
+        candidates = _git(
+            scoped_repo, "for-each-ref", "--format=%(objectname)", "refs/hflow/candidates/"
+        ).split()
+        assert len(set(candidates)) == 2, f"two rounds, two different candidates: {candidates}"
+        assert "src/a.py" not in _git(scoped_repo, "ls-tree", "-r", "--name-only", commit).split()
+        assert set(receipt.candidate_paths) == {"src/parser.py", "src/a.py"}
+        worktree = Path(receipt.candidate.worktree)
+        assert _git(worktree, "status", "--porcelain").strip() == ""
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("first_plan", "repair_plan", "roles"),
+    [
+        (
+            {"src/parser.py": FIXED_SOURCE, "src/secret.txt": "leaked\n"},
+            {"src/parser.py": FIXED_SOURCE + "# repaired\n"},
+            ["implementer"],
+        ),
+        (
+            {"src/parser.py": FIXED_SOURCE},
+            {"src/secret.txt": "leaked\n"},
+            ["implementer", "implementer"],
+        ),
+    ],
+    ids=["first-round", "repair-only-round"],
+)
+def test_a_denied_file_inside_an_allowed_directory_blocks_before_the_freeze(
+    tmp_path: Path,
+    scoped_repo: Path,
+    first_plan: dict[str, str],
+    repair_plan: dict[str, str],
+    roles: list[str],
+) -> None:
+    """``write_deny`` is enforced on what the worker changed, not only quoted in its packet.
+
+    ``src`` is allowed and ``src/secret.txt`` is denied. The write used to pass both scope checks
+    (they only asked about ``write_allow``), ``git add -- src`` committed it, and a repair round
+    whose only change was the denied file counted as progress and bought a reviewer.
+    """
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(scoped_repo, "rev-parse", "HEAD").strip()
+    spec = _scoped_spec(base, allow=["src"], deny=["src/secret.txt"], policy=_policy())
+    driver = RepairingDriver(scoped_repo, first_plan=first_plan, repair_plan=repair_plan)
+    controller = _controller(
+        store, project_root=scoped_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": FailingOnceThenPassing()}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=scoped_repo))
+        assert outcome.task_state is TaskState.BLOCKED
+        assert outcome.block_code is RefusalCode.SCOPE_VIOLATION, outcome.block_reason
+        assert "src/secret.txt" in (outcome.block_reason or "")
+        assert outcome.receipt is None
+        assert [entry.role for entry in store.invocations_for(outcome.run_id)] == roles, (
+            "a denied change is refused before any reviewer is bought for it"
+        )
+        # The denied bytes are in no commit, and were never even staged.
+        assert _commits_touching(scoped_repo, "src/secret.txt") == [base]
+        worktree = _run_worktree(scoped_repo, outcome.run_id)
+        assert _git(worktree, "diff", "--cached", "--name-only").strip() == ""
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("planted", ["src/.acpxrc.json", ".acpxrc.json"])
+def test_an_implementer_written_acpx_config_blocks_before_review(
+    tmp_path: Path, scoped_repo: Path, planted: str
+) -> None:
+    """acpx reads ``<cwd>/.acpxrc.json`` over HFlow's client config, in the worktree it wrote.
+
+    The reviewer runs in the implementer's worktree, so a worker-written client config would
+    reconfigure the next role. It is on the built-in deny list: refused before review wherever
+    it sits, including inside a directory the task allows.
+    """
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(scoped_repo, "rev-parse", "HEAD").strip()
+    spec = _scoped_spec(base, allow=["src"])
+    driver = RepairingDriver(
+        scoped_repo,
+        first_plan={"src/parser.py": FIXED_SOURCE, planted: '{"agents": {}}\n'},
+        repair_plan={},
+    )
+    controller = _controller(
+        store, project_root=scoped_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": FailingOnceThenPassing(fail_first=None)}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=scoped_repo))
+        assert outcome.task_state is TaskState.BLOCKED
+        assert outcome.block_code is RefusalCode.SCOPE_VIOLATION, outcome.block_reason
+        assert planted in (outcome.block_reason or "")
+        assert [entry.role for entry in store.invocations_for(outcome.run_id)] == ["implementer"]
+        assert _commits_touching(scoped_repo, planted) == []
+    finally:
+        store.close()
+
+
+def test_a_repair_that_changes_the_tree_but_not_the_scoped_content_is_not_progress(
+    tmp_path: Path, scoped_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unchanged scoped fingerprint is no content change; a tree change beside it is refused.
+
+    A bytecode cache under an allowed directory is outside the fingerprint (it skips
+    ``__pycache__``) but inside ``git add -- src``. Such a round used to count as progress: every
+    check ran again and a reviewer was bought for a candidate whose checked content had not moved.
+    """
+    # Keep a machine-wide ignore rule from hiding the cache from git: this test is about a path
+    # git does commit.
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "no-global-gitconfig"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-xdg-config"))
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(scoped_repo, "rev-parse", "HEAD").strip()
+    spec = _scoped_spec(base, allow=["src"], policy=_policy())
+    driver = RepairingDriver(
+        scoped_repo,
+        first_plan={"src/parser.py": FIXED_SOURCE},
+        repair_plan={"src/__pycache__/parser.cpython-314.pyc": "not really bytecode\n"},
+    )
+    controller = _controller(
+        store, project_root=scoped_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": FailingOnceThenPassing()}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=scoped_repo))
+        assert outcome.task_state is TaskState.BLOCKED
+        assert outcome.block_code is RefusalCode.SCOPE_VIOLATION, outcome.block_reason
+        assert "fingerprint" in (outcome.block_reason or "")
+        assert [entry.role for entry in store.invocations_for(outcome.run_id)] == [
+            "implementer", "implementer",
+        ], "no reviewer is bought for a round that did not change the checked content"
+        decisions = [record.decision for record in store.repair_records_for(outcome.run_id)]
+        assert decisions == [RepairDecision.ALLOWED, RepairDecision.NO_CONTENT_CHANGE]
+    finally:
+        store.close()
+
+
+class CommittingDriver(RepairingDriver):
+    """An implementer that runs Git itself in its worktree after writing its plan.
+
+    ``first_git`` / ``repair_git`` are argv lists run in the worktree for that round; the
+    literal ``{base}`` is replaced by the task's base commit. The out-of-scope files are written
+    first when ``plant_out_of_scope`` is set, under directories the manifest scan skips.
+    """
+
+    def __init__(
+        self,
+        project_root: Path,
+        *,
+        base: str,
+        first_git: list[list[str]] | None = None,
+        repair_git: list[list[str]] | None = None,
+        plant_out_of_scope: bool = False,
+        **kwargs,  # noqa: ANN003
+    ) -> None:
+        super().__init__(project_root, **kwargs)
+        self.base = base
+        self.first_git = list(first_git or [])
+        self.repair_git = list(repair_git or [])
+        self.plant_out_of_scope = plant_out_of_scope
+
+    def start(self, request):  # noqa: ANN001 - Protocol shape
+        result = super().start(request)
+        if request.role == "implementer":
+            worktree = Path(request.workspace)
+            is_repair = "## Repair attempt" in request.packet
+            if self.plant_out_of_scope and not is_repair:
+                (worktree / ".hflow").mkdir(exist_ok=True)
+                # LF bytes: a line-ending conversion in the worker's own git must not leave
+                # these looking modified to HFlow's status read; the worker's commit is clean.
+                (worktree / ".hflow" / "project.json").write_bytes(b"{}\n")
+                (worktree / "tools" / "__pycache__").mkdir(parents=True, exist_ok=True)
+                (worktree / "tools" / "__pycache__" / "evil.py").write_bytes(b"x = 1\n")
+            for argv in self.repair_git if is_repair else self.first_git:
+                _git(worktree, *[arg.replace("{base}", self.base) for arg in argv])
+        return result
+
+
+_WORKER_COMMITS_OUT_OF_SCOPE = [
+    ["add", "-f", ".hflow/project.json", "tools/__pycache__/evil.py"],
+    ["commit", "-q", "-m", "worker commit"],
+]
+
+
+def test_a_worker_commit_outside_the_scope_is_never_delivered(
+    tmp_path: Path, scoped_repo: Path
+) -> None:
+    """A worker's own commit is refused, not adopted as the freeze base.
+
+    ``.hflow`` and ``__pycache__`` are skipped by the manifest scan and a committed change leaves
+    ``git status`` clean, so this commit passed every scope gate: the run was ACCEPTED and the
+    receipt delivered HFlow's own state and a file no check or fingerprint had seen.
+    """
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(scoped_repo, "rev-parse", "HEAD").strip()
+    spec = _scoped_spec(base, allow=["src"])
+    driver = CommittingDriver(
+        scoped_repo,
+        base=base,
+        first_git=_WORKER_COMMITS_OUT_OF_SCOPE,
+        plant_out_of_scope=True,
+        first_plan={"src/parser.py": FIXED_SOURCE},
+        repair_plan={},
+    )
+    controller = _controller(
+        store, project_root=scoped_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": FailingOnceThenPassing(fail_first=None)}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=scoped_repo))
+        assert outcome.task_state is TaskState.BLOCKED, outcome.receipt
+        assert outcome.block_code is RefusalCode.SCOPE_VIOLATION, outcome.block_reason
+        assert "moved HEAD" in (outcome.block_reason or "")
+        assert outcome.receipt is None
+        assert [entry.role for entry in store.invocations_for(outcome.run_id)] == ["implementer"]
+        assert _git(scoped_repo, "for-each-ref", "refs/hflow/").strip() == "", (
+            "no candidate ref keeps the worker's commit"
+        )
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "repair_git",
+    [
+        [["add", "src"], ["commit", "-q", "--amend", "-m", "amended"]],
+        [["reset", "-q", "--soft", "{base}"]],
+    ],
+    ids=["amend", "reset-soft"],
+)
+def test_a_repair_worker_that_rewrites_the_previous_candidate_is_refused(
+    tmp_path: Path, scoped_repo: Path, repair_git: list[list[str]]
+) -> None:
+    """Round two must build on round one's candidate, so its parent is what it claims to be."""
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(scoped_repo, "rev-parse", "HEAD").strip()
+    spec = _scoped_spec(base, allow=["src"], policy=_policy())
+    driver = CommittingDriver(
+        scoped_repo,
+        base=base,
+        repair_git=repair_git,
+        first_plan={"src/parser.py": FIXED_SOURCE},
+        repair_plan={"src/parser.py": FIXED_SOURCE + "# repaired\n"},
+    )
+    controller = _controller(
+        store, project_root=scoped_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": FailingOnceThenPassing()}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=scoped_repo))
+        assert outcome.task_state is TaskState.BLOCKED, outcome.receipt
+        assert outcome.block_code is RefusalCode.SCOPE_VIOLATION, outcome.block_reason
+        assert "moved HEAD" in (outcome.block_reason or "")
+        assert outcome.receipt is None
+        assert [entry.role for entry in store.invocations_for(outcome.run_id)] == [
+            "implementer", "implementer",
+        ]
+    finally:
+        store.close()
+
+
+def test_the_cumulative_change_is_held_to_the_scope_after_the_freeze(
+    tmp_path: Path, scoped_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The second guard: whatever the freeze returns, the whole base-to-candidate diff is checked.
+
+    The freeze's HEAD check is disabled here, so the worker's commit reaches the controller as a
+    candidate; the cumulative diff must still refuse it before a ref keeps it or a check runs.
+    """
+    from hflow.gitworkspace import GitRepo
+
+    real_freeze = GitRepo.freeze_candidate
+
+    def freeze_without_the_head_check(self, worktree, *args, expected_head, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        return real_freeze(self, worktree, *args, expected_head=self.worktree_commit(worktree), **kwargs)
+
+    monkeypatch.setattr(GitRepo, "freeze_candidate", freeze_without_the_head_check)
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(scoped_repo, "rev-parse", "HEAD").strip()
+    spec = _scoped_spec(base, allow=["src"])
+    driver = CommittingDriver(
+        scoped_repo,
+        base=base,
+        first_git=_WORKER_COMMITS_OUT_OF_SCOPE,
+        plant_out_of_scope=True,
+        first_plan={"src/parser.py": FIXED_SOURCE},
+        repair_plan={},
+    )
+    controller = _controller(
+        store, project_root=scoped_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": FailingOnceThenPassing(fail_first=None)}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=scoped_repo))
+        assert outcome.task_state is TaskState.BLOCKED, outcome.receipt
+        assert outcome.block_code is RefusalCode.SCOPE_VIOLATION, outcome.block_reason
+        assert ".hflow/project.json" in (outcome.block_reason or "")
+        assert outcome.receipt is None
+        assert [entry.role for entry in store.invocations_for(outcome.run_id)] == ["implementer"]
+        assert _git(scoped_repo, "for-each-ref", "refs/hflow/").strip() == ""
+    finally:
+        store.close()
+
+
+def test_a_renamed_file_delivers_both_its_old_and_its_new_path(
+    tmp_path: Path, scoped_repo: Path
+) -> None:
+    """A move is a deletion plus an addition; the receipt names both paths."""
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(scoped_repo, "rev-parse", "HEAD").strip()
+    spec = _scoped_spec(base, allow=["src"])
+    legacy = (scoped_repo / "src" / "a.py").read_text(encoding="utf-8")
+    driver = RepairingDriver(
+        scoped_repo,
+        first_plan={"src/renamed.py": legacy},
+        repair_plan={},
+        first_remove=["src/a.py"],
+    )
+    controller = _controller(
+        store, project_root=scoped_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": FailingOnceThenPassing(fail_first=None)}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=scoped_repo))
+        assert outcome.task_state is TaskState.ACCEPTED, outcome.block_reason
+        assert outcome.receipt is not None
+        assert outcome.receipt.candidate_paths == ["src/a.py", "src/renamed.py"]
+    finally:
+        store.close()
+
+
+class CachingChecks(FailingOnceThenPassing):
+    """Like ruff or mypy: every check run leaves a self-ignoring cache directory in its cwd.
+
+    The cache is written after the round's freeze (checks run on the frozen candidate), so it is
+    HFlow's own byproduct, not the worker's - and it is not on the ignored-artifact allowlist.
+    """
+
+    def run(self, check, cwd, timeout_seconds):  # noqa: ANN001 - Protocol shape
+        cache = Path(cwd) / ".ruff_cache"
+        cache.mkdir(exist_ok=True)
+        (cache / ".gitignore").write_text("*\n", encoding="utf-8")
+        (cache / "CACHEDIR.TAG").write_text("Signature: check cache\n", encoding="utf-8")
+        return super().run(check, cwd, timeout_seconds)
+
+
+def test_an_ignored_cache_left_by_round_one_checks_does_not_make_the_paid_repair_unfreezable(
+    tmp_path: Path, sample_repo: Path
+) -> None:
+    """Ignored files the round-1 checks left behind are carried into the repair's freeze.
+
+    They existed before the repair was bought, the repair's own scope check still refuses any
+    worker change to them, and the freeze never stages an ignored file. Refusing them only after
+    the repair was reserved and dispatched blamed the worker for HFlow's own check output and
+    spent the root's repair on nothing.
+    """
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    spec = _spec(policy=_policy(), base_commit=base)
+    driver = RepairingDriver(
+        sample_repo, first_plan={}, repair_plan={"src/parser.py": FIXED_SOURCE}
+    )
+    controller = _controller(
+        store, project_root=sample_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": CachingChecks()}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=sample_repo))
+        assert outcome.task_state is TaskState.ACCEPTED, (outcome.block_code, outcome.block_reason)
+        assert driver.labels == ["implementer", "implementer-repair", "reviewer"]
+        decisions = [record.decision for record in store.repair_records_for(outcome.run_id)]
+        assert decisions == [RepairDecision.ALLOWED]
+        view = store.root_budget_view(controller.root_binding.root_id)
+        assert view is not None and view.used_repairs == 1
+        assert not (sample_repo / ".ruff_cache").exists(), "the user's checkout is never written"
+    finally:
+        store.close()
+
+
+def test_a_repair_that_rewrites_a_carried_check_cache_is_still_a_scope_violation(
+    tmp_path: Path, sample_repo: Path
+) -> None:
+    """Carrying the checks' ignored leftovers is not a write grant: the worker may not touch them."""
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    spec = _spec(policy=_policy(), base_commit=base)
+    driver = RepairingDriver(
+        sample_repo,
+        first_plan={},
+        repair_plan={"src/parser.py": FIXED_SOURCE, ".ruff_cache/CACHEDIR.TAG": "tampered\n"},
+    )
+    controller = _controller(
+        store, project_root=sample_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": CachingChecks()}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=sample_repo))
+        assert outcome.task_state is TaskState.BLOCKED
+        assert outcome.block_code is RefusalCode.SCOPE_VIOLATION, outcome.block_reason
+        assert ".ruff_cache/CACHEDIR.TAG" in (outcome.block_reason or "")
+        assert driver.labels == ["implementer", "implementer-repair"]
+    finally:
+        store.close()
+
+
+class LeavesAnIgnoredLogInScope(FailingOnceThenPassing):
+    """A check that writes an ignored log *inside* the write scope (``src/run.log``)."""
+
+    def run(self, check, cwd, timeout_seconds):  # noqa: ANN001 - Protocol shape
+        (Path(cwd) / "src" / "run.log").write_text(f"{check.id} output\n", encoding="utf-8")
+        return super().run(check, cwd, timeout_seconds)
+
+
+@pytest.mark.parametrize(
+    "repair_plan",
+    [{}, {"src/run.log": "worker edit\n"}, {"src/parser.py": FIXED_SOURCE}],
+    ids=["no-edit", "edits-only-the-log", "real-fix"],
+)
+def test_an_ignored_check_byproduct_inside_the_write_scope_refuses_the_repair_before_it_is_bought(
+    tmp_path: Path,
+    sample_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    repair_plan: dict[str, str],
+) -> None:
+    """A carried ignored file the scoped fingerprint covers would make it disagree with the commit.
+
+    The freeze never stages an ignored file, but the fingerprint hashes every file under a
+    ``write_allow`` directory. Carried into the repair, ``src/run.log`` made the round-2
+    fingerprint differ from round 1's while the commit and tree stayed the same: the
+    no-content-change guard was skipped, a reviewer was bought for round 1's failing commit, and
+    the evidence covered bytes no commit holds. It is refused before anything is bought.
+    """
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "no-global-gitconfig"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-xdg-config"))
+    (sample_repo / ".gitignore").write_text("*.log\n", encoding="utf-8")
+    _git(sample_repo, "add", ".gitignore")
+    _git(sample_repo, "commit", "-q", "-m", "ignore logs")
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    spec = _scoped_spec(base, allow=["src"], policy=_policy())
+    driver = RepairingDriver(sample_repo, first_plan={}, repair_plan=repair_plan)
+    controller = _controller(
+        store, project_root=sample_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": LeavesAnIgnoredLogInScope()}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=sample_repo))
+        assert outcome.task_state is TaskState.BLOCKED
+        assert outcome.block_code is RefusalCode.SCOPE_VIOLATION, outcome.block_reason
+        assert "src/run.log" in (outcome.block_reason or "")
+        decisions = [record.decision for record in store.repair_records_for(outcome.run_id)]
+        assert decisions == [RepairDecision.ALLOWED, RepairDecision.WORKSPACE_DRIFT]
+        assert driver.labels == ["implementer"], "nothing is dispatched, no reviewer is bought"
+        view = store.root_budget_view(controller.root_binding.root_id)
+        assert view is not None and view.used_repairs == 0
+        assert not (sample_repo / "src" / "run.log").exists(), "the user's checkout is never written"
+    finally:
+        store.close()
+
+
+class FlagsAndEditsTheCandidate(FailingOnceThenPassing):
+    """A check that flags ``src/parser.py`` assume-unchanged and rewrites it.
+
+    The flag makes ``git status`` trust the index, so the edit is invisible to the reconcile's
+    status read: the worktree no longer holds the checked bytes, but looks clean.
+    """
+
+    def run(self, check, cwd, timeout_seconds):  # noqa: ANN001 - Protocol shape
+        _git(Path(cwd), "update-index", "--assume-unchanged", "src/parser.py")
+        (Path(cwd) / "src" / "parser.py").write_text("# rewritten by a check\n", encoding="utf-8")
+        return super().run(check, cwd, timeout_seconds)
+
+
+def test_an_index_flag_hiding_a_change_refuses_the_repair_as_workspace_drift_before_it_is_bought(
+    tmp_path: Path, sample_repo: Path
+) -> None:
+    """The reconcile's status read cannot vouch for a flagged entry, so the repair is refused."""
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    spec = _spec(policy=_policy(), base_commit=base)
+    driver = RepairingDriver(
+        sample_repo, first_plan={}, repair_plan={"src/parser.py": FIXED_SOURCE}
+    )
+    controller = _controller(
+        store, project_root=sample_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": FlagsAndEditsTheCandidate()}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=sample_repo))
+        assert outcome.task_state is TaskState.BLOCKED
+        assert outcome.block_code is RefusalCode.SCOPE_VIOLATION, outcome.block_reason
+        assert "assume-unchanged" in (outcome.block_reason or "")
+        assert "src/parser.py" in (outcome.block_reason or "")
+        decisions = [record.decision for record in store.repair_records_for(outcome.run_id)]
+        assert decisions == [RepairDecision.ALLOWED, RepairDecision.WORKSPACE_DRIFT]
+        assert driver.labels == ["implementer"], "nothing is dispatched for a flagged index"
+    finally:
+        store.close()
+
+
+class LeavesAReportFile(FailingOnceThenPassing):
+    """A check that writes a report file git does *not* ignore into its cwd."""
+
+    def run(self, check, cwd, timeout_seconds):  # noqa: ANN001 - Protocol shape
+        (Path(cwd) / "check-report.out").write_text("report\n", encoding="utf-8")
+        return super().run(check, cwd, timeout_seconds)
+
+
+def test_an_unignored_check_byproduct_refuses_the_repair_as_workspace_drift_before_it_is_bought(
+    tmp_path: Path, sample_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dirty worktree is refused before the reservation, and recorded as what it is.
+
+    It used to be recorded as ``no_content_change``, which describes a repair that ran and
+    changed nothing - not a repair that was never bought because the worktree was dirty.
+    """
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "no-global-gitconfig"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-xdg-config"))
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    spec = _spec(policy=_policy(), base_commit=base)
+    driver = RepairingDriver(
+        sample_repo, first_plan={}, repair_plan={"src/parser.py": FIXED_SOURCE}
+    )
+    controller = _controller(
+        store, project_root=sample_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": LeavesAReportFile()}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=sample_repo))
+        assert outcome.task_state is TaskState.BLOCKED
+        assert outcome.block_code is RefusalCode.SCOPE_VIOLATION, outcome.block_reason
+        assert "check-report.out" in (outcome.block_reason or "")
+        decisions = [record.decision for record in store.repair_records_for(outcome.run_id)]
+        assert decisions == [RepairDecision.ALLOWED, RepairDecision.WORKSPACE_DRIFT]
+        assert driver.labels == ["implementer"], "nothing is dispatched for a dirty worktree"
+        view = store.root_budget_view(controller.root_binding.root_id)
+        assert view is not None and view.used_repairs == 0
+    finally:
+        store.close()
+
+
+class JunctionDriver(RepairingDriver):
+    """An implementer that replaces the worktree's ``src`` with a junction to a directory outside."""
+
+    def start(self, request):  # noqa: ANN001 - Protocol shape
+        result = super().start(request)
+        if request.role == "implementer":
+            import _winapi
+            import shutil
+
+            worktree = Path(request.workspace)
+            outside = worktree.parent.parent / "outside-src"
+            outside.mkdir(exist_ok=True)
+            (outside / "parser.py").write_text("x = 1\n", encoding="utf-8")
+            shutil.rmtree(worktree / "src")
+            _winapi.CreateJunction(str(outside), str(worktree / "src"))
+        return result
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="directory junctions are a Windows feature")
+def test_a_scope_entry_that_leaves_the_worktree_blocks_the_run_instead_of_raising(
+    tmp_path: Path, scoped_repo: Path
+) -> None:
+    """A write_allow entry the worker turned into a link out of the worktree is a recorded block.
+
+    It used to raise out of ``run_task`` with the run left RUNNING, so ``resume`` did nothing and
+    every later revision on the root was refused as "owned by run" until an operator cancelled.
+    """
+    from hflow.contracts import RootBudgetLimits
+
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(scoped_repo, "rev-parse", "HEAD").strip()
+    limits = RootBudgetLimits(max_top_level_submissions=12, max_repairs=1)
+    spec = _scoped_spec(base, allow=["src"])
+    binding = _root_binding_with(store, spec=spec, project_root=scoped_repo, limits=limits)
+
+    def controller_for(spec: TaskSpec, authorization_id: str, driver: FakeDriver) -> Controller:
+        record = _artifact_for(
+            store, spec=spec, project_root=scoped_repo, binding=binding, limits=limits,
+            authorization_id=authorization_id,
+        )
+        return _controller_on_root(
+            store, project_root=scoped_repo, binding=binding, limits=limits, record=record,
+            driver=driver, runners=CheckRunners({"fake": FailingOnceThenPassing(fail_first=None)}),
+        )
+
+    try:
+        driver = JunctionDriver(
+            scoped_repo, first_plan={"src/parser.py": FIXED_SOURCE}, repair_plan={}
+        )
+        outcome = controller_for(spec, "AUTH-junction-1", driver).run_task(
+            _request(project=project, spec=spec, project_root=scoped_repo)
+        )
+        assert outcome.task_state is TaskState.BLOCKED
+        assert outcome.block_code is RefusalCode.SCOPE_VIOLATION, outcome.block_reason
+        assert store.get_run(outcome.run_id)["task_state"] == TaskState.BLOCKED.value
+        assert driver.labels == ["implementer"], "nothing is frozen, checked or reviewed"
+        assert not _git(scoped_repo, "for-each-ref", "refs/hflow").strip(), "no candidate ref"
+
+        second = _spec(policy=None, base_commit=base, revision=2).model_copy(
+            update={"scope": spec.scope}
+        )
+        second_driver = RepairingDriver(
+            scoped_repo, first_plan={"src/parser.py": FIXED_SOURCE}, repair_plan={}
+        )
+        later = controller_for(second, "AUTH-junction-2", second_driver).run_task(
+            _request(project=project, spec=second, project_root=scoped_repo)
+        )
+        assert "owned by run" not in (later.block_reason or ""), later.block_reason
+        assert second_driver.labels, "the root is released for a later revision"
     finally:
         store.close()
 
@@ -1258,6 +2291,488 @@ def test_a_root_that_can_cover_the_worst_case_still_only_spends_two_on_success(
     finally:
         store.close()
 
+
+# --------------------------------------------------------------------------
+# the root's repair counter is a pre-I1 fact, and a real transport's repair needs a root
+# --------------------------------------------------------------------------
+
+
+def _root_binding_with(store: Store, *, spec: TaskSpec, project_root: Path, limits):
+    """Register this task's root with explicit ceilings; ``_root_setup`` fixes max_repairs=1."""
+    from hflow.contracts import RootBudgetBinding
+
+    binding = RootBudgetBinding.derive(
+        project_id="repair-project",
+        repo_path=str(project_root),
+        task_id=spec.task_id,
+        ledger_path=store.path,
+    )
+    store.register_root_budget(binding, limits)
+    return binding
+
+
+def _artifact_for(
+    store: Store, *, spec: TaskSpec, project_root: Path, binding, limits, authorization_id: str
+):
+    """One registered artifact for this exact revision and root: each revision needs its own."""
+    from hflow.authorization import AuthorizationBinding, AuthorizationRecord
+
+    record = AuthorizationRecord(
+        authorization_id=authorization_id,
+        user_text="I approve one bounded run of this exact task against this root.",
+        authorized_at="2026-09-26T00:00:00Z",
+        max_top_level_submissions=4,
+        binding=AuthorizationBinding(
+            mode="m2-live-change",
+            driver="fake",
+            project_id="repair-project",
+            repo_path=str(project_root),
+            base_commit=spec.workspace.base_commit,
+            spec_digest=spec.spec_digest(),
+            spec_path=str(project_root / "task.json"),
+            root_budget=binding,
+        ),
+        root_limits=limits,
+    )
+    store.register_authorization(record.as_store_record())
+    return record
+
+
+def _controller_on_root(
+    store: Store,
+    *,
+    project_root: Path,
+    binding,
+    limits,
+    record,
+    driver: FakeDriver,
+    runners: CheckRunners,
+    reviewer: FakeDriver | None = None,
+) -> Controller:
+    return Controller(
+        store,
+        driver,
+        reviewer_driver=reviewer,
+        controller_build="repair-test",
+        runners=runners,
+        data_dir=project_root.parent / "data",
+        authorization=record,
+        root_binding=binding,
+        root_limits=limits,
+        preflight=lambda: (True, "repair test: no launch binding to probe"),
+    )
+
+
+@pytest.mark.parametrize("trigger", ["business_check", "reviewer"])
+def test_a_root_with_no_repair_left_refuses_an_armed_policy_before_the_first_dispatch(
+    tmp_path: Path, sample_repo: Path, trigger: str
+) -> None:
+    """``max_repairs`` defaults to 0: an armed policy on such a root must not buy I1 (or R1).
+
+    Before, the run paid for I1 (and R1 on the reviewer path), recorded the repair as allowed and
+    then died as an internal error when the repair's reservation hit the ceiling.
+    """
+    from hflow.contracts import RootBudgetLimits
+
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    spec = _spec(policy=_policy(), base_commit=base)
+    limits = RootBudgetLimits(max_top_level_submissions=4)
+    assert limits.max_repairs == 0
+    binding = _root_binding_with(store, spec=spec, project_root=sample_repo, limits=limits)
+    record = _artifact_for(
+        store, spec=spec, project_root=sample_repo, binding=binding, limits=limits,
+        authorization_id="AUTH-no-repair-left",
+    )
+    driver = RepairingDriver(
+        sample_repo, first_plan={}, repair_plan={"src/parser.py": FIXED_SOURCE}
+    )
+    reviewer = None
+    runner = FailingOnceThenPassing()
+    if trigger == "reviewer":
+        runner = FailingOnceThenPassing(fail_first=None)
+        reviewer = RepairingDriver(
+            sample_repo,
+            first_plan={},
+            repair_plan={},
+            review=ReviewOutput(
+                verdict="changes_requested",
+                findings=[{"severity": "major", "statement": "parse(None) still returns None"}],
+            ),
+        )
+    controller = _controller_on_root(
+        store, project_root=sample_repo, binding=binding, limits=limits, record=record,
+        driver=driver, runners=CheckRunners({"fake": runner}), reviewer=reviewer,
+    )
+    try:
+        with pytest.raises(RefusedError) as excinfo:
+            controller.run_task(_request(project=project, spec=spec, project_root=sample_repo))
+        assert excinfo.value.code is RefusalCode.BUDGET_EXHAUSTED, excinfo.value
+        assert "0 repair" in excinfo.value.message, excinfo.value.message
+        assert driver.labels == [] and (reviewer is None or reviewer.labels == []), (
+            "nothing may be dispatched for a repair the root cannot pay for"
+        )
+        assert store.find_run_by_spec_digest(project.project_id, spec.spec_digest()) is None
+        view = store.root_budget_view(binding.root_id)
+        assert view is not None
+        assert (view.used_top_level_submissions, view.used_repairs) == (0, 0)
+        assert store.invocations_for_root(binding.root_id) == []
+    finally:
+        store.close()
+
+
+def test_a_root_refused_for_its_repair_counter_records_nothing_and_a_corrected_root_runs(
+    tmp_path: Path, sample_repo: Path
+) -> None:
+    """The refusal's own advice works: the refused run never registered the root.
+
+    Before, the root row was written with ``max_repairs=0`` before the repair gate refused, so
+    the corrected root file (``max_repairs=1``) was then refused as a limits mismatch forever -
+    there is no top-up path. Every refusal decidable before a write now runs first.
+    """
+    from hflow.authorization import AuthorizationBinding, AuthorizationRecord
+    from hflow.contracts import RootBudgetBinding, RootBudgetLimits
+
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    spec = _spec(policy=_policy(), base_commit=base)
+    binding = RootBudgetBinding.derive(
+        project_id="repair-project",
+        repo_path=str(sample_repo),
+        task_id=spec.task_id,
+        ledger_path=store.path,
+    )
+
+    def artifact(limits: RootBudgetLimits, authorization_id: str) -> AuthorizationRecord:
+        # Not registered by the test: whether the refused run registers it is what is measured.
+        return AuthorizationRecord(
+            authorization_id=authorization_id,
+            user_text="I approve one bounded run of this exact task against this root.",
+            authorized_at="2026-09-26T00:00:00Z",
+            max_top_level_submissions=4,
+            binding=AuthorizationBinding(
+                mode="m2-live-change",
+                driver="fake",
+                project_id="repair-project",
+                repo_path=str(sample_repo),
+                base_commit=spec.workspace.base_commit,
+                spec_digest=spec.spec_digest(),
+                spec_path=str(sample_repo / "task.json"),
+                root_budget=binding,
+            ),
+            root_limits=limits,
+        )
+
+    def controller(limits: RootBudgetLimits, authorization_id: str, driver) -> Controller:
+        return _controller_on_root(
+            store, project_root=sample_repo, binding=binding, limits=limits,
+            record=artifact(limits, authorization_id), driver=driver,
+            runners=CheckRunners({"fake": FailingOnceThenPassing()}),
+        )
+
+    try:
+        zero = RootBudgetLimits(max_top_level_submissions=4)
+        refused_driver = RepairingDriver(
+            sample_repo, first_plan={}, repair_plan={"src/parser.py": FIXED_SOURCE}
+        )
+        with pytest.raises(RefusedError) as excinfo:
+            controller(zero, "AUTH-zero-repairs", refused_driver).run_task(
+                _request(project=project, spec=spec, project_root=sample_repo)
+            )
+        assert excinfo.value.code is RefusalCode.BUDGET_EXHAUSTED, excinfo.value
+        assert "0 repair" in excinfo.value.message, excinfo.value.message
+        assert refused_driver.labels == []
+        assert store.root_budget_view(binding.root_id) is None, (
+            "a refused run must not lock the root at the ceilings it was refused for"
+        )
+        assert store.find_run_by_spec_digest(project.project_id, spec.spec_digest()) is None
+        assert store.authorization_state("AUTH-zero-repairs") is None
+
+        one = RootBudgetLimits(max_top_level_submissions=4, max_repairs=1)
+        driver = RepairingDriver(
+            sample_repo, first_plan={}, repair_plan={"src/parser.py": FIXED_SOURCE}
+        )
+        outcome = controller(one, "AUTH-one-repair", driver).run_task(
+            _request(project=project, spec=spec, project_root=sample_repo)
+        )
+        assert outcome.task_state is TaskState.ACCEPTED, outcome.block_reason
+        view = store.root_budget_view(binding.root_id)
+        assert view is not None
+        assert view.limits.max_repairs == 1 and view.used_repairs == 1
+    finally:
+        store.close()
+
+
+def test_a_later_revision_after_the_root_spent_its_repair_is_a_budget_refusal(
+    tmp_path: Path, sample_repo: Path
+) -> None:
+    """A later revision's I1 is the root's repair (E1), so a spent counter refuses it as budget.
+
+    Without a policy the store's own ceiling refuses the reservation, which must read as
+    BUDGET_EXHAUSTED rather than INTERNAL_ERROR. With a policy the run would need two repairs
+    (its I1 and its own repair), so it is refused before a run row exists.
+    """
+    from hflow.contracts import RootBudgetLimits
+
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    limits = RootBudgetLimits(max_top_level_submissions=12, max_repairs=1)
+    first = _spec(policy=_policy(), base_commit=base)
+    binding = _root_binding_with(store, spec=first, project_root=sample_repo, limits=limits)
+
+    def controller_for(spec: TaskSpec, authorization_id: str, driver: FakeDriver) -> Controller:
+        record = _artifact_for(
+            store, spec=spec, project_root=sample_repo, binding=binding, limits=limits,
+            authorization_id=authorization_id,
+        )
+        return _controller_on_root(
+            store, project_root=sample_repo, binding=binding, limits=limits, record=record,
+            driver=driver, runners=CheckRunners({"fake": FailingOnceThenPassing()}),
+        )
+
+    try:
+        first_driver = RepairingDriver(
+            sample_repo, first_plan={}, repair_plan={"src/parser.py": FIXED_SOURCE}
+        )
+        outcome = controller_for(first, "AUTH-rev-1", first_driver).run_task(
+            _request(project=project, spec=first, project_root=sample_repo)
+        )
+        assert outcome.task_state is TaskState.ACCEPTED, outcome.block_reason
+        view = store.root_budget_view(binding.root_id)
+        assert view is not None and view.used_repairs == 1
+
+        second = _spec(policy=None, base_commit=base, revision=2)
+        second_driver = RepairingDriver(sample_repo, first_plan={}, repair_plan={})
+        outcome = controller_for(second, "AUTH-rev-2", second_driver).run_task(
+            _request(project=project, spec=second, project_root=sample_repo)
+        )
+        assert outcome.task_state is TaskState.BLOCKED
+        assert outcome.block_code is RefusalCode.BUDGET_EXHAUSTED, (
+            outcome.block_code,
+            outcome.block_reason,
+        )
+        assert "repair attempt" in (outcome.block_reason or ""), outcome.block_reason
+        assert second_driver.labels == [], "the refused revision must not start a driver"
+
+        third = _spec(policy=_policy(), base_commit=base, revision=3)
+        third_driver = RepairingDriver(sample_repo, first_plan={}, repair_plan={})
+        with pytest.raises(RefusedError) as excinfo:
+            controller_for(third, "AUTH-rev-3", third_driver).run_task(
+                _request(project=project, spec=third, project_root=sample_repo)
+            )
+        assert excinfo.value.code is RefusalCode.BUDGET_EXHAUSTED, excinfo.value
+        assert third_driver.labels == []
+        assert store.find_run_by_spec_digest(project.project_id, third.spec_digest()) is None
+
+        view = store.root_budget_view(binding.root_id)
+        assert view is not None
+        assert (view.used_top_level_submissions, view.used_repairs) == (3, 1), (
+            "neither refused revision may move the root's counters"
+        )
+    finally:
+        store.close()
+
+
+class SpendsTheRootRepairWhileChecking(FailingOnceThenPassing):
+    """Fails ``unit`` once - and while that check runs, the root's last repair is used up.
+
+    Stands in for whatever spent the counter between admission and the repair decision. The
+    decision has to read the root it would charge, not assume admission's answer still holds.
+    """
+
+    def __init__(self, store: Store, root_id: str) -> None:
+        super().__init__()
+        self.store = store
+        self.root_id = root_id
+
+    def run(self, check, cwd, timeout_seconds):  # noqa: ANN001 - Protocol shape
+        if not self.seen:
+            with self.store.transaction() as conn:
+                conn.execute(
+                    "UPDATE root_budgets SET used_repairs = max_repairs WHERE root_id = ?",
+                    (self.root_id,),
+                )
+        return super().run(check, cwd, timeout_seconds)
+
+
+def test_a_repair_decision_with_no_root_repair_left_records_budget_exhausted(
+    tmp_path: Path, sample_repo: Path
+) -> None:
+    """The decision reads the root view: no repair left is BUDGET_EXHAUSTED, never 'allowed'."""
+    from hflow.contracts import RootBudgetLimits
+
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    spec = _spec(policy=_policy(), base_commit=base)
+    limits = RootBudgetLimits(max_top_level_submissions=4, max_repairs=1)
+    binding = _root_binding_with(store, spec=spec, project_root=sample_repo, limits=limits)
+    record = _artifact_for(
+        store, spec=spec, project_root=sample_repo, binding=binding, limits=limits,
+        authorization_id="AUTH-spent-mid-run",
+    )
+    driver = RepairingDriver(
+        sample_repo, first_plan={}, repair_plan={"src/parser.py": FIXED_SOURCE}
+    )
+    controller = _controller_on_root(
+        store, project_root=sample_repo, binding=binding, limits=limits, record=record,
+        driver=driver,
+        runners=CheckRunners({"fake": SpendsTheRootRepairWhileChecking(store, binding.root_id)}),
+    )
+    request = _request(project=project, spec=spec, project_root=sample_repo)
+    try:
+        outcome = controller.run_task(request)
+        assert outcome.task_state is TaskState.BLOCKED
+        assert outcome.block_code is RefusalCode.VERIFICATION_FAILED, outcome.block_reason
+        decisions = store.repair_records_for(outcome.run_id)
+        assert [entry.decision for entry in decisions] == [RepairDecision.BUDGET_EXHAUSTED]
+        assert "1/1" in decisions[0].reason, decisions[0].reason
+        assert driver.labels == ["implementer"], "no repair may be dispatched"
+        assert [entry.role for entry in store.invocations_for(outcome.run_id)] == ["implementer"]
+    finally:
+        store.close()
+
+
+def _packet_deadlines(packet: str) -> tuple[int, int]:
+    """``(runtime deadline, repair section's remaining deadline)`` as rendered in one packet."""
+    import re
+
+    runtime = re.search(r"^- deadline: (\d+) seconds$", packet, re.MULTILINE)
+    remaining = re.search(r"^- remaining deadline: (\d+) seconds$", packet, re.MULTILINE)
+    assert runtime is not None and remaining is not None, packet
+    return int(runtime.group(1)), int(remaining.group(1))
+
+
+@pytest.mark.parametrize("rooted", [False, True])
+def test_the_repair_packet_states_the_deadline_the_repair_actually_has(
+    tmp_path: Path, sample_repo: Path, rooted: bool
+) -> None:
+    """Never ``0`` for a clock that never started, never more than the attempt is given.
+
+    Offline and rootless (the fake driver may still repair without a root) the repair has its
+    configured deadline; on a root it has that, capped by what the root's clock has left. Either
+    way the repair section and the packet's own runtime line state one number.
+    """
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    spec = _spec(policy=_policy(), base_commit=base)
+    driver = RepairingDriver(
+        sample_repo, first_plan={}, repair_plan={"src/parser.py": FIXED_SOURCE}
+    )
+    runners = CheckRunners({"fake": FailingOnceThenPassing()})
+    if rooted:
+        controller = _controller(
+            store, project_root=sample_repo, spec=spec, driver=driver, runners=runners
+        )
+    else:
+        controller = Controller(
+            store,
+            driver,
+            controller_build="repair-test",
+            runners=runners,
+            data_dir=sample_repo.parent / "data",
+        )
+    request = _request(project=project, spec=spec, project_root=sample_repo)
+    try:
+        outcome = controller.run_task(request)
+        assert outcome.task_state is TaskState.ACCEPTED, outcome.block_reason
+        assert driver.labels == ["implementer", "implementer-repair", "reviewer"]
+        runtime, remaining = _packet_deadlines(driver.packets[1])
+        assert remaining > 0, "a repair is never told it has no time left by a fallback"
+        assert remaining == runtime <= request.deadline_seconds
+    finally:
+        store.close()
+
+
+class DeadlineRecorder(RepairingDriver):
+    """Keeps the deadline each invocation was actually given, next to the packet it was sent."""
+
+    def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+        super().__init__(*args, **kwargs)
+        self.deadlines: list[int] = []
+
+    def start(self, request):  # noqa: ANN001 - Protocol shape
+        self.deadlines.append(int(request.deadline_seconds))
+        return super().start(request)
+
+
+def test_the_first_packet_states_the_deadline_the_first_invocation_is_given(
+    tmp_path: Path, sample_repo: Path
+) -> None:
+    """A root whose deadline is shorter than the request's: the packet and the invocation agree.
+
+    The first packet used to be rendered with the configured 900 seconds while the invocation was
+    given the root-capped value, so the worker was told it had more time than was enforced.
+    """
+    from hflow.contracts import RootBudgetLimits
+
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    spec = _spec(policy=None, base_commit=base)
+    limits = RootBudgetLimits(max_top_level_submissions=4, max_repairs=1, deadline_seconds=600)
+    binding = _root_binding_with(store, spec=spec, project_root=sample_repo, limits=limits)
+    record = _artifact_for(
+        store, spec=spec, project_root=sample_repo, binding=binding, limits=limits,
+        authorization_id="AUTH-deadline",
+    )
+    driver = DeadlineRecorder(sample_repo, first_plan={"src/parser.py": FIXED_SOURCE}, repair_plan={})
+    controller = _controller_on_root(
+        store, project_root=sample_repo, binding=binding, limits=limits, record=record,
+        driver=driver, runners=CheckRunners({"fake": FailingOnceThenPassing(fail_first=None)}),
+    )
+    request = _request(project=project, spec=spec, project_root=sample_repo)
+    assert request.deadline_seconds > limits.deadline_seconds, "the case needs a capped deadline"
+    try:
+        outcome = controller.run_task(request)
+        assert outcome.task_state is TaskState.ACCEPTED, outcome.block_reason
+        import re
+
+        stated = re.search(r"^- deadline: (\d+) seconds$", driver.packets[0], re.MULTILINE)
+        assert stated is not None
+        assert int(stated.group(1)) == driver.deadlines[0] <= limits.deadline_seconds
+    finally:
+        store.close()
+
+
+class RealTransportStandIn(RepairingDriver):
+    """Identifies as the production transport; still reaches no model (it is the fake inside)."""
+
+    driver_id = AcpxDshDriver.driver_id
+
+
+def test_a_real_transport_repair_without_a_root_is_refused_before_a_run_exists(
+    tmp_path: Path, sample_repo: Path
+) -> None:
+    """Plan 5.1: the run's own gate refuses what ``prepare`` reports, before anything is created."""
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    spec = _spec(policy=_policy(), base_commit=base)
+    driver = RealTransportStandIn(
+        sample_repo, first_plan={}, repair_plan={"src/parser.py": FIXED_SOURCE}
+    )
+    controller = Controller(
+        store,
+        driver,
+        controller_build="repair-test",
+        runners=CheckRunners({"fake": FailingOnceThenPassing()}),
+        data_dir=sample_repo.parent / "data",
+    )
+    try:
+        with pytest.raises(RefusedError) as excinfo:
+            controller.run_task(_request(project=project, spec=spec, project_root=sample_repo))
+        assert excinfo.value.code is RefusalCode.BUDGET_EXCEEDED, excinfo.value
+        assert "--root-budget-file" in excinfo.value.message, excinfo.value.message
+        assert driver.labels == []
+        assert store.find_run_by_spec_digest(project.project_id, spec.spec_digest()) is None
+    finally:
+        store.close()
+
 # --------------------------------------------------------------------------
 # E2 review round: the three counterexamples, now formal regression
 # --------------------------------------------------------------------------
@@ -1314,6 +2829,158 @@ def test_the_delivery_base_and_paths_cover_both_rounds(tmp_path: Path, sample_re
         store.close()
 
 
+# --------------------------------------------------------------------------
+# one resolved base: a ref names a commit once, and the reviewer sees the whole change
+# --------------------------------------------------------------------------
+
+
+def _reviewer_packets(driver: RepairingDriver) -> list[str]:
+    """The packets this driver was handed as the reviewer, in order."""
+    return [packet for label, packet in zip(driver.labels, driver.packets) if label == "reviewer"]
+
+
+class BranchMovingDriver(RepairingDriver):
+    """Commits an unrelated file to the user's ``main`` while the first implementer works.
+
+    This is the user carrying on in their own checkout during a run, which worktree isolation
+    exists to allow. The commit is the test's (the user's), never the run's.
+    """
+
+    def __init__(self, project_root: Path, **kwargs: object) -> None:
+        super().__init__(project_root, **kwargs)  # type: ignore[arg-type]
+        self.user_repo = project_root
+        self.moved_to = ""
+
+    def start(self, request):  # noqa: ANN001 - Protocol shape
+        if request.role == "implementer" and not self.moved_to:
+            (self.user_repo / "user_notes.txt").write_text("the user's own work\n", encoding="utf-8")
+            _git(self.user_repo, "add", "user_notes.txt")
+            _git(self.user_repo, "commit", "-q", "-m", "user work while the run is going")
+            self.moved_to = _git(self.user_repo, "rev-parse", "HEAD").strip()
+        return super().start(request)
+
+
+def test_a_head_base_is_resolved_to_the_commit_the_run_started_from(
+    tmp_path: Path, sample_repo: Path
+) -> None:
+    """``base_commit='HEAD'`` is a ref, not a base: the receipt names the commit it resolved to.
+
+    Inside the run's worktree HEAD *is* the frozen candidate, so a delivery diff taken against the
+    literal name came out empty, and the receipt named 'HEAD' as the base of a change it then hid.
+    """
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    start = _git(sample_repo, "rev-parse", "HEAD").strip()
+    spec = _spec(policy=None, base_commit="HEAD")
+    driver = RepairingDriver(
+        sample_repo, first_plan={"src/parser.py": FIXED_SOURCE}, repair_plan={}
+    )
+    controller = _controller(
+        store, project_root=sample_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": FakeCheckRunner()}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=sample_repo))
+        assert outcome.task_state is TaskState.ACCEPTED, outcome.block_reason
+        receipt = outcome.receipt
+        assert receipt is not None
+        assert receipt.candidate.base_commit == start, (
+            f"the receipt must name the resolved commit, not the ref: {receipt.candidate.base_commit!r}"
+        )
+        assert receipt.candidate_paths == ["src/parser.py"], receipt.candidate_paths
+        notes = store.notes_for(outcome.run_id)
+        assert any(f"base 'HEAD' -> {start}" in note for note in notes), notes
+        (packet,) = _reviewer_packets(driver)
+        assert f"git diff {start} {receipt.candidate.git_commit}" in packet
+    finally:
+        store.close()
+
+
+def test_a_branch_base_that_moves_mid_run_keeps_the_commit_the_run_started_from(
+    tmp_path: Path, sample_repo: Path
+) -> None:
+    """The user commits to ``main`` while the run works: the delivery is still measured from the start.
+
+    Resolving the name again at acceptance would diff the candidate against the moved tip, and the
+    user's unrelated file would appear in the delivery as if the candidate had removed it.
+    """
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    start = _git(sample_repo, "rev-parse", "main").strip()
+    spec = _spec(policy=None, base_commit="main")
+    driver = BranchMovingDriver(
+        sample_repo, first_plan={"src/parser.py": FIXED_SOURCE}, repair_plan={}
+    )
+    controller = _controller(
+        store, project_root=sample_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": FakeCheckRunner()}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=sample_repo))
+        assert outcome.task_state is TaskState.ACCEPTED, outcome.block_reason
+        assert driver.moved_to and driver.moved_to != start, "the branch really moved mid-run"
+        receipt = outcome.receipt
+        assert receipt is not None
+        assert receipt.candidate.base_commit == start, receipt.candidate.base_commit
+        assert receipt.candidate_paths == ["src/parser.py"], (
+            f"the user's commit is not part of this delivery: {receipt.candidate_paths}"
+        )
+        assert not (Path(receipt.candidate.worktree) / "user_notes.txt").exists()
+        assert any(f"base 'main' -> {start}" in note for note in store.notes_for(outcome.run_id))
+        (packet,) = _reviewer_packets(driver)
+        assert f"git diff {start} {receipt.candidate.git_commit}" in packet
+        assert "user_notes.txt" not in packet
+    finally:
+        store.close()
+
+
+def test_the_repair_rounds_reviewer_sees_the_whole_change_from_the_original_base(
+    tmp_path: Path, scoped_repo: Path
+) -> None:
+    """I1 fails a check, I2 repairs, R2 is the only reviewer: it must be shown round one's change.
+
+    Round one writes ``src/a.py`` and fails ``unit``, so no reviewer is bought for it. Round two
+    writes ``src/parser.py``. The receipt delivers both from the original base, so the one reviewer
+    that votes on that delivery is told the original base, both paths and the cumulative diff -
+    and, separately and labelled, the patch this round added on top of round one's candidate.
+    """
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(scoped_repo, "rev-parse", "HEAD").strip()
+    spec = _scoped_spec(base, allow=["src/parser.py", "src/a.py"], policy=_policy())
+    driver = RepairingDriver(
+        scoped_repo,
+        first_plan={"src/a.py": "LEGACY = False\n"},
+        repair_plan={"src/parser.py": FIXED_SOURCE},
+    )
+    controller = _controller(
+        store, project_root=scoped_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": FailingOnceThenPassing()}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=scoped_repo))
+        assert outcome.task_state is TaskState.ACCEPTED, outcome.block_reason
+        assert driver.labels == ["implementer", "implementer-repair", "reviewer"], driver.labels
+        receipt = outcome.receipt
+        assert receipt is not None
+        final = receipt.candidate.git_commit
+        first_round = _git(scoped_repo, "rev-parse", f"{final}^").strip()
+        assert first_round != base, "round one really committed a change"
+        assert receipt.candidate_paths == ["src/a.py", "src/parser.py"]
+
+        (packet,) = _reviewer_packets(driver)
+        assert f"- base commit the candidate was produced from: {base}" in packet
+        assert f"git diff {base} {final}" in packet, "the diff to read is the whole delivery"
+        assert "- paths changed from the base commit: src/a.py, src/parser.py" in packet
+        assert f"produced from: {first_round}" not in packet
+        # This round's own patch is offered too, labelled, never in place of the cumulative one.
+        assert "this round's change (repair round 2" in packet
+        assert f"git diff {first_round} {final}" in packet
+        assert "- paths this round changed: src/parser.py" in packet
+    finally:
+        store.close()
+
+
 def test_an_oversize_repair_packet_is_refused_before_any_reservation(
     tmp_path: Path, sample_repo: Path
 ) -> None:
@@ -1359,6 +3026,103 @@ def test_an_oversize_repair_packet_is_refused_before_any_reservation(
         assert outcome is not None and outcome.task_state is TaskState.BLOCKED, (
             "the run must block with a recorded reason rather than raise"
         )
+    finally:
+        store.close()
+
+
+def test_findings_that_overflow_the_repair_packet_are_refused_before_the_repair_is_bought(
+    tmp_path: Path, sample_repo: Path
+) -> None:
+    """Every finding is rendered whole (within its per-value cap), so many of them can overflow.
+
+    The bound is not met by dropping findings: the repair packet is rendered before the
+    reservation, its size is refused, and neither the second implementer nor the root pays.
+    """
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    spec = _spec(policy=_policy(), base_commit=base)
+    findings = [
+        {"severity": "major", "required_fix": f"fix {index}: " + "y" * 1500}
+        for index in range(30)
+    ]
+
+    class FloodRejection(FakeDriver):
+        def start(self, request):  # noqa: ANN001 - Protocol shape
+            result = super().start(request)
+            if request.role != "reviewer":
+                return result
+            return result.model_copy(
+                update={"review": ReviewOutput(verdict="changes_requested", findings=findings)}
+            )
+
+    driver = RepairingDriver(
+        sample_repo, first_plan={}, repair_plan={"src/parser.py": FIXED_SOURCE}
+    )
+    controller = _controller(
+        store,
+        project_root=sample_repo,
+        spec=spec,
+        driver=driver,
+        reviewer=FloodRejection(
+            sample_repo,
+            FakeScript(
+                outcome=InvocationOutcome.COMPLETED,
+                agent_turns=1,
+                review=ReviewOutput(verdict="accepted", findings=[]),
+            ),
+        ),
+        runners=CheckRunners({"fake": FailingOnceThenPassing(fail_first=None)}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=sample_repo))
+        assert outcome.task_state is TaskState.BLOCKED, outcome
+        assert "repair implementer input packet" in (outcome.block_reason or ""), outcome
+        assert [entry.role for entry in store.invocations_for(outcome.run_id)] == [
+            "implementer",
+            "reviewer",
+        ], "an oversize repair packet must not reach the driver"
+        assert len(driver.labels) == 1
+        root = store.root_budget_view(controller.root_binding.root_id)
+        assert root is not None and root.used_top_level_submissions == 2
+    finally:
+        store.close()
+
+
+def test_a_wide_first_round_does_not_push_the_repair_packet_over_its_bound(
+    tmp_path: Path, sample_repo: Path
+) -> None:
+    """The previous round's paths are listed with a cap and a reference, not in full.
+
+    One directory entry in write_allow admits any number of changed files, so a rename sweep in
+    round one used to make every repair packet exceed 32 KiB after ``allowed`` was recorded.
+    """
+    count = 1100
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    spec = _spec(policy=_policy(), base_commit=base).model_copy(
+        update={"scope": Scope(write_allow=["src"], write_deny=[".hflow/**"])}
+    )
+    first_plan = {f"src/generated/module_{index:04d}.py": f"X = {index}\n" for index in range(count)}
+    driver = RepairingDriver(
+        sample_repo, first_plan=first_plan, repair_plan={"src/parser.py": FIXED_SOURCE}
+    )
+    store = Store(tmp_path / "hflow.sqlite")
+    controller = _controller(
+        store, project_root=sample_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": FailingOnceThenPassing()}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=_project(), spec=spec, project_root=sample_repo))
+        assert outcome.task_state is TaskState.ACCEPTED, (outcome.block_code, outcome.block_reason)
+        assert driver.labels == ["implementer", "implementer-repair", "reviewer"]
+        repair_packet = driver.packets[1]
+        assert len(repair_packet.encode("utf-8")) <= 32 * 1024
+        assert f"(+{count - 20} more)" in repair_packet
+        # ``--no-renames``, like every path list HFlow records: with rename detection the command
+        # would print only a moved file's new name, not the path set HFlow scope-checked.
+        assert (
+            f"- full path list: git diff --no-renames --name-only {base} " in repair_packet
+        ), "the full list travels by reference"
     finally:
         store.close()
 
@@ -1582,7 +3346,8 @@ def test_an_expired_deadline_stops_the_whole_process_tree_not_just_the_client(
     Both halves are asserted, and they are different facts:
 
     * the boundary is empty - the managed job holds nothing, which is what "the tree is stopped"
-      means and what the plan's process-boundary rule rests on;
+      means and what the plan's process-boundary rule rests on. ``collect`` closes the job once
+      the teardown is done, so this is read from what the driver recorded when it closed it;
     * the child has terminated - checked by its exit code, then confirmed gone within a bounded
       settle. An un-timed "not gone" is not evidence of a live process: ``process_gone`` asks
       whether the process object is signalled, and Windows keeps that object alive while any handle
@@ -1663,16 +3428,20 @@ def test_an_expired_deadline_stops_the_whole_process_tree_not_just_the_client(
         assert result.outcome is InvocationOutcome.OUTCOME_UNKNOWN, (
             "an unobserved client is unknown, not failed: " + repr(result.outcome)
         )
-        # Half one: nothing is left in the managed boundary.
-        assert boundary.active_processes() == 0, (
-            f"the boundary still holds processes after teardown: {boundary.active_processes()}; "
+        # Half one: nothing was left in the managed boundary when the driver closed it.
+        recorded = driver._exit_boundaries.get(handle.invocation_id)
+        assert recorded is not None and recorded.emptied is True, (
+            f"the boundary still held processes after teardown: {recorded}; "
             f"waits={waits}, detail={result.error_message}"
         )
+        assert any("boundary_empty=True" in note for note in result.limitations), result.limitations
+        assert boundary.handle is None, "the job is closed once the teardown is recorded"
+        assert process._hflow_stdout.closed is True, "the stdout file handle is closed too"
         # Half two: the child was terminated, confirmed by its exit code within a bounded settle.
         settled = _wait_for_exit(child_pid, timeout_seconds=5.0)
         assert settled, (
             f"the child of the client survived the teardown: pid={child_pid}, "
-            f"active={boundary.active_processes()}, detail={result.error_message}"
+            f"recorded={recorded}, detail={result.error_message}"
         )
     finally:
         boundary.terminate()

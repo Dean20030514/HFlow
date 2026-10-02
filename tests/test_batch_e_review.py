@@ -867,13 +867,16 @@ def test_marking_an_already_unresolved_launch_again_keeps_its_state(
     )
 
     # A row that did record a launch is refused instead: a known launch is not an unknown one.
+    # The late report records the launch without reopening the entry: it becomes ``unknown``
+    # (a launch nobody observed the result of), never the open ``started`` a settlement closes.
     store.record_invocation_spawn(
         SpawnFact(invocation_id="I-twice", created=True, pid=4242, spawn_kind=SpawnKind.PROCESS)
     )
     with pytest.raises(StoreError) as refused:
         store.mark_launch_unresolved("I-twice", "too late")
     assert "recorded a launch" in str(refused.value)
-    assert store.invocation("I-twice").state is InvocationStartState.STARTED
+    recorded = store.invocation("I-twice")
+    assert recorded.state is InvocationStartState.UNKNOWN and recorded.started_at is not None
 
 
 # --------------------------------------------------------------------------

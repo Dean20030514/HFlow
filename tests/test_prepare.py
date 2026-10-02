@@ -9,18 +9,21 @@ the one that executes would be worse than no preview.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from hflow.authorization import (
+    AuthorizationBinding,
     AuthorizationRecord,
     current_binding,
     load_authorization,
     verify_authorization,
 )
 from hflow.cli import EXIT_OK, EXIT_REFUSED, main
-from hflow.contracts import RefusedError
+from hflow.contracts import RefusedError, WorkspaceSpec
 from hflow.drivers.fake import FakeDriver, FakeScript
 from hflow.prepare import build_prepare_report, resolve_run, role_drivers
 
@@ -276,6 +279,40 @@ def test_prepare_exits_nonzero_when_admission_would_refuse(
     assert "dependencies" in json.dumps(payload["admission"]["issues"])
 
 
+def test_prepare_refuses_a_glob_write_allow_entry(
+    tmp_path: Path, live_project, worktree_task, project_root: Path, live_profile, acpx_client,
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A glob in ``write_allow`` previews as refused, the way the run would refuse it."""
+    monkeypatch.setenv("HFLOW_ALLOW_WRITES", "true")
+    task = worktree_task.model_copy(
+        update={"scope": worktree_task.scope.model_copy(update={"write_allow": ["src/**"]})}
+    )
+    data_dir = tmp_path / "data"
+    write_profile(data_dir, live_profile)
+    task_file = write_task(tmp_path / "task.json", task)
+    project_file = write_project(tmp_path / "hflow" / "project.json", live_project)
+
+    code = main(
+        [
+            "prepare",
+            "--task", str(task_file),
+            "--project", str(project_file),
+            "--project-root", str(project_root),
+            "--profile", "dsh-local",
+            "--json",
+            "--data-dir", str(data_dir),
+        ]
+    )
+    assert code == EXIT_REFUSED
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["admission"]["ok"] is False
+    assert any(
+        issue["code"] == "scope_violation" and "glob" in issue["detail"]
+        for issue in payload["admission"]["issues"]
+    ), payload["admission"]["issues"]
+
+
 def test_prepare_refuses_an_unknown_profile(
     tmp_path: Path, live_project, task_spec, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -340,6 +377,95 @@ def test_prepare_and_run_resolve_one_configuration(
     assert through_override.execution_root_is_final is True
     assert through_override.spec_digest != shown.spec_digest
     assert through_override.effective_config.implementer_writes is False
+
+
+def _git(cwd: Path, *args: str) -> str:
+    completed = subprocess.run(  # noqa: S603,S607 - fixed, test-local git commands
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Prepare Test",
+            "GIT_AUTHOR_EMAIL": "prepare@example.invalid",
+            "GIT_COMMITTER_NAME": "Prepare Test",
+            "GIT_COMMITTER_EMAIL": "prepare@example.invalid",
+        },
+    )
+    if completed.returncode != 0:
+        raise AssertionError(f"git {' '.join(args)} failed: {completed.stderr}")
+    return completed.stdout
+
+
+def test_the_binding_names_the_commit_a_branch_base_resolves_to(
+    tmp_path: Path, live_project, worktree_task, project_root: Path, live_profile, acpx_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``base_commit='main'`` is resolved once, and the approval names the commit, not the name.
+
+    The task text keeps saying 'main' - its digest is the task's own - but the binding carries the
+    SHA 'main' pointed at when it was resolved. A branch that moves between ``prepare`` and ``run``
+    is a different base, so the approval written for the old one stops applying.
+    """
+    monkeypatch.setenv("HFLOW_ALLOW_WRITES", "true")
+    _git(project_root, "init", "-q", "-b", "main")
+    _git(project_root, "add", ".")
+    _git(project_root, "commit", "-q", "-m", "base")
+    first = _git(project_root, "rev-parse", "main").strip()
+    task = worktree_task.model_copy(
+        update={"workspace": WorkspaceSpec(mode="worktree", base_commit="main", keep=True)}
+    )
+    data_dir = tmp_path / "data"
+    write_profile(data_dir, live_profile)
+    task_file = write_task(tmp_path / "task.json", task)
+    project_file = write_project(tmp_path / "hflow" / "project.json", live_project)
+
+    def resolve():
+        return resolve_run(
+            task_path=task_file,
+            project_root=project_root,
+            data_dir=data_dir,
+            project_path=project_file,
+            profile_id="dsh-local",
+        )
+
+    def expected_for(resolved):
+        return current_binding(
+            mode="m2-live-change",
+            driver=resolved.effective.role("implementer").driver,
+            project=resolved.project,
+            request=resolved.request(),
+            spec_path=task_file,
+            effective=resolved.effective,
+        )
+
+    resolved = resolve()
+    assert resolved.spec.workspace.base_commit == "main", "the task text is not rewritten"
+    report = build_prepare_report(resolved)
+    assert report.authorization.binding["base_commit"] == first
+
+    approval = AuthorizationRecord(
+        authorization_id="AUTH-base-1",
+        user_text="I approve one run of this task from the commit main points at now.",
+        authorized_at="2026-10-01T00:00:00Z",
+        max_top_level_submissions=2,
+        binding=AuthorizationBinding.model_validate(report.authorization.binding),
+    )
+    verify_authorization(approval, expected=expected_for(resolve()))
+
+    (project_root / "notes.txt").write_text("the user keeps working\n", encoding="utf-8")
+    _git(project_root, "add", "notes.txt")
+    _git(project_root, "commit", "-q", "-m", "main moves on")
+    second = _git(project_root, "rev-parse", "main").strip()
+    moved = resolve()
+    assert moved.spec.spec_digest() == resolved.spec.spec_digest(), "same task text, same digest"
+    with pytest.raises(RefusedError) as excinfo:
+        verify_authorization(approval, expected=expected_for(moved))
+    assert "base_commit" in excinfo.value.message
+    assert first in excinfo.value.message and second in excinfo.value.message
 
 
 def test_an_offline_profile_needs_no_authorization_and_resolves_the_fake_driver(
@@ -757,6 +883,116 @@ def test_prepare_refuses_a_reviewed_task_whose_budget_covers_one_turn(
         "budget_exceeded"
     ]
     assert code == EXIT_REFUSED
+
+
+def test_prepare_refuses_a_run_whose_starting_workspace_holds_a_client_config(
+    tmp_path: Path, live_project, worktree_task, task_spec, project_root: Path, live_profile,
+    acpx_client, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """acpx would let ``.acpxrc.json`` replace the agent command, so the driver refuses at spawn.
+
+    Refused there, the dispatch was already reserved and the task cannot simply be submitted
+    again. When the file is already in what the run starts from - the base commit's tree for a
+    worktree run, the project root for an in-place run - the preview and the run gate say so
+    before anything is spent. A file the user has but did not commit is not in the worktree, so
+    it does not refuse a worktree run.
+    """
+    monkeypatch.setenv("HFLOW_ALLOW_WRITES", "true")
+    _git(project_root, "init", "-q", "-b", "main")
+    (project_root / ".acpxrc.json").write_text('{"agents": {}}', encoding="utf-8")
+    _git(project_root, "add", ".")
+    _git(project_root, "commit", "-q", "-m", "base with a client config")
+    task = worktree_task.model_copy(
+        update={"workspace": WorkspaceSpec(mode="worktree", base_commit="main", keep=True)}
+    )
+
+    def codes(resolved) -> list[str]:
+        return [issue.code.value for issue in resolved.dispatch_preconditions]
+
+    committed = _resolve_live(tmp_path, live_project, task, project_root, live_profile)
+    assert "workspace_client_config" in codes(committed), committed.dispatch_preconditions
+    issue = next(
+        issue for issue in committed.dispatch_preconditions
+        if issue.code.value == "workspace_client_config"
+    )
+    assert ".acpxrc.json" in issue.detail and "commit" in issue.detail, issue.detail
+    assert committed.ready_to_dispatch is False
+
+    # Removed and committed: the base no longer has it. The user's untracked copy does not count.
+    _git(project_root, "rm", "-q", "--cached", ".acpxrc.json")
+    _git(project_root, "commit", "-q", "-m", "drop the client config")
+    removed = _resolve_live(tmp_path, live_project, task, project_root, live_profile)
+    assert (project_root / ".acpxrc.json").exists()
+    assert "workspace_client_config" not in codes(removed), removed.dispatch_preconditions
+
+    # In place, the project root is the workspace, so the file there refuses the run.
+    in_place = _resolve_live(tmp_path, live_project, task_spec, project_root, live_profile)
+    assert "workspace_client_config" in codes(in_place), in_place.dispatch_preconditions
+
+
+@pytest.mark.parametrize("committed", [".ACPXRC.JSON", ".AcpxRc.json"])
+def test_prepare_refuses_a_base_commit_with_any_spelling_of_the_client_config(
+    tmp_path: Path, live_project, worktree_task, task_spec, project_root: Path, live_profile,
+    acpx_client, monkeypatch: pytest.MonkeyPatch, committed: str,
+) -> None:
+    """A worktree checks out the committed name; acpx then opens ``<cwd>/.acpxrc.json``.
+
+    On a case-insensitive filesystem that open finds ``.ACPXRC.JSON`` too, and so does the
+    driver's spawn gate - after the dispatch was reserved. So admission matches the base tree's
+    root entries without regard to case and refuses before anything is spent, naming the
+    committed spelling. Only the workspace root counts, as for the exact name.
+    """
+    monkeypatch.setenv("HFLOW_ALLOW_WRITES", "true")
+    _git(project_root, "init", "-q", "-b", "main")
+    (project_root / committed).write_text('{"agents": {}}', encoding="utf-8")
+    nested = project_root / "src" / committed
+    nested.parent.mkdir(parents=True, exist_ok=True)
+    nested.write_text("{}", encoding="utf-8")
+    _git(project_root, "add", ".")
+    _git(project_root, "commit", "-q", "-m", "base with a mixed-case client config")
+    (project_root / committed).unlink()  # only what the base commit holds may decide this
+    task = worktree_task.model_copy(
+        update={"workspace": WorkspaceSpec(mode="worktree", base_commit="main", keep=True)}
+    )
+
+    resolved = _resolve_live(tmp_path, live_project, task, project_root, live_profile)
+
+    issues = [
+        issue for issue in resolved.dispatch_preconditions
+        if issue.code.value == "workspace_client_config"
+    ]
+    assert issues, resolved.dispatch_preconditions
+    assert committed in issues[0].detail and "commit" in issues[0].detail, issues[0].detail
+    assert resolved.ready_to_dispatch is False
+
+    # Only the root entry is acpx's project config: with it removed, the nested one is no issue.
+    _git(project_root, "rm", "-q", "--cached", committed)
+    _git(project_root, "commit", "-q", "-m", "drop the root client config")
+    removed = _resolve_live(tmp_path, live_project, task, project_root, live_profile)
+    assert "workspace_client_config" not in [
+        issue.code.value for issue in removed.dispatch_preconditions
+    ], removed.dispatch_preconditions
+
+
+def test_prepare_refuses_a_launcher_that_lies_inside_the_workspace(
+    tmp_path: Path, live_project, worktree_task, project_root: Path, live_profile,
+    acpx_client, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``dsh`` found on PATH inside the project is a file the agent can write: not resolvable."""
+    monkeypatch.setenv("HFLOW_ALLOW_WRITES", "true")
+    planted = project_root / "node_modules" / ".bin"
+    planted.mkdir(parents=True)
+    (planted / ("dsh.CMD" if os.name == "nt" else "dsh")).write_text("", encoding="utf-8")
+    if os.name != "nt":
+        (planted / "dsh").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{planted}{os.pathsep}{os.environ['PATH']}")
+
+    resolved = _resolve_live(tmp_path, live_project, worktree_task, project_root, live_profile)
+
+    launch = resolved.effective.role("implementer").launch  # type: ignore[union-attr]
+    assert launch is not None and launch.resolvable is False
+    assert "inside the workspace" in launch.detail, launch.detail
+    assert resolved.ready_to_dispatch is False
 
 
 def test_the_dispatch_preconditions_are_the_ones_the_run_gate_raises(

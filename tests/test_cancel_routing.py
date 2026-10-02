@@ -60,6 +60,7 @@ class RaceSeam:
     waits for ``proceed``, then performs the *real* call - so the concurrent cancel happens at a
     chosen point relative to a write that is itself one statement. That is the shape being
     tested: a stop that lands the instant before the conditional write decides who wins.
+    ``when`` limits the seam to the calls it matches; every other call goes straight through.
     """
 
     def __init__(self, store: Store, method: str) -> None:
@@ -69,8 +70,10 @@ class RaceSeam:
         self.entered = threading.Event()
         self.proceed = threading.Event()
 
-    def install(self, monkeypatch) -> RaceSeam:  # noqa: ANN001 - pytest's MonkeyPatch
+    def install(self, monkeypatch, when=None) -> RaceSeam:  # noqa: ANN001 - pytest's MonkeyPatch
         def gated(*args, **kwargs):  # noqa: ANN002, ANN003 - the wrapped method's shape
+            if when is not None and not when(*args, **kwargs):
+                return self.original(*args, **kwargs)
             self.entered.set()
             assert self.proceed.wait(timeout=30), "the race seam was never released"
             return self.original(*args, **kwargs)
@@ -875,7 +878,11 @@ def test_a_stop_racing_the_reviewer_registration_refuses_the_handoff(
     """
     implementer, reviewer = _pair(project_root)
     controller = _controller(store, implementer, reviewer, tmp_path / "data")
-    seam = RaceSeam(store, "register_attempt_invocation_unless_stopped").install(monkeypatch)
+    # The implementer's rootless registration uses the same conditional write; only the
+    # reviewer's is the handoff under test.
+    seam = RaceSeam(store, "register_attempt_invocation_unless_stopped").install(
+        monkeypatch, when=lambda *args, **kwargs: kwargs.get("column") == "review_invocation_id"
+    )
 
     with RunningRun(controller, run_request) as running:
         assert seam.entered.wait(timeout=30), "the reviewer handoff was never reached"
@@ -1140,3 +1147,46 @@ def test_a_stop_inside_the_spawn_gate_waits_for_publication_and_stops_the_child(
         for invocation_id in list(reviewer._handles):
             reviewer.release(invocation_id)
 
+
+
+def test_a_rootless_stop_between_the_reservation_and_the_registration_wins_the_handoff(
+    store: Store, controller: Controller, driver: FakeDriver, project_root: Path,
+    run_request: RunRequest, monkeypatch,
+) -> None:
+    """On the rootless path the attempt is reserved first and its invocation registered after.
+
+    A ``hflow cancel`` landing between the two found no invocation, recorded "cancelled before
+    any invocation was dispatched" and blocked the run without finishing the attempt. The owner
+    then registered the id unconditionally and called the driver, whose gate refused - and the
+    attempt stayed ``ACTIVE`` for good, so ``hflow clean`` refused ``execution_active`` forever.
+    The registration is now conditional on the stop, the stop finishes the live attempt, and its
+    receipt does not claim that nothing was reserved.
+    """
+    observer_driver = FakeDriver(project_root)
+    observer = Controller(
+        store, observer_driver, reviewer_driver=observer_driver,
+        controller_build="observer", controller_id="observer-process",
+    )
+    original_reserve = controller._reserve_dispatch
+    receipts: list[CancellationReceipt] = []
+
+    def reserve_then_stop(**kwargs):  # noqa: ANN003, ANN202 - the controller's own shape
+        reservation = original_reserve(**kwargs)
+        if kwargs.get("role") == "implementer" and not receipts:
+            receipts.append(observer.cancel(kwargs["run_id"]))
+        return reservation
+
+    monkeypatch.setattr(controller, "_reserve_dispatch", reserve_then_stop)
+    outcome = controller.run_task(run_request)
+
+    (receipt,) = receipts
+    assert driver.started == [], "no driver may be asked to start after the stop"
+    assert outcome.task_state is TaskState.BLOCKED
+    assert outcome.block_code is RefusalCode.CANCELLED_BY_OPERATOR, outcome.block_reason
+    attempt = store.open_attempt(outcome.run_id)
+    assert attempt["state"] == AttemptState.CANCELLED.value, "the reserved attempt must be finished"
+    assert not attempt["invocation_id"], "the registration must have lost to the stop"
+    assert receipt.status == "confirmed_stopped" and receipt.mechanism == "none"
+    assert "before any invocation was dispatched" not in receipt.detail, receipt.detail
+    assert "reserved" in receipt.detail, receipt.detail
+    assert store.get_run(outcome.run_id)["turns_reserved"] == 1, "the reservation stays consumed"

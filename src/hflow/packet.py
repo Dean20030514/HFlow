@@ -24,7 +24,7 @@ import json
 from dataclasses import dataclass
 from typing import Literal
 
-from .contracts import AcceptanceCriterion, RepairContext, ReviewOutput, Scope, digest_of
+from .contracts import AcceptanceCriterion, RepairContext, ReviewOutput, Scope, canonical_json, digest_of
 
 PacketRole = Literal["implementer", "reviewer"]
 
@@ -87,7 +87,9 @@ def packet_digest(text: str) -> str:
 
 
 def _finish(role: PacketRole, text: str) -> RenderedPacket:
-    payload = text if text.endswith("\n") else text + "\n"
+    # No surrounding whitespace: acpx trims the prompt it reads from stdin, so a trailing newline
+    # here would make the digest cover bytes the agent never receives.
+    payload = text.strip()
     encoded = payload.encode("utf-8")
     if len(encoded) > MAX_PACKET_BYTES:
         raise PacketTooLargeError(
@@ -228,10 +230,15 @@ def _candidate_lines(candidate: dict[str, object] | None) -> str:
     if candidate.get("paths"):
         paths = candidate["paths"]
         assert isinstance(paths, list)
-        shown = ", ".join(str(path) for path in paths[:20])
-        more = f" (+{len(paths) - 20} more)" if len(paths) > 20 else ""
-        lines.append(f"- paths in the frozen candidate: {shown}{more}")
+        lines.append(f"- paths changed from the base commit: {_path_list(paths)}")
     return "\n".join(lines)
+
+
+def _path_list(paths: list[object]) -> str:
+    """At most twenty paths and a count of the rest, so a wide change cannot grow the packet."""
+    shown = ", ".join(str(path) for path in paths[:20])
+    more = f" (+{len(paths) - 20} more)" if len(paths) > 20 else ""
+    return f"{shown}{more}"
 
 
 def _diff_reference(candidate: dict[str, object] | None) -> str:
@@ -250,9 +257,55 @@ def _diff_reference(candidate: dict[str, object] | None) -> str:
     )
 
 
+def _round_change_lines(candidate: dict[str, object] | None) -> str:
+    """A repair round's own patch, labelled, in addition to the cumulative diff - never instead.
+
+    The candidate a repair round produced is the whole change from the task's base: that is what
+    is delivered, and it is what the base, the paths and the diff above describe. What this round
+    added on top of the previous round's candidate is shown here, separately, so a reviewer can
+    see where the repair started without mistaking the repair patch for the delivery. Empty for
+    a first round.
+    """
+    candidate = candidate or {}
+    parent = str(candidate.get("round_parent_commit", "") or "")
+    commit = str(candidate.get("git_commit", "") or "")
+    if not parent or not commit:
+        return ""
+    round_paths = candidate.get("round_paths") or []
+    assert isinstance(round_paths, list)
+    return (
+        f"\n- this round's change (repair round {candidate.get('round', '?')}, on top of the "
+        "previous round's candidate; part of the diff above, not a replacement for it): "
+        f"git diff {parent} {commit}"
+        f"\n- paths this round changed: {_path_list(round_paths) or 'none'}"
+    )
+
+
 # --------------------------------------------------------------------------
 # the two packets
 # --------------------------------------------------------------------------
+
+
+#: Longest single value of a reviewer finding copied into a repair packet, in UTF-8 bytes. Every
+#: key is rendered; a value above this is cut with an explicit ``…[truncated N bytes]`` marker,
+#: and the packet bound still refuses a section that does not fit as a whole.
+MAX_FINDING_VALUE_BYTES = 2048
+
+
+def _capped_finding_value(value: object) -> object:
+    """One finding value, unchanged if it fits :data:`MAX_FINDING_VALUE_BYTES`, else cut and marked.
+
+    A string is cut on a character boundary. Any other value is measured as its canonical JSON
+    text, and only an oversize one is replaced by that text cut and marked, so the cap bounds a
+    long list or object as well as a long string.
+    """
+    text = value if isinstance(value, str) else canonical_json(value)
+    encoded = text.encode("utf-8")
+    if len(encoded) <= MAX_FINDING_VALUE_BYTES:
+        return value
+    kept = encoded[:MAX_FINDING_VALUE_BYTES].decode("utf-8", errors="ignore")
+    dropped = len(encoded) - len(kept.encode("utf-8"))
+    return f"{kept}…[truncated {dropped} bytes]"
 
 
 def _repair_section(context: RepairContext) -> str:
@@ -261,6 +314,13 @@ def _repair_section(context: RepairContext) -> str:
     Everything here is a recorded fact, and the section says what it is *not*: a permission
     grant, a research brief or an instruction. The write scope, the checks and the configuration
     are unchanged, so the section cannot be read as widening what this attempt may do.
+
+    The previous candidate's paths are capped like the reviewer's lists (twenty plus a count)
+    and the full list is given as a ``git diff --no-renames --name-only`` reference (without
+    ``--no-renames`` a moved file's deleted source would drop out, and the command would not
+    reproduce the recorded paths): one directory entry in
+    ``write_allow`` admits any number of changed files, and a wide first round must not make
+    every repair packet exceed :data:`MAX_PACKET_BYTES`.
     """
     previous = context.previous
     candidate_lines = ["- no previous candidate is recorded (this looks like a first attempt)"]
@@ -270,9 +330,16 @@ def _repair_section(context: RepairContext) -> str:
             f"- candidate commit: {previous.git_commit or '(none frozen)'}",
             f"- candidate tree: {previous.git_tree or '(none)'}",
             f"- candidate fingerprint: {previous.fingerprint or '(none)'}",
-            f"- candidate paths: {', '.join(previous.paths) or '(none recorded)'}",
+            f"- candidate paths: {_path_list(list(previous.paths)) or '(none recorded)'}",
             f"- original task base: {context.original_base_commit or '(not recorded)'}",
         ]
+        if context.original_base_commit and previous.git_commit:
+            # The list above is capped like the reviewer's; the complete one travels by reference,
+            # as the same ``--no-renames`` list HFlow recorded and scope-checked.
+            candidate_lines.append(
+                "- full path list: git diff --no-renames --name-only "
+                f"{context.original_base_commit} {previous.git_commit}"
+            )
 
     failure_lines: list[str] = []
     for fact in context.failed_checks:
@@ -286,14 +353,12 @@ def _repair_section(context: RepairContext) -> str:
         artifact = str(fact.get("artifact", "")).strip()
         if artifact:
             failure_lines.append(f"  artifact: {artifact}")
-    finding_lines: list[str] = []
-    for finding in context.findings:
-        severity = finding.get("severity", "?")
-        statement = str(finding.get("statement", finding.get("detail", ""))).strip()
-        location = str(finding.get("location", "")).strip()
-        finding_lines.append(
-            f"- {severity}: {statement[:600]}" + (f" (at {location})" if location else "")
-        )
+    # Each finding is rendered whole, as canonical JSON: the reviewer contract names no finding
+    # keys, so picking a few known ones would silently drop whatever a reviewer actually wrote.
+    finding_lines = [
+        "- " + canonical_json({key: _capped_finding_value(value) for key, value in finding.items()})
+        for finding in context.findings
+    ]
 
     return f"""
 ## Repair attempt (this is not a new task)
@@ -453,7 +518,7 @@ def render_reviewer_packet(
 
 ## Candidate identity (HFlow froze this; do not rely on any hash quoted in prose)
 {_candidate_lines(candidate or {"fingerprint": candidate_fingerprint})}
-- diff to read: {_diff_reference(candidate)}
+- diff to read: {_diff_reference(candidate)}{_round_change_lines(candidate)}
 - review workspace: {workspace}
 
 ## Program evidence (produced by HFlow, not by the implementer)

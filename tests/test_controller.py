@@ -29,7 +29,7 @@ from hflow.contracts import (
     VerificationResult,
 )
 from hflow.controller import Controller, inspect_run
-from hflow.drivers.fake import FakeScript
+from hflow.drivers.fake import FakeDriver, FakeScript
 from hflow.ids import utc_now
 from hflow.report import status_text
 from hflow.store import Store, StoreError
@@ -417,6 +417,97 @@ def test_resume_does_not_redispatch_after_a_driver_failure(
     assert len(driver.started) == 1
 
 
+class _ReleasingDriver(FakeDriver):
+    """A driver that offers ``release`` and records what was already stored when it was called."""
+
+    def __init__(
+        self, project_root: Path, script: FakeScript, store: Store, *, fail: bool = False
+    ) -> None:
+        super().__init__(project_root, script)
+        self._store = store
+        self._fail = fail
+        #: ``(invocation_id, role, attempt state, review attached)`` at the moment of release.
+        self.released: list[tuple[str, str, str, bool]] = []
+
+    def release(self, invocation_id: str) -> None:
+        request = next(item for item in self.started if item.invocation_id == invocation_id)
+        attempt = self._store.open_attempt(request.run_id)
+        self.released.append(
+            (invocation_id, request.role, attempt["state"], attempt["review_json"] is not None)
+        )
+        if self._fail:
+            raise RuntimeError("release failed")
+
+
+def _releasing_controller(store: Store, driver: FakeDriver, runner: FakeCheckRunner) -> Controller:
+    return Controller(
+        store,
+        driver,
+        controller_build="test-build",
+        runners=CheckRunners({"fake": runner, "command": runner}),
+    )
+
+
+def test_each_invocation_is_released_once_its_result_is_applied(
+    store: Store,
+    project_root: Path,
+    fake_script: FakeScript,
+    check_runner: FakeCheckRunner,
+    run_request: RunRequest,
+) -> None:
+    """The driver is told it may close what it opened - after the result is on record, not before."""
+    driver = _ReleasingDriver(project_root, fake_script, store)
+
+    outcome = _releasing_controller(store, driver, check_runner).run_task(run_request)
+
+    assert outcome.task_state is TaskState.ACCEPTED, outcome.block_reason
+    implementer, reviewer = driver.started
+    assert [entry[:2] for entry in driver.released] == [
+        (implementer.invocation_id, "implementer"),
+        (reviewer.invocation_id, "reviewer"),
+    ]
+    assert driver.released[0][2] == AttemptState.SUCCEEDED.value, (
+        "the implementer is released after its result was applied to the attempt"
+    )
+    assert driver.released[1][3] is True, "the reviewer is released after its result was attached"
+
+
+def test_an_unknown_outcome_is_released_after_it_is_recorded(
+    store: Store,
+    project_root: Path,
+    fake_script: FakeScript,
+    check_runner: FakeCheckRunner,
+    run_request: RunRequest,
+) -> None:
+    fake_script.unknown_invocations = 1
+    driver = _ReleasingDriver(project_root, fake_script, store)
+
+    outcome = _releasing_controller(store, driver, check_runner).run_task(run_request)
+
+    assert outcome.block_code is RefusalCode.OUTCOME_UNKNOWN
+    assert driver.released == [
+        (driver.started[0].invocation_id, "implementer", AttemptState.OUTCOME_UNKNOWN.value, False)
+    ]
+
+
+def test_a_release_that_raises_changes_no_decision(
+    store: Store,
+    project_root: Path,
+    fake_script: FakeScript,
+    check_runner: FakeCheckRunner,
+    run_request: RunRequest,
+) -> None:
+    """Cleanup is not a result: a driver that fails to release leaves a note, not a crash."""
+    driver = _ReleasingDriver(project_root, fake_script, store, fail=True)
+
+    outcome = _releasing_controller(store, driver, check_runner).run_task(run_request)
+
+    assert outcome.task_state is TaskState.ACCEPTED, outcome.block_reason
+    assert len(driver.released) == 2
+    notes = store.notes_for(outcome.run_id)
+    assert sum("could not release invocation" in note for note in notes) == 2, notes
+
+
 # --------------------------------------------------------------------------
 # 7. state + budget move in one transaction
 # --------------------------------------------------------------------------
@@ -645,6 +736,41 @@ def test_command_check_runs_through_the_real_runner(
     evidence = store.evidence_for(outcome.run_id, "verification")
     assert evidence[0]["exit_code"] == 0
     assert evidence[0]["command_json"] != "[]"
+
+
+def test_check_artifacts_stay_in_the_runs_own_data_dir(
+    store: Store, task_spec, project_root: Path, project, driver, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A controller built without ``data_dir`` keeps artifacts next to its own ledger.
+
+    It must not fall back to the platform data dir: that writes one run's evidence into
+    another installation's directory (and, from the test suite, into the user's real one).
+    """
+    from hflow.contracts import CheckDef
+
+    platform_default = tmp_path / "platform-default"
+    monkeypatch.setenv("HFLOW_DATA_DIR", str(platform_default))
+    project_with_command = project.model_copy(
+        update={"checks": [CheckDef(id="unit", kind="command", argv=["python", "-c", "raise SystemExit(0)"])]}
+    )
+    controller = Controller(
+        store, driver, controller_build="test-build", runners=CheckRunners.offline_default(),
+        production=False,
+    )
+    request = RunRequest(
+        task=unit_only(task_spec),
+        project=project_with_command,
+        project_root=project_root,
+        workspace_root=project_root,
+    )
+
+    outcome = controller.run_task(request)
+
+    assert outcome.task_state is TaskState.ACCEPTED
+    assert controller.data_dir == store.path.parent
+    assert list((store.path.parent / "artifacts").rglob("artifact.json"))
+    assert not platform_default.exists()
 
 
 def test_phase_field_tracks_the_checking_stage(

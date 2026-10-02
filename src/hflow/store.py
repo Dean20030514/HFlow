@@ -123,6 +123,16 @@ INVOCATION_UNRESOLVED_STATES: tuple[str, ...] = (
     InvocationStartState.LAUNCH_UNKNOWN.value,
 )
 
+#: The states a settlement or a confirmed stop may still close: the dispatch is in flight and
+#: nothing final is recorded about it. ``unknown`` and ``launch_unknown`` are unresolved too, but
+#: not *open* - only an operator's reconcile closes them - and ``not_started`` and ``settled``
+#: already record their final fact.
+INVOCATION_OPEN_STATES: tuple[str, ...] = (
+    InvocationStartState.RESERVED.value,
+    InvocationStartState.REQUESTED.value,
+    InvocationStartState.STARTED.value,
+)
+
 
 def _add_seconds(timestamp: str, seconds: int) -> str:
     """``timestamp`` (a stored UTC string) plus ``seconds``, in the same textual form."""
@@ -798,21 +808,8 @@ class Store:
         """
         now = utc_now()
         with self.transaction() as conn:
-            row = conn.execute(
-                "SELECT * FROM root_budgets WHERE root_id = ?", (binding.root_id,)
-            ).fetchone()
+            row = self._root_registration_row_locked(conn, binding, limits)
             if row is None:
-                clash = conn.execute(
-                    "SELECT root_id, max_top_level_submissions, max_repairs, deadline_seconds "
-                    "FROM root_budgets WHERE project_id = ? AND repo_path = ? AND task_id = ?",
-                    (binding.project_id, binding.repo_path, binding.task_id),
-                ).fetchone()
-                if clash is not None:
-                    raise StoreError(
-                        f"the task {binding.task_id} of {binding.project_id} at {binding.repo_path} "
-                        f"already has root {clash['root_id']}; this run resolves {binding.root_id} "
-                        "for the same task, and a second root would hand it a second allowance"
-                    )
                 conn.execute(
                     """
                     INSERT INTO root_budgets (
@@ -836,17 +833,54 @@ class Store:
                         now,
                     ),
                 )
-            else:
-                self._check_root_limits_locked(conn, row, binding, limits)
-                if row["binding_digest"] != digest_of(binding.model_dump(mode="json")):
-                    raise StoreError(
-                        f"root {binding.root_id} is already recorded against a different binding "
-                        f"(recorded ledger {row['ledger_path']}, this run resolves "
-                        f"{binding.ledger_path}); the recorded root stands"
-                    )
             return conn.execute(
                 "SELECT * FROM root_budgets WHERE root_id = ?", (binding.root_id,)
             ).fetchone()
+
+    def check_root_registration(
+        self, binding: RootBudgetBinding, limits: RootBudgetLimits
+    ) -> None:
+        """Raise the ``StoreError`` ``register_root_budget`` would raise, without writing.
+
+        The controller asks this before its other root refusals, so a run presenting ceilings
+        that differ from the recorded ones is told so - not that the recorded root cannot afford
+        its repair - and a refused run registers nothing. ``register_root_budget`` repeats the
+        same checks inside its transaction, which stays the gate.
+        """
+        with self._lock:
+            self._root_registration_row_locked(self.conn, binding, limits)
+
+    def _root_registration_row_locked(
+        self,
+        conn: sqlite3.Connection,
+        binding: RootBudgetBinding,
+        limits: RootBudgetLimits,
+    ) -> sqlite3.Row | None:
+        """The recorded row this root agrees with, ``None`` when it is new; refuse otherwise."""
+        row = conn.execute(
+            "SELECT * FROM root_budgets WHERE root_id = ?", (binding.root_id,)
+        ).fetchone()
+        if row is None:
+            clash = conn.execute(
+                "SELECT root_id, max_top_level_submissions, max_repairs, deadline_seconds "
+                "FROM root_budgets WHERE project_id = ? AND repo_path = ? AND task_id = ?",
+                (binding.project_id, binding.repo_path, binding.task_id),
+            ).fetchone()
+            if clash is not None:
+                raise StoreError(
+                    f"the task {binding.task_id} of {binding.project_id} at {binding.repo_path} "
+                    f"already has root {clash['root_id']}; this run resolves {binding.root_id} "
+                    "for the same task, and a second root would hand it a second allowance"
+                )
+            return None
+        self._check_root_limits_locked(conn, row, binding, limits)
+        if row["binding_digest"] != digest_of(binding.model_dump(mode="json")):
+            raise StoreError(
+                f"root {binding.root_id} is already recorded against a different binding "
+                f"(recorded ledger {row['ledger_path']}, this run resolves "
+                f"{binding.ledger_path}); the recorded root stands"
+            )
+        return row
 
     def _check_root_limits_locked(
         self,
@@ -934,6 +968,7 @@ class Store:
         authorization_max: int | None = None,
         required_loop_remaining: int = 1,
         is_repair: bool = False,
+        repo_path: str = "",
     ) -> DispatchReservation:
         """Reserve one top-level dispatch: every counter, in one transaction.
 
@@ -961,14 +996,21 @@ class Store:
         refused, which is what stops "a new id" from being used to dispatch twice.
 
         ``root_binding``/``root_limits`` are ``None`` for a run that is not spent against a root
-        ledger (every legacy run, and every offline run). They cannot be supplied without an
-        ``authorization_id``: a root with nothing to bind it to is not a ledger.
+        ledger (every legacy run, and every offline run without a root budget file). They cannot
+        be supplied without an ``authorization_id``: a root with nothing to bind it to is not a
+        ledger. A rootless dispatch is refused when this ledger already holds a root for the same
+        task - derived from the run's project and task and ``repo_path`` (the run's repository;
+        when it is empty, any repository of that project and task matches) - because spending
+        beside that root would step around its unresolved invocations, its live run and its
+        cumulative ceilings.
 
         ``is_repair`` is the caller's own claim that this dispatch is the bounded repair round
         (batch E2). It is only ever *added* to the ledger's own root-wide rule: a second
         implementer invocation of a root is a repair whether or not a caller says so, and this
         flag cannot make a repair look like a first attempt. On the legacy path there is no
-        invocation row to mark, so the claim travels in the caller's own attempt record.
+        invocation row to mark, so the claim travels in the caller's own attempt record; only a
+        fully offline run gets there with a repair, because admission refuses a repair policy on
+        a real transport without a root.
 
         What this does *not* do on the legacy path: write ``attempts.invocation_id``. That stays
         with the controller's own stop-aware registration, because a stop racing that write is
@@ -1010,6 +1052,7 @@ class Store:
                     attempt_id=attempt_id,
                     row=row,
                     is_repair=is_repair,
+                    repo_path=repo_path,
                 )
 
             if root_binding is None or root_limits is None:
@@ -1081,6 +1124,36 @@ class Store:
                 detail=f"reserved as round {round_number} of root {root_binding.root_id}",
             )
 
+    def root_ids_for_task(self, *, project_id: str, repo_path: str, task_id: str) -> list[str]:
+        """The roots this task already has in this ledger. Read-only.
+
+        The same lookup the rootless dispatch transaction makes, asked by the controller before
+        a run row exists: a rootless run of a task that has a root is refused while nothing has
+        been recorded, so resubmitting the same TaskSpec with its root still dispatches.
+        """
+        with self._lock:
+            return self._task_root_ids_locked(
+                self.conn, project_id=project_id, repo_path=repo_path, task_id=task_id
+            )
+
+    def _task_root_ids_locked(
+        self, conn: sqlite3.Connection, *, project_id: str, repo_path: str, task_id: str
+    ) -> list[str]:
+        """Root ids recorded for ``(project_id, repo_path, task_id)``; project-wide without a path."""
+        rows = (
+            conn.execute(
+                "SELECT root_id FROM root_budgets WHERE project_id = ? AND repo_path = ? "
+                "AND task_id = ?",
+                (project_id, str(Path(repo_path).resolve()), task_id),
+            ).fetchall()
+            if repo_path
+            else conn.execute(
+                "SELECT root_id FROM root_budgets WHERE project_id = ? AND task_id = ?",
+                (project_id, task_id),
+            ).fetchall()
+        )
+        return [str(found["root_id"]) for found in rows]
+
     def _reserve_legacy_locked(
         self,
         conn: sqlite3.Connection,
@@ -1096,15 +1169,37 @@ class Store:
         attempt_id: str | None,
         row: sqlite3.Row,
         is_repair: bool = False,
+        repo_path: str = "",
     ) -> DispatchReservation:
         """The pre-E1 path for a run with no root: authorization, turn and attempt together.
 
         Still one transaction - that part is not new - but no root counter is involved and no
         invocation row is written, because a legacy run's dispatch facts stay where they always
         were (``attempts.invocation_id`` / ``review_invocation_id``). ``is_repair`` still reaches
-        the attempt row here: an offline run performs the same bounded repair, it simply has no
-        root ledger to charge it to.
+        the attempt row here: a fully offline run (the fake driver, no root budget file) performs
+        the same bounded repair, it simply has no root ledger to charge it to. A real transport
+        never repairs on this path: admission refuses its repair policy without a root binding.
+
+        A task that already has a root in this ledger is refused here, inside the transaction: the
+        root's unresolved invocations, its live-run gate and its ceilings are enforced only on the
+        root path, so a rootless dispatch beside it would bypass all of them.
         """
+        task_roots = self._task_root_ids_locked(
+            conn, project_id=row["project_id"], repo_path=repo_path, task_id=row["task_id"]
+        )
+        if task_roots:
+            # The controller refuses this before the run row exists (``root_ids_for_task``), so
+            # reaching it here means the root was registered after that check - a race. This
+            # run's row already exists, and an identical resubmission only returns it.
+            raise StoreError(
+                f"the task {row['task_id']} of {row['project_id']} has root "
+                f"{task_roots[0]} in this ledger, and this run has no root binding: a "
+                "dispatch outside the root would step around its unresolved invocations, its "
+                "live run and its ceilings. Nothing was reserved. The root was registered after "
+                "this run was admitted, so this run is blocked and resubmitting the same "
+                "TaskSpec only returns it: submit a new revision with --root-budget-file (and an "
+                "authorization covering that root) to run this task against its root."
+            )
         if authorization_id:
             self._check_authorization_locked(conn, authorization_id, authorization_max)
             self._claim_authorization_locked(conn, authorization_id)
@@ -1720,6 +1815,18 @@ class Store:
 
         A report never downgrades a row that has already gone further (a settled or unknown
         invocation), and a later "nothing happened" cannot unrecord a launch that did.
+
+        A report that arrives after the entry was closed as ``launch_unknown`` (by a reconcile,
+        or by a confirmed stop that saw no report) never reopens it. The result is what the
+        closure would have recorded had the report come first, so the two orders agree:
+
+        * ``created=True`` records the launch and its process facts, and the entry becomes
+          ``unknown`` - a known launch whose result nobody observed. Returning it to ``started``
+          would make it *open* again, so the next settlement could close it and release a root
+          the closure kept blocked;
+        * ``created=False`` records ``not_started``, exactly as before the closure: the driver's
+          own word that no launch happened is the fact the closure was missing, and a closure
+          leaves a ``not_started`` entry alone.
         """
         with self.transaction() as conn:
             row = conn.execute(
@@ -1732,6 +1839,36 @@ class Store:
             current = InvocationStartState(str(row["state"]))
             if current in {InvocationStartState.SETTLED, InvocationStartState.UNKNOWN}:
                 return False
+            if fact.created and current is InvocationStartState.LAUNCH_UNKNOWN:
+                conn.execute(
+                    """
+                    UPDATE invocations
+                       SET state = ?, started_at = ?, launch_requested_at =
+                               COALESCE(launch_requested_at, ?),
+                           process_started_at = COALESCE(?, process_started_at),
+                           process_pid = COALESCE(?, process_pid),
+                           spawn_kind = ?,
+                           detail = ?
+                     WHERE invocation_id = ? AND state = ?
+                    """,
+                    (
+                        InvocationStartState.UNKNOWN.value,
+                        now,
+                        now,
+                        now if fact.pid is not None else None,
+                        fact.pid,
+                        fact.spawn_kind.value,
+                        (
+                            "a spawn report arrived after this entry was closed as "
+                            f"launch_unknown ({fact.detail[:400]}); the launch is recorded and "
+                            "its result was never observed, so the entry is unknown and keeps "
+                            "blocking the root"
+                        ),
+                        fact.invocation_id,
+                        InvocationStartState.LAUNCH_UNKNOWN.value,
+                    ),
+                )
+                return True
             if fact.created:
                 process_started_at = now if fact.pid is not None else None
                 conn.execute(
@@ -1833,17 +1970,26 @@ class Store:
 
     def settle_invocation(
         self, invocation_id: str, *, outcome: InvocationOutcome | None, detail: str = ""
-    ) -> None:
-        """Close an invocation with an observed outcome. Never decrements a counter.
+    ) -> bool:
+        """Close an *open* invocation with an observed outcome. Never decrements a counter.
 
         ``None`` (or ``OUTCOME_UNKNOWN``) records ``UNKNOWN``, which keeps blocking the root: the
         consumption stays because a provider may have been billed, and there is no automatic
         refund, retry or prompt replay anywhere in this build.
 
-        A ``NOT_STARTED`` invocation is **not** downgraded to ``SETTLED``. That state records a
-        fact - no process was ever handed to a driver - and a later driver-side ``cancelled``
-        observation cannot undo it: the process the driver is reporting on did not exist. The
-        outcome is still recorded, so a reader sees both "never launched" and what was reported.
+        **A compare-and-set from the open states only** (``INVOCATION_OPEN_STATES``). ``True``
+        when this call closed the entry; ``False`` when the entry was no longer open, in which
+        case its recorded state stands and the caller records why it was not settled:
+
+        * ``NOT_STARTED`` records a fact - no launch happened - and a later driver-side
+          ``cancelled`` observation cannot undo it: the process the driver is reporting on did not
+          exist. The reported outcome is still attached, so a reader sees both "never launched"
+          and what was reported;
+        * ``SETTLED`` is terminal: a second settlement (a stop that lands after the result was
+          applied) would rewrite a recorded ``completed`` as ``cancelled``;
+        * ``UNKNOWN`` and ``LAUNCH_UNKNOWN`` are closed only by an operator's reconcile. A local
+          stop or a late driver result is not evidence about what an unobserved invocation did,
+          and settling one would unblock the root it is supposed to keep blocked.
         """
         state = (
             InvocationStartState.UNKNOWN
@@ -1851,6 +1997,24 @@ class Store:
             else InvocationStartState.SETTLED
         )
         with self.transaction() as conn:
+            cur = conn.execute(
+                f"""
+                UPDATE invocations
+                   SET state = ?, outcome = ?, settled_at = ?, detail = ?
+                 WHERE invocation_id = ?
+                   AND state IN ({','.join('?' for _ in INVOCATION_OPEN_STATES)})
+                """,
+                (
+                    state.value,
+                    outcome.value if outcome is not None else None,
+                    utc_now(),
+                    detail[:1000],
+                    invocation_id,
+                    *INVOCATION_OPEN_STATES,
+                ),
+            )
+            if cur.rowcount == 1:
+                return True
             row = conn.execute(
                 "SELECT state FROM invocations WHERE invocation_id = ?", (invocation_id,)
             ).fetchone()
@@ -1869,21 +2033,7 @@ class Store:
                         InvocationStartState.NOT_STARTED.value,
                     ),
                 )
-                return
-            conn.execute(
-                """
-                UPDATE invocations
-                   SET state = ?, outcome = ?, settled_at = ?, detail = ?
-                 WHERE invocation_id = ?
-                """,
-                (
-                    state.value,
-                    outcome.value if outcome is not None else None,
-                    utc_now(),
-                    detail[:1000],
-                    invocation_id,
-                ),
-            )
+            return False
 
     def mark_launch_unresolved(self, invocation_id: str, detail: str) -> None:
         """Record that a launch was requested and nobody can say whether it happened.
@@ -1894,12 +2044,12 @@ class Store:
         stop of a process that really existed, which is precisely why an empty timestamp cannot be
         read as "nothing was launched".
 
-        **Idempotent, and that matters for the ordering it is used in.** A run can reach this
-        state twice: ``reconcile`` closes an interrupted launch this way, and a stop that is
-        confirmed afterwards settles the same invocation again. The second call must not raise -
-        the run really was stopped, and a public ``cancel`` that blows up after writing the
-        receipt reports a failure that did not happen. Only the detail is refreshed; the state,
-        the consumption and the "not re-dispatched" boundary are unchanged.
+        **Idempotent.** An entry can be closed this way twice - ``reconcile`` closes an
+        interrupted launch as ``launch_unknown``, and a later caller may try the same closure - and
+        the second call must not raise. Only the detail is refreshed; the state, the consumption
+        and the "not re-dispatched" boundary are unchanged. (The controller's confirmed stop no
+        longer calls this for an entry that is already ``launch_unknown``: it closes only open
+        entries, see :data:`INVOCATION_OPEN_STATES`.)
 
         A row that already recorded a *launch* is refused rather than rewritten: a known launch is
         not an unknown one, and this method exists to avoid merging them.
@@ -2212,6 +2362,13 @@ class Store:
             )
 
     def record_invocation(self, attempt_id: str, invocation_id: str) -> None:
+        """Record the implementer's invocation id on its attempt. **Unconditional.**
+
+        Not what a controller should call before starting an implementer: a stop that commits
+        between the reservation and this write would be missed, and the driver started anyway.
+        :meth:`register_attempt_invocation_unless_stopped` is the conditional form the controller
+        uses; this one stays for store-level tests and callers that hold their own coordination.
+        """
         with self.transaction() as conn:
             conn.execute(
                 "UPDATE attempts SET invocation_id = ? WHERE attempt_id = ?",
@@ -2255,6 +2412,34 @@ class Store:
             if cur.rowcount != 1:
                 raise StoreError(f"unknown attempt {attempt_id}")
 
+    def attach_review_result_unless_stopped(
+        self, run_id: str, attempt_id: str, payload: dict[str, Any]
+    ) -> bool:
+        """Apply a reviewer result to its attempt **unless the run's stop is recorded**, atomically.
+
+        The reviewer's form of ``finish_attempt(unless_stopped=True)``: the stop decision and the
+        first write of the result are one statement, so a stop committed at any point up to it
+        wins. ``True`` when the result was attached; ``False`` when a stop is recorded, in which
+        case nothing was written and the caller treats the result as a late one. An unknown
+        attempt is refused with ``StoreError``, as :meth:`attach_review_result` does.
+        """
+        with self.transaction() as conn:
+            cur = conn.execute(
+                """
+                UPDATE attempts SET review_json = ?
+                 WHERE attempt_id = ?
+                   AND (SELECT cancel_intent_at FROM runs WHERE run_id = ?) IS NULL
+                """,
+                (canonical_json(payload), attempt_id, run_id),
+            )
+            if cur.rowcount == 1:
+                return True
+            if conn.execute(
+                "SELECT 1 FROM attempts WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone() is None:
+                raise StoreError(f"unknown attempt {attempt_id}")
+            return False
+
     def record_cancel_intent(self, run_id: str) -> str:
         """Note that a stop was requested, *before* asking anything to stop.
 
@@ -2278,11 +2463,49 @@ class Store:
             return now
 
     def record_cancel_receipt(self, run_id: str, receipt: CancellationReceipt) -> None:
+        """Record a stop's receipt without touching the run's state.
+
+        For a stop that does not decide the run - one that reached a run that had already
+        ended. A stop that ends a live run uses :meth:`record_cancel_outcome`, because the
+        receipt is what makes a repeated ``cancel`` return early and must never exist without
+        the block it implies.
+        """
         with self.transaction() as conn:
             conn.execute(
                 "UPDATE runs SET cancel_receipt_json = ?, updated_at = ? WHERE run_id = ?",
                 (canonical_json(receipt.model_dump(mode="json")), utc_now(), run_id),
             )
+
+    def record_cancel_outcome(
+        self, run_id: str, receipt: CancellationReceipt, code: RefusalCode, reason: str
+    ) -> None:
+        """Record a stop's receipt **and** the terminal block it implies, in one statement.
+
+        The receipt is the stop's idempotency key: once it exists, a repeated ``cancel``
+        returns it. Writing it in its own transaction before the block left a window - a
+        ``database is locked`` from another process, a Ctrl+C - after which the run kept a
+        receipt and no block, and every later ``cancel`` returned that receipt while the run
+        stayed ``RUNNING``. One ``UPDATE`` makes the two facts appear together or not at all.
+        """
+        with self.transaction() as conn:
+            cur = conn.execute(
+                """
+                UPDATE runs
+                   SET cancel_receipt_json = ?, task_state = ?, block_code = ?,
+                       block_reason = ?, updated_at = ?
+                 WHERE run_id = ?
+                """,
+                (
+                    canonical_json(receipt.model_dump(mode="json")),
+                    TaskState.BLOCKED.value,
+                    code.value,
+                    reason,
+                    utc_now(),
+                    run_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise RunNotFound(run_id)
 
     def cancel_state(self, run_id: str) -> tuple[str | None, CancellationReceipt | None]:
         row = self.get_run(run_id)
@@ -2618,11 +2841,29 @@ class Store:
         outcome: InvocationOutcome | None,
         result: dict[str, Any] | None,
         block_code: RefusalCode | None = None,
+        unless_stopped: bool = False,
     ) -> sqlite3.Row:
-        """Apply an attempt result only if it still belongs to the live revision."""
+        """Apply an attempt result only if it still belongs to the live revision.
+
+        ``unless_stopped=True`` is the run thread's form: the result is also refused when the
+        run's stop is recorded (``cancel_intent_at`` set), decided in the same transaction as the
+        write. An unconfirmed stop leaves the attempt live on purpose - work may still be running
+        - so without this a late result would be applied to an attempt the stop already decided.
+        The stop's own bookkeeping (``cancel`` finishing the attempt as ``CANCELLED``) uses the
+        plain form.
+        """
         now = utc_now()
         with self.transaction() as conn:
             self._guard_current(conn, run_id, attempt_id)
+            if unless_stopped:
+                stop = conn.execute(
+                    "SELECT cancel_intent_at FROM runs WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                if stop["cancel_intent_at"]:
+                    raise StoreError(
+                        f"run {run_id} has a stop recorded at {stop['cancel_intent_at']}; the "
+                        f"result for attempt {attempt_id} is not applied"
+                    )
             cur = conn.execute(
                 """
                 UPDATE attempts

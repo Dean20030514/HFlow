@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -37,6 +38,45 @@ PROJECT_ID = "demo-project"
 #: launcher to resolve, and the real acpx install is machine-local (`.probe/` is not committed),
 #: so tests point at this file instead. Nothing here is a compatibility proof.
 FAKE_ACPX_CLIENT = Path(__file__).resolve().parent / "fixtures" / "fake_acpx_client.py"
+
+
+@pytest.fixture(autouse=True)
+def _isolated_default_data_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> Path:
+    """Point the platform data dir at a per-test temp dir.
+
+    Anything that falls back to :func:`hflow.paths.default_data_dir` (a CLI call without
+    ``--data-dir``, an in-memory ledger) would otherwise read the user's real profiles and write
+    into their real ``%LOCALAPPDATA%/HFlow``. A profile id inherited from the shell would name a
+    profile in that real directory, so it is cleared too.
+    """
+    directory = tmp_path_factory.mktemp("hflow-default-data")
+    monkeypatch.setenv("HFLOW_DATA_DIR", str(directory))
+    monkeypatch.delenv("HFLOW_PROFILE", raising=False)
+    return directory
+
+
+@pytest.fixture(autouse=True)
+def _dsh_launcher_on_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> Path:
+    """Put a stand-in DSH launcher first on PATH, shaped like the real install.
+
+    A real launch resolves ``dsh`` to an absolute file on PATH and is not resolvable without one,
+    so whether a test's launch resolves would otherwise depend on what this machine has
+    installed - and a real DSH must never be what a test finds. The stand-in is an npm-style batch
+    shim on Windows (the shape ADR 0001 records) that only exits 1; nothing is meant to run it.
+    """
+    directory = tmp_path_factory.mktemp("dsh-launcher")
+    if sys.platform == "win32":
+        (directory / "dsh.CMD").write_text("@exit /b 1\r\n", encoding="utf-8")
+    else:
+        launcher = directory / "dsh"
+        launcher.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        launcher.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{directory}{os.pathsep}{os.environ.get('PATH', '')}")
+    return directory
 
 
 @pytest.fixture()

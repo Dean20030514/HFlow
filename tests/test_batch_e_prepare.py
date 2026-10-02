@@ -342,6 +342,8 @@ def test_a_root_budget_file_outside_the_contract_is_refused(
 # `production=True` is how the gate is asked the question a real (non-fake) run asks: the fake
 # driver's checks are fake by construction and its change is scripted, so these rules never apply
 # to an offline run. No model is called by any of this: it is a pure function of two contracts.
+# Those calls pass `root_bound=True`, because a real transport's repair also needs a root binding
+# (plan 5.1) and that rule is measured on its own below.
 
 
 def _unwritable(spec: TaskSpec, **updates: object) -> TaskSpec:
@@ -358,7 +360,7 @@ def test_a_repair_policy_without_a_worktree_is_refused(project, worktree_task) -
     )
 
     issues = predictable_dispatch_problems(
-        spec, project, production=True, implementer_writes=True
+        spec, project, production=True, implementer_writes=True, root_bound=True
     )
 
     assert [(issue.code, issue.location) for issue in issues] == [
@@ -383,6 +385,7 @@ def test_a_repair_policy_without_a_review_is_refused(project, worktree_task) -> 
         project.model_copy(update={"review_required": False}),
         production=True,
         implementer_writes=True,
+        root_bound=True,
     )
 
     assert [(issue.code, issue.location) for issue in issues] == [
@@ -403,7 +406,7 @@ def test_a_repair_policy_the_run_ceiling_cannot_cover_is_refused(project, worktr
     )
 
     issues = predictable_dispatch_problems(
-        spec, project, production=True, implementer_writes=True
+        spec, project, production=True, implementer_writes=True, root_bound=True
     )
 
     assert [(issue.code, issue.location) for issue in issues] == [
@@ -429,7 +432,7 @@ def test_a_repair_policy_without_review_needs_only_the_two_dispatch_loop(
     unreviewed_project = project.model_copy(update={"review_required": False})
 
     issues = predictable_dispatch_problems(
-        spec, unreviewed_project, production=True, implementer_writes=True
+        spec, unreviewed_project, production=True, implementer_writes=True, root_bound=True
     )
 
     assert [(issue.code, issue.location) for issue in issues] == [
@@ -441,7 +444,7 @@ def test_a_repair_policy_without_review_needs_only_the_two_dispatch_loop(
         update={"budget": spec.budget.model_copy(update={"max_agent_turns": 1})}
     )
     short_issues = predictable_dispatch_problems(
-        short, unreviewed_project, production=True, implementer_writes=True
+        short, unreviewed_project, production=True, implementer_writes=True, root_bound=True
     )
     turns = [issue for issue in short_issues if issue.code == RefusalCode.BUDGET_EXCEEDED]
     assert len(turns) == 1, short_issues
@@ -454,7 +457,7 @@ def test_a_repair_policy_this_scope_supports_is_not_refused(project, worktree_ta
 
     assert (
         predictable_dispatch_problems(
-            spec, project, production=True, implementer_writes=True
+            spec, project, production=True, implementer_writes=True, root_bound=True
         )
         == []
     )
@@ -502,6 +505,136 @@ def test_a_repair_policy_the_scope_cannot_support_is_refused_offline_too(
         )
         == []
     ), "the offline path must not refuse a policy the scope does support"
+
+
+def test_a_repair_policy_on_a_real_transport_needs_a_root_binding(project, worktree_task) -> None:
+    """Plan 5.1: a real transport's repair is charged to a root, so a rootless one is refused.
+
+    Without a root the repair would be bought outside every cross-revision counter - each new
+    revision could buy its own. The offline fake driver reaches no model and keeps its rootless
+    repair, which is why the rule follows the transport rather than the policy alone.
+    """
+    spec = worktree_task.model_copy(update={"repair_policy": _policy()})
+
+    rootless = predictable_dispatch_problems(
+        spec, project, production=True, implementer_writes=True
+    )
+    assert [(issue.code, issue.location) for issue in rootless] == [
+        (RefusalCode.BUDGET_EXCEEDED, "root_budget")
+    ]
+    detail = rootless[0].detail
+    assert "repair_policy" in detail and "--root-budget-file" in detail, detail
+    assert "drop repair_policy" in detail, "the message must say what to do about it"
+
+    assert (
+        predictable_dispatch_problems(
+            spec, project, production=True, implementer_writes=True, root_bound=True
+        )
+        == []
+    ), "a bound root is exactly what the rule asks for"
+    assert (
+        predictable_dispatch_problems(
+            spec, project, production=False, implementer_writes=False
+        )
+        == []
+    ), "a fully offline run may still repair without a root"
+    assert predictable_dispatch_problems(
+        spec, project, production=False, implementer_writes=False, real_transport=True
+    ), "the transport decides, not the production label: a real driver needs the root offline too"
+
+
+def test_prepare_refuses_a_live_repair_policy_without_a_root_budget_file(
+    tmp_path: Path,
+    live_project,
+    worktree_task,
+    project_root: Path,
+    live_profile,
+    acpx_client,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Through the real command surface: a live policy without a root previews as refused."""
+    monkeypatch.setenv("HFLOW_ALLOW_WRITES", "true")
+    data_dir = tmp_path / "data"
+    write_profile(data_dir, live_profile)
+    policy_file = _policy_file(tmp_path / "repair-policy.json")
+    task_file = write_task(tmp_path / "task.json", worktree_task)
+    project_file = write_project(tmp_path / "hflow" / "project.json", live_project)
+    argv = [
+        "prepare",
+        "--task", str(task_file),
+        "--project", str(project_file),
+        "--project-root", str(project_root),
+        "--profile", "dsh-local",
+        "--repair-policy-file", str(policy_file),
+        "--json",
+        "--data-dir", str(data_dir),
+    ]
+
+    code = main(argv)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == EXIT_REFUSED, "a task the live gate refuses must not preview as ready"
+    root_issues = [
+        issue for issue in payload["dispatch_preconditions"] if issue["location"] == "root_budget"
+    ]
+    assert len(root_issues) == 1, payload["dispatch_preconditions"]
+    assert "--root-budget-file" in root_issues[0]["detail"], root_issues[0]["detail"]
+
+    root_file = _write_root_budget(tmp_path / "root-budget.json")
+    main(argv + ["--root-budget-file", str(root_file)])
+    bound = json.loads(capsys.readouterr().out)
+    assert [
+        issue for issue in bound["dispatch_preconditions"] if issue["location"] == "root_budget"
+    ] == [], "with a root budget file the root rule is satisfied"
+    assert not database_path(data_dir).exists(), "a preview writes nothing either way"
+
+
+def test_prepare_reports_a_root_budget_file_with_no_repair_for_an_armed_policy(
+    tmp_path: Path,
+    project,
+    worktree_task,
+    project_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``max_repairs`` 0 with a repair policy: the run refuses it, so the preview does too.
+
+    Decidable from the two files alone - the repair needs at least one - and still zero-write.
+    The ledger-dependent part (a later revision's first implementer also counts as a repair) is
+    the run's own gate, which a preview cannot see without opening the database.
+    """
+    policy_file = _policy_file(tmp_path / "repair-policy.json")
+    no_repair = _write_root_budget(
+        tmp_path / "root-budget-0.json", limits={**LIMITS, "max_repairs": 0}
+    )
+
+    code, data_dir = _prepare(
+        tmp_path, project, worktree_task, project_root,
+        root_budget=no_repair, repair_policy=policy_file,
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == EXIT_REFUSED, "a root the run refuses must not preview as ready"
+    root_issues = [
+        issue for issue in payload["dispatch_preconditions"] if issue["location"] == "root_budget"
+    ]
+    assert [issue["code"] for issue in root_issues] == [RefusalCode.BUDGET_EXHAUSTED.value]
+    assert "max_repairs" in root_issues[0]["detail"], root_issues[0]["detail"]
+    assert not database_path(data_dir).exists()
+
+    one_repair = _write_root_budget(tmp_path / "root-budget-1.json")
+    code, data_dir = _prepare(
+        tmp_path, project, worktree_task, project_root,
+        root_budget=one_repair, repair_policy=policy_file,
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert code == EXIT_OK, payload["dispatch_preconditions"]
+    assert payload["dispatch_preconditions"] == []
+    assert not database_path(data_dir).exists()
+
+    code, _ = _prepare(tmp_path, project, worktree_task, project_root, root_budget=no_repair)
+    payload = json.loads(capsys.readouterr().out)
+    assert code == EXIT_OK, "without a repair policy nothing spends the repair counter"
 
 
 # --------------------------------------------------------------------------
