@@ -336,6 +336,47 @@ def test_prepare_refuses_an_unknown_profile(
     assert not (tmp_path / "data" / "hflow.sqlite").exists()
 
 
+def test_prepare_refuses_a_profile_whose_model_selection_could_not_be_a_fixed_flag(
+    tmp_path: Path, live_project, task_spec, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A model value that is not a token or a provider/model pair stops the preview."""
+    task_file = write_task(tmp_path / "task.json", task_spec)
+    project_file = write_project(tmp_path / "hflow" / "project.json", live_project)
+    path = tmp_path / "data" / "profiles" / "bad-model.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "profile_id": "bad-model",
+                "role_bindings": {"implementer": "a", "reviewer": "a"},
+                "agents": {
+                    "a": {
+                        "harness": "dsh",
+                        "driver": "acpx-dsh",
+                        "model_selection": "pro; rm -rf .",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    code = main(
+        [
+            "prepare",
+            "--task", str(task_file),
+            "--project", str(project_file),
+            "--project-root", str(tmp_path),
+            "--profile", "bad-model",
+            "--json",
+            "--data-dir", str(tmp_path / "data"),
+        ]
+    )
+    assert code == EXIT_REFUSED
+    assert "model_selection" in capsys.readouterr().err
+    assert not (tmp_path / "data" / "hflow.sqlite").exists()
+
+
 def test_prepare_and_run_resolve_one_configuration(
     tmp_path: Path, live_project, worktree_task, project_root: Path, live_profile, acpx_client,
     monkeypatch: pytest.MonkeyPatch,
@@ -780,6 +821,95 @@ def test_an_unresolvable_launch_is_reported_rather_than_hidden(
     assert resolved.ready_to_dispatch is False
     assert report.model_calls_made == 0
     assert any("dispatch precondition" in note for note in report.notes)
+
+
+def test_each_roles_model_selection_is_bound_into_its_launch(
+    tmp_path: Path, live_project, worktree_task, project_root: Path, live_profile, acpx_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The model a role asks for is part of *its* launch, so the approval digest covers it.
+
+    ``native_profile`` passes nothing: its launch has no model at all, so a configuration that
+    never selected a model binds exactly what it bound before model passing existed.
+    """
+    monkeypatch.setenv("HFLOW_ALLOW_WRITES", "true")
+    pair = '["deepseek-official","deepseek-v4-pro"]'
+    profile = live_profile.model_copy(
+        update={
+            "agents": {
+                "dsh-implementer": live_profile.agents["dsh-implementer"].model_copy(
+                    update={"model_selection": pair}
+                ),
+                "dsh-reviewer": live_profile.agents["dsh-reviewer"].model_copy(
+                    update={"model_selection": "native_profile"}
+                ),
+            }
+        }
+    )
+    resolved = _resolve_live(tmp_path, live_project, worktree_task, project_root, profile)
+    implementer = resolved.effective.role("implementer").launch  # type: ignore[union-attr]
+    reviewer = resolved.effective.role("reviewer").launch  # type: ignore[union-attr]
+    assert implementer is not None and reviewer is not None
+    assert implementer.model == pair
+    assert reviewer.model == ""
+    assert "model" not in reviewer.model_dump(mode="json"), "native_profile binds no model key"
+
+    # The same configuration without the implementer's model is a different approval.
+    without_model = resolved.effective.model_copy(
+        update={
+            "roles": [
+                entry.model_copy(
+                    update={"launch": entry.launch.model_copy(update={"model": ""})}  # type: ignore[union-attr]
+                )
+                for entry in resolved.effective.roles
+            ]
+        }
+    )
+    assert without_model.digest() != resolved.effective.digest()
+
+    # The preview names the flag and says the capability is still only documented.
+    report = build_prepare_report(resolved)
+    note = " ".join(report.notes)
+    assert "--model" in note and "documented" in note
+
+
+def test_a_native_profile_launch_binds_what_it_bound_before_model_passing() -> None:
+    """Pinned digest of a fixed ``native_profile`` launch, computed before ``model`` existed."""
+    from hflow.contracts import EffectiveConfig, LaunchConfig, RoleConfig, digest_of
+
+    launch = LaunchConfig(
+        driver_id="acpx-dsh-acp",
+        harness="dsh",
+        agent_argv=["dsh", "--profile", "acp"],
+        client_argv_prefix=["node"],
+        client_entry="cli.js",
+        node="node",
+        python="python",
+        dsh_executable="dsh",
+        profile="acp",
+    )
+    assert digest_of(launch.model_dump(mode="json")) == (
+        "sha256:bd08c87743770efa6d8d18191cc54feace405ca5a74e0d64e8f90ed07efbd387"
+    )
+    effective = EffectiveConfig(
+        source="machine_profile",
+        profile_id="p",
+        roles=[
+            RoleConfig(
+                role="implementer",
+                agent="a",
+                harness="dsh",
+                driver="acpx-dsh",
+                driver_id="acpx-dsh-acp",
+                launch=launch,
+            )
+        ],
+    )
+    assert effective.digest() == (
+        "sha256:f7eaf12696b92310455f8f9ff3d9e047f305063920b818a2e7f89dace7bf8604"
+    )
+    chosen = launch.model_copy(update={"model": "deepseek-v4-pro"})
+    assert digest_of(chosen.model_dump(mode="json")) != digest_of(launch.model_dump(mode="json"))
 
 
 # --------------------------------------------------------------------------

@@ -468,8 +468,9 @@ def _role_config(
     The launch is resolved here and travels with the configuration, so it is covered by
     ``EffectiveConfig.digest()`` - what an approval binds - and consumed by ``build_driver``
     afterwards rather than re-derived from the environment. That is the difference between
-    approving a configuration and approving a name. The run's ``workspaces``
-    (:func:`launch_workspaces`) go into the resolution, so no launch program is a file inside them.
+    approving a configuration and approving a name. The role's own binding goes into the
+    resolution, so its ``model_selection`` becomes that launch's ``--model`` value, and the run's
+    ``workspaces`` (:func:`launch_workspaces`) go in so no launch program is a file inside them.
     """
     from .drivers.acpx_dsh import resolve_launch_config
     from .drivers.selected import resolve_driver_id
@@ -481,7 +482,7 @@ def _role_config(
         # default; a profile that wants another one will need the binding to carry it, which
         # this build does not claim to support (see README, "Not implemented").
         launch = resolve_launch_config(
-            data_dir=data_dir, env=env, workspaces=workspaces
+            data_dir=data_dir, env=env, binding=binding, workspaces=workspaces
         )
     return RoleConfig(
         role=role,
@@ -1072,10 +1073,13 @@ def build_prepare_report(
             "approval would have to cover"
         )
         notes.append(
-            "the profile selects which agent, transport and write permission each role uses; "
-            "the model behind a DSH launch is still chosen by the DSH profile the launcher "
-            "starts with. `model_selection` is recorded and reported but is not passed as a "
-            "launcher flag yet - `hflow doctor --profile <id>` shows the exact argv"
+            "the profile selects which agent, transport, write permission and model each role "
+            "uses. A `model_selection` other than native_profile is passed as the client's "
+            "`--model <value>` (bound in the launch above); native_profile passes no flag and "
+            "the DSH profile the launcher starts with decides. The model_selection capability "
+            "is still documented only: no set_config_option round trip with a real DSH has been "
+            "observed, so each run records what its stream showed - `hflow doctor --profile "
+            "<id>` shows the exact argv"
         )
     if not budget.within_budget:
         notes.append(
@@ -1225,6 +1229,8 @@ def render_prepare_text(report: PrepareReport) -> str:
             )
             lines.append(f"               start  {' '.join(launch.client_argv_prefix)}")
             lines.append(f"               launcher {' '.join(launch.agent_argv)}")
+            if launch.model:
+                lines.append(f"               client flag --model {launch.model}")
             if launch.dsh_home:
                 lines.append(f"               DSH_HOME {launch.dsh_home}")
             if not launch.resolvable:

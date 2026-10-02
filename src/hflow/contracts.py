@@ -19,12 +19,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable, Iterator
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal, Protocol, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 from pydantic.json_schema import SkipJsonSchema
 
 SCHEMA_VERSION = 1
@@ -631,13 +639,73 @@ class TaskSpec(BaseModel):
 # --------------------------------------------------------------------------
 
 
+#: ``model_selection`` value meaning "pass no model flag": the launcher's own profile decides.
+NATIVE_MODEL_SELECTION = "native_profile"
+#: One model token as it may appear on the client command line. Deliberately narrow: no
+#: whitespace, quotes or shell metacharacters, and no leading ``-`` (a value that starts like a
+#: flag could be read as one).
+_MODEL_TOKEN = re.compile(r"[A-Za-z0-9._:/][A-Za-z0-9._:/-]{0,127}")
+
+
+def normalize_model_selection(value: Any) -> str:
+    """The one accepted spelling of a profile's ``model_selection``, or ``ValueError``.
+
+    Accepted: ``native_profile`` (no flag), a bare token, or exactly two tokens as a JSON array -
+    DSH's opaque model value ids are ``JSON.stringify([provider, model])``, for example
+    ``["deepseek-official","deepseek-v4-pro"]``. The pair may be written as a JSON array or as a
+    string holding one; either way it is kept in the compact form the client compares against
+    the advertised catalog, byte for byte. Anything else is refused, because the value becomes
+    a fixed flag on the client command line (rule 9) and is never task text.
+    """
+    pair: Any = None
+    if isinstance(value, list):
+        pair = value
+    elif isinstance(value, str) and value.strip().startswith("["):
+        try:
+            pair = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"model_selection {value!r} is not a valid JSON array") from exc
+        if not isinstance(pair, list):
+            raise ValueError(f"model_selection {value!r} is not a JSON array")
+    elif not isinstance(value, str):
+        raise ValueError("model_selection must be a string or a two-item array of strings")
+    if pair is not None:
+        if len(pair) != 2 or not all(
+            isinstance(item, str) and _MODEL_TOKEN.fullmatch(item) for item in pair
+        ):
+            raise ValueError(
+                "model_selection as an array must be exactly two tokens [provider, model], each "
+                "1-128 characters of A-Z a-z 0-9 . _ : / - (not starting with -)"
+            )
+        return json.dumps(pair, separators=(",", ":"))
+    if value == NATIVE_MODEL_SELECTION or _MODEL_TOKEN.fullmatch(value):
+        return value
+    raise ValueError(
+        f"model_selection {value!r} is not '{NATIVE_MODEL_SELECTION}', a token of 1-128 "
+        "characters of A-Z a-z 0-9 . _ : / - (not starting with -), or a two-token JSON array"
+    )
+
+
+def launch_model(model_selection: str) -> str:
+    """The value a launch passes as ``--model``: empty for ``native_profile``."""
+    normalized = normalize_model_selection(model_selection)
+    return "" if normalized == NATIVE_MODEL_SELECTION else normalized
+
+
 class AgentBinding(BaseModel):
     model_config = Strict
 
     harness: str
     driver: str
-    model_selection: str = "native_profile"
+    #: ``native_profile`` (no model flag) or a validated model value, see
+    #: :func:`normalize_model_selection`.
+    model_selection: str = NATIVE_MODEL_SELECTION
     capability_record: str = ""
+
+    @field_validator("model_selection", mode="before")
+    @classmethod
+    def _valid_model_selection(cls, value: Any) -> str:
+        return normalize_model_selection(value)
 
 
 class ProfileLimits(BaseModel):
@@ -699,11 +767,27 @@ class LaunchConfig(BaseModel):
     #: The DSH profile the launcher starts with, and the DSH home it will use ("" = ambient).
     profile: str = ""
     dsh_home: str = ""
+    #: The client's ``--model`` value, from the role's validated ``model_selection``; empty for
+    #: ``native_profile``, which passes no flag. A fixed per-profile value, never task text.
+    model: str = ""
     #: False when a program this launch needs could not be resolved on this machine. Recorded
     #: rather than raised so a preview can report the missing dependency instead of failing
     #: before it has said anything; the launch itself still refuses.
     resolvable: bool = True
     detail: str = ""
+
+    @model_serializer(mode="wrap")
+    def _omit_unset_model(self, handler: Any):
+        """A launch that passes no model serializes exactly as it did before ``model`` existed.
+
+        So a ``native_profile`` configuration keeps its approval digest, while any chosen model
+        is part of what an approval binds. (No return annotation on purpose: pydantic would take
+        it as the serialization schema and drop the field list.)
+        """
+        data = handler(self)
+        if not self.model:
+            data.pop("model", None)
+        return data
 
 
 class RoleConfig(BaseModel):
@@ -878,6 +962,61 @@ class InvocationOutcome(StrEnum):
     OUTCOME_UNKNOWN = "outcome_unknown"
 
 
+class ModelApplied(StrEnum):
+    """What became of the model a launch asked for, as far as the stream shows."""
+
+    #: No ``--model`` was on the client command line (``native_profile``).
+    NOT_PASSED = "not_passed"
+    #: The flag was passed, no change request was needed (the session started on that value),
+    #: and the stream's last reported value is still the requested one.
+    PASSED = "passed"
+    #: ``session/set_config_option`` for the model succeeded and the effective value equals the
+    #: request.
+    ACCEPTED = "accepted"
+    #: The client or the agent refused the model before any prompt was sent.
+    REJECTED = "rejected"
+    #: A change was asked for, but the stream does not show it taking effect; or no change
+    #: request was answered and the stream shows a value other than the request (a later
+    #: ``config_option_update``, or a refusal that no pre-prompt rejection confirmed).
+    UNKNOWN = "unknown"
+
+
+class ModelChange(BaseModel):
+    """One observed change of the model option's current value after the session started."""
+
+    model_config = Strict
+
+    #: ``session/set_config_option`` (its response) or ``config_option_update``.
+    source: str
+    value: str
+
+
+class ModelObservation(BaseModel):
+    """The session's model option as the client's stream showed it. Observed, not assumed.
+
+    Values are the agent's opaque option ids, copied verbatim; nothing here parses them.
+    """
+
+    model_config = Strict
+
+    #: True when ``session/new`` advertised a ``select`` option of category ``model`` (id
+    #: ``model`` breaks a tie, as in the client).
+    advertised: bool = False
+    #: The id of that option, when one was advertised.
+    config_id: str = ""
+    #: Its ``currentValue`` in the ``session/new`` response.
+    initial_value: str | None = None
+    #: The ``--model`` value this launch passed (``None``: none was passed).
+    requested: str | None = None
+    #: The last value the stream reported for the option.
+    effective_value: str | None = None
+    changes: list[ModelChange] = Field(default_factory=list)
+    #: Which message the effective value was last read from ("" when none was seen).
+    source: str = ""
+    #: The ``currentValue`` of the ``thought_level`` option (reasoning effort), when advertised.
+    thought_level: str | None = None
+
+
 class InvocationResult(BaseModel):
     """What a driver may report. Note the absence of any task/acceptance state."""
 
@@ -900,6 +1039,11 @@ class InvocationResult(BaseModel):
     raw_ref: str = ""
     error_code: str | None = None
     error_message: str | None = None
+    #: The session's model option as observed in the stream, and what became of a requested
+    #: model. ``None`` when the driver observed no stream (the offline driver, a launch that
+    #: never happened, a result recorded before these fields existed).
+    model_observation: ModelObservation | None = None
+    model_applied: ModelApplied | None = None
 
 
 class CancellationReceipt(BaseModel):
@@ -1703,6 +1847,12 @@ class AttemptRecord(BaseModel):
     is_repair: bool = False
     created_at: str = ""
     finished_at: str | None = None
+    #: The model facts each invocation's stored result carries. ``None`` = not recorded: a
+    #: result without them (an older run, the offline driver) is not read as "no model".
+    model_observation: ModelObservation | None = None
+    model_applied: ModelApplied | None = None
+    review_model_observation: ModelObservation | None = None
+    review_model_applied: ModelApplied | None = None
 
 
 class RunInspection(BaseModel):

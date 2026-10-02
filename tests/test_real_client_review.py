@@ -192,6 +192,147 @@ def test_real_client_launch_path_stays_the_production_one(tmp_path: Path) -> Non
     assert argv[-2:] == ["-f", "-"], "the task travels on stdin, never in a command line"
 
 
+# --------------------------------------------------------------------------
+# model selection through the real client (C2): zero model, mock agent only
+# --------------------------------------------------------------------------
+
+#: The mock's ``dsh-catalog`` persona advertises these (DSH's grouped shape, placeholder ids).
+MOCK_INITIAL_MODEL = '["mock-provider","mock-flash"]'
+MOCK_OTHER_MODEL = '["mock-provider","mock-pro"]'
+
+
+def _run_model_invocation(
+    tmp_path: Path, *, scenario: str, model_selection: str
+) -> tuple[object, object, list[dict], list[dict]]:
+    """One implementer invocation through the pinned client; returns result, handle, streams."""
+    import json
+
+    from hflow.contracts import AgentBinding, InvocationRequest
+
+    _require_real_client()
+    run_dir = (tmp_path / "real-client-model").resolve()
+    workspace = run_dir / "ws"
+    workspace.mkdir(parents=True, exist_ok=True)
+    wire_log = run_dir / "mock-wire.jsonl"
+    driver = AcpxDshDriver(
+        data_dir=run_dir / "data",
+        acpx_cli=INSTALLED_ACPX,
+        python_executable=sys.executable,
+        agent_argv_override=[
+            sys.executable, "-u", str(MOCK_AGENT), "--scenario", scenario,
+            "--wire-log", str(wire_log),
+        ],
+        binding=AgentBinding(harness="dsh", driver="acpx-dsh", model_selection=model_selection),
+        completion_timeout_seconds=120,
+    )
+    request = InvocationRequest(
+        invocation_id="I-model",
+        attempt_id="A-model",
+        run_id="R-model",
+        role="implementer",
+        task_id="T-model",
+        task_revision=1,
+        goal="say hello",
+        acceptance=[],
+        write_allow=[],
+        write_deny=[],
+        workspace=str(workspace),
+        deadline_seconds=90,
+        spec_digest="sha256:test",
+        data_dir=str(run_dir / "data"),
+    )
+    try:
+        handle = driver.start_handle(request)
+        result = driver.collect(handle)
+    finally:
+        for invocation_id in list(driver._handles):
+            driver.release(invocation_id)
+    stream = [
+        json.loads(line)
+        for line in Path(handle.event_log).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    wire = [
+        json.loads(line)
+        for line in wire_log.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    return result, handle, stream, wire
+
+
+def _methods(stream: list[dict]) -> list[str]:
+    return [message["method"] for message in stream if isinstance(message.get("method"), str)]
+
+
+def test_real_client_applies_an_advertised_model_before_the_prompt(tmp_path: Path) -> None:
+    """``--model`` from the profile: set_config_option, then the prompt, and it was accepted.
+
+    The value is a JSON pair with embedded quotes; it has to cross the Windows command line and
+    arrive at the agent byte for byte, or the catalog comparison would refuse it.
+    """
+    from hflow.contracts import InvocationOutcome, ModelApplied
+
+    result, handle, stream, wire = _run_model_invocation(
+        tmp_path, scenario="dsh-catalog", model_selection=MOCK_OTHER_MODEL
+    )
+
+    methods = _methods(stream)
+    assert "session/set_config_option" in methods and "session/prompt" in methods
+    assert methods.index("session/set_config_option") < methods.index("session/prompt")
+    received = [
+        entry["payload"]["params"]["value"]
+        for entry in wire
+        if entry.get("dir") == "in"
+        and entry["payload"].get("method") == "session/set_config_option"
+    ]
+    assert received == [MOCK_OTHER_MODEL], "the exact value must reach the agent intact"
+
+    assert result.outcome is InvocationOutcome.COMPLETED, result.error_message
+    assert result.model_applied is ModelApplied.ACCEPTED
+    observation = result.model_observation
+    assert observation is not None and observation.advertised is True
+    assert observation.initial_value == MOCK_INITIAL_MODEL
+    assert observation.requested == MOCK_OTHER_MODEL
+    assert observation.effective_value == MOCK_OTHER_MODEL
+    assert observation.thought_level == "high"
+    assert handle.dispatched is True
+
+
+def test_real_client_refuses_an_unadvertised_model_without_sending_the_prompt(
+    tmp_path: Path,
+) -> None:
+    from hflow.contracts import InvocationOutcome, ModelApplied
+
+    result, handle, stream, wire = _run_model_invocation(
+        tmp_path, scenario="dsh-catalog", model_selection='["mock-provider","not-offered"]'
+    )
+
+    assert "session/prompt" not in _methods(stream)
+    assert not any(
+        entry.get("dir") == "in" and entry["payload"].get("method") == "session/prompt"
+        for entry in wire
+    ), "the agent never received a prompt"
+    assert result.outcome is InvocationOutcome.FAILED
+    assert result.error_code == "model_rejected_before_prompt"
+    assert result.model_applied is ModelApplied.REJECTED
+    assert handle.dispatched is False
+    assert result.model_observation is not None
+    assert result.model_observation.effective_value == MOCK_INITIAL_MODEL
+
+
+def test_real_client_without_a_catalog_records_that_none_was_advertised(tmp_path: Path) -> None:
+    from hflow.contracts import InvocationOutcome, ModelApplied
+
+    result, _, stream, _ = _run_model_invocation(
+        tmp_path, scenario="normal", model_selection="native_profile"
+    )
+
+    assert "session/prompt" in _methods(stream)
+    assert result.outcome is InvocationOutcome.COMPLETED, result.error_message
+    assert result.model_applied is ModelApplied.NOT_PASSED
+    assert result.model_observation is not None
+    assert result.model_observation.advertised is False
+    assert result.model_observation.effective_value is None
 def _received_prompts(wire_log: Path) -> list[str]:
     """The prompt text the mock agent itself read, one entry per ``session/prompt``."""
     prompts = []

@@ -7,6 +7,7 @@ probe needs, from the schema shipped inside the pinned acpx dependency:
 * ``session/new``        -> a session id
 * ``session/prompt``     -> one thought chunk, one message chunk, then ``stopReason``
 * ``session/cancel``     -> notification; marks the in-flight turn cancelled
+* ``session/set_config_option`` -> only in the ``dsh-catalog`` scenario (see below)
 
 Everything else returns JSON-RPC ``-32601`` (method not found) instead of guessing, so
 a client that depends on unimplemented surface fails visibly.
@@ -45,6 +46,7 @@ SCENARIOS = (
     "cancel-prompt",  # prompt waits for session/cancel, then answers stopReason=cancelled
     "bad-init",  # initialize returns an unrelated shape
     "exit-after-init",  # exits immediately after initialize succeeds
+    "dsh-catalog",  # like normal, but session/new advertises a DSH-shaped grouped model catalog
 )
 
 #: ``role-answer`` settings, taken from the environment so the mock stays a fixed program:
@@ -54,6 +56,47 @@ SCENARIOS = (
 IMPLEMENTER_PATH_ENV = "MOCK_IMPLEMENTER_PATH"
 REVIEW_MODE_ENV = "MOCK_REVIEW_MODE"
 REVIEWER_PROMPT_MARKER = "Review the frozen candidate"
+
+#: ``dsh-catalog``: the *shape* of the configOptions a recorded DSH ``session/new`` returned - a
+#: ``model`` select whose values are opaque JSON ``[provider, model]`` strings, grouped by
+#: provider, plus a ``reasoning_effort`` select of category ``thought_level``. The ids are
+#: placeholders: this says nothing about which models a real DSH build offers.
+CATALOG_MODEL_VALUES = (
+    '["mock-provider","mock-flash"]',
+    '["mock-provider","mock-pro"]',
+)
+CATALOG_EFFORT_VALUES = ("off", "low", "high", "max")
+
+
+def catalog_config_options(model: str, effort: str) -> list[dict[str, Any]]:
+    """The ``dsh-catalog`` configOptions with the given current values."""
+    return [
+        {
+            "id": "model",
+            "name": "Model",
+            "category": "model",
+            "type": "select",
+            "currentValue": model,
+            "options": [
+                {
+                    "group": "mock-provider",
+                    "name": "Mock provider",
+                    "options": [
+                        {"value": value, "name": json.loads(value)[1]}
+                        for value in CATALOG_MODEL_VALUES
+                    ],
+                }
+            ],
+        },
+        {
+            "id": "reasoning_effort",
+            "name": "Reasoning effort",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": effort,
+            "options": [{"value": value, "name": value.title()} for value in CATALOG_EFFORT_VALUES],
+        },
+    ]
 
 
 class Wire:
@@ -96,6 +139,8 @@ class MockAgent:
         self.prompts_seen = 0
         self._permission_seq = 0
         self._answers: dict[str, Any] = {}
+        #: ``dsh-catalog`` current selections, changed only by ``session/set_config_option``.
+        self.config = {"model": CATALOG_MODEL_VALUES[0], "reasoning_effort": "high"}
 
     # -- request dispatch ---------------------------------------------------
 
@@ -116,9 +161,12 @@ class MockAgent:
                 {
                     "sessionId": self.session_id,
                     "modes": None,
-                    "configOptions": None,
+                    "configOptions": self._config_options(),
                 },
             )
+            return
+        if method == "session/set_config_option" and self.scenario == "dsh-catalog":
+            self.on_set_config_option(request_id, params)
             return
         if method == "session/prompt":
             self.on_prompt(request_id, params)
@@ -135,6 +183,34 @@ class MockAgent:
             self.wire.error(request_id, -32601, f"Method not found: {method} (probe mock)")
         else:
             self.wire.record("note", {"ignored_notification": method})
+
+    def _config_options(self) -> list[dict[str, Any]] | None:
+        if self.scenario != "dsh-catalog":
+            return None
+        return catalog_config_options(self.config["model"], self.config["reasoning_effort"])
+
+    def on_set_config_option(self, request_id: Any, params: dict[str, Any]) -> None:
+        """Change one advertised option, the way the recorded DSH bridge does.
+
+        An unknown id or a value outside the advertised set is ``invalidParams``; an accepted
+        change is announced with ``config_option_update`` and answered with the full list.
+        """
+        config_id = params.get("configId")
+        value = params.get("value")
+        allowed = {"model": CATALOG_MODEL_VALUES, "reasoning_effort": CATALOG_EFFORT_VALUES}
+        if config_id not in allowed or value not in allowed[config_id]:
+            self.wire.error(request_id, -32602, f"Invalid params: {config_id}={value!r}")
+            return
+        self.config[config_id] = value
+        options = self._config_options()
+        self.wire.notify(
+            "session/update",
+            {
+                "sessionId": params.get("sessionId") or self.session_id,
+                "update": {"sessionUpdate": "config_option_update", "configOptions": options},
+            },
+        )
+        self.wire.result(request_id, {"configOptions": options})
 
     def on_initialize(self, request_id: Any) -> None:
         if self.scenario == "bad-init":

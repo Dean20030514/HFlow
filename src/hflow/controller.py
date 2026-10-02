@@ -4140,6 +4140,30 @@ class _CycleResult:
         self.accepted = accepted
 
 
+def _stored_model_facts(row: Any, column: str, prefix: str) -> dict[str, Any]:
+    """The model facts an attempt's stored invocation result carries, read as recorded.
+
+    A result without them - written before they existed, by the offline driver, or not a driver
+    result at all - yields nothing, which ``status`` reports as "not recorded" rather than as an
+    absent model.
+    """
+    from .contracts import ModelApplied, ModelObservation
+
+    raw = row[column] if column in row.keys() else None
+    try:
+        payload = json.loads(raw) if raw else {}
+        observation = payload.get("model_observation")
+        applied = payload.get("model_applied")
+        return {
+            f"{prefix}model_observation": ModelObservation.model_validate(observation)
+            if isinstance(observation, dict)
+            else None,
+            f"{prefix}model_applied": ModelApplied(applied) if applied else None,
+        }
+    except (ValueError, TypeError, AttributeError):
+        return {}
+
+
 def inspect_run(store: Store, run_id: str, *, project_root: Path | None = None) -> RunInspection:
     """Read-only projection for ``status``/``report``. Zero model calls, by design."""
     from .contracts import AttemptRecord, EvidenceRecord
@@ -4170,6 +4194,8 @@ def inspect_run(store: Store, run_id: str, *, project_root: Path | None = None) 
             is_repair=bool(a["is_repair"]) if "is_repair" in a.keys() else False,
             created_at=a["created_at"],
             finished_at=a["finished_at"],
+            **_stored_model_facts(a, "result_json", ""),
+            **_stored_model_facts(a, "review_json", "review_"),
         )
         for a in store.attempts_for(run_id)
     ]

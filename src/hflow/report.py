@@ -6,7 +6,7 @@ observed, it prints as ``unknown`` rather than being estimated.
 
 from __future__ import annotations
 
-from .contracts import ResultReceipt, RunInspection
+from .contracts import ModelApplied, ModelObservation, ResultReceipt, RunInspection
 
 
 def _unknown(value: object) -> str:
@@ -199,6 +199,33 @@ def _repair_lines(inspection: RunInspection) -> list[str]:
     return lines
 
 
+def _model_line(
+    role: str, observation: ModelObservation | None, applied: ModelApplied | None
+) -> str:
+    """One invocation's model facts as its stream showed them, or "not recorded".
+
+    The values are the agent's opaque option ids, printed verbatim. A run recorded before these
+    facts existed (or by the offline driver) says so instead of reading as "no model".
+    """
+    if observation is None and applied is None:
+        return (
+            f"    model         {role} not recorded (this result carries no model observation)"
+        )
+    applied_text = _unknown(applied.value if applied else None)
+    parts = [f"    model         {role} model_applied={applied_text}"]
+    if observation is not None:
+        parts.append(f"advertised={observation.advertised}")
+        parts.append(f"requested={observation.requested or '-'}")
+        parts.append(f"effective={_unknown(observation.effective_value)}")
+        if observation.source:
+            parts.append(f"(from {observation.source})")
+        if observation.changes:
+            parts.append(f"changes={len(observation.changes)}")
+        if observation.thought_level is not None:
+            parts.append(f"thought_level={observation.thought_level}")
+    return " ".join(parts)
+
+
 def status_text(inspection: RunInspection) -> str:
     run = inspection.run
     lines = [
@@ -234,6 +261,13 @@ def status_text(inspection: RunInspection) -> str:
             f"repair={attempt.is_repair}"
             + (f" block={attempt.block_code}" if attempt.block_code else "")
         )
+        lines.append(_model_line("implementer", attempt.model_observation, attempt.model_applied))
+        if attempt.review_invocation_id:
+            lines.append(
+                _model_line(
+                    "reviewer", attempt.review_model_observation, attempt.review_model_applied
+                )
+            )
     lines.extend(_repair_lines(inspection))
     lines.append("evidence")
     if not inspection.evidence:

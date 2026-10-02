@@ -14,6 +14,14 @@ live run would use, instead of a fake that shares the driver's in-process state.
 Scenario behaviour is selected by the first element of the configured agent argv, so the
 "stubborn agent" case is a real separate process tree that ignores cancellation.
 
+Model selection mirrors the pinned client's ``--model``: ``STUB_MODEL_CATALOG=grouped`` makes
+``session/new`` advertise a DSH-shaped grouped catalog (placeholder ids). A requested model that
+is advertised and not already current is applied with an outbound ``session/set_config_option``
+before the prompt; one that is not advertised, or a request with no catalog at all, ends the run
+with the client's JSON-RPC error line and exit 1, without sending the prompt.
+``STUB_CLIENT_FAIL_BEFORE_PROMPT=1`` ends any run that way after the session started, for the
+case that is *not* a model refusal.
+
 Usage (normally spawned by the driver):
     python fake_acpx_client.py --cwd <dir> --format json --timeout 60 exec -f -
 """
@@ -30,6 +38,49 @@ import time
 from pathlib import Path
 
 SPAWN_LOG = "agent-spawns.jsonl"
+#: The grouped catalog's values: an initial one and one other, both advertised.
+CATALOG_VALUES = ('["stub-provider","stub-flash"]', '["stub-provider","stub-pro"]')
+#: Request id of the model change; the prompt keeps id 2, which the stub agents answer.
+SET_CONFIG_ID = 10
+
+
+def catalog(model: str) -> list[dict]:
+    """``configOptions`` in the shape a recorded DSH session/new returned."""
+    return [
+        {
+            "id": "model",
+            "name": "Model",
+            "category": "model",
+            "type": "select",
+            "currentValue": model,
+            "options": [
+                {
+                    "group": "stub-provider",
+                    "name": "Stub provider",
+                    "options": [{"value": value, "name": value} for value in CATALOG_VALUES],
+                }
+            ],
+        },
+        {
+            "id": "reasoning_effort",
+            "name": "Reasoning effort",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": "high",
+            "options": [{"value": value, "name": value} for value in ("off", "low", "high", "max")],
+        },
+    ]
+
+
+def client_error(message: str) -> None:
+    """The client's own error line, as the pinned acpx prints it before exiting 1."""
+    out(
+        {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32603, "message": message, "data": {"acpxCode": "RUNTIME"}},
+        }
+    )
 
 
 def load_agent_argv() -> list[str]:
@@ -69,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--format", default="json")
     parser.add_argument("--timeout", type=int, default=60)
     parser.add_argument("--delay-before-prompt", type=float, default=0.0)
+    parser.add_argument("--model", default=None)
     # Accepted and ignored: the driver passes `-f -`, and the body is read from stdin.
     parser.add_argument("-f", "--file", dest="task_file", default=None)
     parser.add_argument("command", nargs="?")
@@ -132,13 +184,56 @@ def main(argv: list[str] | None = None) -> int:
             "params": {"cwd": str(workdir), "mcpServers": []},
         }
     )
+    advertised = os.environ.get("STUB_MODEL_CATALOG") == "grouped"
     out(
         {
             "jsonrpc": "2.0",
             "id": 1,
-            "result": {"sessionId": f"sess-{os.getpid()}", "configOptions": []},
+            "result": {
+                "sessionId": f"sess-{os.getpid()}",
+                "configOptions": catalog(CATALOG_VALUES[0]) if advertised else [],
+            },
         }
     )
+
+    refusal = ""
+    session_id = f"sess-{os.getpid()}"
+    if args.model and not advertised:
+        refusal = f"Cannot apply --model {args.model!r}: no model support was advertised"
+    elif args.model and args.model not in CATALOG_VALUES:
+        refusal = f"Cannot apply --model {args.model!r}: that model was not advertised"
+    if args.model and not refusal and args.model != CATALOG_VALUES[0]:
+        out(
+            {
+                "jsonrpc": "2.0",
+                "id": SET_CONFIG_ID,
+                "method": "session/set_config_option",
+                "params": {"sessionId": session_id, "configId": "model", "value": args.model},
+            }
+        )
+        out(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "config_option_update",
+                        "configOptions": catalog(args.model),
+                    },
+                },
+            }
+        )
+        out(
+            {"jsonrpc": "2.0", "id": SET_CONFIG_ID, "result": {"configOptions": catalog(args.model)}}
+        )
+    if not refusal and os.environ.get("STUB_CLIENT_FAIL_BEFORE_PROMPT") == "1":
+        refusal = "stub client failed before the prompt"
+    if refusal:
+        process.kill()
+        process.wait()
+        client_error(refusal)
+        return 1
 
     pump_done = threading.Event()
 

@@ -27,6 +27,10 @@ Facts baked in from the M0 probe and the installed acpx 0.17.1 bundle (not assum
   envelope. The digest of the text it was handed is reported back in the invocation result,
   so a driver that sends something other than the packet is caught. That digest is a local
   record of the input, not an acknowledgement from the agent or the model.
+* A profile's model is passed as acpx's global ``--model <value>`` flag, the validated value
+  verbatim (``LaunchConfig.model``). acpx applies it after ``session/new`` with
+  ``session/set_config_option`` and before ``session/prompt``, and refuses a value the agent
+  did not advertise without sending the prompt. ``native_profile`` passes no flag.
 * ``acpx cancel`` reaches a *queue owner* for a persisted session, which one-shot ``exec``
   does not have. ``exec`` itself sends ``session/cancel`` for the active prompt when its own
   process receives SIGINT, SIGTERM or SIGHUP - but HFlow cannot deliver those to the client:
@@ -70,6 +74,9 @@ from ..contracts import (
     InvocationRequest,
     InvocationResult,
     LaunchConfig,
+    ModelApplied,
+    ModelChange,
+    ModelObservation,
     NormalizedEvent,
     ReconcileOutcome,
     ReconcileResult,
@@ -78,6 +85,7 @@ from ..contracts import (
     SpawnFact,
     SpawnKind,
     ReviewOutput,
+    launch_model,
 )
 from ..ids import utc_now
 from ..artifacts import BoundedTextSink, StreamCapture
@@ -293,6 +301,7 @@ def resolve_launch_config(
     node_executable: str | None = None,
     agent_argv_override: list[str] | None = None,
     env: Mapping[str, str] | None = None,
+    binding: AgentBinding | None = None,
     workspaces: Sequence[Path] = (),
 ) -> LaunchConfig:
     """Resolve every fact that decides *which programs* a real invocation launches.
@@ -315,8 +324,16 @@ def resolve_launch_config(
     launcher, ``dsh``, the client interpreter or the acpx entry it runs - is a file the agent
     can write, and is refused the same way, as is a workspace inside the ``node_modules`` tree
     the entry loads its modules from.
+
+    ``binding`` is the role's binding; its ``model_selection`` becomes the launch's ``--model``
+    value (none for ``native_profile``). It is validated again here, because a binding can be
+    copied without validation, and an invalid value refuses rather than reaching an argv.
     """
     source = env if env is not None else os.environ
+    try:
+        model = launch_model(binding.model_selection) if binding is not None else ""
+    except ValueError as exc:
+        raise RefusedError(RefusalCode.INVALID_SPEC, str(exc)) from exc
     resolved_data_dir = Path(data_dir)
 
     entry = _resolve_client_entry(
@@ -432,6 +449,7 @@ def resolve_launch_config(
         dsh_executable=resolved_dsh,
         profile=profile,
         dsh_home=str(resolved_home) if resolved_home is not None else "",
+        model=model,
         resolvable=resolvable,
         detail=detail,
     )
@@ -477,6 +495,197 @@ def _client_prefix_for(entry: Path | None, *, node: str, python: str) -> list[st
     if suffix == ".py":
         return [python, "-u"]
     return []
+
+
+def _rpc_id(value: Any) -> tuple[str, Any] | None:
+    """A JSON-RPC id as a key that keeps its type: ``2``, ``2.0`` and ``True`` stay distinct."""
+    if value is None or isinstance(value, (dict, list)):
+        return None
+    return type(value).__name__, value
+
+
+def _option_of(config_options: Any, category: str, preferred_id: str) -> dict[str, Any] | None:
+    """The ``select`` option of one category, the way acpx picks it.
+
+    Category match first, and among those the one whose id is ``preferred_id``; an option that
+    only has that id (no category) is the last resort.
+    """
+    if not isinstance(config_options, list):
+        return None
+    chosen: dict[str, Any] | None = None
+    best = -1
+    for option in config_options:
+        if not isinstance(option, dict) or option.get("type") != "select":
+            continue
+        if option.get("category") == category:
+            rank = 2 if option.get("id") == preferred_id else 1
+        elif option.get("id") == preferred_id:
+            rank = 0
+        else:
+            continue
+        if rank > best:
+            chosen, best = option, rank
+    return chosen
+
+
+def _option_values(options: Any) -> set[str]:
+    """The values a ``select`` option offers, from a flat list or from provider groups."""
+    values: set[str] = set()
+    for entry in options if isinstance(options, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        if isinstance(entry.get("value"), str):
+            values.add(entry["value"])
+        values |= _option_values(entry.get("options"))
+    return values
+
+
+class _ModelWatch:
+    """What one invocation's stream shows about its model option. Observation only.
+
+    Reads the ``session/new`` response's ``configOptions``, every ``config_option_update``, and
+    each outbound ``session/set_config_option`` for the model with its response. It never
+    decides an outcome; ``collect`` asks it narrow questions.
+    """
+
+    def __init__(self, requested: str | None) -> None:
+        self.requested = requested
+        self.advertised = False
+        self.config_id = ""
+        #: Every value the advertised model option offers (flat or grouped), verbatim.
+        self.values: set[str] = set()
+        self.initial_value: str | None = None
+        self.effective_value: str | None = None
+        self.source = ""
+        self.thought_level: str | None = None
+        self.changes: list[ModelChange] = []
+        self.session_created = False
+        #: Outbound requests awaiting their response: id key -> method.
+        self._pending: dict[tuple[str, Any], str] = {}
+        #: Outcomes of the model's set_config_option requests, in order: True = succeeded.
+        self.set_results: list[bool] = []
+        self.set_requests = 0
+        #: The client's own error line: a JSON-RPC error with a null id, as acpx prints it.
+        self.client_error = ""
+
+    def observe(self, message: dict[str, Any]) -> None:
+        method = message.get("method")
+        key = _rpc_id(message.get("id"))
+        if isinstance(method, str):
+            params = message.get("params") if isinstance(message.get("params"), dict) else {}
+            if key is not None and method == "session/new":
+                self._pending[key] = method
+            elif key is not None and method == "session/set_config_option":
+                config_id = params.get("configId")
+                if config_id == (self.config_id or "model"):
+                    self._pending[key] = method
+                    self.set_requests += 1
+            elif method == "session/update":
+                update = params.get("update") if isinstance(params.get("update"), dict) else {}
+                if update.get("sessionUpdate") == "config_option_update":
+                    self._read_options(update.get("configOptions"), "config_option_update")
+            return
+        answered = self._pending.pop(key, None) if key is not None else None
+        result = message.get("result")
+        if answered == "session/new" and isinstance(result, dict):
+            self.session_created = True
+            option = _option_of(result.get("configOptions"), "model", "model")
+            if option is not None:
+                self.advertised = True
+                self.config_id = str(option.get("id") or "")
+                self.values = _option_values(option.get("options"))
+                current = option.get("currentValue")
+                self.initial_value = current if isinstance(current, str) else None
+                self.effective_value = self.initial_value
+                self.source = "session/new"
+            self._read_thought_level(result.get("configOptions"))
+        elif answered == "session/set_config_option":
+            # Any JSON-RPC success counts as the agent accepting the request, whatever shape its
+            # result has; the effective value is only taken from a result that reports one.
+            ok = "result" in message and "error" not in message
+            self.set_results.append(ok)
+            if ok and isinstance(result, dict):
+                self._read_options(result.get("configOptions"), "session/set_config_option")
+        elif (
+            answered is None
+            and "id" in message
+            and message.get("id") is None
+            and "error" in message
+            and not self.client_error
+        ):
+            error = message.get("error") if isinstance(message.get("error"), dict) else {}
+            self.client_error = str(error.get("message") or error)[:500]
+
+    def _read_options(self, config_options: Any, source: str) -> None:
+        option = _option_of(config_options, "model", self.config_id or "model")
+        if option is not None and isinstance(option.get("currentValue"), str):
+            value = option["currentValue"]
+            if value != self.effective_value:
+                self.changes.append(ModelChange(source=source, value=value))
+            self.effective_value = value
+            self.source = source
+        self._read_thought_level(config_options)
+
+    def _read_thought_level(self, config_options: Any) -> None:
+        option = _option_of(config_options, "thought_level", "reasoning_effort")
+        if option is not None and isinstance(option.get("currentValue"), str):
+            self.thought_level = option["currentValue"]
+
+    def refused(self) -> bool:
+        """The requested model was refused, as the stream shows it.
+
+        Either the client could not offer it - no model option was advertised, or the value is
+        not among the advertised ones - so no change request went out; or the agent answered the
+        change request with an error. A value that was already current needs no request, so its
+        absence is not a refusal, and a request still awaiting its answer is unknown, not refused.
+        """
+        if self._pending:
+            return False
+        if self.set_requests == 0:
+            return self.requested is not None and (
+                not self.advertised or self.requested not in self.values
+            )
+        return bool(self.set_results) and not any(self.set_results)
+
+    def observation(self) -> ModelObservation:
+        return ModelObservation(
+            advertised=self.advertised,
+            config_id=self.config_id,
+            initial_value=self.initial_value,
+            requested=self.requested,
+            effective_value=self.effective_value,
+            changes=list(self.changes),
+            source=self.source,
+            thought_level=self.thought_level,
+        )
+
+    def applied(self, *, rejected: bool) -> ModelApplied:
+        """Classify the requested model from what the stream showed. Never a guess upward.
+
+        ``rejected`` is ``collect``'s confirmed pre-prompt refusal. Otherwise: an answered change
+        request is ``accepted`` only while the effective value is the request; an unanswered one
+        is ``unknown``. With no change request, ``passed`` is said only while the stream's last
+        reported value is still the request - a refusal the stream shows (not advertised, not in
+        the catalog) that an earlier outcome branch shadowed, or a later
+        ``config_option_update`` that moved the model away, is ``unknown``, not ``passed``.
+        """
+        if not self.requested:
+            return ModelApplied.NOT_PASSED
+        if rejected or (self.set_results and not any(self.set_results)):
+            return ModelApplied.REJECTED
+        if any(self.set_results):
+            return (
+                ModelApplied.ACCEPTED
+                if self.effective_value == self.requested
+                else ModelApplied.UNKNOWN
+            )
+        if self.set_requests:
+            return ModelApplied.UNKNOWN
+        # No change request went out. The rejection branch did not confirm a refusal (rule 7: no
+        # upgrade without an observation), so a refusal or a different value is unknown.
+        if self.refused() or self.effective_value != self.requested:
+            return ModelApplied.UNKNOWN
+        return ModelApplied.PASSED
 
 
 def _workspace_client_config(workspace: Path) -> Path | None:
@@ -535,12 +744,13 @@ class AcpxDshDriver:
         agent_argv_override: list[str] | None = None,
         max_raw_log_bytes: int = MAX_RAW_LOG_BYTES,
         launch: LaunchConfig | None = None,
+        binding: AgentBinding | None = None,
     ) -> None:
         self.data_dir = Path(data_dir)
         #: The resolved launch. Given one, this driver uses it verbatim - it does not read the
         #: environment again, which is what makes an approval of this configuration an approval
         #: of what actually runs. Constructed without one (a direct caller, tests), it resolves
-        #: its own from the arguments below.
+        #: its own from the arguments below (``binding`` supplies the model to pass, if any).
         if launch is None:
             launch = resolve_launch_config(
                 data_dir=self.data_dir,
@@ -550,6 +760,7 @@ class AcpxDshDriver:
                 dsh_executable=dsh_executable,
                 python_executable=python_executable,
                 agent_argv_override=agent_argv_override,
+                binding=binding,
             )
         if launch.driver_id != DRIVER_ID:
             raise DriverSetupError(
@@ -611,6 +822,8 @@ class AcpxDshDriver:
         self._transcripts: dict[str, AnswerTranscript] = {}
         #: Request ids of the ``session/prompt`` messages observed, in stream order.
         self._prompt_request_ids: dict[str, list[Any]] = {}
+        #: What the stream showed about each invocation's model option (see ``_ModelWatch``).
+        self._model_watches: dict[str, _ModelWatch] = {}
         #: Every response that carried a ``stopReason``, as ``(id, stopReason)`` in stream order,
         #: whatever request it answered. Which of them settles the turn is decided in
         #: ``_prompt_response``, not by the order they arrived in.
@@ -752,6 +965,15 @@ class AcpxDshDriver:
             "child on Windows - Ctrl+Break arrives as SIGBREAK, which acpx does not handle)",
             "stopReason=end_turn is turn settlement, not success: acceptance is decided by "
             "checks and review",
+            (
+                f"model: --model {self.launch.model} on the client command line (acpx applies it "
+                "with session/set_config_option before the prompt and refuses a value the agent "
+                "did not advertise)"
+                if self.launch.model
+                else "model: native_profile - no --model flag; the launcher's DSH profile decides"
+            ),
+            "model_selection capability: documented only - no set_config_option round trip "
+            "with a real DSH has been observed; each run records what its stream showed",
         ]
         if self.dsh_home is not None:
             notes.append(f"probe DSH_HOME: {self.dsh_home}")
@@ -811,7 +1033,12 @@ class AcpxDshDriver:
         Node; a Python entry point (the test stand-in) runs under Python. Feeding a
         JavaScript file to the Python interpreter fails immediately, which is a defect this
         driver must not have.
+
+        A bound model is the one optional flag: acpx's *global* ``--model``, so it precedes the
+        subcommand. Its value is the launch's validated, approval-bound value - a fixed
+        configuration flag, never task text (that still travels on stdin).
         """
+        model = ["--model", self.launch.model] if self.launch.model else []
         return [
             *self._client_prefix(),
             str(self.acpx_cli),
@@ -821,6 +1048,7 @@ class AcpxDshDriver:
             "json",
             "--timeout",
             str(deadline_seconds),
+            *model,
             "exec",
             "-f",
             "-",
@@ -1044,6 +1272,7 @@ class AcpxDshDriver:
         self._events[request.invocation_id] = []
         self._transcripts[request.invocation_id] = AnswerTranscript(role=request.role)
         self._prompt_request_ids[request.invocation_id] = []
+        self._model_watches[request.invocation_id] = _ModelWatch(self.launch.model or None)
         self._terminal_responses[request.invocation_id] = []
         self._lines[request.invocation_id] = deque(maxlen=MAX_BUFFERED_LINES)
         self._unparsed[request.invocation_id] = 0
@@ -1286,9 +1515,13 @@ class AcpxDshDriver:
 
         Neutral facts, no policy: the dispatch marker and the prompt's request id, the session
         identity, the assistant text of the turn (which is where a reviewer's verdict actually
-        travels), and each terminal response together with the request id it answered.
+        travels), each terminal response together with the request id it answered, and what the
+        stream says about the session's model option.
         """
         handle = self._handles[invocation_id]
+        watch = self._model_watches.get(invocation_id)
+        if watch is not None:
+            watch.observe(message)
         if message.get("method") == "session/prompt":
             handle.dispatched = True
             handle.dispatched_at = handle.dispatched_at or utc_now()
@@ -1413,6 +1646,7 @@ class AcpxDshDriver:
                     invocation_id, ExitBoundary(emptied=emptied, left_behind=None, detail=stop_detail)
                 )
             close_output_handles(process)
+            observation, applied = self._model_facts(invocation_id, rejected=False)
             result = InvocationResult(
                 invocation_id=invocation_id,
                 outcome=InvocationOutcome.OUTCOME_UNKNOWN,
@@ -1429,6 +1663,8 @@ class AcpxDshDriver:
                     f"({wait_seconds:.3f}s of waiting); stopped={stopped}"
                 ),
                 raw_ref=str(handle.event_log),
+                model_observation=observation,
+                model_applied=applied,
             )
             self._results[invocation_id] = result
             return result
@@ -1494,6 +1730,17 @@ class AcpxDshDriver:
             outcome = InvocationOutcome.OUTCOME_UNKNOWN
             error_code = "unbound_completion"
             error_message = self._unbound_detail(invocation_id)
+        elif self._model_rejected_before_prompt(invocation_id, handle, process):
+            # Narrow on purpose: a model was passed, the client refused it (or relayed the agent's
+            # refusal) and exited with its error, no session/prompt left the client in a complete
+            # stream, and the process tree is gone. Nothing reached a model, so this is a definite
+            # failure; every other missing stop reason stays unknown below.
+            outcome = InvocationOutcome.FAILED
+            error_code = "model_rejected_before_prompt"
+            error_message = (
+                f"the client refused --model {self.launch.model} before sending the prompt "
+                f"(exit {process.returncode}): {self._model_watches[invocation_id].client_error}"
+            )
         elif stop_reason in {None, ""}:
             outcome = InvocationOutcome.OUTCOME_UNKNOWN
             error_code = "no_stop_reason"
@@ -1558,6 +1805,9 @@ class AcpxDshDriver:
         review, note = self._review_output(handle, outcome)
         if note:
             limitations.append(note)
+        observation, applied = self._model_facts(
+            invocation_id, rejected=error_code == "model_rejected_before_prompt"
+        )
         result = InvocationResult(
             invocation_id=invocation_id,
             outcome=outcome,
@@ -1571,10 +1821,47 @@ class AcpxDshDriver:
             raw_ref=str(handle.event_log),
             error_code=error_code,
             error_message=error_message,
+            model_observation=observation,
+            model_applied=applied,
         )
         handle.finished = True
         self._results[invocation_id] = result
         return result
+
+    def _model_rejected_before_prompt(
+        self, invocation_id: str, handle: DriverHandle, process: subprocess.Popen
+    ) -> bool:
+        """The one no-stop-reason case that is a definite failure. All conditions must hold.
+
+        Called after the boundary, overflow, unparseable-line and unbound-completion checks, so
+        the boundary is known empty and the retained stream is whole and parsed. On top of that:
+        a model was passed; the stream was drained; the session was created; no ``session/prompt``
+        left the client; the model was refused - by the client before any change request (no
+        model option advertised, or the value not among the advertised ones), or by the agent
+        answering that request with an error; the client printed its own JSON-RPC error line
+        (null id); and it exited non-zero.
+        """
+        watch = self._model_watches.get(invocation_id)
+        return bool(
+            self.launch.model
+            and watch is not None
+            and self._stream_drained.get(invocation_id)
+            and process.returncode not in (None, 0)
+            and not handle.dispatched
+            and not self._prompt_request_ids.get(invocation_id)
+            and watch.session_created
+            and watch.refused()
+            and watch.client_error
+        )
+
+    def _model_facts(
+        self, invocation_id: str, *, rejected: bool
+    ) -> tuple[ModelObservation | None, ModelApplied | None]:
+        """The invocation's model observation and what became of the requested model."""
+        watch = self._model_watches.get(invocation_id)
+        if watch is None:
+            return None, None
+        return watch.observation(), watch.applied(rejected=rejected)
 
     def _prompt_response(self, invocation_id: str) -> tuple[bool, str | None]:
         """``(answered, stop_reason)`` of the response that answers this invocation's prompt.

@@ -29,6 +29,7 @@ from hflow.contracts import (
     EvidenceStatus,
     InvocationOutcome,
     InvocationRequest,
+    ModelApplied,
     RefusalCode,
     RefusedError,
     RunRequest,
@@ -75,6 +76,7 @@ class DriverHarness:
         *,
         delay_before_prompt: float = 0.0,
         max_raw_log_bytes: int | None = None,
+        binding: AgentBinding | None = None,
     ) -> None:
         self.mode = mode
         self.data_dir = (tmp_path / "data").resolve()
@@ -101,6 +103,7 @@ class DriverHarness:
             python_executable=sys.executable,
             completion_timeout_seconds=90,
             agent_argv_override=stub_argv,
+            binding=binding,
             **extra,  # type: ignore[arg-type]
         )
         # The stub keeps its marker files in STUB_SCRATCH_DIR; the fake client inherits the
@@ -159,13 +162,18 @@ def harness_factory(tmp_path: Path):
     created: list[DriverHarness] = []
 
     def make(
-        mode: str, *, delay_before_prompt: float = 0.0, max_raw_log_bytes: int | None = None
+        mode: str,
+        *,
+        delay_before_prompt: float = 0.0,
+        max_raw_log_bytes: int | None = None,
+        binding: AgentBinding | None = None,
     ) -> DriverHarness:
         harness = DriverHarness(
             tmp_path / f"{mode}-{len(created)}",
             mode,
             delay_before_prompt=delay_before_prompt,
             max_raw_log_bytes=max_raw_log_bytes,
+            binding=binding,
         )
         created.append(harness)
         return harness
@@ -1020,6 +1028,297 @@ def test_missing_stop_reason_is_unknown_not_success(harness_factory) -> None:
     assert result.outcome is InvocationOutcome.OUTCOME_UNKNOWN
     assert result.error_code == "no_stop_reason"
     harness.driver.release(handle.invocation_id)
+
+
+# --------------------------------------------------------------------------
+# group 3b: model selection - observed always, passed only from the bound profile
+# --------------------------------------------------------------------------
+
+#: The stand-in's grouped catalog (``STUB_MODEL_CATALOG=grouped``): DSH's shape, placeholder ids.
+STAND_IN_INITIAL_MODEL = '["stub-provider","stub-flash"]'
+STAND_IN_OTHER_MODEL = '["stub-provider","stub-pro"]'
+
+
+def _model_binding(model_selection: str) -> AgentBinding:
+    return AgentBinding(harness="dsh", driver=DRIVER_ID, model_selection=model_selection)
+
+
+def test_client_argv_carries_a_bound_model_as_one_fixed_global_flag(tmp_path: Path) -> None:
+    """``native_profile`` adds nothing; a chosen model is one ``--model`` before ``exec``.
+
+    The value is the profile's validated value, verbatim - a JSON pair stays one argument, and
+    the agent launch argv (rule 9's launcher plus fixed flags) does not change at all.
+    """
+    native = AcpxDshDriver(
+        data_dir=tmp_path, acpx_cli=FAKE_CLIENT, binding=_model_binding("native_profile")
+    )
+    assert native.launch.model == ""
+    assert "--model" not in native._client_argv(tmp_path, tmp_path, 60)
+
+    chosen = AcpxDshDriver(
+        data_dir=tmp_path, acpx_cli=FAKE_CLIENT, binding=_model_binding(STAND_IN_OTHER_MODEL)
+    )
+    argv = chosen._client_argv(tmp_path, tmp_path, 60)
+    assert chosen.launch.model == STAND_IN_OTHER_MODEL
+    assert argv.count("--model") == 1
+    flag = argv.index("--model")
+    assert argv[flag + 1] == STAND_IN_OTHER_MODEL
+    assert flag < argv.index("exec"), "--model is a global flag: it goes before the subcommand"
+    assert argv[-2:] == ["-f", "-"], "the task still travels on stdin"
+    assert chosen._agent_argv() == native._agent_argv()
+
+
+def test_the_stand_in_stream_with_a_grouped_catalog_yields_the_effective_model(
+    harness_factory,
+) -> None:
+    """Observed without passing anything: what the session started with is recorded."""
+    harness = harness_factory("cooperative")
+    harness.driver.extra_env["STUB_MODEL_CATALOG"] = "grouped"
+    handle, _ = harness.start()
+    result = harness.driver.collect(handle)
+
+    assert result.outcome is InvocationOutcome.COMPLETED
+    observation = result.model_observation
+    assert observation is not None
+    assert observation.advertised is True
+    assert observation.config_id == "model"
+    assert observation.initial_value == STAND_IN_INITIAL_MODEL
+    assert observation.effective_value == STAND_IN_INITIAL_MODEL
+    assert observation.requested is None
+    assert observation.source == "session/new"
+    assert observation.thought_level == "high"
+    assert observation.changes == []
+    assert result.model_applied is ModelApplied.NOT_PASSED
+    harness.driver.release(handle.invocation_id)
+
+
+def test_a_stream_without_a_catalog_records_that_no_model_was_advertised(harness_factory) -> None:
+    harness = harness_factory("cooperative")
+    handle, _ = harness.start()
+    result = harness.driver.collect(handle)
+
+    assert result.outcome is InvocationOutcome.COMPLETED
+    assert result.model_observation is not None
+    assert result.model_observation.advertised is False
+    assert result.model_observation.effective_value is None
+    assert result.model_applied is ModelApplied.NOT_PASSED
+    harness.driver.release(handle.invocation_id)
+
+
+def test_an_advertised_model_is_applied_and_accepted_before_the_prompt(harness_factory) -> None:
+    harness = harness_factory("cooperative", binding=_model_binding(STAND_IN_OTHER_MODEL))
+    harness.driver.extra_env["STUB_MODEL_CATALOG"] = "grouped"
+    handle, _ = harness.start()
+    result = harness.driver.collect(handle)
+
+    assert result.outcome is InvocationOutcome.COMPLETED
+    observation = result.model_observation
+    assert observation is not None
+    assert observation.requested == STAND_IN_OTHER_MODEL
+    assert observation.initial_value == STAND_IN_INITIAL_MODEL
+    assert observation.effective_value == STAND_IN_OTHER_MODEL
+    assert observation.source == "session/set_config_option"
+    assert [change.value for change in observation.changes] == [STAND_IN_OTHER_MODEL]
+    assert result.model_applied is ModelApplied.ACCEPTED
+    harness.driver.release(handle.invocation_id)
+
+
+def test_an_unadvertised_model_fails_before_any_prompt_is_sent(harness_factory) -> None:
+    """The client refuses the model and exits: a definite failure, not an unknown outcome.
+
+    No ``session/prompt`` left the client, the stream is complete and the process is gone, so
+    nothing reached a model - which is what makes FAILED (and not OUTCOME_UNKNOWN) honest.
+    """
+    harness = harness_factory("cooperative", binding=_model_binding('["stub-provider","nope"]'))
+    harness.driver.extra_env["STUB_MODEL_CATALOG"] = "grouped"
+    handle, _ = harness.start()
+    result = harness.driver.collect(handle)
+
+    assert result.outcome is InvocationOutcome.FAILED
+    assert result.error_code == "model_rejected_before_prompt"
+    assert handle.dispatched is False
+    assert result.agent_turns == 0
+    assert result.model_applied is ModelApplied.REJECTED
+    assert result.model_observation is not None
+    assert result.model_observation.effective_value == STAND_IN_INITIAL_MODEL
+    harness.driver.release(handle.invocation_id)
+
+
+def test_a_model_with_no_catalog_to_choose_from_fails_before_the_prompt(harness_factory) -> None:
+    harness = harness_factory("cooperative", binding=_model_binding("stub-pro"))
+    handle, _ = harness.start()
+    result = harness.driver.collect(handle)
+
+    assert result.outcome is InvocationOutcome.FAILED
+    assert result.error_code == "model_rejected_before_prompt"
+    assert result.model_observation is not None
+    assert result.model_observation.advertised is False
+    assert result.model_applied is ModelApplied.REJECTED
+    harness.driver.release(handle.invocation_id)
+
+
+@pytest.mark.parametrize(
+    ("model", "applied"),
+    [
+        (None, ModelApplied.NOT_PASSED),
+        (STAND_IN_OTHER_MODEL, ModelApplied.ACCEPTED),
+        # Already the session's value: the client sends no change, and that is not a refusal.
+        (STAND_IN_INITIAL_MODEL, ModelApplied.PASSED),
+    ],
+)
+def test_a_client_error_before_the_prompt_that_is_not_a_model_rejection_stays_unknown(
+    harness_factory, model: str | None, applied: ModelApplied
+) -> None:
+    """The narrow conjunction is narrow: any other missing stop reason keeps today's reading.
+
+    Without a model on the command line, with one the agent accepted, or with one that was
+    already current, a client that errors out before the prompt is not a model rejection - and
+    is not reclassified (rule 5).
+    """
+    binding = _model_binding(model) if model else None
+    harness = harness_factory("cooperative", binding=binding)
+    harness.driver.extra_env["STUB_MODEL_CATALOG"] = "grouped"
+    harness.driver.extra_env["STUB_CLIENT_FAIL_BEFORE_PROMPT"] = "1"
+    handle, _ = harness.start()
+    result = harness.driver.collect(handle)
+
+    assert result.outcome is InvocationOutcome.OUTCOME_UNKNOWN
+    assert result.error_code == "no_stop_reason"
+    assert handle.dispatched is False
+    assert result.model_applied is applied
+    harness.driver.release(handle.invocation_id)
+
+
+def _watched_session(requested: str, *, catalog: list[str] | None, current: str = "") -> object:
+    """A ``_ModelWatch`` that has seen ``session/new`` answered, with or without a model option."""
+    from hflow.drivers.acpx_dsh import _ModelWatch
+
+    watch = _ModelWatch(requested)
+    watch.observe({"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {}})
+    result: dict[str, object] = {"sessionId": "s"}
+    if catalog is not None:
+        result["configOptions"] = [_model_option(current, catalog)]
+    watch.observe({"jsonrpc": "2.0", "id": 1, "result": result})
+    return watch
+
+
+def _model_option(current: str, catalog: list[str]) -> dict[str, object]:
+    return {
+        "id": "model",
+        "category": "model",
+        "type": "select",
+        "currentValue": current,
+        "options": [{"value": value} for value in catalog],
+    }
+
+
+def test_an_already_current_model_with_no_later_change_is_passed() -> None:
+    watch = _watched_session("a", catalog=["a", "b"], current="a")
+
+    assert watch.refused() is False
+    assert watch.applied(rejected=False) is ModelApplied.PASSED
+
+
+def test_a_model_moved_away_after_the_session_started_is_not_passed() -> None:
+    """Already current, so no change request went out - then the stream shows another value.
+
+    "passed" means nothing in the stream contradicts the request. A ``config_option_update``
+    moving the model away does, so the label must not claim the requested model ran.
+    """
+    watch = _watched_session("a", catalog=["a", "b"], current="a")
+    watch.observe(
+        {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "s",
+                "update": {
+                    "sessionUpdate": "config_option_update",
+                    "configOptions": [_model_option("b", ["a", "b"])],
+                },
+            },
+        }
+    )
+
+    assert watch.effective_value == "b"
+    assert len(watch.changes) == 1
+    assert watch.applied(rejected=False) is ModelApplied.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "catalog",
+    [None, ["a", "b"]],
+    ids=["no-model-option-advertised", "value-not-in-the-catalog"],
+)
+def test_a_refusal_shadowed_by_an_earlier_outcome_is_not_passed(catalog) -> None:
+    """The stream shows the client could not offer the model, but ``collect`` settled the turn on
+    an earlier branch (boundary, overflow, unparseable, unbound), so ``rejected`` is False.
+
+    The refusal is still in the stream; "passed" would say the opposite. Not upgraded to
+    ``rejected`` either: the branch that confirms a rejection did not run (rule 7).
+    """
+    watch = _watched_session("zzz", catalog=catalog, current="a")
+    watch.observe(
+        {"jsonrpc": "2.0", "id": None, "error": {"code": -32603, "message": "model unavailable"}}
+    )
+
+    assert watch.refused() is True
+    assert watch.applied(rejected=False) is ModelApplied.UNKNOWN
+
+
+def test_status_shows_each_invocations_model_and_old_runs_say_not_recorded(
+    tmp_path: Path, project, task_spec, project_root: Path, harness_factory
+) -> None:
+    """status/report read the model facts from the stored result; nothing is re-derived."""
+    from hflow.controller import inspect_run
+    from hflow.report import report_json, status_text
+
+    harness = harness_factory("cooperative", binding=_model_binding(STAND_IN_OTHER_MODEL))
+    harness.driver.extra_env["STUB_MODEL_CATALOG"] = "grouped"
+    store = Store(tmp_path / "hflow.sqlite")
+    controller = Controller(
+        store,
+        harness.driver,
+        controller_build="test-build",
+        runners=CheckRunners({"fake": FakeCheckRunner()}),
+        data_dir=harness.data_dir,
+        production=False,
+    )
+    try:
+        outcome = controller.run_task(
+            RunRequest(
+                task=task_spec,
+                project=project,
+                project_root=project_root,
+                workspace_root=project_root,
+            )
+        )
+        inspection = inspect_run(store, outcome.run_id)
+        # An attempt row written before model observation existed: its stored result simply
+        # has no model fields.
+        with store.transaction() as conn:
+            conn.execute(
+                "UPDATE attempts SET result_json = ? WHERE run_id = ?",
+                (json.dumps({"invocation_id": "old", "outcome": "completed"}), outcome.run_id),
+            )
+        legacy = inspect_run(store, outcome.run_id)
+    finally:
+        for invocation_id in list(harness.driver._handles):
+            harness.driver.release(invocation_id)
+        store.close()
+
+    implementer = inspection.attempts[0]
+    assert implementer.model_applied is ModelApplied.ACCEPTED
+    assert implementer.model_observation is not None
+    assert implementer.model_observation.effective_value == STAND_IN_OTHER_MODEL
+    rendered = status_text(inspection)
+    assert "model_applied=accepted" in rendered
+    assert STAND_IN_OTHER_MODEL in rendered
+    assert report_json(inspection)["attempts"][0]["model_applied"] == "accepted"
+
+    assert legacy.attempts[0].model_observation is None
+    assert legacy.attempts[0].model_applied is None
+    assert "model         implementer not recorded" in status_text(legacy)
 
 
 def test_output_overflow_is_untrustworthy_not_success(harness_factory) -> None:

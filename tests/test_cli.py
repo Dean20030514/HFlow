@@ -259,6 +259,38 @@ def test_doctor_resolves_a_selected_profile_per_role(
         assert entry["driver_id"] == "fake"
 
 
+def test_doctor_shows_the_model_flag_and_keeps_model_selection_documented(
+    tmp_path: Path, live_profile: MachineProfile, acpx_client, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Each role's ``--model`` (or its absence) is shown, and the capability is not upgraded."""
+    data_dir = tmp_path / "data"
+    pair = '["deepseek-official","deepseek-v4-pro"]'
+    profile = live_profile.model_copy(
+        update={
+            "agents": {
+                "dsh-implementer": live_profile.agents["dsh-implementer"].model_copy(
+                    update={"model_selection": pair}
+                ),
+                "dsh-reviewer": live_profile.agents["dsh-reviewer"].model_copy(
+                    update={"model_selection": "native_profile"}
+                ),
+            }
+        }
+    )
+    write_profile(data_dir, profile)
+
+    exit_code = main(["doctor", "--json", "--profile", "dsh-local", "--data-dir", str(data_dir)])
+    assert exit_code == EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+
+    implementer = " ".join(payload["profile"]["roles"]["implementer"]["dependencies"])
+    reviewer = " ".join(payload["profile"]["roles"]["reviewer"]["dependencies"])
+    assert f"--model {pair}" in implementer
+    assert "no --model flag" in reviewer
+    assert "documented only" in implementer
+    assert "model_selection" in payload["capabilities"]["states"]["documented"]
+
+
 def test_doctor_refuses_a_profile_it_cannot_resolve(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

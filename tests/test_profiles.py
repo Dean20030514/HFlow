@@ -254,3 +254,77 @@ def test_no_profile_and_no_driver_is_the_offline_default(tmp_path: Path) -> None
     assert machine.profile is None
     assert machine.is_real_driver is False
     assert machine.bindings["implementer"][0] == "command-line"
+
+
+# --------------------------------------------------------------------------
+# model_selection values (C2b): what may become the client's --model flag
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("written", "stored"),
+    [
+        ("native_profile", "native_profile"),
+        ("deepseek-v4-pro", "deepseek-v4-pro"),
+        ("provider/model:v1.2_x", "provider/model:v1.2_x"),
+        # DSH's opaque value ids are JSON [provider, model] pairs. Both spellings a person may
+        # write are kept as the one compact form acpx compares against the advertised catalog.
+        ('["deepseek-official","deepseek-v4-pro"]', '["deepseek-official","deepseek-v4-pro"]'),
+        ('[ "deepseek-official" , "deepseek-v4-pro" ]', '["deepseek-official","deepseek-v4-pro"]'),
+        (["deepseek-official", "deepseek-v4-pro"], '["deepseek-official","deepseek-v4-pro"]'),
+    ],
+)
+def test_a_model_selection_is_a_token_or_a_provider_model_pair(
+    tmp_path: Path, written: object, stored: str
+) -> None:
+    document = {
+        "profile_id": "models",
+        "role_bindings": {"implementer": "a", "reviewer": "a"},
+        "agents": {"a": {"harness": "dsh", "driver": "acpx-dsh", "model_selection": written}},
+    }
+    path = tmp_path / "profiles" / "models.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    profile = load_profile(tmp_path, "models")
+    assert profile.agents["a"].model_selection == stored
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        "",
+        "two words",
+        "a;b",
+        'quote"inside',
+        "x" * 129,
+        "--approve-all",
+        '["only-one"]',
+        '["a","b","c"]',
+        '["a b","c"]',
+        '["a",2]',
+        '{"provider":"a"}',
+        "[not json",
+        ["a"],
+        ["a", "b", "c"],
+        ["a", 1],
+        17,
+    ],
+)
+def test_an_invalid_model_selection_is_refused_at_profile_load(
+    tmp_path: Path, written: object
+) -> None:
+    """Anything that is not a token or a pair never reaches a command line: the load refuses."""
+    document = {
+        "profile_id": "models",
+        "role_bindings": {"implementer": "a", "reviewer": "a"},
+        "agents": {"a": {"harness": "dsh", "driver": "acpx-dsh", "model_selection": written}},
+    }
+    path = tmp_path / "profiles" / "models.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(RefusedError) as excinfo:
+        load_profile(tmp_path, "models")
+    assert excinfo.value.code is RefusalCode.INVALID_SPEC
+    assert "model_selection" in excinfo.value.message

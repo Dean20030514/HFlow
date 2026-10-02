@@ -159,7 +159,8 @@ def build_driver(
     The name resolution is ``resolve_driver_id``'s, not a second copy of it, so a name that
     ``prepare`` accepted cannot fail here for a different reason. ``launch`` is the launch that
     was resolved *before* the approval; when given, the driver consumes it instead of reading
-    the environment again, so what was approved is what runs.
+    the environment again, so what was approved is what runs. Without one, the driver resolves
+    its own launch from ``binding``, including the model it passes.
     """
     resolved = resolve_driver_id(binding)
     if resolved == FAKE_DRIVER_ID:
@@ -168,7 +169,7 @@ def build_driver(
         root = Path(data_dir)
         root.mkdir(parents=True, exist_ok=True)
         return FakeDriver(root)
-    return AcpxDshDriver(data_dir=data_dir, dsh_home=dsh_home, launch=launch)
+    return AcpxDshDriver(data_dir=data_dir, dsh_home=dsh_home, launch=launch, binding=binding)
 
 
 class UnselectedDriver:
