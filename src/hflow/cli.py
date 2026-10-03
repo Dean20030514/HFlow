@@ -957,9 +957,11 @@ def _observer_controller(store: Store, args: argparse.Namespace, run_id: str) ->
 def cmd_cancel(args: argparse.Namespace) -> int:
     store = _open_store(args)
     try:
-        inspection = inspect_run(store, args.run_id)
-        controller = _observer_controller(store, args, inspection.run.run_id)
-        receipt = controller.cancel(inspection.run.run_id)
+        # The run row, not the read projection: a stored record status/report cannot read (a
+        # malformed dsh_context or repair note) must not stop a run from being stopped.
+        run_id = str(store.get_run(args.run_id)["run_id"])
+        controller = _observer_controller(store, args, run_id)
+        receipt = controller.cancel(run_id)
     except RunNotFound:
         print(f"unknown run {args.run_id}", file=sys.stderr)
         return EXIT_USAGE
@@ -972,9 +974,11 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 def cmd_resume(args: argparse.Namespace) -> int:
     store = _open_store(args)
     try:
-        observation = inspect_run(store, args.run_id)
-        controller = _observer_controller(store, args, observation.run.run_id)
-        outcome = controller.resume(observation.run.run_id)
+        # As in ``cmd_cancel``: resolved from the run row, so an unreadable stored record fails
+        # status/report only and never keeps a run from being reconciled.
+        run_id = str(store.get_run(args.run_id)["run_id"])
+        controller = _observer_controller(store, args, run_id)
+        outcome = controller.resume(run_id)
     except RunNotFound:
         print(f"unknown run {args.run_id}", file=sys.stderr)
         return EXIT_USAGE

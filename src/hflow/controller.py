@@ -247,6 +247,12 @@ NOTE_REPAIR = "repair"
 #: taken before the first dispatch; each later comparison that found a change records the digests
 #: and the changed keys and files, never values.
 NOTE_GIT_METADATA = "git_metadata"
+#: The ``git_metadata`` notes that warn rather than record a baseline: a comparison that found the
+#: metadata changed or unreadable. ``inspect_run`` projects exactly these for ``status``/``report``.
+GIT_METADATA_WARNING_PREFIXES = (
+    f"{NOTE_GIT_METADATA}: changed",
+    f"{NOTE_GIT_METADATA}: unreadable",
+)
 
 
 class RunOutcome:
@@ -1965,7 +1971,13 @@ class Controller:
                     # check or reviewer. ``hflow clean`` and the next worktree run read the
                     # metadata next, so it is compared once more and the answer is a note. It never
                     # relabels the block: an ``outcome_unknown`` stays one (AGENTS rules 5 and 8).
-                    self._note_git_metadata_at_exit(run_id, repo, worktree, git_metadata_before)
+                    # The note also rides on the outcome, so ``hflow run`` prints it; ``status``
+                    # and ``report`` show it from the store (``git_metadata_notes``).
+                    note = self._note_git_metadata_at_exit(
+                        run_id, repo, worktree, git_metadata_before
+                    )
+                    if note:
+                        cycle.outcome.notes.append(note)
                 return cycle.outcome
             if round_number > 1:
                 # A second repair is not a thing this build does. The cycle only asks for a repair
@@ -2530,32 +2542,41 @@ class Controller:
 
     def _note_git_metadata_at_exit(
         self, run_id: str, repo: GitRepo, worktree: Path, before: GitMetadataSnapshot | None
-    ) -> None:
+    ) -> str | None:
         """Compare the shared Git metadata once more as a run ends without a receipt: record, never decide.
 
-        Never calls ``_blocked`` or any store transition, so the run's block stays what it was.
+        Never calls ``_blocked`` or any store transition, so the run's block stays what it was, and
+        never raises: the outcome is already decided, and an exception here would take it away
+        from the caller and leave the run looking undecided. Returns the note, or ``None`` when the
+        metadata is unchanged, so ``_drive`` can put it on the outcome the operator sees.
         """
         if before is None:
-            return
+            return None
         try:
             after = repo.metadata_snapshot(worktree)
-        except GitError as exc:
-            self.store.record_note(
-                run_id,
-                f"{NOTE_GIT_METADATA}: unreadable when the run ended: {before.digest} -> ({exc}); "
-                "inspect and restore it before hflow clean or the next worktree run",
+        except Exception as exc:  # noqa: BLE001 - a note, never a decision
+            detail = str(exc) if isinstance(exc, GitError) else f"{type(exc).__name__}: {exc}"
+            note = (
+                f"{NOTE_GIT_METADATA}: unreadable when the run ended: {before.digest} -> "
+                f"({detail}); the run's block is unchanged - inspect and restore it before hflow "
+                "clean or the next worktree run"
             )
-            return
-        changes = after.changes_since(before)
-        if not changes:
-            return
-        self.store.record_note(
-            run_id,
-            f"{NOTE_GIT_METADATA}: changed when the run ended: {before.digest} -> {after.digest} "
-            f"({_change_list(changes)}); the run's block is unchanged - inspect and restore it "
-            "(git config --list --show-origin --show-scope) before hflow clean or the next "
-            "worktree run, which read it again",
-        )
+        else:
+            changes = after.changes_since(before)
+            if not changes:
+                return None
+            note = (
+                f"{NOTE_GIT_METADATA}: changed when the run ended: {before.digest} -> "
+                f"{after.digest} ({_change_list(changes)}); the run's block is unchanged - inspect "
+                "and restore it (git config --list --show-origin --show-scope) before hflow clean "
+                "or the next worktree run, which read it again"
+            )
+        try:
+            self.store.record_note(run_id, note)
+        except StoreError:
+            # Still returned: the outcome's notes are then the only place the warning appears.
+            pass
+        return note
 
     # -- steps ---------------------------------------------------------------
 
@@ -4558,6 +4579,13 @@ def inspect_run(store: Store, run_id: str, *, project_root: Path | None = None) 
         else None,
         repair_records=repair_records,
         dsh_context=store.dsh_context_for(run_id),
+        # Read-only: the warnings a metadata comparison recorded, including the ones no block
+        # reason carries (a run that ended without a receipt, or a stop that already decided it).
+        git_metadata_notes=[
+            note
+            for note in store.notes_for(run_id)
+            if note.startswith(GIT_METADATA_WARNING_PREFIXES)
+        ],
         effective_config=recorded_config,
         model_calls_made=0,
         root_budget=root_usage,

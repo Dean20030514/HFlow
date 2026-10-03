@@ -197,6 +197,14 @@ def _redacted_label(label: str) -> str:
     return f"{kind}:{section}.*.{key}" if dot and subsection else label
 
 
+def _undecodable(args: tuple[str, ...], reason: str) -> str:
+    """The refusal text for git output that is not text: names the command, never the bytes."""
+    return (
+        f"git {' '.join(args)} printed output that could not be decoded as text ({reason}); "
+        "a configuration value or path holds bytes that are not valid in this encoding"
+    )
+
+
 def _config_records(listing: str) -> list[tuple[str, str, str, str | None]]:
     """``git config --list -z --show-scope --show-origin`` as ``(scope, origin, key, value)``.
 
@@ -410,17 +418,27 @@ class GitRepo:
         if literal_pathspecs:
             # A scope entry is a path, never a pattern: '*', '?', '[' and ':(magic)' mean themselves.
             env["GIT_LITERAL_PATHSPECS"] = "1"
-        completed = subprocess.run(  # noqa: S603,S607
-            ["git", *args],
-            cwd=str(cwd or self.root),
-            capture_output=True,
-            text=True,
-            timeout=300,
-            check=False,
-            env=env,
-        )
+        try:
+            completed = subprocess.run(  # noqa: S603,S607
+                ["git", *args],
+                cwd=str(cwd or self.root),
+                capture_output=True,
+                text=True,
+                timeout=300,
+                check=False,
+                env=env,
+            )
+        except UnicodeDecodeError as exc:
+            # POSIX decodes in this thread: git printed bytes that are not text in this encoding
+            # (a configuration value is raw bytes, so a worker can write any).
+            raise GitError(_undecodable(args, exc.reason)) from exc
         if completed.returncode != 0:
-            raise GitError(f"git {' '.join(args)} failed: {completed.stderr.strip()[:300]}")
+            raise GitError(f"git {' '.join(args)} failed: {(completed.stderr or '').strip()[:300]}")
+        if completed.stdout is None:
+            # Windows decodes in a reader thread; the decode error ends that thread and the
+            # output comes back as None. Reading it as empty would make "unreadable" look like
+            # "nothing there".
+            raise GitError(_undecodable(args, "decoding failed"))
         return completed.stdout
 
     def status_report(self, cwd: Path | None = None) -> StatusReport:
@@ -567,9 +585,12 @@ class GitRepo:
         return flagged
 
     def _git_query(self, cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
-        """A read-only git query whose exit code the caller interprets (``run`` raises on any)."""
+        """A read-only git query whose exit code the caller interprets (``run`` raises on any).
+
+        Output that cannot be decoded raises :class:`GitError`, as in ``run``, on either platform.
+        """
         try:
-            return subprocess.run(  # noqa: S603,S607 - fixed read-only query
+            completed = subprocess.run(  # noqa: S603,S607 - fixed read-only query
                 ["git", *args],
                 cwd=str(cwd),
                 capture_output=True,
@@ -580,6 +601,11 @@ class GitRepo:
             )
         except subprocess.TimeoutExpired as exc:
             raise GitError(f"git {' '.join(args)} timed out after {exc.timeout}s") from exc
+        except UnicodeDecodeError as exc:
+            raise GitError(_undecodable(args, exc.reason)) from exc
+        if completed.stdout is None or completed.stderr is None:
+            raise GitError(_undecodable(args, "decoding failed"))
+        return completed
 
     def _global_attributes_file(self, cwd: Path) -> str:
         """The global attributes file git reads in ``cwd``, or ``""`` when it reads none."""
@@ -637,7 +663,10 @@ class GitRepo:
         names as an origin, plus ``config``, ``config.worktree`` and ``info/attributes`` under
         ``git rev-parse --git-path`` and the global attributes file, present or not. Read-only:
         none of these commands runs a filter. Any failure, a timeout included, raises
-        :class:`GitError`.
+        :class:`GitError` - and so does output that is not text (a configuration value is raw
+        bytes a worker can write): ``run`` and ``_git_query`` convert the decode failure on both
+        platforms, and the ``UnicodeDecodeError`` branch below keeps the contract if a read
+        bypasses them.
 
         Needs Git 2.31+ (``rev-parse --path-format=absolute``; ``--show-scope`` is 2.26). The
         global attributes file comes from ``git var GIT_ATTR_GLOBAL`` on Git 2.42+ and from git's
@@ -677,6 +706,10 @@ class GitRepo:
             raise GitError(
                 f"git {' '.join(str(part) for part in exc.cmd[1:4])} timed out after {exc.timeout}s"
             ) from exc
+        except UnicodeDecodeError as exc:
+            # Not ``surrogateescape``: a lone surrogate would only move the failure into
+            # ``digest_of`` and the note writes, which encode as strict UTF-8.
+            raise GitError(f"git metadata output is not decodable as text ({exc.reason})") from exc
         for path in files:
             entries[f"file:{path}"] = _file_digest(Path(path))
         return GitMetadataSnapshot(tuple(sorted(entries.items())))

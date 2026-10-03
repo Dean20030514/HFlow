@@ -3719,6 +3719,7 @@ def test_a_worker_configured_git_filter_blocks_the_run_before_hflow_stages_anyth
         assert len(changed) == 1, notes
         assert "config@worktree:filter.*.clean" in changed[0] and "hflow clean" in changed[0]
         assert not any(note.startswith("git_metadata: changed when the run ended") for note in notes)
+        assert inspect_run(store, outcome.run_id).git_metadata_notes == changed
         # The filter is live: HFlow's own staging runs it now, so its absence above is the guard's.
         GitRepo.discover(scoped_repo).run("add", "-A", "--", "src", cwd=worktree)
         assert marker.exists()
@@ -3866,8 +3867,9 @@ def test_a_run_that_ends_without_a_receipt_notes_a_shared_config_change_and_keep
 ) -> None:
     """A run that ends before any comparison is compared once more; the answer is a note only.
 
-    ``hflow clean`` and the next worktree run read the metadata next, so the operator is told. The
-    block is never relabelled: an ``outcome_unknown`` stays one (AGENTS rules 5 and 8).
+    ``hflow clean`` and the next worktree run read the metadata next, so the operator is told: the
+    note rides on the outcome ``hflow run`` prints, and ``status`` / ``report`` project it from the
+    store. The block is never relabelled: an ``outcome_unknown`` stays one (AGENTS rules 5 and 8).
     """
     _isolate_git_home(tmp_path, monkeypatch)
     store = Store(tmp_path / "hflow.sqlite")
@@ -3908,5 +3910,208 @@ def test_a_run_that_ends_without_a_receipt_notes_a_shared_config_change_and_keep
         assert not any(
             note.startswith("git_metadata: changed before the candidate freeze") for note in notes
         )
+        # What the operator sees, not only the store row: `hflow run` prints the outcome's notes.
+        assert at_exit[0] in outcome.notes, outcome.notes
+        # `hflow status` / `hflow report` project the same note, read-only and verbatim.
+        inspection = inspect_run(store, outcome.run_id)
+        assert inspection.git_metadata_notes == at_exit
+        rendered = status_text(inspection)
+        assert f"git metadata  {at_exit[0]}" in rendered.splitlines(), rendered
+        assert "filter.*.clean" in rendered
+        assert report_json(inspection)["git_metadata_notes"] == at_exit
+        assert inspection.model_calls_made == 0
+    finally:
+        store.close()
+
+
+#: A config value git stores as raw bytes and prints as-is: not valid UTF-8 (nor GBK).
+NOT_TEXT_CONFIG = b"\n[hflowprobe]\n\tx = \xff\xfe\n"
+
+#: On Windows CPython's subprocess reader thread raises the UnicodeDecodeError itself (stdout then
+#: comes back ``None``, which ``GitRepo`` turns into a ``GitError``), and pytest reports that
+#: thread's exception as a warning. It is the condition under test, not a leak.
+NOT_TEXT_THREAD_WARNING = pytest.mark.filterwarnings(
+    "ignore::pytest.PytestUnhandledThreadExceptionWarning"
+)
+
+
+def _append_to_shared_config(worktree: Path, data: bytes) -> None:
+    common = Path(
+        _git(worktree, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+    )
+    with (common / "config").open("ab") as handle:
+        handle.write(data)
+
+
+def _skip_unless_not_text_here() -> None:
+    import locale
+
+    try:
+        NOT_TEXT_CONFIG.decode(locale.getpreferredencoding(False))
+    except UnicodeDecodeError:
+        return
+    pytest.skip("this locale decodes every byte, so git's output is always text here")
+
+
+class WritesNonTextSharedConfig(RepairingDriver):
+    """The implementer writes a config value that is not valid text: git stores raw bytes."""
+
+    def start(self, request):  # noqa: ANN001 - Protocol shape
+        result = super().start(request)
+        if request.role == "implementer":
+            _append_to_shared_config(Path(request.workspace), NOT_TEXT_CONFIG)
+        return result
+
+
+@NOT_TEXT_THREAD_WARNING
+def test_a_shared_config_value_that_is_not_text_blocks_the_run_at_the_freeze(
+    tmp_path: Path, sample_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Undecodable metadata is unreadable metadata: ``scope_violation`` at the freeze, never RUNNING.
+
+    Before, the decode failure escaped as ``AttributeError`` (Windows: the output came back
+    ``None``) or ``UnicodeDecodeError`` (POSIX) past every ``except GitError``: ``run_task`` raised
+    and the run stayed ``RUNNING`` with no block.
+    """
+    _skip_unless_not_text_here()
+    _isolate_git_home(tmp_path, monkeypatch)
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    spec = _spec(policy=None, base_commit=base)
+    driver = WritesNonTextSharedConfig(
+        sample_repo, first_plan={"src/parser.py": FIXED_SOURCE}, repair_plan={}
+    )
+    controller = _controller(
+        store, project_root=sample_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": FailingOnceThenPassing(fail_first=None)}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=sample_repo))
+        assert outcome.task_state is TaskState.BLOCKED
+        assert outcome.block_code is RefusalCode.SCOPE_VIOLATION, outcome.block_reason
+        reason = outcome.block_reason or ""
+        assert reason.startswith(f"{GIT_METADATA_CHANGED} or became unreadable"), reason
+        assert "before the candidate freeze" in reason
+        assert "could not be decoded as text" in reason
+        assert driver.labels == ["implementer"]
+        row = store.get_run(outcome.run_id)
+        assert row["task_state"] == TaskState.BLOCKED.value
+        assert row["block_code"] == RefusalCode.SCOPE_VIOLATION.value
+        assert _git(sample_repo, "for-each-ref", "refs/hflow/").strip() == "", "nothing was frozen"
+        notes = inspect_run(store, outcome.run_id).git_metadata_notes
+        assert len(notes) == 1, notes
+        assert notes[0].startswith("git_metadata: unreadable before the candidate freeze: sha256:")
+    finally:
+        store.close()
+
+
+@NOT_TEXT_THREAD_WARNING
+def test_a_config_value_that_is_not_text_before_the_run_blocks_it_before_any_dispatch(
+    tmp_path: Path, sample_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A legacy non-UTF-8 value already in the user's global config: no baseline, no dispatch.
+
+    The pre-dispatch snapshot cannot be taken, so nothing could be compared later: the run blocks
+    ``internal_error``. Before, the decode failure escaped ``_drive`` after ``worktree add`` and
+    left the run ``DRAFT`` with no block.
+    """
+    _skip_unless_not_text_here()
+    _isolate_git_home(tmp_path, monkeypatch)
+    (tmp_path / "no-global-gitconfig").write_bytes(NOT_TEXT_CONFIG)
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    spec = _spec(policy=None, base_commit=base)
+    driver = RepairingDriver(sample_repo, first_plan={"src/parser.py": FIXED_SOURCE}, repair_plan={})
+    controller = _controller(
+        store, project_root=sample_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": FailingOnceThenPassing(fail_first=None)}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=sample_repo))
+        assert outcome.task_state is TaskState.BLOCKED
+        assert outcome.block_code is RefusalCode.INTERNAL_ERROR, outcome.block_reason
+        reason = outcome.block_reason or ""
+        assert reason.startswith("git workspace failed: "), reason
+        assert "could not be decoded as text" in reason
+        assert driver.labels == [], "nothing is dispatched without a baseline"
+        assert store.invocations_for(outcome.run_id) == []
+        row = store.get_run(outcome.run_id)
+        assert row["task_state"] == TaskState.BLOCKED.value
+        assert row["block_code"] == RefusalCode.INTERNAL_ERROR.value
+    finally:
+        store.close()
+
+
+class ChecksBreakTheSnapshot(FailingOnceThenPassing):
+    """``unit`` fails with a declared code (no policy, so the run ends) after ``breaks`` ran once."""
+
+    def __init__(self, breaks) -> None:  # noqa: ANN001 - a callable taking the worktree
+        super().__init__()
+        self.breaks = breaks
+
+    def run(self, check, cwd, timeout_seconds):  # noqa: ANN001 - Protocol shape
+        if check.id == "unit" and check.id not in self.seen:
+            self.breaks(Path(cwd))
+        return super().run(check, cwd, timeout_seconds)
+
+
+@NOT_TEXT_THREAD_WARNING
+@pytest.mark.parametrize("failure", ["non_text_config", "unexpected_exception"])
+def test_the_exit_comparison_never_raises_over_an_outcome_already_decided(
+    tmp_path: Path, sample_repo: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """It only records a note: a failed read becomes an ``unreadable`` note and the outcome stands.
+
+    Before, a run already blocked ``verification_failed`` (or ``outcome_unknown``) whose exit
+    comparison failed with anything but a ``GitError`` made ``run_task`` raise instead of
+    returning the outcome.
+    """
+    _isolate_git_home(tmp_path, monkeypatch)
+    if failure == "non_text_config":
+        _skip_unless_not_text_here()
+
+        def breaks(worktree: Path) -> None:
+            _append_to_shared_config(worktree, NOT_TEXT_CONFIG)
+
+        expected = "could not be decoded as text"
+    else:
+        armed: list[bool] = []
+        real_snapshot = GitRepo.metadata_snapshot
+
+        def snapshot(self, worktree):  # noqa: ANN001, ANN202 - the method's own shape
+            if armed:
+                raise RuntimeError("an unexpected failure inside the snapshot")
+            return real_snapshot(self, worktree)
+
+        monkeypatch.setattr(GitRepo, "metadata_snapshot", snapshot)
+
+        def breaks(worktree: Path) -> None:
+            armed.append(True)
+
+        expected = "RuntimeError: an unexpected failure inside the snapshot"
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    spec = _spec(policy=None, base_commit=base)
+    driver = RepairingDriver(sample_repo, first_plan={}, repair_plan={})
+    controller = _controller(
+        store, project_root=sample_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": ChecksBreakTheSnapshot(breaks)}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=sample_repo))
+        assert outcome.task_state is TaskState.BLOCKED
+        assert outcome.block_code is RefusalCode.VERIFICATION_FAILED, outcome.block_reason
+        assert store.get_run(outcome.run_id)["block_code"] == RefusalCode.VERIFICATION_FAILED.value
+        at_exit = [
+            note for note in store.notes_for(outcome.run_id)
+            if note.startswith("git_metadata: unreadable when the run ended: sha256:")
+        ]
+        assert len(at_exit) == 1, store.notes_for(outcome.run_id)
+        assert expected in at_exit[0] and "block is unchanged" in at_exit[0]
+        assert at_exit[0] in outcome.notes
+        assert inspect_run(store, outcome.run_id).git_metadata_notes == at_exit
     finally:
         store.close()

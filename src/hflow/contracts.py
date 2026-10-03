@@ -2021,6 +2021,11 @@ class RunInspection(BaseModel):
     repair_records: list[RepairRecord] = Field(default_factory=list)
     #: One per frozen candidate, oldest first; empty for a run that froze no Git candidate.
     dsh_context: list[DshContextRecord] = Field(default_factory=list)
+    #: Every ``git_metadata: changed ...`` / ``git_metadata: unreadable ...`` note, oldest first:
+    #: the shared Git metadata changed after dispatch. A block reason does not always say so (a run
+    #: that ended without a receipt, a stop that already decided it), and ``hflow clean`` and the
+    #: next worktree run read that metadata again. Empty when no comparison found a change.
+    git_metadata_notes: list[str] = Field(default_factory=list)
     #: The configuration this run actually used, as recorded when the run row was created.
     #: ``None`` for a run that predates config binding: reported as "not recorded" rather
     #: than back-filled from whatever configuration happens to be current now.

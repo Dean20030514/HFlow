@@ -398,6 +398,10 @@ def status_text(inspection: RunInspection) -> str:
     lines.append(_drift_line(inspection))
     if run.block_code:
         lines.append(f"blocked       {run.block_code}: {run.block_reason}")
+    # Right under the block: the warning can be the one fact the block reason leaves out (a run
+    # that ended without a receipt, or a stop that already decided it), and `hflow clean` reads
+    # that metadata next.
+    lines.extend(f"git metadata  {note}" for note in inspection.git_metadata_notes)
     lines.append("attempts")
     if not inspection.attempts:
         lines.append("  (none)")
@@ -535,6 +539,8 @@ def report_json(inspection: RunInspection) -> dict[str, object]:
         "repair_records": [r.model_dump(mode="json") for r in inspection.repair_records],
         # One per frozen Git candidate; empty means none was classified (see the text form).
         "dsh_context": [r.model_dump(mode="json") for r in inspection.dsh_context],
+        # The shared-Git-metadata warnings, verbatim from the store; empty means none was found.
+        "git_metadata_notes": list(inspection.git_metadata_notes),
         "receipt": inspection.receipt.model_dump(mode="json") if inspection.receipt else None,
         "effective_config": inspection.effective_config.model_dump(mode="json")
         if inspection.effective_config

@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 import hflow.drivers.acpx_dsh as acpx_dsh_module
-from hflow.cli import EXIT_BLOCKED, EXIT_OK, EXIT_REFUSED, main
+from hflow.cli import EXIT_BLOCKED, EXIT_OK, EXIT_REFUSED, EXIT_USAGE, main
 from hflow.contracts import (
     EffectiveConfig,
     EvidenceStatus,
@@ -858,6 +858,61 @@ def test_an_interrupted_controller_leaves_a_run_resume_reconciles(
     assert reconciled["invocation_id"] == attempt["invocation_id"]
     assert reconciled["outcome"] == "unknown"
     assert store.get_run(run_id)["block_code"] == RefusalCode.OUTCOME_UNKNOWN.value
+
+
+@pytest.mark.parametrize(
+    "note",
+    ["dsh_context: {not json", 'dsh_context: {"paths": []}'],
+    ids=["not-json", "not-a-record"],
+)
+def test_an_unreadable_stored_record_fails_status_but_never_blocks_resume_or_cancel(
+    store: Store, project_root: Path, run_request: RunRequest, tmp_path: Path,
+    capsys: pytest.CaptureFixture[str], note: str,
+) -> None:
+    """`cancel` and `resume` resolve the run from its row, not from the status projection.
+
+    A dsh_context note that does not parse or validate (a hand-edited store, or a record a later
+    build wrote with one more field) fails `status`/`report` loudly. Before, `cancel` and `resume`
+    built that same projection first, so the record also kept the run from being stopped or
+    reconciled.
+    """
+
+    class InterruptedDriver(FakeDriver):
+        def start(self, request):  # noqa: ANN001, ANN201 - the driver protocol's own shape
+            self.started.append(request)
+            self._report_spawn(request, created=True, detail="the invocation began")
+            raise KeyboardInterrupt
+
+    runner = FakeCheckRunner()
+    owner = Controller(
+        store,
+        InterruptedDriver(project_root),
+        controller_build="cli-resume-test",
+        runners=CheckRunners({"fake": runner, "command": runner}),
+        data_dir=tmp_path / "data",
+        production=False,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        owner.run_task(run_request)
+    run_id = str(store.list_runs()[0]["run_id"])
+    store.record_note(run_id, note)
+    with pytest.raises(StoreError):
+        inspect_run(store, run_id)
+
+    exit_code = main(["resume", run_id, "--json", "--data-dir", str(tmp_path / "data")])
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == EXIT_BLOCKED, payload
+    assert any("reconciled an interrupted attempt" in item for item in payload["notes"]), payload
+    assert json.loads(store.open_attempt(run_id)["reconcile_json"])["outcome"] == "unknown"
+
+    exit_code = main(["cancel", run_id, "--json", "--data-dir", str(tmp_path / "data")])
+    receipt = json.loads(capsys.readouterr().out)
+    assert exit_code == EXIT_OK, receipt
+    assert receipt["status"] == "unknown" and receipt["run_already_ended"] is True, receipt
+    assert store.get_run(run_id)["block_code"] == RefusalCode.OUTCOME_UNKNOWN.value
+
+    assert main(["resume", "R-no-such-run", "--data-dir", str(tmp_path / "data")]) == EXIT_USAGE
+    assert "unknown run R-no-such-run" in capsys.readouterr().err
 
 
 def test_the_fake_driver_confirms_only_the_stops_of_its_own_invocations(

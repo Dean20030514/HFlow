@@ -1070,3 +1070,74 @@ def test_a_git_timeout_inside_the_metadata_snapshot_is_a_git_error(
     monkeypatch.setattr(subprocess, "run", hung_listing)
     with pytest.raises(GitError, match="timed out"):
         repo.metadata_snapshot(worktree)
+
+
+#: A config value git stores as raw bytes and prints as-is: not valid UTF-8 (nor GBK).
+NOT_TEXT_CONFIG = b"\n[hflowprobe]\n\tx = \xff\xfe\n"
+
+#: On Windows CPython's subprocess reader thread raises the UnicodeDecodeError itself (stdout then
+#: comes back ``None``, which ``GitRepo`` turns into a ``GitError``), and pytest reports that
+#: thread's exception as a warning. It is the condition under test, not a leak.
+NOT_TEXT_THREAD_WARNING = pytest.mark.filterwarnings(
+    "ignore::pytest.PytestUnhandledThreadExceptionWarning"
+)
+
+
+def _append_to_shared_config(worktree: Path, data: bytes) -> None:
+    """What a worker can do from its worktree: the repository's config is shared by every worktree."""
+    common = Path(
+        _git(worktree, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+    )
+    with (common / "config").open("ab") as handle:
+        handle.write(data)
+
+
+@NOT_TEXT_THREAD_WARNING
+def test_a_config_value_that_is_not_text_makes_the_metadata_snapshot_a_git_error(
+    sample_repo: Path, isolated_git_home: Path
+) -> None:
+    """Undecodable git output must raise ``GitError``, never ``AttributeError`` or ``UnicodeDecodeError``.
+
+    On Windows the decode fails in subprocess's reader thread and the output comes back as
+    ``None``; on POSIX ``subprocess.run`` raises ``UnicodeDecodeError`` itself. Unconverted, either
+    escapes every ``except GitError`` and leaves the run ``RUNNING`` with no block.
+    """
+    import locale
+
+    try:
+        NOT_TEXT_CONFIG.decode(locale.getpreferredencoding(False))
+    except UnicodeDecodeError:
+        pass
+    else:  # pragma: no cover - a single-byte locale decodes any byte
+        pytest.skip("this locale decodes every byte, so git's output is always text here")
+    repo = GitRepo.discover(sample_repo)
+    worktree = repo.create_worktree("R-metadata-not-text", repo.head)
+    repo.metadata_snapshot(worktree)
+    _append_to_shared_config(worktree, NOT_TEXT_CONFIG)
+
+    with pytest.raises(GitError, match="could not be decoded as text"):
+        repo.metadata_snapshot(worktree)
+
+
+@pytest.mark.parametrize("how", ["posix-raises", "windows-returns-none"])
+@pytest.mark.parametrize("query", ["run-config-list", "git-query-attr-global"])
+def test_undecodable_git_output_is_a_git_error_on_either_platforms_path(
+    sample_repo: Path, isolated_git_home: Path, monkeypatch: pytest.MonkeyPatch, how: str, query: str
+) -> None:
+    """Both platform behaviours, simulated on whichever one runs the test, for both helpers."""
+    repo = GitRepo.discover(sample_repo)
+    worktree = repo.create_worktree("R-metadata-undecodable", repo.head)
+    # ``GitRepo.run`` reads the listing; ``_git_query`` reads ``git var GIT_ATTR_GLOBAL``.
+    marker = "--list" if query == "run-config-list" else "GIT_ATTR_GLOBAL"
+    real_run = subprocess.run
+
+    def undecodable(argv, *args, **kwargs):  # noqa: ANN001,ANN002,ANN003 - subprocess.run shape
+        if argv and argv[0] == "git" and marker in argv:
+            if how == "posix-raises":
+                raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+            return subprocess.CompletedProcess(argv, 0, None, "")
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", undecodable)
+    with pytest.raises(GitError, match="could not be decoded as text"):
+        repo.metadata_snapshot(worktree)
