@@ -712,6 +712,10 @@ What the freeze commits, and what it refuses:
 - Path lists are taken with `--no-renames`: a moved file appears as both its old and its new path
   in the staged set, the round and reviewer lists and `candidate_paths`, so the deleted side of a
   move is held to the deny rules too.
+- The same cumulative list is classified against DSH's context list (instruction files, the root
+  skill directories, a root `.env`; see "What the harness does that HFlow does not control") and
+  kept as that attempt's `dsh_context` record, after the candidate ref is written. A stopped or
+  scope-refused candidate gets no record. It is never a refusal.
 - HFlow's own Git commands cannot be hooked or redirected. Every call through its repository
   handle forces `core.hooksPath` to an empty HFlow-owned temporary directory,
   `core.fsmonitor=false`, `commit.gpgsign=false`, `core.ignoreStat=false` and
@@ -1182,6 +1186,16 @@ a run on this machine; they are stated so nobody claims the opposite:
   the prompt separately, not the whole call, and its expiry sends no `session/cancel`. HFlow's own
   invocation deadline - capped by the root's clock - is the bound, enforced by the local wait and
   the forced stop. HFlow never passes `--prompt-retries`.
+- **DSH loads instruction files, skills and an env file from the workspace.** These facts were
+  read at `dsh-v0.2.0-rc.2` (639ed015) only, not at the earlier tags. Its agent-instructions
+  (maxBytes 65536) loads every present `AGENTS.md`, `CLAUDE.md`, `AGENTS.local.md` and
+  `CLAUDE.local.md` from the project root - the nearest `.git`, a worktree's `.git` file included -
+  down to its cwd, and in a deeper directory after a tool touches a file there, following links.
+  Its skill-filesystem scans the root `.dsh/skills` and `.agents/skills`, and loadLayeredEnv reads
+  `<cwd>/.env`. The reviewer's and a repair implementer's cwd is the candidate worktree. HFlow
+  records which of these files a frozen candidate changed (`dsh_context`, shown by `status` and
+  `report`, with a receipt limitation) and refuses nothing; an ignored file of this kind already
+  refuses the freeze, and files already in the base commit are not flagged.
 
 ## Client launch hardening
 
@@ -1359,6 +1373,7 @@ attempts
     stream        implementer updates_after_prompt_response=unknown (not recorded: no bound prompt response, no stream read to its end, or a result without this record)
     model         reviewer not recorded (this result carries no model observation)
     stream        reviewer updates_after_prompt_response=unknown (not recorded: no bound prompt response, no stream read to its end, or a result without this record)
+dsh context   not recorded: no frozen Git candidate was classified for this run (an in-place run, a run that ended or was refused before its candidate was kept, or one recorded before this build)
 repair        no repair decision recorded
 evidence
   E-69hb2f96cn  kind=verification check=unit status=passed exit=0
@@ -1409,6 +1424,13 @@ model_calls   0 (this command; provider-side requests are reported by the receip
   not read to their end.
 - `repair` lists every repair decision the run recorded, refusals included, or says `no repair
   decision recorded`.
+- `dsh context` projects the stored `dsh_context` records. `not recorded` means no frozen Git
+  candidate was classified (this demo is in place); otherwise each frozen candidate shows `none on
+  the list` or `CHANGED n:` with the files a DSH agent started in its worktree would load as
+  instructions, skills or environment. The `list` line is the list each record was classified
+  against, as stored with it. The review evidence of an attempt whose record changed files ends
+  in `dsh_context=changed`, a join by attempt id rather than a field of the evidence. It is a
+  record only: nothing was refused, and files already in the base commit are not listed.
 - `candidate` compares the workspace against the fingerprint the run was accepted at. If it
   says `DRIFTED`, the stored `ACCEPTED` describes the candidate as it was, not the files on
   disk now; nothing has been re-verified.

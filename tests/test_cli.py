@@ -31,7 +31,7 @@ from hflow.controller import Controller, inspect_run
 from hflow.drivers.acpx_dsh import DRIVER_ID as ACPX_DSH_DRIVER_ID
 from hflow.drivers.acpx_dsh import AcpxDshDriver
 from hflow.drivers.fake import FakeDriver
-from hflow.store import Store
+from hflow.store import Store, StoreError
 from hflow.verify import CheckRunners, FakeCheckRunner
 
 from .conftest import write_profile, write_project, write_task
@@ -372,6 +372,34 @@ def test_status_text_marks_unknowns_instead_of_zeroing_them(
     receipt = payload["receipt"]
     assert receipt["usage"]["provider_cost"] is None
     assert receipt["usage"]["provider_billed_tokens"] is None
+
+
+def test_status_says_dsh_context_was_not_recorded_without_a_frozen_candidate(
+    store: Store, controller, run_request
+) -> None:
+    """An in-place run freezes no Git candidate, so nothing was classified: said in words."""
+    outcome = controller.run_task(run_request)
+    inspection = inspect_run(store, outcome.run_id)
+    assert "dsh context   not recorded" in status_text(inspection)
+    assert report_json(inspection)["dsh_context"] == []
+
+
+@pytest.mark.parametrize(
+    ("note", "message"),
+    [
+        ("dsh_context: {not json", "unreadable dsh_context"),
+        ('dsh_context: {"paths": []}', "not a valid DshContextRecord"),
+    ],
+    ids=["not-json", "not-a-record"],
+)
+def test_an_unreadable_dsh_context_record_raises_instead_of_being_skipped(
+    store: Store, controller, run_request, note: str, message: str
+) -> None:
+    """A dropped record would make a partial list look complete, so status fails loudly."""
+    outcome = controller.run_task(run_request)
+    store.record_note(outcome.run_id, note)
+    with pytest.raises(StoreError, match=message):
+        store.dsh_context_for(outcome.run_id)
 
 
 def test_schema_covers_the_hand_written_input_documents(

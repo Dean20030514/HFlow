@@ -575,6 +575,20 @@ Not built around configuration either:
   refused at the driver's spawn gate with the dispatch already reserved: the run stays blocked,
   an identical TaskSpec returns that blocked run, and the next step is a new revision - whose
   first implementer, under a root budget, is charged as a repair, so the root needs one left.
+- **A candidate that changes the files DSH loads as context is recorded, not refused.** The list
+  is `AGENTS.md`, `CLAUDE.md`, `AGENTS.local.md` and `CLAUDE.local.md` at any depth, the root
+  `.dsh/skills/**` and `.agents/skills/**`, and a root `.env`, in any letter case; it is read from
+  upstream DSH source at dsh-v0.2.0-rc.2 (639ed015) and not observed in a DSH run. After each
+  freeze the whole change from the task's original base (`--no-renames`, so a deletion counts) is
+  classified against it and kept as that attempt's `dsh_context` record. `status` and `report`
+  show it, the review evidence of that attempt is marked `dsh_context=changed` (joined by attempt
+  id), and an accepted receipt carries a limitation naming the files. Nothing is refused and the
+  reviewer packet is unchanged; it already lists every changed path. An ignored instruction file
+  or `.env` the implementer writes already refuses the freeze. Not covered: such files already in
+  the base commit; in-place runs; a link to a directory that holds one; an ignored `AGENTS.md`
+  under an allowlisted cache directory (`__pycache__`, `.pytest_cache`); anything under the DSH
+  home. Refusing these files, labelling them in the reviewer packet, or telling the repair
+  implementer each needs a ruling.
 
 Not verified, even where something works on one binding:
 
@@ -633,9 +647,11 @@ Not verified, even where something works on one binding:
   implementer's `approve-all`, DSH's permission escalations - up to unconfined commands - are
   auto-approved; DSH uploads session logs to DeepSeek by default; DSH reports blocked and aborted
   turns as `end_turn`; a failed DSH turn arrives as a JSON-RPC error rather than a stop reason,
-  which HFlow records as `prompt_error_response` and leaves `outcome_unknown`; and acpx's
-  `--timeout` bounds each phase, not the call. See "What the harness does that HFlow does not
-  control" in `docs/operations.md`.
+  which HFlow records as `prompt_error_response` and leaves `outcome_unknown`; acpx's `--timeout`
+  bounds each phase, not the call; and DSH loads `AGENTS.md`/`CLAUDE.md` (and their `.local`
+  forms), project skills and the workspace `.env` into each role's context next to HFlow's packet
+  (documented at dsh-v0.2.0-rc.2; see the `dsh_context` bullet under "Not implemented"). See "What
+  the harness does that HFlow does not control" in `docs/operations.md`.
 - **Nothing is sandboxed.** `command` checks and a real worker run with the current user's
   rights: no filesystem confinement, no credential confinement, and no protection against
   another process of the same user changing the workspace, the authorization artifact or the

@@ -414,6 +414,27 @@ class RepairContext(BaseModel):
     detail: str = ""
 
 
+class DshContextRecord(BaseModel):
+    """Which paths of one frozen candidate's change are on the DSH context list.
+
+    The change is the whole ``--no-renames`` diff from the task's original base to the frozen
+    candidate, classified by the controller after the freeze against the list named in
+    ``list_source``. The list is documented upstream, not observed, and nothing here is enforced:
+    a Record, not an Observation, because nothing watched DSH load a file. An empty ``paths``
+    means "checked, none on the list", which differs from no record at all.
+    """
+
+    model_config = Strict
+
+    attempt_id: str
+    round: int = 1
+    base_commit: str
+    candidate_commit: str
+    paths: list[str] = Field(default_factory=list)
+    list_source: str = ""
+    recorded_at: str = ""
+
+
 class BudgetRequest(BaseModel):
     """How many top-level invocations one run may buy.
 
@@ -1897,6 +1918,8 @@ class RunInspection(BaseModel):
     #: not repair because that check failed for an environmental reason" is a fact an operator
     #: needs, and an absent record would make the run look arbitrary.
     repair_records: list[RepairRecord] = Field(default_factory=list)
+    #: One per frozen candidate, oldest first; empty for a run that froze no Git candidate.
+    dsh_context: list[DshContextRecord] = Field(default_factory=list)
     #: The configuration this run actually used, as recorded when the run row was created.
     #: ``None`` for a run that predates config binding: reported as "not recorded" rather
     #: than back-filled from whatever configuration happens to be current now.

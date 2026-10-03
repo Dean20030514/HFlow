@@ -44,7 +44,7 @@ from hflow.drivers.fake import FakeDriver, FakeScript
 from hflow.gitworkspace import IGNORED_ARTIFACT_ALLOWLIST, GitError, GitRepo, GitStatusParseError
 from hflow.store import Store
 from hflow.verify import CheckRunners
-from hflow.workspace import matches_pattern
+from hflow.workspace import dsh_context_paths, matches_pattern
 
 SCRIPT_SOURCE = '''"""Tiny text utilities used as the M2 sample project."""
 
@@ -572,6 +572,79 @@ def test_a_rename_lists_both_the_deleted_source_and_the_new_path(sample_repo: Pa
     expected = ["src/textkit/__init__.py", "src/textkit/core.py"]
     assert list(freeze.paths) == expected
     assert sorted(repo.diff_paths(base, freeze.candidate_commit)) == expected
+
+
+@pytest.mark.parametrize(
+    ("path", "flagged"),
+    [
+        *(
+            (path, True)
+            for path in (
+                "AGENTS.md",
+                "CLAUDE.md",
+                "AGENTS.local.md",
+                "CLAUDE.local.md",
+                "src/AGENTS.md",
+                "a/b/c/claude.local.md",
+                "Agents.MD",
+                ".env",
+                ".ENV",
+                ".dsh/skills/x/SKILL.md",
+                ".agents/skills/y.md",
+                ".DSH/Skills/z",
+                ".dsh",
+                ".dsh/skills",
+                ".agents",
+            )
+        ),
+        *(
+            (path, False)
+            for path in (
+                "src/.env",
+                "docs/AGENTS.md.bak",
+                "AGENTS.mdx",
+                "my-AGENTS.md",
+                ".dsh/config.yml",
+                "src/.dsh/skills/x.md",
+                ".agents/other/x",
+                "README.md",
+                ".env.example",
+                "agents/skills/x",
+                ".dshx/skills/a",
+                ".agents/skillsx/a",
+            )
+        ),
+    ],
+)
+def test_dsh_context_paths_flags_what_dsh_would_load_or_scan_through(
+    path: str, flagged: bool
+) -> None:
+    """Instruction files at any depth, the root skill dirs (and what leads to them), a root .env."""
+    assert dsh_context_paths([path]) == ([path] if flagged else [])
+
+
+def test_dsh_context_paths_keeps_git_order_and_the_spelling_found() -> None:
+    assert dsh_context_paths(["src/Agents.md", "README.md", ".env", "src/Agents.md"]) == [
+        "src/Agents.md",
+        ".env",
+    ]
+
+
+def test_a_moved_instruction_file_is_classified_on_both_sides(sample_repo: Path) -> None:
+    """``--no-renames`` names the moved-away path too, so the deletion is classified as well."""
+    (sample_repo / "src" / "AGENTS.md").write_text("be careful\n", encoding="utf-8")
+    _git(sample_repo, "add", ".")
+    _git(sample_repo, "commit", "-q", "-m", "add instructions")
+    repo = GitRepo.discover(sample_repo)
+    base = repo.head
+    worktree = repo.create_worktree("R-dsh-move", base)
+    (worktree / "src" / "AGENTS.md").rename(worktree / "src" / "textkit" / "CLAUDE.md")
+
+    freeze = repo.freeze_candidate(worktree, ["src"], expected_head=base)
+    assert dsh_context_paths(repo.diff_paths(base, freeze.candidate_commit)) == [
+        "src/AGENTS.md",
+        "src/textkit/CLAUDE.md",
+    ]
 
 
 def test_a_staged_rename_of_a_denied_file_is_refused_after_staging(

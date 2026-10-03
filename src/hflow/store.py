@@ -39,6 +39,7 @@ from .contracts import (
     CheckPhase,
     DeliveryState,
     DispatchReservation,
+    DshContextRecord,
     EffectiveConfig,
     EvidenceRecord,
     EvidenceStatus,
@@ -85,6 +86,10 @@ _EFFECTIVE_CONFIG_PREFIX = "effective_config: "
 #: The effective configuration is a document, not a one-line operator remark, so it gets its
 #: own bound instead of the 1000-character default (which would cut it mid-JSON).
 EFFECTIVE_CONFIG_NOTE_LIMIT = 8000
+#: Prefix of the run note that carries one frozen candidate's DSH context record. Kept in
+#: ``run_notes`` like the effective configuration: no storage version change, and an older build
+#: sees one more note.
+_DSH_CONTEXT_PREFIX = "dsh_context: "
 
 
 def _same_offline_reprocessing(
@@ -2608,6 +2613,39 @@ class Store:
                 return None
         return None
         return None
+
+    def record_dsh_context(self, run_id: str, record: DshContextRecord) -> None:
+        """Record which of a frozen candidate's changed paths are on the DSH context list."""
+        note = _DSH_CONTEXT_PREFIX + canonical_json(record.model_dump(mode="json"))
+        # Never cut: a cut document would read back as unreadable. The path list is bounded by
+        # the candidate's diff, which the receipt stores in full anyway.
+        self.record_note(run_id, note, limit=len(note))
+
+    def dsh_context_for(self, run_id: str) -> list[DshContextRecord]:
+        """Every DSH context record this run kept, oldest first.
+
+        A note that cannot be read as a ``DshContextRecord`` raises instead of being skipped,
+        like :meth:`repair_records_for`: a silently dropped record would make a partial list
+        look complete. Only ``status``/``report`` read these; the controller never does.
+        """
+        records: list[DshContextRecord] = []
+        for note in self.notes_for(run_id):
+            if not note.startswith(_DSH_CONTEXT_PREFIX):
+                continue
+            try:
+                loaded = json.loads(note[len(_DSH_CONTEXT_PREFIX) :])
+            except json.JSONDecodeError as exc:
+                raise StoreError(
+                    f"run {run_id} has an unreadable dsh_context record ({exc}); it is not skipped"
+                ) from exc
+            try:
+                records.append(DshContextRecord.model_validate(loaded))
+            except ValidationError as exc:
+                raise StoreError(
+                    f"run {run_id} has a dsh_context record that is not a valid "
+                    f"DshContextRecord: {exc}"
+                ) from exc
+        return records
 
     def record_worktree(self, run_id: str, path: Path) -> None:
         """Record the workspace this run was given. Written before any work happens in it."""

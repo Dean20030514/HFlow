@@ -25,6 +25,32 @@ _SNAPSHOT_SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", ".hflow"}
 #: it (see :func:`matches_pattern`).
 BUILTIN_WRITE_DENY: tuple[str, ...] = (".git", ".hflow", ".acpxrc.json", "**/.acpxrc.json")
 
+# The DSH context list below is read from upstream DSH dsh-v0.2.0-rc.2 (639ed015; master da00f7f
+# is identical for these packages). It is not checked against earlier tags and not observed in a
+# DSH run: it classifies a candidate's changed paths, it neither watches DSH nor enforces anything.
+
+#: DSH's agent-instructions loads every one of these present in each directory from its project
+#: root (the nearest ``.git``, which a worktree's ``.git`` file is) down to its cwd, and in a deeper
+#: directory after a tool touches a file there.
+DSH_INSTRUCTION_FILE_NAMES: tuple[str, ...] = (
+    "AGENTS.md",
+    "CLAUDE.md",
+    "AGENTS.local.md",
+    "CLAUDE.local.md",
+)
+#: The project-root directories DSH's skill-filesystem scans.
+DSH_SKILL_DIRS: tuple[str, ...] = (".dsh/skills", ".agents/skills")
+#: The file DSH's loadLayeredEnv reads from its cwd at start-up.
+DSH_WORKSPACE_ENV_FILE = ".env"
+#: Stored in every record, so a later build that widens the list cannot make an old "none
+#: changed" read as if it had applied the new list.
+DSH_CONTEXT_LIST_SOURCE: str = (
+    "upstream DSH dsh-v0.2.0-rc.2 (639ed015) source, not observed in a DSH run: "
+    f"{', '.join(DSH_INSTRUCTION_FILE_NAMES)} at any depth; "
+    f"{', '.join(d + '/**' for d in DSH_SKILL_DIRS)} at the root; "
+    f"a root {DSH_WORKSPACE_ENV_FILE}; any letter case"
+)
+
 #: Characters that make a ``write_allow`` entry a pattern rather than a path.
 _GLOB_CHARS = ("*", "?", "[")
 
@@ -47,6 +73,35 @@ def matches_pattern(path: str, patterns: list[str]) -> bool:
         if fnmatch.fnmatch(candidate, pattern.rstrip("/") + "/**"):
             return True
     return False
+
+
+def dsh_context_paths(paths: Iterable[str]) -> list[str]:
+    """Return the ``paths`` that are on the DSH context list, in order, as Git spelled them.
+
+    The input is workspace-root-relative paths as :meth:`GitRepo.diff_paths` returns them
+    (``--no-renames``, so a deleted or moved-away file counts). Matching ignores case, like the
+    ``.acpxrc.json`` gate. A file or link at ``.dsh``, ``.agents`` or a skill directory itself
+    counts, because DSH would scan through it. This classifies against a documented list
+    (:data:`DSH_CONTEXT_LIST_SOURCE`); it neither observes DSH nor enforces anything.
+    """
+    names = {name.casefold() for name in DSH_INSTRUCTION_FILE_NAMES}
+    skill_dirs = [d.casefold() for d in DSH_SKILL_DIRS]
+    env_file = DSH_WORKSPACE_ENV_FILE.casefold()
+    found: list[str] = []
+    for raw in paths:
+        folded = _normalize(raw).casefold()
+        if not folded:
+            continue
+        if (
+            folded.rsplit("/", 1)[-1] in names
+            or folded == env_file
+            or any(
+                folded == d or d.startswith(folded + "/") or folded.startswith(d + "/")
+                for d in skill_dirs
+            )
+        ):
+            found.append(raw)
+    return list(dict.fromkeys(found))
 
 
 def resolve_within(root: Path, relative: str) -> Path:

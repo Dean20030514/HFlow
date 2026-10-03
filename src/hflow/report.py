@@ -250,6 +250,46 @@ def _stream_line(role: str, order: StreamOrder | None) -> str:
     )
 
 
+def _dsh_context_lines(inspection: RunInspection) -> list[str]:
+    """The stored DSH context records, projected as recorded.
+
+    Each record carries the list it was classified against, and that is what is printed: the
+    current build's list may differ, and applying it to an old record would state a check that
+    never ran.
+    """
+    records = inspection.dsh_context
+    if not records:
+        return [
+            "dsh context   not recorded: no frozen Git candidate was classified for this run (an "
+            "in-place run, a run that ended or was refused before its candidate was kept, or one "
+            "recorded before this build)"
+        ]
+    lines = [
+        "dsh context   files a DSH agent would load from the candidate worktree, per frozen "
+        "candidate (git diff --no-renames <original base>..<candidate>, classified when it was "
+        "frozen)"
+    ]
+    for record in records:
+        count = len(record.paths)
+        found = (
+            f"CHANGED {count}: {', '.join(record.paths[:20])}"
+            + (f" (+{count - 20} more)" if count > 20 else "")
+            if record.paths
+            else "none on the list"
+        )
+        lines.append(
+            f"  {record.attempt_id}  round={record.round} "
+            f"candidate={record.candidate_commit} {found}"
+        )
+    for source in dict.fromkeys(record.list_source for record in records):
+        lines.append(f"  list        {source or '(not recorded)'}")
+    lines.append(
+        "  meaning     recorded only: nothing was refused and the reviewer packet is unchanged. "
+        "Files already in the base commit load too and are not listed"
+    )
+    return lines
+
+
 def status_text(inspection: RunInspection) -> str:
     run = inspection.run
     lines = [
@@ -294,10 +334,15 @@ def status_text(inspection: RunInspection) -> str:
                 )
             )
             lines.append(_stream_line("reviewer", attempt.review_stream_order))
+    lines.extend(_dsh_context_lines(inspection))
     lines.extend(_repair_lines(inspection))
     lines.append("evidence")
     if not inspection.evidence:
         lines.append("  (none)")
+    # Joined by attempt id: the reviewer attaches to the implementer's attempt, so the review row
+    # of an attempt whose frozen candidate changed DSH context files is marked. It is not a field
+    # of the evidence row.
+    dsh_changed = {record.attempt_id for record in inspection.dsh_context if record.paths}
     for item in inspection.evidence:
         # The exit code is shown whenever one was recorded, not only for `command` checks: the
         # offline runner declares a verdict and a code without running a command, and a repair
@@ -307,6 +352,11 @@ def status_text(inspection: RunInspection) -> str:
         lines.append(
             f"  {item.evidence_id}  kind={item.kind} check={item.check_id or '-'} "
             f"status={item.status.value} exit={_unknown(item.exit_code)}"
+            + (
+                " dsh_context=changed"
+                if item.kind == "review" and item.attempt_id in dsh_changed
+                else ""
+            )
         )
     lines.append(
         f"model_calls   {inspection.model_calls_made} (this command; provider-side requests are "
@@ -398,6 +448,8 @@ def report_json(inspection: RunInspection) -> dict[str, object]:
         # Batch E2 repair decisions, refusals included. An empty list means this run recorded
         # none, which the text form says in words rather than leaving a blank section.
         "repair_records": [r.model_dump(mode="json") for r in inspection.repair_records],
+        # One per frozen Git candidate; empty means none was classified (see the text form).
+        "dsh_context": [r.model_dump(mode="json") for r in inspection.dsh_context],
         "receipt": inspection.receipt.model_dump(mode="json") if inspection.receipt else None,
         "effective_config": inspection.effective_config.model_dump(mode="json")
         if inspection.effective_config

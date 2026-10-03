@@ -33,6 +33,7 @@ from .contracts import (
     CheckPhase,
     DeliveryState,
     DispatchReservation,
+    DshContextRecord,
     EffectiveConfig,
     EvidenceStatus,
     HarnessDriver,
@@ -100,8 +101,10 @@ from .gitworkspace import (
 from .store import INVOCATION_OPEN_STATES, RunNotFound, Store, StoreError
 from .verify import CLEAN_EXIT_REASONS, CheckRunners, failed_check_facts, verify_candidate
 from .workspace import (
+    DSH_CONTEXT_LIST_SOURCE,
     candidate_fingerprint,
     changed_paths,
+    dsh_context_paths,
     expand_scope,
     manifest,
     paths_outside_scope,
@@ -3067,12 +3070,11 @@ class Controller:
                 # Second guard, on Git's own answer rather than on the status the freeze read:
                 # the whole change from the task's original base to this candidate is held to
                 # the scope and every deny rule before a ref keeps it or a check runs on it.
+                cumulative_paths = repo.diff_paths(
+                    original_base_commit, freeze.candidate_commit, cwd=project_root
+                )
                 cumulative_outside = paths_outside_scope(
-                    repo.diff_paths(
-                        original_base_commit, freeze.candidate_commit, cwd=project_root
-                    ),
-                    spec.scope,
-                    project.write_deny,
+                    cumulative_paths, spec.scope, project.write_deny
                 )
                 if cumulative_outside:
                     return _CycleResult(
@@ -3094,6 +3096,23 @@ class Controller:
                 ref = repo.candidate_ref(run_id, attempt_id)
                 ref_status = repo.ensure_candidate_ref(ref, freeze.candidate_commit)
                 self.store.record_note(run_id, f"candidate ref {ref} ({ref_status})")
+                # The next role (the reviewer, or a repair round) starts a DSH agent in this
+                # worktree, and upstream DSH source says it loads these files as instructions,
+                # skills or environment next to HFlow's packet. They are recorded from Git's own
+                # list, never refused here (refusing needs a ruling), and an empty list is
+                # recorded too.
+                self.store.record_dsh_context(
+                    run_id,
+                    DshContextRecord(
+                        attempt_id=attempt_id,
+                        round=round_number,
+                        base_commit=original_base_commit,
+                        candidate_commit=freeze.candidate_commit,
+                        paths=dsh_context_paths(cumulative_paths),
+                        list_source=DSH_CONTEXT_LIST_SOURCE,
+                        recorded_at=utc_now(),
+                    ),
+                )
             except GitError as exc:
                 return _CycleResult(
                     outcome=self._blocked(
@@ -3861,6 +3880,9 @@ class Controller:
         describes is the cumulative change a repaired run actually produced - base to final
         candidate - rather than the last round's patch.
 
+        The DSH context limitation is re-derived from that same Git delivery diff, never read
+        back from the stored ``dsh_context`` records, so a bad note cannot fail an acceptance.
+
         Always returns the run's outcome; a refusal of the acceptance write never escapes. A stop
         can commit after the intent is read here and before ``finalize_acceptance``, which then
         refuses the late success in its own transaction: the outcome is the state the stop
@@ -3991,6 +4013,7 @@ class Controller:
             if freeze is not None
             else []
         )
+        dsh_changed = dsh_context_paths(delivery_paths) if freeze is not None else []
 
         receipt = ResultReceipt(
             run_id=run_id,
@@ -4047,6 +4070,18 @@ class Controller:
                 ),
                 "review ran in the implementer's invocations' workspace; its isolation is not "
                 "independently enforced",
+                *(
+                    [
+                        "the candidate changes files that upstream DSH source (dsh-v0.2.0-rc.2) "
+                        "says a DSH agent started in this worktree loads as instructions, skills "
+                        f"or environment ({_first_paths(dsh_changed)}); every role started there "
+                        "after the freeze - the reviewer when one ran, a repair implementer when "
+                        "there was one - would have them in its context. Recorded from the Git "
+                        "diff, not observed in an agent and not refused"
+                    ]
+                    if dsh_changed
+                    else []
+                ),
             ],
         )
 
@@ -4367,6 +4402,12 @@ class _CycleResult:
         self.accepted = accepted
 
 
+def _first_paths(paths: list[str], limit: int = 20) -> str:
+    """The first ``limit`` paths joined for a receipt line, with a count of the rest."""
+    shown = ", ".join(paths[:limit])
+    return shown + (f" (+{len(paths) - limit} more)" if len(paths) > limit else "")
+
+
 def _stored_model_facts(row: Any, column: str, prefix: str) -> dict[str, Any]:
     """The model facts an attempt's stored invocation result carries, read as recorded.
 
@@ -4492,6 +4533,7 @@ def inspect_run(store: Store, run_id: str, *, project_root: Path | None = None) 
         if row["receipt_json"]
         else None,
         repair_records=repair_records,
+        dsh_context=store.dsh_context_for(run_id),
         effective_config=recorded_config,
         model_calls_made=0,
         root_budget=root_usage,

@@ -392,6 +392,14 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
   dispatch already reserved. Both checks match the name without regard to case among the
   workspace root's own entries (acpx's open finds `.ACPXRC.JSON` on a case-insensitive
   filesystem) and name the spelling they found.
+- **A candidate's harness context files are recorded, not refused.** `workspace.dsh_context_paths`
+  classifies the `--no-renames` list `_attempt_cycle` already takes for the cumulative scope check
+  against DSH's documented context list (instruction files at any depth, the root skill
+  directories, a root `.env`; upstream dsh-v0.2.0-rc.2 source). `store.record_dsh_context` keeps
+  one `DshContextRecord` per frozen attempt in `run_notes` (prefix `dsh_context: `, carrying its
+  `list_source`; no storage version change), and only `status`/`report` read it back. `_accept`
+  re-derives the receipt limitation from its own Git delivery diff. `_review` and the reviewer
+  packet are unchanged. The reviewer's DSH still loads the files; nothing here is enforcement.
 - **Every launch program is an absolute file outside the workspace.** `resolve_launch_config`
   never falls back to a bare name: `dsh`, and `node`/`python` for a `.js`/`.py` client, are looked
   up only on the absolute entries of the resolving environment's `PATH` (`find_on_path`, never the
