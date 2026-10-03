@@ -978,6 +978,88 @@ def test_launch_surfaces_are_recorded_but_never_bound(
     assert implementer.client.dsh_carrier == "unknown"
 
 
+def _prepare_json(
+    tmp_path: Path, project, task, project_root: Path, profile, capsys
+) -> tuple[int, dict]:
+    data_dir = tmp_path / "data"
+    write_profile(data_dir, profile)
+    code = main(
+        [
+            "prepare",
+            "--task", str(write_task(tmp_path / "task.json", task)),
+            "--project", str(write_project(tmp_path / "hflow" / "project.json", project)),
+            "--project-root", str(project_root),
+            "--profile", profile.profile_id,
+            "--json",
+            "--data-dir", str(data_dir),
+        ]
+    )
+    return code, json.loads(capsys.readouterr().out)
+
+
+def test_a_client_manifest_nested_too_deeply_to_parse_does_not_stop_prepare(
+    tmp_path: Path, live_project, worktree_task, project_root: Path, live_profile, acpx_client,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The repro: a 200 KB ``[[[...]]]`` acpx package.json used to abort prepare with a trace."""
+    import shutil
+
+    monkeypatch.setenv("HFLOW_ALLOW_WRITES", "true")
+    monkeypatch.delenv("DSH_HOME", raising=False)
+    entry = tmp_path / "client" / "node_modules" / "acpx" / "dist" / "cli.py"
+    entry.parent.mkdir(parents=True)
+    shutil.copyfile(acpx_client, entry)
+    manifest = entry.parent.parent / "package.json"
+    manifest.write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
+    monkeypatch.setenv("HFLOW_ACPX_CLI", str(entry))
+
+    code, payload = _prepare_json(
+        tmp_path, live_project, worktree_task, project_root, live_profile, capsys
+    )
+
+    assert code == EXIT_OK, "an unreadable manifest is a note, never a reason prepare fails"
+    assert set(payload["launch_surfaces"]) == {"implementer", "reviewer"}
+    client = payload["launch_surfaces"]["implementer"]["client"]
+    assert client["acpx_version"] == ""
+    assert f"{manifest} is not valid JSON (or is nested too deeply to parse)" in client["notes"]
+
+
+def test_a_launch_surface_observation_that_raises_leaves_the_role_out_with_a_note(
+    tmp_path: Path, live_project, worktree_task, project_root: Path, live_profile, acpx_client,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Like the spawn and probe paths, a record that fails never stops the preview or its gate."""
+    from hflow.prepare import render_prepare_text
+
+    monkeypatch.setenv("HFLOW_ALLOW_WRITES", "true")
+    monkeypatch.delenv("DSH_HOME", raising=False)
+    resolved = _resolve_live(tmp_path, live_project, worktree_task, project_root, live_profile)
+    observed = build_prepare_report(resolved)
+
+    def broken(*_args, **_kwargs):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr("hflow.drivers.dsh_surfaces.observe_launch_surfaces", broken)
+    report = build_prepare_report(resolved)
+
+    assert report.launch_surfaces == {}
+    for role in ("implementer", "reviewer"):
+        assert (
+            f"{role} launch surfaces could not be examined: RecursionError: "
+            "maximum recursion depth exceeded"
+        ) in report.notes
+    assert report.authorization.binding_digest == observed.authorization.binding_digest
+    text = render_prepare_text(report)
+    assert "launch surfaces (recorded, not enforced" not in text
+    assert "implementer launch surfaces could not be examined" in text
+
+    code, payload = _prepare_json(
+        tmp_path, live_project, worktree_task, project_root, live_profile, capsys
+    )
+    assert code == EXIT_OK
+    assert payload["launch_surfaces"] == {}
+
+
 # --------------------------------------------------------------------------
 # the exit code answers "will this run?", not "is the task well formed?"
 # --------------------------------------------------------------------------

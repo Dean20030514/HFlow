@@ -553,12 +553,16 @@ def resolved_launches(effective: EffectiveConfig) -> list[LaunchConfig]:
 
 
 def launch_surface_preview(
-    resolved: ResolvedRun, env: Mapping[str, str] | None = None
+    resolved: ResolvedRun,
+    env: Mapping[str, str] | None = None,
+    notes: list[str] | None = None,
 ) -> dict[str, LaunchSurfaces]:
     """What each role's DSH would read on its own, as far as it is knowable before dispatch.
 
     A worktree does not exist yet, so its files are left to the spawn-time record; a
     per-invocation home is named, not looked into. Nothing is created and nothing is bound.
+    An observation that fails leaves that role out, with the reason appended to ``notes``:
+    like the spawn and probe paths, a record never stops the preview.
     """
     from .drivers.acpx_dsh import (
         INVOCATION_ID_PLACEHOLDER,
@@ -574,19 +578,26 @@ def launch_surface_preview(
     for entry in resolved.effective.roles:
         if entry.launch is None:
             continue
-        kind, home = effective_dsh_home(entry.launch, child_home=child_home)
-        surfaces[entry.role] = observe_launch_surfaces(
-            entry.launch,
-            dsh_home=home,
-            dsh_home_kind=kind,
-            child_env=child_environment(
-                env if env is not None else os.environ,
-                extra_env={},
-                dsh_home=entry.launch.dsh_home,
-            ),
-            workspace=workspace,
-            look_in_home=kind == "bound",
-        )
+        try:
+            kind, home = effective_dsh_home(entry.launch, child_home=child_home)
+            surfaces[entry.role] = observe_launch_surfaces(
+                entry.launch,
+                dsh_home=home,
+                dsh_home_kind=kind,
+                child_env=child_environment(
+                    env if env is not None else os.environ,
+                    extra_env={},
+                    dsh_home=entry.launch.dsh_home,
+                ),
+                workspace=workspace,
+                look_in_home=kind == "bound",
+            )
+        except Exception as exc:  # noqa: BLE001 - a record never stops the preview
+            if notes is not None:
+                notes.append(
+                    f"{entry.role} launch surfaces could not be examined: "
+                    f"{type(exc).__name__}: {exc}"
+                )
     return surfaces
 
 
@@ -1105,7 +1116,7 @@ def build_prepare_report(
             "the worktree path contains the run id, which is chosen at dispatch: the packet "
             "size and digest above are for the template path and shift with the id's length"
         )
-    surfaces = launch_surface_preview(resolved, env) if resolved.is_real_driver else {}
+    surfaces = launch_surface_preview(resolved, env, notes) if resolved.is_real_driver else {}
     if resolved.is_real_driver:
         notes.append(
             "a live run needs an authorization artifact the user writes from their own "

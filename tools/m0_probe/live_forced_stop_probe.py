@@ -414,7 +414,8 @@ def run_trial(
         )
 
     # Observed running, not merely unanswered: None (the pid could not be opened) is not liveness.
-    alive_before = process_gone(evidence.helper_pid, 0.0) is False
+    helper_state = process_gone(evidence.helper_pid, 0.0)
+    alive_before = helper_state is False
 
     # --- 3. supporting evidence only: the agent's own tool-call projection
     for event in driver.events(handle.invocation_id):
@@ -424,7 +425,7 @@ def run_trial(
     if ready.get("nonce") is None:
         evidence.notes.append("helper READY carried no nonce")
     if not alive_before:
-        evidence.notes.append("helper had already exited before the stop request")
+        evidence.notes.append(_not_alive_note(helper_state))
         evidence.result = "INCONCLUSIVE"
         _safe_cleanup(driver, handle, boundary)
         return evidence
@@ -505,6 +506,20 @@ def _wait_gone(pid: int | None, timeout: float) -> bool | None:
             return True
         time.sleep(0.05)
     return process_gone(pid, 0.2)
+
+
+def _not_alive_note(helper_state: bool | None) -> str:
+    """The note for a helper not observed running before the stop.
+
+    Only an observed exit (``process_gone`` answered True) is written as one; None means the
+    pid could not be opened or the wait failed, which is neither gone nor alive.
+    """
+    if helper_state is True:
+        return "helper had already exited before the stop request"
+    return (
+        "helper liveness before the stop was unanswered "
+        "(the pid could not be opened or the wait failed)"
+    )
 
 
 def _read_heartbeat(ready: dict) -> str:

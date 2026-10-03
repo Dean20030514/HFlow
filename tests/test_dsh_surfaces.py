@@ -326,6 +326,45 @@ def test_client_and_sdk_versions_are_read_from_package_files(tmp_path: Path) -> 
     assert any("not inside a node_modules tree" in note for note in loose.notes)
 
 
+def test_a_manifest_nested_too_deeply_to_parse_is_a_note_not_an_exception(
+    tmp_path: Path,
+) -> None:
+    """Under the read limit, but deep enough to exhaust the JSON parser's recursion."""
+    depth = 100_000
+    nested = "[" * depth + "]" * depth
+    assert len(nested) < dsh_surfaces.MANIFEST_READ_LIMIT_BYTES, "must reach the parser"
+    modules = tmp_path / "node_modules"
+    entry = modules / "acpx" / "dist" / "cli.js"
+    entry.parent.mkdir(parents=True)
+    entry.write_text("// not run\n", encoding="utf-8")
+    acpx_manifest = modules / "acpx" / "package.json"
+    acpx_manifest.write_text(nested, encoding="utf-8")
+    sdk_manifest = modules / "@agentclientprotocol" / "sdk" / "package.json"
+    sdk_manifest.parent.mkdir(parents=True)
+    sdk_manifest.write_text(nested, encoding="utf-8")
+
+    identity = observe_client_identity(_launch(client_entry=str(entry)))
+
+    assert identity.acpx_version == "" and identity.acpx_package_json == ""
+    assert identity.sdk_version == "" and identity.sdk_package_json == ""
+    assert f"{acpx_manifest} is not valid JSON (or is nested too deeply to parse)" in (
+        identity.notes
+    )
+    assert f"{sdk_manifest} is not valid JSON (or is nested too deeply to parse)" in (
+        identity.notes
+    )
+
+    # The full observation used at spawn and by prepare degrades the same way.
+    surfaces = observe_launch_surfaces(
+        _launch(client_entry=str(entry)),
+        dsh_home=tmp_path / "home" / ".dsh",
+        dsh_home_kind="per_invocation",
+        child_env={},
+        look_in_home=False,
+    )
+    assert surfaces.client.acpx_version == ""
+
+
 def test_dsh_carriers_are_classified_from_shim_text_without_running_them(tmp_path: Path) -> None:
     desktop = tmp_path / "Desktop App" / "resources" / "runtime"
     shim = desktop / "cli" / "bin" / "dsh.cmd"

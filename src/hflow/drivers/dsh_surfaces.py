@@ -197,8 +197,10 @@ def _json_file(path: Path, notes: list[str]) -> dict | None:
         return None
     try:
         parsed = json.loads(data.decode("utf-8", "replace"))
-    except ValueError:
-        notes.append(f"{path} is not valid JSON")
+    except (ValueError, RecursionError):
+        # A file under the read limit can still nest deeply enough to exhaust the parser's
+        # recursion; that is a note like any other unreadable manifest, never an exception.
+        notes.append(f"{path} is not valid JSON (or is nested too deeply to parse)")
         return None
     if not isinstance(parsed, dict):
         notes.append(f"{path} is not a JSON object")
