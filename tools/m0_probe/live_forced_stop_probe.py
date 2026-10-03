@@ -413,7 +413,8 @@ def run_trial(
             "not reached within the cap - job membership is the ownership proof"
         )
 
-    alive_before = not process_gone(evidence.helper_pid, 0.0)
+    # Observed running, not merely unanswered: None (the pid could not be opened) is not liveness.
+    alive_before = process_gone(evidence.helper_pid, 0.0) is False
 
     # --- 3. supporting evidence only: the agent's own tool-call projection
     for event in driver.events(handle.invocation_id):
@@ -495,7 +496,7 @@ class _NoopRunner:
         return CheckOutcome(EvidenceStatus.PASSED, exit_code=0, detail="noop")
 
 
-def _wait_gone(pid: int | None, timeout: float) -> bool:
+def _wait_gone(pid: int | None, timeout: float) -> bool | None:
     if pid is None:
         return False
     deadline = time.monotonic() + timeout

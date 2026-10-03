@@ -1456,6 +1456,17 @@ result's limitations, and a Job that cannot be emptied makes the result `OUTCOME
 `boundary_not_empty`. Every invocation's Job handle and its `stdout.ndjson` handle are closed when
 its result is collected, including after a deadline teardown.
 
+**A process Windows will not open is not a process that has gone.** A live stop is confirmed only
+when the Job is empty *and* the client process itself is shown to have exited: the driver's own
+`Popen` handle reports its exit, its process object is signalled, or `OpenProcess` answers
+`ERROR_INVALID_PARAMETER` (no process has that id). `ERROR_ACCESS_DENIED`, any other failure, and
+a wait that fails are unanswered, not gone. A stop whose Job emptied but whose client exit neither
+`Popen` nor a re-opened pid shows is `unknown` with `mechanism=none`, never reports
+`local_process_stopped=true`, and blocks like any unconfirmed stop. An in-process reconcile
+reports a client that its own process handle still sees running as `still_running`. The
+unanswered path is exercised with an injected `OpenProcess` failure in the offline tests; it has
+not been observed on a real client.
+
 Once an intent is recorded the run's stop state is final: acceptance refuses, and a later
 failure (a transport error, a `review_protocol_error`, a rejected review) is recorded against
 the attempt without relabelling the run - an unconfirmed stop stays `outcome_unknown`, a

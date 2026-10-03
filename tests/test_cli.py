@@ -802,3 +802,27 @@ def test_the_fake_driver_confirms_only_the_stops_of_its_own_invocations(
     assert foreign.status == "unknown"
     assert foreign.mechanism == "none"
     assert foreign.local_process_stopped is None
+
+
+def test_zero_model_preflight_refuses_an_unanswered_client_exit() -> None:
+    """``process_gone`` may now be ``None`` (unanswered): the pre-flight refuses it like False."""
+    from hflow.cli import _zero_model_preflight
+
+    class ProbeOnly:
+        driver_id = "probe-only"
+
+        def readonly_client_check(self, args=None, *, timeout_seconds=60):
+            return {
+                "returncode": 0,
+                "stdout": "9.9.9\n",
+                "stderr": "",
+                "boundary_kind": "stub",
+                "boundary_empty": True,
+                "process_gone": None,
+            }
+
+    ok, detail = _zero_model_preflight({"implementer": ProbeOnly()})()
+
+    assert ok is False
+    assert "role implementer" in detail
+    assert "did not settle" in detail

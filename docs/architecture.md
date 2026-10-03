@@ -297,8 +297,13 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
   client, exit `0xC000013A`, before any cancel reached the agent). That is reasoned and observed
   once, not a delivery that was tried and measured. A client that has exited is not an empty
   boundary: a stop asks the Job, and is `confirmed_stopped` only when the boundary is empty
-  (`forced` if this stop had to terminate leftovers, `none` if it was already empty). When the
-  client exits, `collect` terminates whatever is still in the Job, keeps the outcome and adds
+  (`forced` if this stop had to terminate leftovers, `none` if it was already empty). A live stop
+  also needs the client process itself shown to have exited: the driver's own `Popen` handle
+  reporting its exit, its process object signalled, or `OpenProcess` answering
+  `ERROR_INVALID_PARAMETER`. A process that exists but cannot be opened (`ERROR_ACCESS_DENIED`, or
+  any other failure) is unanswered, never gone (`winjob.process_gone` returns `None`), and leaves
+  the stop `unknown` unless `Popen` saw the exit. When the client exits, `collect` terminates
+  whatever is still in the Job, keeps the outcome and adds
   `descendants_terminated_after_client_exit: N`; a Job that cannot be emptied makes the result
   `OUTCOME_UNKNOWN` / `boundary_not_empty`. Each invocation's Job and its `stdout.ndjson` handle
   are closed when its result is collected, and the controller calls the driver's optional

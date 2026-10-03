@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -47,6 +48,7 @@ from hflow.drivers import winjob
 from hflow.drivers.winjob import process_gone
 from hflow.store import Store
 from hflow.verify import CheckRunners, FakeCheckRunner
+from tests.test_winjob import ERROR_ACCESS_DENIED, kernel32_stand_in
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 FAKE_CLIENT = FIXTURES / "fake_acpx_client.py"
@@ -1493,7 +1495,7 @@ def test_cancel_in_flight_stops_a_stubborn_process_tree(harness_factory) -> None
 
     helper_file = harness.wait_for_stub_marker("helper")
     helper_pid = int(helper_file.read_text(encoding="utf-8"))
-    assert not process_gone(helper_pid, 0.5), "the helper must be alive before the stop"
+    assert process_gone(helper_pid, 0.5) is False, "the helper must be alive before the stop"
 
     # Wait until the dispatch marker and the in-progress tool call are observed.
     deadline = time.time() + 20
@@ -1679,11 +1681,103 @@ def test_unrelated_control_processes_are_untouched(harness_factory) -> None:
         harness.wait_for_stub_marker("helper")
         harness.driver.cancel_handle(handle)
         time.sleep(0.5)
-        assert not process_gone(unrelated.pid, 0.5), "an unrelated process must survive"
+        assert process_gone(unrelated.pid, 0.5) is False, "an unrelated process must survive"
         harness.driver.release(handle.invocation_id)
     finally:
         unrelated.kill()
         unrelated.wait(timeout=10)
+
+
+def _refuse_open_process(monkeypatch) -> None:
+    """Make every pid-based ``OpenProcess`` answer ``ERROR_ACCESS_DENIED`` from now on.
+
+    Installed after launch: the boundary keeps the kernel32 it opened with
+    (``ProcessBoundary._api``), so only the pid-based ``process_gone`` sees the refusal. A
+    boundary that called ``_kernel32()`` lazily would break this seam, not production.
+    """
+    monkeypatch.setattr(
+        winjob, "_kernel32", lambda: kernel32_stand_in(open_error=ERROR_ACCESS_DENIED)[0]
+    )
+
+
+@requires_job_object
+def test_a_stop_whose_client_cannot_be_opened_is_confirmed_by_its_own_handle(
+    harness_factory, monkeypatch
+) -> None:
+    """Re-opening the pid is refused, but ``Popen``'s own handle saw the exit: that is observed."""
+    harness = harness_factory("stubborn")
+    handle, _ = harness.start()
+    harness.wait_for_stub_marker("helper")
+
+    _refuse_open_process(monkeypatch)
+    try:
+        receipt = harness.driver.cancel_handle(handle)
+    finally:
+        monkeypatch.undo()
+
+    assert receipt.status == "confirmed_stopped"
+    assert receipt.mechanism == "forced"
+    assert receipt.local_process_stopped is True
+    assert "boundary_empty=True" in receipt.detail
+    harness.driver.release(handle.invocation_id)
+
+
+@requires_job_object
+def test_a_stop_whose_client_exit_neither_handle_answers_is_not_confirmed(
+    harness_factory, monkeypatch
+) -> None:
+    """The Job emptied, but neither ``Popen`` nor a re-opened pid shows the client exited."""
+    harness = harness_factory("stubborn")
+    handle, _ = harness.start()
+    harness.wait_for_stub_marker("helper")
+
+    monkeypatch.setattr(harness.driver._processes[handle.invocation_id], "poll", lambda: None)
+    _refuse_open_process(monkeypatch)
+    try:
+        receipt = harness.driver.cancel_handle(handle)
+    finally:
+        monkeypatch.undo()
+
+    assert receipt.status == "unknown"
+    assert receipt.mechanism == "none"
+    # Not pinned to False: that is the pre-existing mapping for emptied-but-unconfirmed.
+    assert receipt.local_process_stopped is not True
+    assert "boundary_empty=True" in receipt.detail, (
+        "the Job itself was emptied; only the client exit is unanswered"
+    )
+    harness.driver.release(handle.invocation_id)
+
+
+def test_an_unanswered_exit_check_is_polled_to_its_bound_and_never_confirms(monkeypatch) -> None:
+    calls: list[int] = []
+
+    def unanswered(pid: int, wait_seconds: float = 0.0) -> None:
+        calls.append(pid)
+        return None
+
+    monkeypatch.setattr("hflow.drivers.acpx_dsh.process_gone", unanswered)
+    started = time.monotonic()
+    assert AcpxDshDriver._await_process_gone(4242, 0.3) is False
+    assert time.monotonic() - started >= 0.3
+    assert len(calls) <= 20, "an immediate unanswered failure must not be retried in a tight loop"
+
+    answers = iter([None, None, True])
+    monkeypatch.setattr(
+        "hflow.drivers.acpx_dsh.process_gone", lambda pid, wait_seconds=0.0: next(answers)
+    )
+    assert AcpxDshDriver._await_process_gone(4242, 2.0) is True, (
+        "an unanswered check that later answers gone still confirms"
+    )
+
+
+def test_an_exit_seen_through_the_drivers_own_handle_counts_as_gone(monkeypatch) -> None:
+    """``Popen.poll()`` reads the signal through a handle we hold; no pid re-open is needed."""
+    monkeypatch.setattr("hflow.drivers.acpx_dsh.process_gone", lambda pid, wait_seconds=0.0: None)
+
+    exited = types.SimpleNamespace(poll=lambda: 1)
+    assert AcpxDshDriver._await_process_gone(4242, 2.0, process=exited) is True  # type: ignore[arg-type]
+    running = types.SimpleNamespace(poll=lambda: None)
+    assert AcpxDshDriver._await_process_gone(4242, 0.3, process=running) is False  # type: ignore[arg-type]
 
 
 def test_unconfirmed_stop_blocks_instead_of_claiming_success(harness_factory, monkeypatch) -> None:
@@ -1892,7 +1986,7 @@ class LingeringClient:
         assert self.boundary.contains(self.descendant_pid) is True, (
             "the descendant must be inside the managed boundary, or this case tests nothing"
         )
-        assert not process_gone(self.descendant_pid, 0.2), "the descendant must outlive its client"
+        assert process_gone(self.descendant_pid, 0.2) is False, "the descendant must outlive its client"
         return self.descendant_pid
 
     def cleanup(self) -> None:
@@ -2055,6 +2149,25 @@ def test_reconcile_unknown_after_process_disappears(harness_factory) -> None:
 
     assert result.outcome.value == "unknown"
     assert result.local_process_alive is False
+    harness.driver.release(handle.invocation_id)
+
+
+@requires_job_object
+def test_reconcile_does_not_read_an_unopenable_process_as_gone(harness_factory, monkeypatch) -> None:
+    """A process this user may not open is not a process that exited."""
+    harness = harness_factory("stubborn")
+    handle, _ = harness.start()
+    harness.wait_for_stub_marker("helper")
+
+    _refuse_open_process(monkeypatch)
+    try:
+        result = harness.driver.reconcile_handle(handle)
+    finally:
+        monkeypatch.undo()
+
+    assert result.outcome.value == "still_running"
+    assert result.local_process_alive is True
+    harness.driver.cancel_handle(handle)
     harness.driver.release(handle.invocation_id)
 
 

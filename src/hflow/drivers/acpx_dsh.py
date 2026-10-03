@@ -1096,6 +1096,8 @@ class AcpxDshDriver:
                     returncode = child.wait(timeout=10)
                     timed_out = True
             emptied = boundary.wait_empty(10.0)
+            # True only for an observed exit. None (unanswered) fails the preflight exactly as
+            # False does.
             gone = process_gone(child.pid, 3.0)
         finally:
             boundary.close()
@@ -2243,7 +2245,7 @@ class AcpxDshDriver:
         # it, and the job is the only thing that knows.
         boundary.terminate()
         emptied = boundary.wait_empty(BOUNDARY_EMPTY_TIMEOUT_SECONDS)
-        parent_gone = self._await_process_gone(process.pid)
+        parent_gone = self._await_process_gone(process.pid, process=process)
         stopped = bool(emptied and parent_gone)
         exit_detail = (
             f"client exit={process.poll()}"
@@ -2258,7 +2260,12 @@ class AcpxDshDriver:
         )
 
     @staticmethod
-    def _await_process_gone(pid: int, settle_seconds: float = FORCE_STOP_GRACE_SECONDS) -> bool:
+    def _await_process_gone(
+        pid: int,
+        settle_seconds: float = FORCE_STOP_GRACE_SECONDS,
+        *,
+        process: subprocess.Popen | None = None,
+    ) -> bool:
         """Has this process reached its signalled state? Polled, not waited once.
 
         ``process_gone`` asks whether the process *object is signalled*, which is not the same
@@ -2277,15 +2284,28 @@ class AcpxDshDriver:
         operator deciding whether to re-dispatch needs "the tree is gone", not "the tree was gone a
         moment after I asked".
 
+        Only an observed exit counts. ``process_gone`` answers ``None`` when Windows will not say
+        (the process exists but cannot be opened, or the wait failed). That answer returns at
+        once, so it is asked again once per poll step up to the same bound, and is then reported
+        as not gone. It is never rounded up to gone. When the driver holds the client's ``Popen``,
+        ``process.poll()`` reads the same signal through the handle ``Popen`` already owns, so an
+        exit it reports is an observed exit even when re-opening the pid is refused.
+
         Bounded by the same grace the forced stop already uses, so an unconfirmable process keeps
         reporting unknown rather than being waited on forever.
         """
         deadline = time.monotonic() + settle_seconds
         while True:
-            if process_gone(pid, 0.05):
+            if process is not None and process.poll() is not None:
+                return True  # observed through our own handle, no re-open needed
+            gone = process_gone(pid, 0.05)
+            if gone is True:
                 return True
             if time.monotonic() >= deadline:
                 return False
+            if gone is None:
+                # An unanswered check returns immediately: wait out the step a timed check takes.
+                time.sleep(0.05)
 
     def _close_client_stdin(self, process: subprocess.Popen) -> None:
         if process.stdin is not None and not process.stdin.closed:
@@ -2326,7 +2346,9 @@ class AcpxDshDriver:
                 detail="no process was ever recorded for this invocation",
                 protocol_cancel_supported=self.protocol_cancel_supported,
             )
-        alive = process.poll() is None and not process_gone(process.pid)
+        # ``process_gone`` is True only for an observed exit. An unanswered query (None) leaves a
+        # process that its own handle still sees running reported as running.
+        alive = process.poll() is None and process_gone(process.pid) is not True
         recorded = self._results.get(invocation_id)
         if alive:
             return ReconcileResult(

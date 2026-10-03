@@ -68,13 +68,15 @@ def _wait_for_exit(pid: int, *, timeout_seconds: float) -> bool:
 
     process_query_limited_information = 0x1000
     still_active = 259
+    error_invalid_parameter = 87
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.OpenProcess.restype = wintypes.HANDLE
     deadline = time.monotonic() + timeout_seconds
     while True:
         handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
         if not handle:
-            return True  # no process object at all: gone
+            # Only "no such process" is absence; a process this user cannot open still exists.
+            return ctypes.get_last_error() == error_invalid_parameter
         try:
             code = wintypes.DWORD()
             if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value != still_active:

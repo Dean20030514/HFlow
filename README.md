@@ -541,9 +541,12 @@ Not verified, even where something works on one binding:
   limitations), a Job that cannot be emptied makes the result `boundary_not_empty` /
   `outcome_unknown`, and an exited client is never reported stopped without asking the Job. It
   does not follow a descendant that leaves the job, does not exist on other platforms, and a stop
-  that cannot be confirmed stays `still_running`/`unknown`. Off Windows the boundary degrades to
-  `direct_child_only`, whose terminate does nothing, so there a forced stop or a deadline teardown
-  (`completion_timeout`) does not kill even the direct child.
+  that cannot be confirmed stays `still_running`/`unknown` - including one whose Job emptied but
+  whose client exit neither the driver's own `Popen` handle nor a re-opened pid could show: only
+  "no such process" (`ERROR_INVALID_PARAMETER`) or a signalled process counts as gone, and the
+  access-denied answer has only been injected in offline tests, never observed on a real client.
+  Off Windows the boundary degrades to `direct_child_only`, whose terminate does nothing, so there
+  a forced stop or a deadline teardown (`completion_timeout`) does not kill even the direct child.
 - **A worker can still change the shared Git configuration.** Every Git command HFlow runs through
   its repository handle forces `core.hooksPath` to an empty HFlow-owned directory,
   `core.fsmonitor=false`, `commit.gpgsign=false`, `core.ignoreStat=false` and
@@ -581,6 +584,7 @@ Not verified, even where something works on one binding:
 python -m pytest -q tests/test_cancel_routing.py         # 25 tests: a stop reaches the live role, wins the handoff, and is never undone
 python -m pytest -q tests/test_authorization.py          # 16 tests: the authorized real-run gate
 python -m pytest -q tests/test_driver_acpx_dsh.py        # 75 tests, no model, no credential: launch hardening, model flag and observation, Job teardown
+python -m pytest -q tests/test_winjob.py                 # which Windows answers prove a process gone (injected kernel32, plus two real-kernel pids)
 python -m pytest -q tests/test_review.py                 # 37 tests: the review output grammar
 python -m pytest -q tests/test_review_wire.py            # 30 tests: reviewer verdict -> receipt; completion bound to its own prompt
 python -m pytest -q tests/test_real_client_review.py     # 9 tests: installed acpx + mock agent, no model (hardened launch, --model)

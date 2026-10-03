@@ -73,7 +73,7 @@ def _helper_pid(markers: Path, label: str) -> int:
     return int(_wait_for(f"{label}-*.helper", markers).read_text(encoding="utf-8").strip())
 
 
-def _gone(pid: int, timeout: float = 10.0) -> bool:
+def _gone(pid: int, timeout: float = 10.0) -> bool | None:
     return winjob.process_gone(pid, timeout)
 
 
@@ -164,6 +164,24 @@ def test_a_timed_out_check_leaves_no_descendants_in_its_boundary(tmp_path: Path)
         )
     finally:
         _retire(markers, [helper_pid])
+
+
+@requires_job_object
+def test_an_unanswerable_direct_child_query_is_reported_unknown(tmp_path: Path, monkeypatch) -> None:
+    """A pid that could not be opened is an unanswered query, not an exit and not a running child."""
+    monkeypatch.setattr("hflow.verify.process_gone", lambda pid, wait_seconds=0.0: None)
+
+    outcome = CommandCheckRunner().run(
+        _check([sys.executable, "-c", "import time; time.sleep(300)"], check_id="unanswerable", timeout=3),
+        tmp_path,
+        3,
+    )
+
+    assert outcome.status is EvidenceStatus.ERROR
+    assert "(timeout after 3s)" in outcome.detail
+    assert "direct_child_gone=unknown" in outcome.detail
+    assert "direct_child_gone=True" not in outcome.detail
+    assert "direct_child_gone=None" not in outcome.detail
 
 
 @requires_job_object

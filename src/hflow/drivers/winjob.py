@@ -46,6 +46,9 @@ SYNCHRONIZE = 0x00100000
 WAIT_OBJECT_0 = 0x00000000
 WAIT_TIMEOUT = 0x00000102
 
+#: The one ``OpenProcess`` failure that means no process has this id (Win32 error 87).
+ERROR_INVALID_PARAMETER = 87
+
 
 class JobBoundaryError(RuntimeError):
     """The process boundary could not be established. Callers must not ignore this."""
@@ -416,12 +419,19 @@ def parent_pid(pid: int) -> int | None:
         api.CloseHandle(snapshot)
 
 
-def process_gone(pid: int, wait_seconds: float = 0.0) -> bool:
-    """Has this process exited? Best effort, and never the only evidence we record.
+def process_gone(pid: int, wait_seconds: float = 0.0) -> bool | None:
+    """Has this process exited? ``True`` only when that was observed, ``None`` when unanswered.
 
     ``OpenProcess`` succeeding does **not** mean the process is alive: a handle held
     elsewhere (``Popen`` keeps one) keeps the object openable after exit. The reliable
     question is whether the process object is signalled, which is what this asks.
+
+    Failing to open it is not proof of absence either. Windows answers a pid that names no
+    process with ``ERROR_INVALID_PARAMETER``, and only that answer means gone. A process that
+    exists but will not be opened (``ERROR_ACCESS_DENIED``), any other failure, and a wait that
+    itself fails all return ``None``. ``False`` means it was opened and is still running.
+    Callers treat ``None`` as "not confirmed gone", never as gone and never as alive. Best
+    effort, and never the only evidence we record.
     """
     if pid <= 0:
         return True
@@ -437,10 +447,14 @@ def process_gone(pid: int, wait_seconds: float = 0.0) -> bool:
     api.OpenProcess.restype = wintypes.HANDLE
     handle = api.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, pid)
     if not handle:
-        return True  # cannot open it at all => it does not exist
+        error = ctypes.get_last_error()  # type: ignore[attr-defined]
+        return True if error == ERROR_INVALID_PARAMETER else None
     try:
         result = api.WaitForSingleObject(handle, int(wait_seconds * 1000))
-        return result == WAIT_OBJECT_0
+        if result == WAIT_OBJECT_0:
+            return True
+        # Anything else means the wait failed: WAIT_FAILED reads as -1 through the default restype.
+        return False if result == WAIT_TIMEOUT else None
     finally:
         api.CloseHandle(handle)
 

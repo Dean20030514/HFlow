@@ -478,7 +478,9 @@ class CommandCheckRunner:
                 # Reap first, then ask whether the direct child is really gone: the question
                 # is answerable only once nothing is holding the process object open.
                 self._reap_direct_child(child)
-                details.append(f"direct_child_gone={process_gone(child.pid, 0.0)}")
+                gone = process_gone(child.pid, 0.0)
+                # None is an unanswered query (the pid could not be opened), not an exit.
+                details.append(f"direct_child_gone={'unknown' if gone is None else gone}")
             readers_incomplete = not self._join_readers(readers)
             reader_status = {
                 str(getattr(thread, "_hflow_name", index)): str(
