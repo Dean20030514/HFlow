@@ -18,7 +18,6 @@ from __future__ import annotations
 import glob
 import json
 import os
-import re
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -98,7 +97,13 @@ from .gitworkspace import (
     GitRepo,
     GitStatusParseError,
 )
-from .store import INVOCATION_OPEN_STATES, RunNotFound, Store, StoreError
+from .store import (
+    INVOCATION_OPEN_STATES,
+    INVOCATION_UNRESOLVED_STATES,
+    RunNotFound,
+    Store,
+    StoreError,
+)
 from .verify import CLEAN_EXIT_REASONS, CheckRunners, failed_check_facts, verify_candidate
 from .workspace import (
     DSH_CONTEXT_LIST_SOURCE,
@@ -148,75 +153,9 @@ def _packet_workspace(packet: RenderedPacket) -> str:
     return ""
 
 
-#: Field markers an evidence row's detail text uses. A reference value ends where the next marker
-#: begins - which is also what lets a path contain spaces: the path is not split on whitespace,
-#: because "C:/temp/run 1/artifact.json" is one value, not two tokens.
-_REFERENCE_MARKERS = (
-    "reason=",
-    "artifact=",
-    "stdout:",
-    "stdout=",
-    "stderr:",
-    "stderr=",
-    "env_names=",
-    "withheld_secret_like=",
-)
-
-#: Both spellings are accepted on purpose. The evidence row writes ``stdout: 3000/3000 bytes``
-#: (reading like a log line) and the reviewer packet writes ``stdout=3000/3000B``; a reader that
-#: matched only one of them returned "no evidence" for a row that had it. The separator and the
-#: optional ``B`` are the whole difference, so the parser does not depend on which produced it.
-_STREAM_REFERENCE = re.compile(
-    r"^(?P<retained>\d+)\s*/\s*(?P<total>\d+)\s*B?(?:\s*bytes)?"
-    r"\s+truncated=(?P<truncated>\w+)"
-    r"\s+digest=(?P<digest>\S+)"
-)
-
-
-def _reference_field(detail: str, field: str) -> str:
-    """One ``field=value`` (or ``field: value``) reference out of an evidence row's detail text.
-
-    The value runs to the next known marker (or to the end). Splitting on spaces would cut a path
-    that contains one, which is exactly how a real temp directory looks: the reviewer would be
-    handed "C:/temp/run" for "C:/temp/run 1".
-    """
-    for marker in (f"{field}=", f"{field}:"):
-        start = detail.find(marker)
-        while start != -1:
-            # Only a marker at a field boundary counts: "reason=" inside a word is not a field.
-            if start == 0 or detail[start - 1] == " ":
-                break
-            start = detail.find(marker, start + 1)
-        if start == -1:
-            continue
-        value_start = start + len(marker)
-        end = len(detail)
-        for other in _REFERENCE_MARKERS:
-            if other == marker:
-                continue
-            position = detail.find(other, value_start)
-            # The next field starts where the marker does, separated from this value by a space -
-            # or immediately, which is how the packet writes "…/3000B truncated=False".
-            if position != -1 and (position == value_start or detail[position - 1] == " "):
-                end = min(end, position)
-        return detail[value_start:end].strip()
-    return ""
-
-
-def _stream_reference(detail: str, name: str) -> dict[str, object]:
-    """The retained-bytes/truncated/digest facts for one stream, out of the detail text."""
-    value = _reference_field(detail, name)
-    if not value:
-        return {}
-    match = _STREAM_REFERENCE.match(value)
-    if match is None:
-        return {}
-    return {
-        "retained_bytes": match.group("retained"),
-        "total_bytes": match.group("total"),
-        "truncated": match.group("truncated"),
-        "digest": match.group("digest"),
-    }
+# The evidence-reference reader is the one ``verify`` defines next to the writer: it reads only
+# HFlow's leading reference block of a row's detail text, never the free text a check printed.
+from .verify import _reference_field, _stream_reference  # noqa: E402
 
 
 def _change_list(items: list[str]) -> str:
@@ -450,6 +389,12 @@ class Controller:
         #: Workspace the current run targets; set by ``run_task``. Only used for the
         #: read-only drift check in ``workspace_matches_receipt``.
         self.project_root: Path | None = None
+        #: The attempts this controller object reserved, per run. Every CLI process shares the
+        #: default controller id, so the claim alone does not tell two identical submissions
+        #: apart; what does is whose reservation the run's attempt is. A refusal from a
+        #: controller that holds none of the run's attempts is not that run's outcome, and
+        #: ``_blocked`` does not write it (see ``Store.block_unless_stopped``).
+        self._held_attempts: dict[str, set[str]] = {}
         assert_driver_shape(driver)
         assert_driver_shape(self.reviewer_driver)
 
@@ -540,12 +485,31 @@ class Controller:
             # Admitted but never dispatched (for example an interrupted controller): continue
             # the existing run instead of opening a second one. Only the turns this run still
             # needs are asked for, because its first dispatch may already have been paid for.
-            self._assert_allowance_for(run_id, spec, project)
-            self._assert_root_repair_allowance(run_id, spec)
+            #
+            # The run is claimed first, so a refusal below can end *this* controller's run and
+            # never a run another controller is driving.
             if not self.store.claim_run(run_id, self.controller_id):
                 raise RefusedError(
                     RefusalCode.RUN_CLAIMED_BY_OTHER,
                     f"run {run_id} is owned by another controller; one owner per project at a time",
+                )
+            # An authorization that cannot cover the remaining loop stays a plain refusal: the
+            # run row already exists, and a new authorization for this same TaskSpec continues
+            # it, so ending the run here would make the refusal's own advice unusable.
+            self._assert_allowance_for(run_id, spec, project)
+            try:
+                self._assert_root_repair_allowance(run_id, spec)
+            except RefusedError as exc:
+                # A root's repair counter is never raised (there is no top-up path), so no later
+                # submission of this TaskSpec could ever pass this gate. Raising would leave the
+                # admitted run DRAFT forever, every resubmission exiting 2 although run state
+                # exists; the run instead ends through the conditional block path, as it did
+                # when the dispatch transaction refused it.
+                return self._refuse(
+                    run_id,
+                    exc.code,
+                    f"{exc.message} (this run was admitted earlier but never dispatched; it ends "
+                    "here because no resubmission of the same TaskSpec can pass this gate)",
                 )
             self._record_effective_config(run_id)
             return self._drive(run_id, request)
@@ -810,12 +774,14 @@ class Controller:
                 self.store.record_cancel_receipt(run_id, receipt)
                 self._note_stop_of_ended_run(run_id, row)
                 return receipt
-            self.store.record_cancel_outcome(
+            ended_meanwhile = self._end_live_run_for_stop(
                 run_id,
                 receipt,
                 RefusalCode.CANCELLED_BY_OPERATOR,
                 f"cancelled before dispatch at {intent_at}",
             )
+            if ended_meanwhile is not None:
+                return ended_meanwhile
             self._finish_live_attempt(run_id, attempt, receipt)
             return receipt
 
@@ -831,7 +797,7 @@ class Controller:
             self._note_stop_of_ended_run(run_id, row)
             return receipt
         if receipt.status != "confirmed_stopped":
-            self.store.record_cancel_outcome(
+            ended_meanwhile = self._end_live_run_for_stop(
                 run_id,
                 receipt,
                 RefusalCode.OUTCOME_UNKNOWN,
@@ -839,8 +805,8 @@ class Controller:
                 f"({self._driver_label(driver, role)}): {receipt.status}; work may still be running",
             )
             self.store.record_note(run_id, target_note)
-            return receipt
-        self.store.record_cancel_outcome(
+            return ended_meanwhile or receipt
+        ended_meanwhile = self._end_live_run_for_stop(
             run_id,
             receipt,
             RefusalCode.CANCELLED_BY_OPERATOR,
@@ -849,8 +815,38 @@ class Controller:
             "stopped, business result unknown",
         )
         self.store.record_note(run_id, target_note)
+        if ended_meanwhile is not None:
+            return ended_meanwhile
         self._finish_confirmed_stop(run_id, attempt, active_invocation, receipt)
         return receipt
+
+    def _end_live_run_for_stop(
+        self, run_id: str, receipt: CancellationReceipt, code: RefusalCode, reason: str
+    ) -> CancellationReceipt | None:
+        """End a live run with this stop's receipt and block; ``None`` when that happened.
+
+        The store refuses to relabel a run that reached an outcome after the stop read it live
+        (another ``cancel`` recorded its own stop first, for example). That run keeps the outcome
+        it has, exactly as a stop of an already-ended run does (the ``ended`` branch of
+        :meth:`cancel`): *this* stop's own receipt is returned with ``run_already_ended`` set -
+        never the other stop's, which answered a different request - and it is recorded only
+        when no stop receipt exists yet, so the first stop's stored receipt stands.
+
+        A confirmed stop that loses this race keeps its fact in two places only: the receipt
+        returned to its caller and the ``cancel_target`` note the caller records. The first
+        stop's block is not relabelled (an ``outcome_unknown`` block stays one, so ``resume``
+        still reconciles it), and no attempt or ledger entry is touched - the confirmed stop's
+        bookkeeping is skipped, as it is for any stop of a run that already ended, and the open
+        entry is left for that reconcile.
+        """
+        if self.store.record_cancel_outcome(run_id, receipt, code, reason):
+            return None
+        ended = receipt.model_copy(update={"run_already_ended": True})
+        _intent, recorded = self.store.cancel_state(run_id)
+        if recorded is None:
+            self.store.record_cancel_receipt(run_id, ended)
+        self._note_stop_of_ended_run(run_id, self.store.get_run(run_id))
+        return ended
 
     def _reapply_recorded_stop(
         self, run_id: str, row: object, receipt: CancellationReceipt
@@ -1250,45 +1246,65 @@ class Controller:
             )
 
     def _assert_root_repair_allowance(self, run_id: str, spec: TaskSpec) -> None:
-        """Refuse an armed repair policy the root's repair counter cannot pay for, before I1.
+        """Refuse a run the root's repair counter cannot pay for, before anything is written.
 
         The worst-case gate prices top-level submissions only; the repair counter is enforced by
-        the repair's own reservation. Without this check a root with no repair left (``max_repairs``
-        defaults to 0) would buy I1 - and R1 on the reviewer path - and only then discover that
-        the repair it armed for cannot be bought.
+        the dispatch's own reservation. Without this check a root with no repair left
+        (``max_repairs`` defaults to 0) would buy I1 - and R1 on the reviewer path - and only then
+        discover that the repair it armed for cannot be bought, and a later revision would get an
+        authorization record and a run row only to be refused at its first reservation.
 
-        What this run may need, read from the ledger's own rule: the repair itself, plus one more
-        when another run already dispatched an implementer on this root, because the ledger
-        charges a later revision's first implementer as a repair too. A run whose own implementer
-        is already recorded is past I1, so the repair decision checks the counter from there.
-        The dispatch transaction stays the real gate; this removes the predictable case.
+        What this run may need, read from the ledger's own rule: one repair when another run
+        already dispatched an implementer on this root, because the ledger charges every later
+        implementer - a later revision's first one included, whatever its ``repair_policy`` - as
+        a repair; plus the repair itself when the task arms a ``repair_policy``. A run whose own
+        implementer is already recorded is past I1, so the repair decision checks the counter
+        from there. The dispatch transaction stays the real gate; this removes the predictable
+        case.
         """
-        if self.root_binding is None or self.root_limits is None or spec.repair_policy is None:
+        if self.root_binding is None or self.root_limits is None:
             return
-        implementers = [
-            entry
-            for entry in self.store.invocations_for_root(self.root_binding.root_id)
-            if entry.role == "implementer"
-        ]
+        entries = self.store.invocations_for_root(self.root_binding.root_id)
+        implementers = [entry for entry in entries if entry.role == "implementer"]
         if any(entry.run_id == run_id for entry in implementers):
+            return
+        armed = spec.repair_policy is not None
+        if not armed and any(
+            entry.state.value in INVOCATION_UNRESOLVED_STATES for entry in entries
+        ):
+            # The root is blocked by an unresolved invocation whatever its repair counter says;
+            # the dispatch transaction refuses that with its own message, which names the step
+            # that actually works (reconcile), so a repair count is not reported in its place.
+            return
+        needed = (1 if armed else 0) + (1 if implementers else 0)
+        if needed == 0:
             return
         view = self.store.root_budget_view(self.root_binding.root_id)
         used = view.used_repairs if view is not None else 0
         limit = view.limits.max_repairs if view is not None else self.root_limits.max_repairs
-        needed = 1 + (1 if implementers else 0)
         if used + needed > limit:
             first = (
-                "; this revision's first implementer is itself charged as a repair, because an "
+                "this revision's first implementer is itself charged as a repair, because an "
                 "earlier run already dispatched one on this root"
                 if implementers
                 else ""
             )
+            if armed:
+                what = f"this task's repair policy needs {needed} more" + (
+                    f"; {first}" if first else ""
+                )
+                remedy = "obtain a root budget whose max_repairs covers the repair, or drop repair_policy"
+            else:
+                what = f"this run needs {needed} more: {first}"
+                remedy = (
+                    "a recorded root's ceilings are never raised (there is no top-up path), so no "
+                    "later revision of this task can buy another implementer on this root"
+                )
             raise RefusedError(
                 RefusalCode.BUDGET_EXHAUSTED,
                 f"root {self.root_binding.root_id} has used {used} of its {limit} repair "
-                f"attempt(s), and this task's repair policy needs {needed} more{first}. Nothing "
-                "was dispatched and no allowance was consumed; obtain a root budget whose "
-                "max_repairs covers the repair, or drop repair_policy.",
+                f"attempt(s), and {what}. Nothing was dispatched and no allowance was consumed; "
+                f"{remedy}.",
             )
 
     def _worktree_path(
@@ -1515,6 +1531,7 @@ class Controller:
             )
         except StoreError as exc:
             raise RefusedError(self._dispatch_refusal_code(str(exc)), str(exc)) from exc
+        self._held_attempts.setdefault(run_id, set()).add(str(reservation.attempt_id))
         if self.authorization is not None:
             self.store.record_note(
                 run_id,
@@ -1533,6 +1550,19 @@ class Controller:
                 f"{reservation.invocation.state.value}",
             )
         return reservation
+
+    @staticmethod
+    def _lost_dispatch_race(message: str) -> bool:
+        """Is this refused reservation another controller's run, not a failure of this one?
+
+        The two store refusals that only a concurrent dispatch on the same run produces: a live
+        attempt that is not the one being reserved, and a run that already reached a terminal
+        state. Neither may be written over the run as this controller's ``internal_error``.
+        """
+        return (
+            "refusing a second live attempt" in message
+            or "a terminal run never dispatches again" in message
+        )
 
     def _dispatch_refusal_code(self, message: str) -> RefusalCode:
         """Which refusal a refused reservation is, read from the store's own wording.
@@ -1871,7 +1901,11 @@ class Controller:
             base_name = spec.workspace.base_commit or "HEAD"
             try:
                 repo = GitRepo.discover(project_root)
-                user_tree_before = repo.user_change_fingerprint()
+                # HFlow's own data directory may sit inside the checkout; its writes are not the
+                # user's state changing.
+                user_tree_before = repo.user_change_fingerprint(
+                    exclude=(self.data_dir, self._ledger_data_dir(self.store))
+                )
                 resolved_base = repo.resolve_commit(request.base_commit or base_name)
                 worktree = repo.create_worktree(run_id, resolved_base)
                 self.store.record_worktree(run_id, worktree)
@@ -1895,7 +1929,24 @@ class Controller:
                 dirty_target = True
         execution_root = worktree or project_root
 
-        self.store.set_task_state(run_id, [TaskState.DRAFT], TaskState.READY, idempotent=True)
+        try:
+            self.store.set_task_state(run_id, [TaskState.DRAFT], TaskState.READY, idempotent=True)
+        except StoreError as exc:
+            # A stop recorded during the setup above (``hflow cancel`` from another shell while
+            # the worktree was being made) already ended the run ``BLOCKED``. Like
+            # ``_advance_to_review``, the transition that cannot happen is reported through the
+            # conditional block path, which keeps the stop's recorded state, instead of escaping
+            # ``run_task`` as a traceback.
+            outcome = self._blocked(
+                run_id, RefusalCode.INTERNAL_ERROR, f"the run could not become ready: {exc}"
+            )
+            if repo is not None and worktree is not None:
+                note = self._note_git_metadata_at_exit(
+                    run_id, repo, worktree, git_metadata_before
+                )
+                if note:
+                    outcome.notes.append(note)
+            return outcome
 
         # A run that must change files needs the driver to allow it; a read-only probe does
         # not. This is decided from the run's own mode, recorded as a fact, and never silently
@@ -2783,6 +2834,21 @@ class Controller:
                 is_repair=previous is not None,
             )
         except RefusedError as exc:
+            if self._lost_dispatch_race(str(exc)):
+                # Another controller's attempt is live on this run, or the run already ended:
+                # that is a concurrent identical submission's run, and this refusal is not its
+                # outcome. Nothing is written; the existing run is reported, as the insert race
+                # in ``run_task`` does.
+                return _CycleResult(
+                    outcome=self._outcome_for(
+                        run_id,
+                        notes=[
+                            "a concurrent identical submission is driving this run (or already "
+                            f"ended it); no second dispatch was made and nothing was recorded "
+                            f"against it ({exc})"
+                        ],
+                    )
+                )
             return _CycleResult(outcome=self._refuse(run_id, exc.code, str(exc)))
         attempt_id = dispatch.attempt_id
         invocation_id = (
@@ -2934,8 +3000,9 @@ class Controller:
             self._release_invocation(self.driver, run_id, invocation_id)
             return _CycleResult(outcome=self._outcome_for(run_id))
 
-        if result.agent_turns is not None:
-            self.store.set_turns_observed(run_id, result.agent_turns)
+        # ``turns_observed`` is not written here: only an *applied* result adds its self-reported
+        # turns (see ``_apply_result_or_stay_stopped``), so a late result after a stop moves
+        # nothing, and a repaired run reports the sum of its implementer rounds.
 
         if result.prompt_digest and result.prompt_digest != prepared.packet.digest:
             # The transport reports the digest of the text it sent (see ``packet_digest``: this
@@ -3076,6 +3143,13 @@ class Controller:
                         *IGNORED_ARTIFACT_ALLOWLIST,
                         *(glob.escape(path) for path in carried_ignored),
                     ],
+                    # Every round, the first included: an allowlisted ignored file the scoped
+                    # fingerprint hashes refuses the freeze, as ``_reconcile_repair_workspace``
+                    # refuses one left by a previous round's checks.
+                    fingerprinted={
+                        path.relative_to(Path(os.path.realpath(worktree))).as_posix()
+                        for path in expand_scope(Path(os.path.realpath(worktree)), spec.scope)
+                    },
                     # The commit this round started from. A worker that committed, amended or
                     # reset inside the worktree moved HEAD away from it and is refused there.
                     expected_head=(
@@ -3227,6 +3301,23 @@ class Controller:
         # number from the one the attempt was given. Read from the ledger, so a restarted
         # controller reaches the same answer instead of restarting the clock.
         remaining_root_seconds = self._remaining_deadline_seconds()
+        # A worktree run removes the worker's ``__pycache__`` bytecode before every command check
+        # (it is never committed or fingerprinted, so neither identity changes); bytecode the
+        # candidate commit itself tracks is kept. Read from the commit's tree object, so no filter
+        # or hook in the worktree runs. An in-place run deletes nothing in the user's checkout.
+        committed_bytecode: list[str] = []
+        if repo is not None and worktree is not None and freeze is not None:
+            try:
+                committed_bytecode = repo.committed_bytecode_paths(freeze.candidate_commit)
+            except GitError as exc:
+                return _CycleResult(
+                    outcome=self._blocked(
+                        run_id,
+                        RefusalCode.INTERNAL_ERROR,
+                        f"the candidate commit's tracked bytecode could not be listed ({exc}), so "
+                        "no check was started",
+                    )
+                )
         verification = verify_candidate(
             store=self.store,
             spec=spec,
@@ -3249,6 +3340,8 @@ class Controller:
             # configured timeout while the root has less time than that would let the run work past
             # its own deadline and then accept the result.
             time_budget_seconds=remaining_root_seconds,
+            remove_bytecode=repo is not None and worktree is not None,
+            committed_bytecode=committed_bytecode,
         )
         if remaining_root_seconds is not None and remaining_root_seconds <= 0:
             # The clock ran out while the implementer was working. Checks were recorded as
@@ -3367,7 +3460,9 @@ class Controller:
             project_root=execution_root,
             verification=verification,
             review=review,
-            observed_turns=result.agent_turns,
+            # The run's total: the sum of every applied implementer round's self-report, so a
+            # repaired delivery's receipt does not show the last round alone.
+            observed_turns=self.store.get_run(run_id)["turns_observed"],
             # The delivery diff covers the *whole* change from the task's original base to this
             # final candidate, so a repaired delivery cannot be read as a delivery of the last
             # patch alone. The agent's own claim is not used for this.
@@ -4128,14 +4223,24 @@ class Controller:
         # Post-acceptance facts go into the note *after* the terminal transition, because the
         # transition itself clears block_reason. The target repository's user-visible state is
         # checked here: a run must not have touched it.
+        # The comparison is stat-level (see ``GitRepo.user_change_fingerprint``): "left untouched"
+        # is written only when it found no difference, and a difference gets the WARNING alone.
         if repo is not None:
-            if spec.workspace.mode == "worktree" and dirty_target:
+            user_tree_changed = bool(user_tree_before) and (
+                repo.user_change_fingerprint(
+                    exclude=(self.data_dir, self._ledger_data_dir(self.store))
+                )
+                != user_tree_before
+            )
+            if spec.workspace.mode == "worktree" and dirty_target and not user_tree_changed:
                 self.store.record_note(
                     run_id,
                     "target repository had uncommitted changes; they were left untouched "
-                    "(not stashed, not committed) and the candidate came from an isolated worktree",
+                    "(not stashed, not committed; same HEAD, index, stash and status entries "
+                    "with the same size and mtime) and the candidate came from an isolated "
+                    "worktree",
                 )
-            if user_tree_before and repo.user_change_fingerprint() != user_tree_before:
+            if user_tree_changed:
                 self.store.record_note(
                     run_id,
                     "WARNING: the target repository's own state changed during the run; the "
@@ -4230,6 +4335,10 @@ class Controller:
             if recorded is not None and recorded.state.value not in INVOCATION_OPEN_STATES:
                 self._note_not_settled(run_id, recorded.invocation_id, outcome)
             return False
+        if result.agent_turns is not None and outcome is not InvocationOutcome.OUTCOME_UNKNOWN:
+            # The implementer's self-report, added once per applied result: a repaired run's
+            # total covers both rounds, and a late result (the branch above) adds nothing.
+            self.store.add_turns_observed(run_id, result.agent_turns)
         self._settle_invocation(dispatch, outcome, settle_detail)
         if block_code is not None:
             self._blocked(run_id, block_code, reason)
@@ -4272,16 +4381,41 @@ class Controller:
         statement wins. Reading the row here and then writing unconditionally is the race this
         replaces - a cancel landing between the two would have been overwritten by a late
         ``review_protocol_error``.
+
+        The same write refuses two more relabellings, and the outcome then carries a note
+        instead: a run that already ended (a terminal state or a delivery receipt) keeps that
+        outcome, and a controller holding none of the run's attempts - a concurrent identical
+        submission that lost the race to dispatch - does not block the run another controller is
+        driving.
         """
-        if self.store.block_unless_stopped(run_id, code, reason):
+        if self.store.block_unless_stopped(
+            run_id, code, reason, held_attempts=sorted(self._held_attempts.get(run_id, ()))
+        ):
             return self._outcome_for(run_id)
-        return self._outcome_for(
-            run_id,
-            notes=[
+        row = self.store.get_run(run_id)
+        if row["cancel_intent_at"]:
+            note = (
                 f"the {code.value} block was not recorded: a stop had already decided this run's "
                 "state, which no later failure relabels"
-            ],
-        )
+            )
+        elif row["task_state"] in {
+            TaskState.ACCEPTED.value,
+            TaskState.BLOCKED.value,
+            TaskState.CANCELLED.value,
+        } or row["receipt_json"]:
+            note = (
+                f"the {code.value} block was not recorded: the run had already ended "
+                f"{row['task_state']}"
+                + (" with a delivery receipt" if row["receipt_json"] else "")
+                + f", and a recorded outcome is never relabelled ({reason})"
+            )
+        else:
+            note = (
+                f"the {code.value} block was not recorded: this run's attempt was reserved by "
+                "another controller (a concurrent identical submission), whose attempt decides "
+                f"it; this controller dispatched nothing for it ({reason})"
+            )
+        return self._outcome_for(run_id, notes=[note])
 
     def _stop_recorded(self, run_id: str) -> bool:
         """Has this run's stop been requested? The question a driver asks before it spawns.

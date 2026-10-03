@@ -311,9 +311,16 @@ def test_candidate_change_after_verification_invalidates_evidence(
         base_ref="base",
         limitations=[],
     )
-    assert "no receipt" not in " ".join(stale.notes)
-    assert stale.block_code is RefusalCode.EVIDENCE_STALE
-    assert "no longer applies" in (stale.block_reason or "")
+    # The stale evidence is refused, never reused: no new receipt is written. The run already
+    # ended ACCEPTED with its own receipt, and a recorded outcome is never relabelled, so the
+    # refusal rides on the outcome as a note instead of a block over the accepted run.
+    notes = " ".join(stale.notes)
+    assert "no receipt" not in notes
+    assert stale.task_state is TaskState.ACCEPTED
+    assert stale.block_code is None
+    assert "evidence_stale block was not recorded" in notes
+    assert "no longer applies" in notes
+    assert stale.receipt == outcome.receipt
 
 
 # --------------------------------------------------------------------------

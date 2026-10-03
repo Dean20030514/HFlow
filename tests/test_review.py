@@ -17,6 +17,7 @@ from hflow.review import (
     REVIEW_INVALID,
     REVIEW_MISSING,
     MAX_ANSWER_BYTES,
+    MAX_FAILED_OBJECT_STARTS,
     AnswerTranscript,
     ReviewDecodeError,
     decode_review,
@@ -125,12 +126,53 @@ def test_bare_and_labelled_fences_are_both_supported(label: str) -> None:
     assert review.verdict == "accepted"
 
 
-def test_a_verdict_may_carry_no_findings_and_stays_a_verdict() -> None:
-    """Acceptance is not reduced to a boolean: the object survives as the contract type."""
-    review = decode_review('{"verdict": "accepted"}')
+def test_prose_may_also_follow_the_one_result_object_and_is_never_interpreted() -> None:
+    """The bare form matches the fenced form: prose around the object is allowed and unread.
 
-    assert isinstance(review, ReviewOutput)
-    assert review.findings == []
+    The parser identifies the object by structure; it does not read the words after it, so
+    text that seems to withdraw the verdict changes nothing (the fenced form behaves the same).
+    """
+    for answer in (
+        '{"verdict": "accepted", "findings": []}\nActually, on reflection, changes are needed.',
+        'Start. {"verdict": "accepted", "findings": []} Ignore that verdict.',
+        fenced(ACCEPTED) + "Actually, on reflection, changes are needed.\n",
+    ):
+        assert decode_review(answer).verdict == "accepted"
+
+
+def test_a_verdict_without_findings_is_invalid_not_completed_on_the_models_behalf() -> None:
+    """The packet says ``findings`` is required; the parser never fills in an empty list."""
+    with pytest.raises(ReviewDecodeError) as excinfo:
+        decode_review('{"verdict": "accepted"}')
+
+    assert excinfo.value.kind == REVIEW_INVALID
+    assert "findings" in excinfo.value.detail
+
+
+def test_the_keys_the_reviewer_is_told_are_required_are_the_schemas_required_keys() -> None:
+    """The output contract note and the embedded schema must not drift apart again."""
+    from hflow.packet import OUTPUT_CONTRACT_NOTE
+
+    marker = "Required keys: "
+    sentence = OUTPUT_CONTRACT_NOTE[OUTPUT_CONTRACT_NOTE.index(marker) + len(marker) :]
+    told = [key.strip() for key in sentence[: sentence.index(".")].split(",")]
+
+    assert told == ReviewOutput.model_json_schema()["required"]
+    assert set(told) == {"verdict", "findings"}
+
+
+def test_the_reviewer_is_told_the_verdict_object_rule_the_parser_enforces() -> None:
+    """Prose may hold other JSON; a second object with a verdict key is refused, and said so."""
+    from hflow.packet import OUTPUT_CONTRACT_NOTE
+
+    note = " ".join(OUTPUT_CONTRACT_NOTE.split())
+    assert "Prose outside the block is allowed" in note
+    assert "no other object with a verdict key may appear anywhere in the message" in note
+
+    assert decode_review('Prose with `{"timeout": 30}`.\n' + fenced(ACCEPTED)).verdict == "accepted"
+    with pytest.raises(ReviewDecodeError) as excinfo:
+        decode_review(f"Earlier draft: {REJECTED}\n" + fenced(ACCEPTED))
+    assert excinfo.value.kind == REVIEW_AMBIGUOUS
 
 
 def test_unknown_fields_are_refused_rather_than_ignored() -> None:
@@ -200,16 +242,225 @@ def test_two_result_objects_are_ambiguous_not_whichever_one_validates() -> None:
     assert excinfo.value.kind == REVIEW_AMBIGUOUS
 
 
-def test_two_bare_objects_are_ambiguous() -> None:
-    answer = (
-        'Notes: {"checked": "AC-1"}\n'
-        '{"verdict": "accepted", "findings": []}\n'
-    )
+def test_two_bare_verdict_objects_are_ambiguous() -> None:
+    answer = f"First pass: {REJECTED}\nSecond pass: {ACCEPTED}\n"
 
     with pytest.raises(ReviewDecodeError) as excinfo:
         decode_review(answer)
 
     assert excinfo.value.kind == REVIEW_AMBIGUOUS
+    assert '2 top-level JSON objects with a "verdict" key' in excinfo.value.detail
+
+
+def test_one_bare_verdict_object_is_the_result_next_to_other_prose_json() -> None:
+    """Deliberate change (R10): an object without a ``verdict`` key is prose, not a result.
+
+    This answer used to be refused as two bare objects. Only an object that carries a
+    ``verdict`` key competes for the result, so the one verdict object is decoded and the
+    note object is never read.
+    """
+    answer = 'Notes: {"checked": "AC-1"}\n' + ACCEPTED + "\n"
+
+    assert decode_review(answer).verdict == "accepted"
+
+
+def test_several_objects_without_a_verdict_key_are_ambiguous() -> None:
+    answer = 'Notes: {"checked": "AC-1"} and {"checked": "AC-2"}\n'
+
+    with pytest.raises(ReviewDecodeError) as excinfo:
+        decode_review(answer)
+
+    assert excinfo.value.kind == REVIEW_AMBIGUOUS
+    assert 'none with a "verdict" key' in excinfo.value.detail
+
+
+def test_one_object_with_a_misspelt_verdict_key_is_invalid_not_missing() -> None:
+    with pytest.raises(ReviewDecodeError) as excinfo:
+        decode_review('My answer: {"verdikt": "accepted", "findings": []}\n')
+
+    assert excinfo.value.kind == REVIEW_INVALID
+    assert "verdikt" in excinfo.value.detail
+
+
+@pytest.mark.parametrize("bare_first", [True, False], ids=["bare-before-fence", "bare-after-fence"])
+def test_a_bare_object_next_to_a_result_block_is_ambiguous(bare_first: bool) -> None:
+    """A conflicting verdict outside the json fence is not silently discarded."""
+    bare = '{"verdict": "changes_requested", "findings": [{"statement": "still broken"}]}\n'
+    block = f"{FENCE}json\n{ACCEPTED}\n{FENCE}\n"
+    answer = bare + block if bare_first else block + bare
+
+    with pytest.raises(ReviewDecodeError) as excinfo:
+        decode_review(answer)
+
+    assert excinfo.value.kind == REVIEW_AMBIGUOUS
+    assert "outside it" in excinfo.value.detail
+
+
+def test_a_verdict_object_outside_the_result_block_makes_it_ambiguous() -> None:
+    """Updated for R10: an object outside the block competes only when it has a ``verdict`` key.
+
+    The previous rule counted every JSON object, which refused contract-following answers
+    whose prose mentions ``{}``; the reviewer packet allows prose outside the block. Any
+    object carrying a ``verdict`` key - even one that would not validate - still competes.
+    """
+    for outside in ('{"verdict": "accept"}', '{"id": "AC-1", "verdict": "changes_requested"}'):
+        answer = f"I checked {outside} first.\n" + fenced(ACCEPTED)
+
+        with pytest.raises(ReviewDecodeError) as excinfo:
+            decode_review(answer)
+
+        assert excinfo.value.kind == REVIEW_AMBIGUOUS
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "The handler now returns `{}` on a missing key.\n\n" + fenced(ACCEPTED),
+        'Setting `{"timeout": 30}` in config is honoured.\n\n' + fenced(ACCEPTED),
+        fenced(ACCEPTED) + "Note: the parser still rejects `{}` input.\n",
+        'I checked {"id": "AC-1"} first.\n' + fenced(ACCEPTED),
+    ],
+    ids=["empty-object-before", "config-object-before", "empty-object-after", "note-object"],
+)
+def test_other_json_in_prose_next_to_a_result_block_is_allowed(answer: str) -> None:
+    """R10: JSON that is not a verdict object is prose, as the reviewer packet promises."""
+    assert decode_review(answer).verdict == "accepted"
+
+
+REJECTED_WITH_FINDING = (
+    '{"verdict": "changes_requested", "findings": '
+    '[{"severity": "high", "summary": "broken", "file": "a.py"}]}'
+)
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "The format string uses an unclosed { placeholder.\n"
+        + REJECTED_WITH_FINDING
+        + f"\n{FENCE}json\n{ACCEPTED}\n{FENCE}\n",
+        'Checked the 27" layout. ' + REJECTED_WITH_FINDING + f"\n{FENCE}json\n{ACCEPTED}\n{FENCE}\n",
+        'The 27" monitor note. '
+        + ACCEPTED
+        + ' Then I reconsidered " and the real answer: '
+        + REJECTED_WITH_FINDING
+        + "\n",
+    ],
+    ids=["unbalanced-brace", "stray-quote-next-to-fence", "stray-quotes-two-bare-objects"],
+)
+def test_stray_prose_characters_do_not_hide_a_competing_verdict(answer: str) -> None:
+    """R13: an inch mark or an unbalanced brace in prose must not hide a bare rejection.
+
+    The old scanner tracked JSON string and depth state across the prose, so the object after
+    a stray ``"`` or ``{`` was never counted and a rejection could become an acceptance.
+    """
+    with pytest.raises(ReviewDecodeError) as excinfo:
+        decode_review(answer)
+
+    assert excinfo.value.kind == REVIEW_AMBIGUOUS
+
+
+def test_failed_object_starts_are_bounded_and_refused_past_the_bound() -> None:
+    """Each failed decode costs time proportional to the answer, so their number is bounded.
+
+    Past the bound the answer is refused - never accepted - because a competing verdict may
+    not have been looked for.
+    """
+    noise = 'and {"a": x} '
+    within = noise * MAX_FAILED_OBJECT_STARTS + "\n" + fenced(ACCEPTED)
+    beyond = noise * (MAX_FAILED_OBJECT_STARTS + 1) + "\n" + fenced(ACCEPTED)
+
+    assert decode_review(within).verdict == "accepted"
+    with pytest.raises(ReviewDecodeError) as excinfo:
+        decode_review(beyond)
+    assert excinfo.value.kind == REVIEW_AMBIGUOUS
+    assert "search for a competing verdict stopped" in excinfo.value.detail
+
+
+def test_a_long_run_of_prose_braces_is_classified_in_linear_time() -> None:
+    """``{`` not followed by a key or ``}`` cannot start an object and is never decoded.
+
+    A decode attempt at each of these used to cost time proportional to its offset (the
+    decoder's error computes a line number), so this answer took tens of seconds.
+    """
+    import time
+
+    answer = "{" * 256 * 1024 + "\n" + fenced(REJECTED)
+
+    started = time.perf_counter()
+    review = decode_review(answer)
+
+    assert review.verdict == "changes_requested"
+    assert time.perf_counter() - started < 10
+
+
+def test_a_lone_prose_brace_is_invalid_with_the_decoders_message() -> None:
+    with pytest.raises(ReviewDecodeError) as excinfo:
+        decode_review("The helper {x} is fine and I approve.")
+
+    assert excinfo.value.kind == REVIEW_INVALID
+    assert "not valid JSON" in excinfo.value.detail
+
+
+def test_an_object_nested_in_a_verdict_object_is_part_of_it_not_a_competitor() -> None:
+    answer = (
+        'Verdict: {"verdict": "changes_requested", "findings": '
+        '[{"verdict": "accepted", "note": "quoted from the old review"}]}\n'
+    )
+
+    review = decode_review(answer)
+
+    assert review.verdict == "changes_requested"
+    assert review.findings == [{"verdict": "accepted", "note": "quoted from the old review"}]
+
+
+def test_prose_braces_that_are_not_json_do_not_make_an_answer_ambiguous() -> None:
+    for answer in (
+        "The helper {x} and the set {a, b} are fine.\n" + fenced(ACCEPTED),
+        "The helper {x} is fine.\n" + ACCEPTED + "\n",
+    ):
+        assert decode_review(answer).verdict == "accepted"
+
+
+def test_one_malformed_bare_object_is_invalid_not_missing() -> None:
+    with pytest.raises(ReviewDecodeError) as excinfo:
+        decode_review('Verdict: {"verdict": "accepted", "findings": [}')
+
+    assert excinfo.value.kind == REVIEW_INVALID
+    assert "not valid JSON" in excinfo.value.detail
+
+
+@pytest.mark.parametrize("label", ["text", "python"])
+def test_an_example_object_inside_a_labelled_fence_is_never_the_verdict(label: str) -> None:
+    """The fail-open case: a rejection in prose that shows the format as an example."""
+    answer = (
+        "I found a blocking defect: the function returns None. The required format is:\n"
+        f"{FENCE}{label}\n{ACCEPTED}\n{FENCE}\n"
+        "I cannot accept this."
+    )
+
+    with pytest.raises(ReviewDecodeError) as excinfo:
+        decode_review(answer)
+
+    assert excinfo.value.kind == REVIEW_MISSING
+    assert "no top-level JSON object" in excinfo.value.detail
+
+
+def test_a_labelled_example_plus_one_bare_object_decodes_the_bare_object() -> None:
+    answer = (
+        "The format is:\n"
+        f"{FENCE}python\n{ACCEPTED}\n{FENCE}\n"
+        "My verdict:\n"
+        f"{REJECTED}\n"
+    )
+
+    assert decode_review(answer).verdict == "changes_requested"
+
+
+def test_a_labelled_example_next_to_a_result_block_is_not_ambiguous() -> None:
+    answer = f"Example:\n{FENCE}text\n{REJECTED}\n{FENCE}\n" + fenced(ACCEPTED)
+
+    assert decode_review(answer).verdict == "accepted"
 
 
 def test_prose_without_any_object_is_missing_not_an_approval() -> None:
@@ -303,8 +554,8 @@ def test_without_message_ids_a_turn_boundary_splits_messages() -> None:
 
 def test_a_sequence_gap_starts_a_new_message() -> None:
     instance = AnswerTranscript(session_id="sess-1", role="reviewer")
-    first, params = update('{"verdict": "changes_requested"}', message_id=None)
-    second, _ = update('{"verdict": "accepted"}', message_id=None)
+    first, params = update(REJECTED, message_id=None)
+    second, _ = update(ACCEPTED, message_id=None)
     instance.observe_update(first, params=params, sequence=0, line_index=0)
     instance.observe_update(second, params=params, sequence=5, line_index=5)
 

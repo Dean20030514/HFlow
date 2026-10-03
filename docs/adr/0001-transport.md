@@ -337,3 +337,19 @@ a chunk sent after the prompt response or from a stream not read to its end; a s
 only by an observed exit (`ERROR_INVALID_PARAMETER`, a signalled process, or the driver's own
 `Popen` handle) together with an empty Job. See README "Non-negotiables" and "Not verified" for
 the rest (shared Git metadata comparison, the launch-surface and DSH-context records).
+
+## Addendum 2026-10-03 (later the same day) — third read of the upstreams
+
+Appended; the decision and every capability state above stand. Release metadata, compare views and
+source only; nothing was executed against DSH or a model, so every row is *documented*.
+
+| Fact | Label |
+|---|---|
+| acpx: `compare 27efb1b...main` is identical (0 commits); the latest release is still `v0.19.4`. New since the previous read: #850 (an adapter's provider error that ends with `end_turn` makes `exec` exit 0), #851 (persistent-session scope lock) and PR #852 (tooling); none touches `exec` cancellation, `--timeout`, Windows process handling, `.acpxrc.json` loading or the JSON stream. #835 is still open with no decision | documented |
+| acpx 0.17.1 already has a repeatable `exec --config-option <key=value>` (added in 0.14.0; `src/cli/flags.ts` L198-221 and L432-438 at `50a47ad`): after `--model` it sends one `session/set_config_option` per option before `session/prompt`. Unlike `--model` it does **not** check that the agent advertised the option or value; a JSON-RPC rejection stops `exec` before the prompt, a silent success is not checked. HFlow does not use it (passing DSH's `reasoning_effort` that way is not decided) | documented |
+| DSH: new prerelease `dsh-v0.2.1-alpha.1` = `5badb15009ae1756c3afe0ae0cef1faafc290ccc` (npm dist-tag `alpha`; `latest` is still 0.2.0-rc.2). `packages/acp/acp/src` is the same tree object (`f6f88229`) as at `dsh-v0.2.0-rc.2`, and so are `apps/cli/src`, the DeepSeek LLM adapter and both `cordis.patch.yml` layers. agentInfo is still 0.0.1, there is still no `PromptResponse.usage` and no `usage_update.cost`. DSH has no workspace-trust concept and never checks whether `DSH_HOME` lies inside the workspace | documented |
+| ACP: no schema release after `schema-v1.24.1`; `schema/v1/schema.json` is the same blob (`fa1242c6`) on `main`. PR #2281 (`59172baf`) adds a stop reason `error` only to unstable v2 shapes and asserts that v1 refuses it. `@agentclientprotocol/sdk` reached 1.7.0 (DSH still pins 1.4.0); 1.5.1 adds a 32 MiB incoming-message limit that closes the connection, and request ids are still numbered from 0 on each side | documented |
+
+Nothing here needs a transport change: an unknown stop reason (including `error`) and a JSON-RPC
+error answering the prompt both stay `OUTCOME_UNKNOWN`, and the stop reason stays bound to the
+observed `session/prompt` id.

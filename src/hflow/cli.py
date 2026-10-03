@@ -9,6 +9,10 @@ rest ``unknown``. ``resume`` reconciles and never re-dispatches.
 ``run`` is offline only with the ``fake`` driver (the default without a profile). With
 ``--driver acpx-dsh`` or a profile that binds it, ``run`` launches the real Harness and needs a
 user authorization artifact.
+
+Exit codes: 0 accepted (or the command succeeded), 2 refused at admission (no run state),
+3 blocked after dispatch, 4 usage, 5 the run exists and is not finished, 6 status/report found
+the run but a stored record of it no longer validates.
 """
 
 from __future__ import annotations
@@ -20,7 +24,9 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
+
+from pydantic import ValidationError
 
 from .contracts import (
     CancellationReceipt,
@@ -59,6 +65,14 @@ EXIT_OK = 0
 EXIT_REFUSED = 2
 EXIT_BLOCKED = 3
 EXIT_USAGE = 4
+#: The run exists and is not finished (DRAFT / READY / RUNNING / CHECKING): a history query for
+#: a run another controller still drives, or a ``resume`` no-op on a run a hard kill left
+#: ``RUNNING``. Never ``EXIT_REFUSED``, which promises that no run state was created.
+EXIT_IN_PROGRESS = 5
+#: ``status`` / ``report`` found the run but one of its stored records no longer validates (it was
+#: written under another build's contracts, or edited). The run exists, so this is never
+#: ``EXIT_REFUSED``; nothing is repaired or rewritten.
+EXIT_RECORD_UNREADABLE = 6
 
 
 def _load_json(path: Path) -> object:
@@ -129,12 +143,23 @@ def _drift_note(outcome: RunOutcome) -> str | None:
     )
 
 
+#: Every task state maps explicitly; a run outcome is never ``EXIT_REFUSED`` (that code means
+#: admission refused and nothing was created). ``CANCELLED`` is not written by this build (an
+#: operator stop ends ``BLOCKED`` with ``cancelled_by_operator``); a row that carries it has
+#: ended, so it reads as blocked rather than as refused or in progress.
+_STATE_EXIT_CODES: dict[TaskState, int] = {
+    TaskState.ACCEPTED: EXIT_OK,
+    TaskState.BLOCKED: EXIT_BLOCKED,
+    TaskState.CANCELLED: EXIT_BLOCKED,
+    TaskState.DRAFT: EXIT_IN_PROGRESS,
+    TaskState.READY: EXIT_IN_PROGRESS,
+    TaskState.RUNNING: EXIT_IN_PROGRESS,
+    TaskState.CHECKING: EXIT_IN_PROGRESS,
+}
+
+
 def _outcome_exit_code(outcome: RunOutcome) -> int:
-    if outcome.task_state is TaskState.ACCEPTED:
-        return EXIT_OK
-    if outcome.task_state is TaskState.BLOCKED:
-        return EXIT_BLOCKED
-    return EXIT_REFUSED
+    return _STATE_EXIT_CODES[outcome.task_state]
 
 
 # --------------------------------------------------------------------------
@@ -837,6 +862,21 @@ def cmd_run(args: argparse.Namespace) -> int:
     return _outcome_exit_code(outcome)
 
 
+def _unreadable_record(run_id: str, exc: ValueError) -> int:
+    """One line for a stored record that no longer validates, with a code that is not ``2``.
+
+    ``EXIT_REFUSED`` promises that no run state exists; this run exists, with attempts and ledger
+    charges, so the answer is :data:`EXIT_RECORD_UNREADABLE`. ``cancel`` and ``resume`` read the
+    run row instead and keep working on such a run.
+    """
+    if isinstance(exc, ValidationError):
+        reason = f"invalid {exc.title}: {profiles.summarize_validation_error(exc)}"
+    else:
+        reason = f"not valid JSON: {exc}"
+    print(f"stored record unreadable for run {run_id}: {reason}", file=sys.stderr)
+    return EXIT_RECORD_UNREADABLE
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     store = _open_store(args)
     try:
@@ -846,6 +886,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     except RunNotFound:
         print(f"unknown run {args.run_id}", file=sys.stderr)
         return EXIT_USAGE
+    except (ValidationError, json.JSONDecodeError) as exc:
+        return _unreadable_record(args.run_id, exc)
     finally:
         store.close()
     from .report import status_text
@@ -866,6 +908,8 @@ def cmd_report(args: argparse.Namespace) -> int:
     except RunNotFound:
         print(f"unknown run {args.run_id}", file=sys.stderr)
         return EXIT_USAGE
+    except (ValidationError, json.JSONDecodeError) as exc:
+        return _unreadable_record(args.run_id, exc)
     finally:
         store.close()
     if args.json:
@@ -1097,13 +1141,30 @@ def cmd_schema(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------
 
 
+_DATA_DIR_HELP = "runtime data directory (default: platform data dir, outside any repo)"
+
+
 def _add_store_args(parser: argparse.ArgumentParser) -> None:
-    """`--data-dir` is registered per subcommand: it must work before and after the verb."""
-    parser.add_argument(
-        "--data-dir",
-        default=None,
-        help="runtime data directory (default: platform data dir, outside any repo)",
-    )
+    """`--data-dir` works before and after the verb.
+
+    The top-level parser owns the default (``None``); the per-subcommand copy uses
+    ``argparse.SUPPRESS`` so that, when it is not given after the verb, it leaves a value given
+    before the verb in place instead of overwriting it. Given in both places, the later one wins.
+    """
+    parser.add_argument("--data-dir", default=argparse.SUPPRESS, help=_DATA_DIR_HELP)
+
+
+class _Parser(argparse.ArgumentParser):
+    """Usage errors exit ``EXIT_USAGE`` (4), not argparse's own 2 (which is ``EXIT_REFUSED``).
+
+    Subparsers inherit the class (``add_subparsers`` defaults ``parser_class`` to the parent's
+    type), so a missing required option, an unknown flag, a bad choice and an unknown subcommand
+    all land here. ``--help`` goes through ``exit(0)`` and is unchanged.
+    """
+
+    def error(self, message: str) -> NoReturn:
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_USAGE, f"{self.prog}: error: {message}\n")
 
 
 def _add_repair_policy_arg(parser: argparse.ArgumentParser) -> None:
@@ -1127,7 +1188,8 @@ def _add_repair_policy_arg(parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="hflow", description=__doc__)
+    parser = _Parser(prog="hflow", description=__doc__)
+    parser.add_argument("--data-dir", default=None, help=_DATA_DIR_HELP)
     sub = parser.add_subparsers(dest="command", required=True)
 
     doctor = sub.add_parser("doctor", help="read-only environment probe (no model calls)")
@@ -1323,6 +1385,9 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         return EXIT_USAGE
+    # No catch-all for pydantic's ValidationError here: the input loaders raise RefusedError
+    # themselves, and mapping any other one to EXIT_REFUSED would tell a caller "no run state"
+    # about a run that exists (review G, R12). status/report handle an unreadable stored record.
 
 
 if __name__ == "__main__":

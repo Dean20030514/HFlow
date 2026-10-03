@@ -51,13 +51,24 @@ recorded stream the answer is the **last** of 17 assistant messages
   when it is absent - never "the last NDJSON line", never the whole transcript. User text,
   thoughts, tool results and other sessions cannot supply the answer.
 * `decode_review` accepts exactly one Review object and validates it against the canonical
-  `contracts.ReviewOutput`. Supported forms: a bare JSON object, one fenced block (plain or
-  `json`-labelled - the form the recorded reviewer used), or prose ending in one JSON object.
-  A labelled `python` sample is decoration, not a result block.
+  `contracts.ReviewOutput`. Supported forms: one fenced block (plain or `json`-labelled - the
+  form the recorded reviewer used) with no *verdict object* (a JSON object with a `verdict`
+  key) outside the fences; with no such block, exactly one verdict object (a bare answer, or
+  one inside prose); with neither, exactly one JSON object, so a misspelt key is invalid, not
+  missing. Prose may come before or after the result and is never interpreted; other JSON in
+  the prose, such as `{}` or a config snippet, is allowed and never read. A labelled `python`
+  or `text` block is decoration, not a result block: its body is never read, even when it
+  holds an object. Objects are found by trying a JSON decode at every `{` outside the fences
+  (leftmost first, resuming after each object), not by tracking quotes or braces across
+  prose, so an inch mark (`27"`) or a stray `{` cannot hide a competing verdict. The reviewer
+  packet says the same: no other object with a verdict key may appear in the message.
 * Refused, not repaired: malformed JSON, repeated keys (Python's decoder keeps the last
-  value), `NaN`/`Infinity`, wrong types/enums, missing required fields, unknown fields, two
-  candidate result blocks, or any non-finite constant - and no model is ever asked to fix a
-  format.
+  value), `NaN`/`Infinity`, wrong types/enums, missing required fields (`verdict` and
+  `findings` are both required), unknown fields, two candidate result blocks, a result block
+  next to a verdict object outside it, two verdict objects, two objects none of which has a
+  verdict key, more than `MAX_FAILED_OBJECT_STARTS` (64) places that begin like an object but
+  do not decode, or any non-finite constant - and no model is ever asked to fix a format.
+  Prose braces that do not decode as a JSON object, such as `{x}`, are never an object.
 
 `AcpxDshDriver.collect()` now decodes the verdict **only** for a `reviewer` invocation and
 **only** when the turn actually completed *and* its terminal response answers the observed

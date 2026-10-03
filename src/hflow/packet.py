@@ -49,7 +49,8 @@ MAX_EVIDENCE_ROWS = 200
 OUTPUT_CONTRACT_NOTE = (
     "Return exactly one JSON object, in your final message, matching the schema below.\n"
     "Put it in a single fenced block labelled json (```json ... ```), and put nothing else\n"
-    "inside that block. Prose outside the block is allowed. Required keys: verdict, findings.\n"
+    "inside that block. Prose outside the block is allowed, but no other object with a\n"
+    "verdict key may appear anywhere in the message. Required keys: verdict, findings.\n"
     "verdict must be exactly \"accepted\" or \"changes_requested\"; findings is a list of\n"
     "objects (they may be empty). No trailing commas, no comments, no second result block.\n"
     "If the work is not acceptable, use verdict \"changes_requested\" and put the defects in\n"
@@ -348,8 +349,10 @@ def _repair_section(context: RepairContext) -> str:
             f"exit={fact.get('exit_code')!r} reason={fact.get('exit_reason') or '(none)'}"
         )
         detail = str(fact.get("detail", "")).strip()
+        if len(detail) > MAX_DETAIL_CHARS:
+            detail = detail[:MAX_DETAIL_CHARS] + "… (detail truncated; see the artifact reference)"
         if detail:
-            failure_lines.append(f"  detail: {detail[:600]}")
+            failure_lines.append(f"  detail: {detail}")
         artifact = str(fact.get("artifact", "")).strip()
         if artifact:
             failure_lines.append(f"  artifact: {artifact}")

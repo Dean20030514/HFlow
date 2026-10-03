@@ -2425,3 +2425,209 @@ def test_reconcile_after_completion_reports_unprocessed_result(harness_factory) 
     assert result.local_process_alive is False
     assert result.protocol_cancel_supported is False
     harness.driver.release(handle.invocation_id)
+
+
+# --------------------------------------------------------------------------
+# group 7: feeding the prompt to a client that does not read it
+# --------------------------------------------------------------------------
+
+#: Exits with an argument-parse style error before reading stdin (acpx does this on a bad flag).
+EXIT_BEFORE_STDIN_CLIENT = """\
+import sys
+sys.stderr.write("config error: stand-in for an argument parse failure\\n")
+sys.stderr.flush()
+sys.exit(1)
+"""
+
+#: Hangs before it ever reads stdin - the case the invocation deadline exists for.
+SLEEP_BEFORE_STDIN_CLIENT = """\
+import time
+time.sleep(60)
+"""
+
+#: Fills more than a pipe's worth of stderr before reading stdin, then settles its turn.
+STDERR_FLOOD_CLIENT = """\
+import json, sys
+sys.stderr.write("e" * 300_000)
+sys.stderr.flush()
+data = sys.stdin.buffer.read()
+sys.stderr.write("\\nread %d prompt bytes\\n" % len(data))
+sys.stderr.flush()
+prompt = {"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": "s-1"}}
+print(json.dumps(prompt), flush=True)
+print(json.dumps({"jsonrpc": "2.0", "id": 2, "result": {"stopReason": "end_turn"}}), flush=True)
+"""
+
+#: Closes its stdin without reading it, and still settles a turn with end_turn. (A client that
+#: reads part of the prompt and then closes stdin is not detectable: the pipe accepts a write
+#: before the reader takes it, so the writer cannot see what was discarded unread.)
+UNREAD_STDIN_CLIENT = """\
+import json, os, sys, time
+os.close(0)
+time.sleep(0.5)
+prompt = {"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": "s-1"}}
+print(json.dumps(prompt), flush=True)
+print(json.dumps({"jsonrpc": "2.0", "id": 2, "result": {"stopReason": "end_turn"}}), flush=True)
+"""
+
+#: Far past the Windows anonymous pipe buffer (about 4 KiB) and past the 64 KiB a pipe was seen
+#: to accept ahead of its reader here.
+LARGE_GOAL = "x" * 300_000
+
+
+def _stdin_driver(tmp_path: Path, source: str) -> AcpxDshDriver:
+    client = tmp_path / "stdin_client.py"
+    client.write_text(source, encoding="utf-8")
+    (tmp_path / "ws").mkdir(exist_ok=True)
+    return AcpxDshDriver(
+        data_dir=(tmp_path / "data").resolve(),
+        acpx_cli=client,
+        python_executable=sys.executable,
+        completion_timeout_seconds=90,
+        agent_argv_override=[sys.executable, "-c", "pass"],
+    )
+
+
+def _stdin_request(
+    tmp_path: Path, *, deadline_seconds: int = 60, goal: str = LARGE_GOAL
+) -> InvocationRequest:
+    return InvocationRequest(
+        invocation_id="I-stdin",
+        attempt_id="A-stdin",
+        run_id="R-stdin",
+        role="implementer",
+        task_id="T-stdin",
+        task_revision=1,
+        goal=goal,
+        acceptance=[],
+        write_allow=["src/x.py"],
+        write_deny=[],
+        workspace=str((tmp_path / "ws").resolve()),
+        deadline_seconds=deadline_seconds,
+        spec_digest="sha256:test",
+        writes_allowed=False,
+        data_dir=str((tmp_path / "data").resolve()),
+    )
+
+
+def _start_bounded(driver: AcpxDshDriver, request: InvocationRequest, seconds: float = 10.0):
+    """``start_handle`` on a helper thread, so a regression fails here instead of hanging."""
+    import threading
+
+    box: dict[str, object] = {}
+
+    def run() -> None:
+        try:
+            box["handle"] = driver.start_handle(request)
+        except BaseException as exc:  # noqa: BLE001 - re-raised below
+            box["error"] = exc
+
+    started = time.monotonic()
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    assert not thread.is_alive(), "start_handle blocked writing the prompt"
+    if "error" in box:
+        raise box["error"]  # type: ignore[misc]
+    return box["handle"], time.monotonic() - started
+
+
+def _assert_released(driver: AcpxDshDriver, invocation_id: str) -> None:
+    driver.release(invocation_id)
+    process = driver._processes[invocation_id]
+    assert process.poll() is not None
+    assert driver._boundaries[invocation_id].handle is None, "the boundary was not closed"
+    assert process.stdin.closed
+    assert driver.release_notes(invocation_id) == []
+
+
+def test_a_client_that_exits_before_reading_a_large_prompt_is_collected(tmp_path: Path) -> None:
+    """``close`` flushes what the buffer still holds and raised ``EINVAL`` into ``start_handle``
+    after the child was published: no handle, no stderr, a boundary nobody released."""
+    driver = _stdin_driver(tmp_path, EXIT_BEFORE_STDIN_CLIENT)
+
+    handle, elapsed = _start_bounded(driver, _stdin_request(tmp_path))
+    result = driver.collect(handle)
+
+    assert elapsed < 5.0
+    assert result.outcome is InvocationOutcome.OUTCOME_UNKNOWN
+    assert result.error_code == "no_stop_reason"
+    assert "exited 1" in (result.error_message or "")
+    assert any(note.startswith("prompt_write_incomplete:") for note in result.limitations)
+    stderr = (driver.data_dir / "invocations" / "I-stdin" / "stderr.txt").read_text(encoding="utf-8")
+    assert "config error: stand-in for an argument parse failure" in stderr
+    _assert_released(driver, handle.invocation_id)
+
+
+def test_the_deadline_applies_to_a_client_that_never_reads_its_prompt(tmp_path: Path) -> None:
+    """The prompt write used to block ``start_handle`` until the client exited, so the deadline -
+    applied only in ``collect`` - was never reached for the one client it exists for."""
+    driver = _stdin_driver(tmp_path, SLEEP_BEFORE_STDIN_CLIENT)
+
+    started = time.monotonic()
+    handle, elapsed = _start_bounded(driver, _stdin_request(tmp_path, deadline_seconds=2))
+    result = driver.collect(handle)
+    total = time.monotonic() - started
+
+    assert elapsed < 2.0, "start_handle returned only after the write"
+    assert result.outcome is InvocationOutcome.OUTCOME_UNKNOWN
+    assert result.error_code == "completion_timeout"
+    assert any(note.startswith("prompt_write_incomplete:") for note in result.limitations)
+    # The 2 s deadline, then the boundary teardown and the short writer join - not the client's 60 s.
+    assert 1.5 <= total < 20.0, total
+    _assert_released(driver, handle.invocation_id)
+
+
+def test_a_client_that_floods_stderr_before_reading_stdin_does_not_deadlock(tmp_path: Path) -> None:
+    """stderr is drained from the spawn on, so the client gets past its stderr and reads the
+    whole prompt; the turn settles normally."""
+    driver = _stdin_driver(tmp_path, STDERR_FLOOD_CLIENT)
+
+    handle, elapsed = _start_bounded(driver, _stdin_request(tmp_path, deadline_seconds=30))
+    result = driver.collect(handle)
+
+    assert elapsed < 5.0
+    assert result.outcome is InvocationOutcome.COMPLETED, result.error_message
+    assert not any("prompt_write_incomplete" in note for note in result.limitations)
+    prompt_size = len((driver.data_dir / "invocations" / "I-stdin" / "task.txt").read_bytes())
+    stderr = (driver.data_dir / "invocations" / "I-stdin" / "stderr.txt").read_bytes()
+    assert f"read {prompt_size} prompt bytes".encode() in stderr
+    _assert_released(driver, handle.invocation_id)
+
+
+def test_a_turn_settled_without_the_whole_prompt_is_never_completed(tmp_path: Path) -> None:
+    """The reported prompt digest is of the prompt HFlow meant to send; a client that did not
+    receive it settled some other task, whatever its stop reason says."""
+    driver = _stdin_driver(tmp_path, UNREAD_STDIN_CLIENT)
+
+    # Well past what the pipe accepts ahead of its reader, so some write must fail.
+    handle, _elapsed = _start_bounded(driver, _stdin_request(tmp_path, goal="x" * 600_000))
+    result = driver.collect(handle)
+
+    assert result.outcome is InvocationOutcome.OUTCOME_UNKNOWN
+    assert result.error_code == "prompt_write_incomplete"
+    assert any(note.startswith("prompt_write_incomplete:") for note in result.limitations)
+    _assert_released(driver, handle.invocation_id)
+
+
+def test_a_failure_after_the_child_is_published_tears_down_and_never_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Anything that fails once the process exists is recorded and released, never raised past a
+    published handle (the controller's generic error path releases nothing)."""
+    driver = _stdin_driver(tmp_path, SLEEP_BEFORE_STDIN_CLIENT)
+
+    def broken_start(*_args, **_kwargs) -> None:
+        raise RuntimeError("stand-in for a thread that could not start")
+
+    monkeypatch.setattr(driver, "_start_io_threads", broken_start)
+    handle, _elapsed = _start_bounded(driver, _stdin_request(tmp_path), seconds=30.0)
+    process = driver._processes[handle.invocation_id]
+
+    assert process.poll() is not None, "the published child was torn down"
+    assert driver._boundaries[handle.invocation_id].handle is None
+    result = driver.collect(handle)
+    assert result.outcome is InvocationOutcome.OUTCOME_UNKNOWN
+    assert result.error_code == "reader_failed"
+    assert "RuntimeError" in (result.error_message or "")
+    _assert_released(driver, handle.invocation_id)

@@ -14,8 +14,10 @@ The rules enforced here:
   migration survivable.
 * The file is copied first, with the SQLite backup API (a consistent snapshot, not a
   file copy of a database that may have a live WAL), and only when a migration is
-  actually needed. The copy is never overwritten: the earliest pre-migration state is
-  the only one that can be restored to.
+  actually needed. The copy is written to a temporary sibling, verified and only then
+  renamed into place, so an interrupted copy never poses as a snapshot. The copy is never
+  overwritten: the earliest pre-migration state is the only one that can be restored to, and
+  a defective file at the snapshot's name refuses the migration instead of being trusted.
 * A database whose recorded version is newer than this build is refused *before* any
   write. An older build cannot know what a newer layout means, so opening it read-write
   would corrupt facts it does not understand.
@@ -41,7 +43,10 @@ neither - and batch E2's repair rule is exactly "no observation, no automatic re
 
 from __future__ import annotations
 
+import contextlib
+import os
 import sqlite3
+import urllib.parse
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
@@ -442,8 +447,93 @@ def backup_path_for(database: Path, from_version: int) -> Path:
     return database.with_name(database.name + MIGRATION_BACKUP_SUFFIX.format(version=from_version))
 
 
+#: Files SQLite keeps next to a database. A stale one next to a fresh copy would be read as part
+#: of it (a leftover hot ``-journal`` is rolled back *into* the new file on its first open).
+_SIDECAR_SUFFIXES = ("-journal", "-wal", "-shm")
+
+
+def _sidecars(path: Path) -> list[Path]:
+    return [path.with_name(path.name + suffix) for suffix in _SIDECAR_SUFFIXES]
+
+
+def _readonly_uri(path: Path) -> str:
+    """A SQLite ``file:`` URI that opens ``path`` read-only, for a local, mapped or UNC path.
+
+    Built from the absolute but *unresolved* path: ``Path.resolve()`` can rewrite a mapped network
+    drive to its UNC form, and ``Path.as_uri()`` turns ``\\\\server\\share\\...`` into
+    ``file://server/share/...``, whose authority SQLite refuses (it accepts only an empty one or
+    ``localhost``, and even ``file://localhost/C%24/...`` does not open). SQLite reads a UNC path
+    from ``file:////server/share/...`` and a drive path from ``file:///C:/...``. Everything except
+    ``/`` and ``:`` is percent-encoded, so ``?``, ``#`` and ``%`` in a name stay part of the path.
+    """
+    text = os.path.abspath(path)
+    if os.name == "nt":
+        text = text.replace("\\", "/")
+        if text.startswith("//?/UNC/"):
+            text = "//" + text[len("//?/UNC/") :]
+        elif text.startswith("//?/"):
+            text = text[len("//?/") :]
+        if not text.startswith("/"):
+            text = "/" + text  # "C:/x" -> "/C:/x" -> file:///C:/x
+    return "file://" + urllib.parse.quote(text, safe="/:") + "?mode=ro"
+
+
+def _snapshot_defect(path: Path, from_version: int) -> str | None:
+    """Why the file at ``path`` is not a usable pre-migration snapshot, or ``None`` if it is.
+
+    A usable snapshot is a complete SQLite database (``PRAGMA integrity_check`` says ``ok``) that
+    reads as the version being migrated *from*. An interrupted copy fails one of the two: a 0-byte
+    file opens as an empty database (version 0), and a partial one either fails the integrity
+    check or carries a hot journal that a read-only open refuses to roll back. The file is opened
+    read-only so that checking it never changes it; the ``-wal``/``-shm`` files such an open
+    creates for a WAL-flagged file (a snapshot written by an earlier build) are removed again.
+    """
+    created = [sidecar for sidecar in _sidecars(path) if not sidecar.exists()]
+    try:
+        if path.stat().st_size == 0:
+            return "it is empty (0 bytes)"
+        conn = sqlite3.connect(_readonly_uri(path), uri=True)
+        try:
+            rows = conn.execute("PRAGMA integrity_check").fetchall()
+            if [tuple(row) for row in rows] != [("ok",)]:
+                return f"PRAGMA integrity_check reported {rows[0][0] if rows else 'nothing'!r}"
+            version = _effective_version(conn)
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error, MigrationError) as exc:
+        return f"it cannot be read as an HFlow database ({exc})"
+    finally:
+        for sidecar in created:
+            # Only what this read-only check made, and only while it holds nothing: an empty
+            # ``-wal`` and its index carry no page of the database.
+            with contextlib.suppress(OSError):
+                if sidecar.name.endswith("-shm") or sidecar.stat().st_size == 0:
+                    sidecar.unlink()
+    if version != from_version:
+        return f"it reads as storage version {version}, not the expected {from_version}"
+    return None
+
+
+def _fsync(path: Path) -> None:
+    # Windows needs a handle opened for writing before FlushFileBuffers will accept it.
+    with open(path, "r+b") as handle:
+        os.fsync(handle.fileno())
+    if os.name != "nt":
+        directory = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+
 def _backup(conn: sqlite3.Connection, database: Path, from_version: int) -> Path | None:
-    """Copy the database with the SQLite backup API, once.
+    """Copy the database with the SQLite backup API, once, and only ever publish a whole copy.
+
+    The copy is written to a temporary sibling, verified (integrity and version), flushed and only
+    then renamed onto the final name, so an interrupted or failed copy can never sit at the name a
+    later open trusts. A snapshot already at the final name is the earliest one and is never
+    overwritten - but it is verified the same way before it is trusted, and a defective one refuses
+    the migration rather than letting the ledger be migrated with no real restore point.
 
     Returns ``None`` for an in-memory database, which has no file to restore.
     """
@@ -451,13 +541,45 @@ def _backup(conn: sqlite3.Connection, database: Path, from_version: int) -> Path
         return None
     target = backup_path_for(database, from_version)
     if target.exists():
+        defect = _snapshot_defect(target, from_version)
+        if defect is not None:
+            raise MigrationError(
+                f"{database} needs a migration from storage version {from_version}, but the "
+                f"pre-migration snapshot {target} already exists and is not usable: {defect}. "
+                "It is probably left over from an interrupted earlier backup. Refusing to migrate "
+                "without a real restore point, and not overwriting that file (the earliest "
+                "snapshot is never overwritten). Move it aside (keep it if it may matter), then "
+                "open the ledger again to take a fresh snapshot. The ledger was not changed."
+            )
         return target
     target.parent.mkdir(parents=True, exist_ok=True)
-    destination = sqlite3.connect(str(target))
+    partial = target.with_name(target.name + ".partial")
+    for stale in (partial, *_sidecars(partial)):
+        stale.unlink(missing_ok=True)
     try:
-        conn.backup(destination)
-    finally:
-        destination.close()
+        destination = sqlite3.connect(str(partial))
+        try:
+            conn.backup(destination)
+            # The copy inherits the ledger's WAL flag. A rollback-journal file is one
+            # self-contained file - nothing beside it is part of the snapshot - and the store
+            # switches a restored copy back to WAL on its next open.
+            destination.execute("PRAGMA journal_mode = DELETE")
+        finally:
+            destination.close()
+        defect = _snapshot_defect(partial, from_version)
+        if defect is not None:
+            raise MigrationError(
+                f"the pre-migration snapshot of {database} failed verification: {defect}. "
+                "The ledger was not changed."
+            )
+        _fsync(partial)
+        os.replace(partial, target)
+    except BaseException:
+        # Never let a failed cleanup hide why the snapshot failed.
+        for leftover in (partial, *_sidecars(partial)):
+            with contextlib.suppress(OSError):
+                leftover.unlink(missing_ok=True)
+        raise
     return target
 
 

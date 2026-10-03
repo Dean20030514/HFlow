@@ -9,8 +9,10 @@ reported facts:
   ``creates_authorization: false`` and ``model_calls_made: 0``;
 * the **root binding** it would register, the **limits** from the file, the **required
   submission count** for one accepted delivery, and that **no repair is planned** for a task
-  that carries no policy (the counter is recorded, nothing spends it) - in both the JSON and the
-  text form;
+  that carries no policy (no in-run repair round is armed, but a later revision's first
+  implementer on a root that already dispatched one is still charged to the repair counter,
+  which the run - not the preview - checks against the ledger) - in both the JSON and the text
+  form;
 * the **exit code follows ``ready_to_dispatch``**: a task the run would dispatch previews as
   ready, a task the run would refuse previews as refused even though a root file was given.
 
@@ -179,9 +181,22 @@ def test_prepare_with_a_root_budget_file_creates_no_database_run_or_authorizatio
     assert root["repair_enabled"] is False, "a budget field is not an armed repair"
     assert root["single_loop_dispatches"] == REQUIRED_SUBMISSIONS
     assert "carries no repair policy" in root["detail"], root["detail"]
-    assert any(
-        "no repair is planned for this task" in note for note in payload["notes"]
-    ), payload["notes"]
+    # No in-run round is armed, but the counter is not idle: a later revision's first
+    # implementer is charged to it, and only the run (which reads the ledger) refuses on it.
+    assert "nothing spends" not in root["detail"], root["detail"]
+    assert "no in-run repair round is armed" in root["detail"], root["detail"]
+    assert "this revision's first implementer is charged to it" in root["detail"], root["detail"]
+    assert "refuses budget_exhausted before writing anything" in root["detail"], root["detail"]
+    assert "does not read the ledger" in root["detail"], root["detail"]
+    repair_notes = [
+        note for note in payload["notes"] if "no repair is planned for this task" in note
+    ]
+    assert len(repair_notes) == 1, payload["notes"]
+    assert "nothing spends" not in repair_notes[0], repair_notes[0]
+    assert "no in-run repair round is armed" in repair_notes[0], repair_notes[0]
+    assert "first implementer is charged to it as a repair" in repair_notes[0], repair_notes[0]
+    assert "refuses budget_exhausted before writing anything" in repair_notes[0]
+    assert "prepare does not read the ledger" in repair_notes[0], repair_notes[0]
 
     # Zero write. The database the preview names must not exist: a file that was never created
     # holds no run row and no authorization, which is a stronger statement than counting rows in
@@ -260,6 +275,10 @@ def test_the_text_preview_names_the_root_limits_and_the_off_repair_switch(
     # The E1 sentence ("not implemented in E1") would now be false: repair exists, and what this
     # task has is the absence of an opt-in - which the text must say in those words.
     assert "repair      none planned - this task carries no repair policy" in text, text
+    assert "nothing spends" not in text, text
+    assert "no in-run repair round is armed" in text, text
+    assert "this revision's first implementer is charged to" in text, text
+    assert "budget_exhausted before writing anything when none is left" in text, text
     assert "repair plan" in text and "no repair_policy on this task" in text, text
 
 
@@ -634,7 +653,11 @@ def test_prepare_reports_a_root_budget_file_with_no_repair_for_an_armed_policy(
 
     code, _ = _prepare(tmp_path, project, worktree_task, project_root, root_budget=no_repair)
     payload = json.loads(capsys.readouterr().out)
-    assert code == EXIT_OK, "without a repair policy nothing spends the repair counter"
+    assert code == EXIT_OK, (
+        "without a repair policy the preview cannot refuse on max_repairs 0: whether a later "
+        "revision's first implementer is charged as a repair depends on the ledger, which only "
+        "the run reads"
+    )
 
 
 # --------------------------------------------------------------------------

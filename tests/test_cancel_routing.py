@@ -1190,3 +1190,106 @@ def test_a_rootless_stop_between_the_reservation_and_the_registration_wins_the_h
     assert "before any invocation was dispatched" not in receipt.detail, receipt.detail
     assert "reserved" in receipt.detail, receipt.detail
     assert store.get_run(outcome.run_id)["turns_reserved"] == 1, "the reservation stays consumed"
+
+
+def test_a_confirmed_stop_that_loses_the_race_returns_its_own_receipt(
+    store: Store, project, task_spec, project_root: Path, run_request: RunRequest,
+    tmp_path: Path,
+) -> None:
+    """Two stops race on a running run: the second keeps its own answer, not the first one's.
+
+    The owner's driver confirms a forced stop, but before it returns, a cross-process
+    ``hflow cancel`` (an observer controller whose driver cannot confirm anything) ends the run
+    ``outcome_unknown`` with its own receipt. The owner's ``record_cancel_outcome`` is then
+    refused because the run already ended. Its caller must get *its* receipt - confirmed,
+    forced, ``run_already_ended`` set - and not the observer's ``unknown`` one, which answered a
+    different request. The stored receipt and block stay the first stop's, the confirmed fact is
+    kept in the ``cancel_target`` note, no attempt or ledger entry is settled for the confirmed
+    stop, and ``resume`` still reconciles the ``outcome_unknown`` run without re-dispatching.
+    """
+    from .test_batch_e_dispatch import (
+        GatedDriver,
+        RunningTask,
+        _authorization,
+        _binding,
+        _limits,
+        _root_controller,
+    )
+
+    binding = _binding(store, task_spec, project_root)
+    limits = _limits()
+    implementer = GatedDriver(project_root, label="implementer", gated_roles={"implementer"})
+    owner = _root_controller(
+        store, implementer, binding=binding, limits=limits,
+        authorization=_authorization(
+            spec=task_spec, binding=binding, limits=limits, project_root=project_root
+        ),
+        data_dir=tmp_path / "data",
+    )
+    observer_driver = FakeDriver(project_root)
+    observer = Controller(
+        store, observer_driver, reviewer_driver=observer_driver,
+        controller_build="observer", controller_id="observer-process",
+    )
+    seen: dict[str, object] = {}
+    confirm = implementer.cancel
+
+    def cancel_after_a_racing_stop(invocation_id: str) -> CancellationReceipt:
+        seen["observer"] = observer.cancel(str(seen["run_id"]))
+        return confirm(invocation_id)
+
+    implementer.cancel = cancel_after_a_racing_stop  # type: ignore[method-assign]
+    with RunningTask(owner, run_request) as running:
+        assert implementer.entered.wait(timeout=30)
+        run_id = str(store.list_runs()[0]["run_id"])
+        seen["run_id"] = run_id
+        receipt = owner.cancel(run_id)
+        implementer.released.set()
+    assert running.error is None, running.error
+
+    first = seen["observer"]
+    assert isinstance(first, CancellationReceipt)
+    assert first.status != "confirmed_stopped", first
+    assert first.run_already_ended is False, "the observer's stop ended a live run"
+
+    # The owner's answer is its own: the driver confirmed a forced stop of a run that had
+    # already ended by the time the stop could record it.
+    assert receipt.status == "confirmed_stopped", receipt
+    assert receipt.mechanism == "forced", receipt
+    assert receipt.local_process_stopped is True
+    assert receipt.run_already_ended is True, receipt
+    assert receipt.detail == "implementer driver: the stop reached the invocation"
+    assert receipt.invocation_id == implementer.cancel_calls[0]
+
+    # The first stop's facts stand: its receipt is the stored one and its block is not relabelled.
+    _intent, stored = store.cancel_state(run_id)
+    assert stored == first, "the stored receipt stays the first stop's"
+    row = store.get_run(run_id)
+    assert row["task_state"] == TaskState.BLOCKED.value
+    assert row["block_code"] == RefusalCode.OUTCOME_UNKNOWN.value, row["block_reason"]
+    notes = store.notes_for(run_id)
+    assert any(
+        "cancel_target:" in note and "reported=confirmed_stopped mechanism=forced" in note
+        for note in notes
+    ), notes
+    assert any("a stop was requested for a run already BLOCKED" in note for note in notes), notes
+    # The confirmed stop's bookkeeping is skipped: the attempt is not finished as cancelled and
+    # the ledger entry is not settled - an unconfirmed stop's run waits for reconcile.
+    attempt = store.open_attempt(run_id)
+    assert attempt is not None and attempt["state"] != AttemptState.CANCELLED.value
+    (entry,) = store.invocations_for(run_id)
+    assert entry.state.value != "settled", entry
+
+    # The run is terminal: a repeated stop returns the stored (first) receipt and changes nothing.
+    assert owner.cancel(run_id) == first
+    started = list(implementer.started)
+    outcome = owner.resume(run_id)
+    assert outcome.task_state is TaskState.BLOCKED
+    assert outcome.block_code is RefusalCode.OUTCOME_UNKNOWN
+    assert implementer.started == started, "resume must not re-dispatch"
+    assert any("reconciled an interrupted attempt" in note for note in outcome.notes or [])
+    # The gated start resumed after both stops and its spawn gate saw the recorded stop, so the
+    # entry says no launch happened; an entry still open would have become ``unknown``. Either
+    # way neither stop nor reconcile settles it.
+    (entry,) = store.invocations_for(run_id)
+    assert entry.state.value in {"not_started", "unknown"}, entry

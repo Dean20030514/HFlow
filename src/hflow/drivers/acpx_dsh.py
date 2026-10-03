@@ -18,8 +18,9 @@ Facts baked in from the M0 probe and the installed acpx 0.17.1 bundle (not assum
   prompt or credentials - only the fixed launcher path and profile flag.
 * acpx always loads ``<--cwd>/.acpxrc.json`` and lets it override this driver's config,
   agent argv included, with no opt-out; a workspace that has one is refused before spawn.
-* The task body goes through acpx's documented stdin path (``-f -``), then the child's
-  stdin is closed so input is complete. The ACP stdin between acpx and DSH is acpx's own
+* The task body goes through acpx's documented stdin path (``-f -``), written from its own
+  thread after both output readers started, then the child's stdin is closed so input is
+  complete. The ACP stdin between acpx and DSH is acpx's own
   pipe and is never touched from here.
 * The body is the controller's rendered input packet, verbatim (``hflow.packet``). This
   driver adds no task facts of its own: it does not read the repository to fill a gap, and
@@ -142,6 +143,12 @@ FORCE_STOP_GRACE_SECONDS = 2.0
 BOUNDARY_EMPTY_TIMEOUT_SECONDS = 10.0
 #: How long ``release`` waits for each reader thread before leaving it (and its pipe) alone.
 RELEASE_JOIN_SECONDS = 2.0
+#: How long ``collect`` waits, once the client's tree is gone, for the stdin writer to finish.
+#: With the tree gone the pipe has no reader left, so the writer's blocked write fails at once.
+STDIN_WRITER_JOIN_SECONDS = 2.0
+#: How much of the prompt the stdin writer hands to the pipe per write, so what was accepted
+#: before a failure can be reported.
+STDIN_WRITE_CHUNK = 64 * 1024
 #: DSH reads these at launch (sandbox mode and approval policy; tool set). They are removed from
 #: every child environment and never set, so an ambient value cannot widen what a role may do.
 STRIPPED_DSH_ENV = ("DSH_PERMISSION_MODE", "DSH_TOOLS_MODE")
@@ -939,6 +946,13 @@ class AcpxDshDriver:
         self._streams: dict[str, Any] = {}
         self._threads: dict[str, threading.Thread] = {}
         self._stream_drained: dict[str, bool] = {}
+        #: Why the protocol stream reader stopped before reading the stream to its end (the
+        #: exception class), or why the reader could not be started at all. Written before the
+        #: reader's drained flag, so ``collect`` reads it as final once the flag is set.
+        self._reader_failures: dict[str, str] = {}
+        #: What the stdin writer did with the prompt: ``(delivered, detail)``. ``delivered`` is True
+        #: only when every byte was written and flushed into the pipe; ``detail`` names a failure.
+        self._stdin_writes: dict[str, tuple[bool, str]] = {}
         self._receipts: dict[str, CancellationReceipt] = {}
         self._events: dict[str, list[NormalizedEvent]] = {}
         #: Assistant messages of each invocation, kept so a reviewer's final answer can be
@@ -1416,6 +1430,22 @@ class AcpxDshDriver:
                 self._spawn_pending.discard(request.invocation_id)
                 self._gate.notify_all()
 
+        # The child is published and reported. From here on start_handle never raises: a failure
+        # would leave a published process, its boundary and the parent's file handles with nobody
+        # to collect or release them (the controller's generic error path does neither). Anything
+        # that fails is recorded, the tree is torn down through the boundary and released, and
+        # ``collect`` reports the invocation as unknown (``reader_failed``).
+        try:
+            self._prepare_stream_state(request)
+            self._start_io_threads(request.invocation_id, child, prompt_bytes, stdout_path, stderr_path)
+        except BaseException as exc:
+            self._abandon_after_spawn(request.invocation_id, child, handle, exc)
+            if not isinstance(exc, Exception):
+                raise
+        return handle
+
+    def _prepare_stream_state(self, request: InvocationRequest) -> None:
+        """Per-invocation stream state, set before any thread that reads or writes it starts."""
         # One declared retention budget per invocation, split between the protocol stream and
         # stderr. The reader enforces it by writing only up to its share and repeatedly trimming
         # the client's own file back to that share: a looping client keeps writing, and the file
@@ -1440,32 +1470,145 @@ class AcpxDshDriver:
         self._events_capped[request.invocation_id] = False
         self._peak_raw_bytes[request.invocation_id] = 0
 
-        # Task text via stdin, then close it: HFlow -> acpx input is complete. The ACP pipe
-        # between acpx and DSH is acpx's own and is not touched here.
-        assert child.stdin is not None
-        try:
-            child.stdin.write(prompt_bytes)
-            child.stdin.flush()
-        except (BrokenPipeError, OSError):
-            pass  # the process may already have failed; collect() reports the real reason
-        finally:
-            child.stdin.close()
+    def _start_io_threads(
+        self,
+        invocation_id: str,
+        child: subprocess.Popen,
+        prompt_bytes: bytes,
+        stdout_path: Path,
+        stderr_path: Path,
+    ) -> None:
+        """Start both readers, then the stdin writer. Returns without waiting for any of them.
 
+        The readers come first: a client that writes a pipe's worth of stderr before it reads its
+        stdin would otherwise deadlock with a driver blocked writing the prompt. The prompt is
+        written from its own thread, so ``start_handle`` returns at once and ``collect``'s
+        deadline-bounded wait applies from the spawn: a client that never reads its stdin is torn
+        down at the invocation deadline, and the teardown is what unblocks the writer.
+        """
         thread = threading.Thread(
             target=self._consume_stream,
-            args=(request.invocation_id, stdout_path),
+            args=(invocation_id, stdout_path),
             daemon=True,
         )
-        self._threads[request.invocation_id] = thread
+        self._threads[invocation_id] = thread
         thread.start()
         stderr_thread = threading.Thread(
             target=self._consume_stderr,
-            args=(request.invocation_id, stderr_path),
+            args=(invocation_id, stderr_path),
             daemon=True,
         )
-        self._threads[request.invocation_id + ":stderr"] = stderr_thread
+        self._threads[f"{invocation_id}:stderr"] = stderr_thread
         stderr_thread.start()
-        return handle
+        writer = threading.Thread(
+            target=self._feed_stdin,
+            args=(invocation_id, child, prompt_bytes),
+            daemon=True,
+        )
+        self._threads[f"{invocation_id}:stdin"] = writer
+        writer.start()
+
+    def _feed_stdin(self, invocation_id: str, child: subprocess.Popen, prompt_bytes: bytes) -> None:
+        """Write the task to the client's stdin, then close it: HFlow -> acpx input is complete.
+
+        The ACP pipe between acpx and DSH is acpx's own and is not touched here. A client that
+        exits (or is torn down) before reading everything breaks the pipe; that is recorded, not
+        raised, and ``collect`` reports it. ``close`` is guarded too: it flushes what the buffer
+        still holds, and on a broken pipe that raises (``EINVAL`` on Windows). Only this thread
+        closes stdin while it runs - closing a buffered writer from another thread would wait on
+        the lock a blocked write holds.
+        """
+        stream = child.stdin
+        total = len(prompt_bytes)
+        accepted = 0
+        delivered = False
+        detail = ""
+        try:
+            if stream is None:
+                detail = "the client has no stdin pipe"
+                return
+            try:
+                view = memoryview(prompt_bytes)
+                for start in range(0, total, STDIN_WRITE_CHUNK):
+                    accepted += stream.write(view[start : start + STDIN_WRITE_CHUNK]) or 0
+                stream.flush()
+                delivered = True
+            except (OSError, ValueError) as exc:
+                detail = (
+                    f"{type(exc).__name__} after about {accepted} of {total} prompt bytes were "
+                    "handed to the pipe"
+                )
+            try:
+                stream.close()
+            except (OSError, ValueError) as exc:
+                if delivered:
+                    detail = f"every prompt byte was written; closing stdin then raised {type(exc).__name__}"
+                elif not detail:
+                    detail = f"closing stdin raised {type(exc).__name__}"
+        except BaseException as exc:  # noqa: BLE001 - a writer must report, never die silently
+            delivered = False
+            detail = detail or f"the stdin writer failed: {type(exc).__name__}"
+        finally:
+            self._stdin_writes[invocation_id] = (delivered, detail)
+
+    def _stdin_state(self, invocation_id: str, *, join_seconds: float) -> tuple[bool, str]:
+        """``(delivered, note)`` for the prompt write; ``note`` is empty for a clean write.
+
+        Waits up to ``join_seconds`` for a writer that is still running. A writer still blocked
+        after that has not delivered the prompt.
+        """
+        writer = self._threads.get(f"{invocation_id}:stdin")
+        if writer is not None and writer.is_alive() and join_seconds > 0:
+            writer.join(timeout=join_seconds)
+        if writer is not None and writer.is_alive():
+            return False, (
+                "prompt_write_incomplete: the stdin writer was still blocked writing the prompt "
+                "when the result was folded; the client did not read its whole input"
+            )
+        recorded = self._stdin_writes.get(invocation_id)
+        if recorded is None:
+            if writer is None:
+                # No writer was started (``start_handle`` was abandoned after the spawn).
+                return False, "prompt_write_incomplete: the prompt was never written to the client"
+            return False, "prompt_write_incomplete: the stdin writer recorded nothing"
+        delivered, detail = recorded
+        if delivered:
+            return True, (f"prompt_stdin_close: {detail}" if detail else "")
+        return False, (
+            f"prompt_write_incomplete: the prompt was not fully written to the client's stdin "
+            f"({detail}); the reported prompt digest is of the prompt HFlow meant to send"
+        )
+
+    def _abandon_after_spawn(
+        self, invocation_id: str, child: subprocess.Popen, handle: DriverHandle, exc: BaseException
+    ) -> None:
+        """``start_handle`` failed after the child was published: tear down and release.
+
+        Best effort and never raising. The failure is recorded as a reader failure, so ``collect``
+        folds the invocation as unknown instead of judging a stream nobody read; the tree is
+        stopped through the managed boundary, which is closed with what it held recorded; and
+        the normal release path closes the parent's pipes and files.
+        """
+        self._reader_failures.setdefault(
+            invocation_id,
+            f"start_handle failed after the client process was created ({type(exc).__name__})",
+        )
+        try:
+            with self._teardown_lock(invocation_id):
+                _stopped, emptied, detail = self._force_stop_client(child, handle)
+                self._close_boundary(
+                    invocation_id, ExitBoundary(emptied=emptied, left_behind=None, detail=detail)
+                )
+        except Exception:  # noqa: BLE001 - release below still closes the boundary
+            pass
+        reader = self._threads.get(invocation_id)
+        if reader is None or not reader.is_alive():
+            # No reader will ever set the flag; ``collect`` must not wait for one.
+            self._stream_drained[invocation_id] = True
+        try:
+            self.release(invocation_id)
+        except Exception:  # noqa: BLE001 - nothing further can be done here
+            pass
 
     def _write_config(self, invocation_dir: Path, *, writes_allowed: bool) -> Path:
         """Per-invocation acpx config: structured argv, explicit agent name, explicit policy.
@@ -1500,6 +1643,26 @@ class AcpxDshDriver:
         return path
 
     def _consume_stream(self, invocation_id: str, stdout_path: Path) -> None:
+        """The reader thread's target: ``_read_stream`` with a guard that cannot be skipped.
+
+        A reader that died silently used to leave the stream undrained and uncounted, and
+        ``collect`` then folded the partial stream as if it were whole. Whatever escapes is
+        recorded (the exception class) before the drained flag is set, so ``collect`` neither
+        waits for a reader that is gone nor judges what it did not read: it reports
+        ``reader_failed``.
+        """
+        try:
+            self._read_stream(invocation_id, stdout_path)
+        except BaseException as exc:  # noqa: BLE001 - recorded; collect reports it
+            self._reader_failures.setdefault(
+                invocation_id, f"the stream reader stopped with {type(exc).__name__}"
+            )
+            if not isinstance(exc, Exception):
+                raise
+        finally:
+            self._stream_drained[invocation_id] = True
+
+    def _read_stream(self, invocation_id: str, stdout_path: Path) -> None:
         """Tail the client's protocol stream into a bounded retained log, projecting each line.
 
         What is bounded here is what HFlow **keeps**: the retained log stops at the protocol share
@@ -1567,7 +1730,8 @@ class AcpxDshDriver:
             self._overflow[invocation_id] = self._overflow[invocation_id] or sink.truncated
             final_capture = sink.capture()
         self._stdout_captures[invocation_id] = final_capture
-        self._stream_drained[invocation_id] = True
+        # The drained flag is not set here: ``_consume_stream`` sets it in its ``finally``, after
+        # any failure raised below has been recorded, so the flag is always the reader's last write.
         if os.environ.get("HFLOW_DRIVER_DEBUG"):
             print(
                 f"driver-debug: {invocation_id} lines={len(self._lines[invocation_id])} "
@@ -1614,12 +1778,27 @@ class AcpxDshDriver:
         # Numbered before parsing, so unparseable and message-less lines take a number too.
         line_index = self._line_counts[invocation_id]
         self._line_counts[invocation_id] = line_index + 1
-        observed = project_line(text, len(self._events[invocation_id]), utc_now())
-        if not observed.parsed:
+        try:
+            observed = project_line(text, len(self._events[invocation_id]), utc_now())
+        except Exception:  # noqa: BLE001 - a line the projection cannot read is unparseable
+            observed = None
+        if observed is None or not observed.parsed:
             self._unparsed[invocation_id] += 1
             return
         if observed.message is not None:
-            self._note_message(invocation_id, observed.message, line_index=line_index)
+            try:
+                self._note_message(invocation_id, observed.message, line_index=line_index)
+            except Exception as exc:  # noqa: BLE001 - never kill the reader, never drop the line
+                # A message this driver cannot interpret is counted like an unparseable line, so
+                # the outcome cannot look clean, and the turn's answer is no longer trusted.
+                self._unparsed[invocation_id] += 1
+                transcript = self._transcripts.get(invocation_id)
+                if transcript is not None and not transcript.rejected:
+                    transcript.reject(
+                        f"stream line {line_index} could not be interpreted by the driver "
+                        f"({type(exc).__name__}), so the turn's answer is not identified"
+                    )
+                return
         if observed.event is not None:
             if self._events_capped[invocation_id]:
                 return
@@ -1888,6 +2067,11 @@ class AcpxDshDriver:
             ]
             if self._surface_notes.get(invocation_id):
                 timeout_limitations.append(self._surface_notes[invocation_id])
+            _delivered, stdin_note = self._stdin_state(
+                invocation_id, join_seconds=STDIN_WRITER_JOIN_SECONDS
+            )
+            if stdin_note:
+                timeout_limitations.append(stdin_note)
             result = InvocationResult(
                 invocation_id=invocation_id,
                 outcome=InvocationOutcome.OUTCOME_UNKNOWN,
@@ -1927,7 +2111,22 @@ class AcpxDshDriver:
         # write, so once this is True every value read below is final; while it is False the reader
         # may still be adding lines, and every decision that needs a whole stream (the stream order,
         # the verdict, the model refusal) uses this one answer instead of asking again later.
-        drained = bool(self._stream_drained.get(invocation_id))
+        #
+        # A reader that failed set the flag as well, from its guard: the stream it leaves behind is
+        # partial, so every whole-stream decision below treats it as not read to its end.
+        #
+        # The order of these two reads matters. The reader records its failure *before* it sets the
+        # flag, so the flag is read first and the failure second: a failure recorded between the two
+        # reads is then seen, while the other order could read "no failure" and then "finished" and
+        # judge a partial stream as whole. The failure read here is the only one; nothing below
+        # (``_review_output`` included) asks ``_reader_failures`` again.
+        reader_finished = bool(self._stream_drained.get(invocation_id))
+        reader_failure = self._reader_failures.get(invocation_id)
+        drained = reader_finished and reader_failure is None
+        # The tree is gone, so a writer still blocked on the pipe fails at once; the wait is short.
+        prompt_delivered, stdin_note = self._stdin_state(
+            invocation_id, join_seconds=STDIN_WRITER_JOIN_SECONDS
+        )
         unparsed = self._unparsed.get(invocation_id, 0)
         oversized = self._oversized.get(invocation_id, 0)
         overflowed = self._overflow.get(invocation_id, False)
@@ -1957,6 +2156,26 @@ class AcpxDshDriver:
                 f"the client exited {process.returncode}, but its managed boundary could not be "
                 f"confirmed empty afterwards ({exit_boundary.detail}); work it started may still "
                 "be running"
+            )
+        elif reader_failure is not None:
+            # The driver did not read the stream to its end, so nothing below can be judged: the
+            # stop reason, the unparseable count and the prompt binding all come from a prefix.
+            outcome = InvocationOutcome.OUTCOME_UNKNOWN
+            error_code = "reader_failed"
+            error_message = (
+                f"{reader_failure}; the client's output was not read to its end (client exited "
+                f"{process.returncode}), so the result cannot be judged from it"
+            )
+        elif not reader_finished and handle.role != "reviewer":
+            # The reader had not finished within STREAM_DRAIN_TIMEOUT_SECONDS of the exit. A
+            # settled turn in the prefix read so far says nothing about the lines not yet read.
+            # (A reviewer keeps its documented path: COMPLETED with no verdict, below.)
+            outcome = InvocationOutcome.OUTCOME_UNKNOWN
+            error_code = "stream_not_drained"
+            error_message = (
+                f"the client's output was not read to its end within "
+                f"{STREAM_DRAIN_TIMEOUT_SECONDS}s of the client's exit ({process.returncode}); "
+                "a partial stream is not a settled turn"
             )
         elif overflowed:
             # Reported before "unparseable lines": cutting the stream is what makes the tail
@@ -2045,6 +2264,13 @@ class AcpxDshDriver:
             outcome = InvocationOutcome.FAILED
             error_code, error_message = f"stop_reason_{stop_reason}", f"turn settled as {stop_reason}"
 
+        if outcome is InvocationOutcome.COMPLETED and not prompt_delivered:
+            # The turn settled, but the client did not receive the whole prompt: what it settled
+            # is not the task whose digest is reported. Never a success.
+            outcome = InvocationOutcome.OUTCOME_UNKNOWN
+            error_code = "prompt_write_incomplete"
+            error_message = stdin_note
+
         limitations = [
             "candidate content is not extracted here; verification runs on the workspace",
             "billed usage is not observable on this transport",
@@ -2069,6 +2295,17 @@ class AcpxDshDriver:
                 "the managed boundary after the client exited; terminated through it before this "
                 "result was returned)"
             )
+        if reader_failure is not None:
+            limitations.append(
+                f"reader_failed: {reader_failure}; the protocol stream was not read to its end"
+            )
+        elif not reader_finished:
+            limitations.append(
+                f"stream_not_drained: the client's output was not read to its end within "
+                f"{STREAM_DRAIN_TIMEOUT_SECONDS}s of the client's exit"
+            )
+        if stdin_note:
+            limitations.append(stdin_note)
         if not handle.dispatched:
             limitations.append("no session/prompt was observed; the harness never received the task")
         if unbound:
@@ -2115,7 +2352,7 @@ class AcpxDshDriver:
                 "named, or no session; none is the turn's answer, and a reviewer's final answer "
                 "is then not identified"
             )
-        review, note = self._review_output(handle, outcome, drained)
+        review, note = self._review_output(handle, outcome, drained, reader_failure)
         if note:
             limitations.append(note)
         if self._surface_notes.get(invocation_id):
@@ -2286,7 +2523,11 @@ class AcpxDshDriver:
         return detail
 
     def _review_output(
-        self, handle: DriverHandle, outcome: InvocationOutcome, drained: bool
+        self,
+        handle: DriverHandle,
+        outcome: InvocationOutcome,
+        drained: bool,
+        reader_failure: str | None = None,
     ) -> tuple[ReviewOutput | None, str]:
         """Decode a verdict from a reviewer's *final answer*, or explain why there is none.
 
@@ -2298,7 +2539,9 @@ class AcpxDshDriver:
         whether the wire was intact.
 
         ``drained`` is ``collect``'s one reading of the reader's flag, the same one the stream
-        order was decided from.
+        order was decided from, and ``reader_failure`` is its one reading of the reader's failure
+        (read after the flag). Neither is read again here, so the verdict cannot be decided from a
+        different answer than the outcome was.
         """
         transcript = self._transcripts.get(handle.invocation_id)
         if transcript is None:
@@ -2313,6 +2556,12 @@ class AcpxDshDriver:
             # lines, the transcript can still change (a later chunk can reject it, which also
             # clears what the after-response check counts), and what followed the response is not
             # known. Once drained, nothing changes it any more.
+            if reader_failure is not None:
+                return None, (
+                    f"review_{REVIEW_AMBIGUOUS}: the client's output was not read to its end "
+                    f"({reader_failure}), so what followed the session/prompt response is not known and "
+                    "no verdict is decoded"
+                )
             return None, (
                 f"review_{REVIEW_AMBIGUOUS}: the client's output was not read to its end within "
                 f"{STREAM_DRAIN_TIMEOUT_SECONDS}s of the client's exit, so what followed the "
@@ -2638,11 +2887,12 @@ class AcpxDshDriver:
             return False, False, "no managed process boundary was recorded for this invocation"
 
         if handle.dispatched and process.poll() is None:
-            # A bounded wait, not a request: the client's stdin was already closed once the task
-            # was written (``start_handle``), so there is no EOF left to send and nothing here asks
-            # it to stop. A client that is about to exit on its own gets this long before the
-            # boundary is terminated. The close is a defensive no-op for that already-closed pipe.
-            self._close_client_stdin(process)
+            # A bounded wait, not a request: the stdin writer closes the client's stdin once the
+            # task is written (``_feed_stdin``), so there is no EOF left to send and nothing here
+            # asks it to stop. A client that is about to exit on its own gets this long before the
+            # boundary is terminated. The close is a defensive no-op for that already-closed pipe,
+            # and is skipped while the writer still owns it.
+            self._close_client_stdin(process, invocation_id)
             try:
                 process.wait(timeout=FORCE_STOP_GRACE_SECONDS)
             except subprocess.TimeoutExpired:
@@ -2714,7 +2964,12 @@ class AcpxDshDriver:
                 # An unanswered check returns immediately: wait out the step a timed check takes.
                 time.sleep(0.05)
 
-    def _close_client_stdin(self, process: subprocess.Popen) -> None:
+    def _close_client_stdin(self, process: subprocess.Popen, invocation_id: str | None = None) -> None:
+        writer = self._threads.get(f"{invocation_id}:stdin") if invocation_id else None
+        if writer is not None and writer.is_alive():
+            # The writer owns stdin while it runs: closing a buffered writer here would wait on
+            # the lock its blocked write holds. The boundary teardown is what unblocks it.
+            return
         if process.stdin is not None and not process.stdin.closed:
             try:
                 process.stdin.close()
@@ -2861,7 +3116,8 @@ class AcpxDshDriver:
                 boundary.terminate()
             self._close_boundary(invocation_id)
         stderr_reader = self._threads.get(f"{invocation_id}:stderr")
-        for name in (invocation_id, f"{invocation_id}:stderr"):
+        stdin_writer = self._threads.get(f"{invocation_id}:stdin")
+        for name in (invocation_id, f"{invocation_id}:stderr", f"{invocation_id}:stdin"):
             thread = self._threads.get(name)
             if thread is not None and thread.is_alive():
                 thread.join(timeout=RELEASE_JOIN_SECONDS)
@@ -2871,6 +3127,17 @@ class AcpxDshDriver:
             # only those no live reader is blocked on.
             for stream in (process.stdin, process.stdout, process.stderr):
                 if stream is None or getattr(stream, "closed", False):
+                    continue
+                if stream is process.stdin and stdin_writer is not None and stdin_writer.is_alive():
+                    # Closing it would wait on the lock the writer's blocked write holds; the
+                    # writer closes it itself once the write fails or completes.
+                    note = (
+                        "stdin writer still blocked at release; the pipe is left to it and is "
+                        "closed when its write ends"
+                    )
+                    notes = self._release_notes.setdefault(invocation_id, [])
+                    if note not in notes:
+                        notes.append(note)
                     continue
                 if (
                     stream is process.stderr

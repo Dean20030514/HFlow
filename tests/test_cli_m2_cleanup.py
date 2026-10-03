@@ -600,10 +600,14 @@ def test_an_unconfirmed_stop_of_a_live_run_still_makes_clean_refuse(
 
     import sqlite3
 
-    # A run another controller is still driving: RUNNING, its attempt not yet decided.
+    # A run another controller is still driving: RUNNING, its attempt not yet decided - and so
+    # no delivery receipt yet (a stop never relabels a run that carries one).
     connection = sqlite3.connect(str(cli_project["data"] / "hflow.sqlite"))
     try:
-        connection.execute("UPDATE runs SET task_state = 'RUNNING' WHERE run_id = ?", (run_id,))
+        connection.execute(
+            "UPDATE runs SET task_state = 'RUNNING', receipt_json = NULL WHERE run_id = ?",
+            (run_id,),
+        )
         connection.commit()
     finally:
         connection.close()
@@ -762,3 +766,122 @@ def test_clean_reports_missing_when_the_path_vanished_without_a_cleanup(
     refused = _preview(cli_project, capsys, run_id)
     assert refused["allowed"] is False
     assert refused["workspace_state"] == "MISSING"
+
+
+# --------------------------------------------------------------------------
+# group 6: a run without a receipt never loses a commit to clean
+# --------------------------------------------------------------------------
+
+
+def _blocked_before_freeze(
+    files: dict[str, Path], capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> tuple[str, Path]:
+    """A run blocked before any freeze (a write outside the scope), its stray file removed."""
+    plan = tmp_path / "outside-plan.json"
+    plan.write_text(json.dumps({"src/textkit/extra.py": "X = 1\n"}), encoding="utf-8")
+    code, _ = _run_cli(files, plan=plan)
+    assert code == EXIT_BLOCKED
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["block_code"] == "scope_violation", payload
+    assert payload["receipt"] is None
+    preview = _preview(files, capsys, payload["run_id"])
+    worktree = Path(preview["path"])
+    # The operator inspected the refused file and removed it; HEAD never moved.
+    (worktree / "src" / "textkit" / "extra.py").unlink()
+    return payload["run_id"], worktree
+
+
+def test_clean_of_a_blocked_run_whose_head_is_the_base_is_allowed(
+    cli_project: dict[str, Path], capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    run_id, worktree = _blocked_before_freeze(cli_project, capsys, tmp_path)
+    base = cli_project["base"].read_text(encoding="utf-8").strip()
+
+    preview = _preview(cli_project, capsys, run_id)
+    assert preview["allowed"] is True, preview["refusals"]
+    assert preview["head"] == base
+    assert preview["candidate_ref"] == "", "no candidate was frozen, so no ref may be claimed"
+    assert any("base commit" in reason for reason in preview["reasons"]), preview["reasons"]
+    assert not any("candidate ref" in reason for reason in preview["reasons"]), preview["reasons"]
+    assert not any("candidate commit" in keep for keep in preview["keeps"]), preview["keeps"]
+    assert not any("receipt and" in keep for keep in preview["keeps"]), preview["keeps"]
+
+    code = main(["clean", run_id, "--apply", "--data-dir", str(cli_project["data"]), "--json"])
+    assert code == EXIT_OK
+    result = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert result["status"] == "REMOVED"
+    assert not worktree.exists()
+    assert "candidate ref" not in result["detail"], result["detail"]
+    assert "receipt" not in result["detail"], result["detail"]
+
+
+def test_clean_refuses_to_drop_an_unreferenced_commit_until_a_ref_keeps_it(
+    cli_project: dict[str, Path], capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """A worker's commit in a blocked run is the only trace of what it did: never dropped."""
+    run_id, worktree = _blocked_before_freeze(cli_project, capsys, tmp_path)
+    source = cli_project["repo"]
+    _git(worktree, "commit", "-q", "--allow-empty", "-m", "worker commit no ref holds")
+    head = _git(worktree, "rev-parse", "HEAD").strip()
+    assert _git(source, "for-each-ref", "--contains", head).strip() == ""
+
+    refused = _preview(cli_project, capsys, run_id)
+    assert refused["allowed"] is False
+    codes = [item["reason"] for item in refused["refusals"]]
+    assert codes == ["unretained_commit"], refused["refusals"]
+    detail = refused["refusals"][0]["detail"]
+    assert head in detail and "git branch" in detail, detail
+    assert not any("candidate ref" in reason for reason in refused["reasons"]), refused["reasons"]
+
+    code = main(["clean", run_id, "--apply", "--data-dir", str(cli_project["data"]), "--json"])
+    assert code == EXIT_BLOCKED
+    result = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert result["applied"] is False and result["status"] == "REFUSED"
+    assert worktree.exists(), "the worktree holding the only reference to the commit stays"
+    assert _git(worktree, "rev-parse", "HEAD").strip() == head
+
+    # The operator keeps the commit with a branch; now nothing is dropped and clean may proceed.
+    _git(source, "branch", "keep-worker-commit", head)
+    allowed = _preview(cli_project, capsys, run_id)
+    assert allowed["allowed"] is True, allowed["refusals"]
+    assert allowed["retained_by"] == ["refs/heads/keep-worker-commit"]
+    assert any("refs/heads/keep-worker-commit" in keep for keep in allowed["keeps"])
+
+    code = main(["clean", run_id, "--apply", "--data-dir", str(cli_project["data"]), "--json"])
+    assert code == EXIT_OK
+    removed = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert removed["status"] == "REMOVED"
+    assert "refs/heads/keep-worker-commit" in removed["detail"]
+    assert "receipt" not in removed["detail"], removed["detail"]
+    assert not worktree.exists()
+    assert _git(source, "cat-file", "-t", head).strip() == "commit"
+
+
+def test_clean_of_a_failed_candidate_names_its_ref_and_refuses_a_commit_on_top(
+    cli_project: dict[str, Path], capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    bad_plan = tmp_path / "bad-plan.json"
+    bad_plan.write_text(
+        json.dumps({"src/textkit/__init__.py": SCRIPT_SOURCE + "\n# touched, not fixed\n"}),
+        encoding="utf-8",
+    )
+    code, _ = _run_cli(cli_project, plan=bad_plan)
+    assert code == EXIT_BLOCKED
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["block_code"] == "verification_failed" and payload["receipt"] is None
+    run_id = payload["run_id"]
+
+    preview = _preview(cli_project, capsys, run_id)
+    assert preview["allowed"] is True, preview["refusals"]
+    assert preview["candidate_ref"].startswith(f"refs/hflow/candidates/{run_id}/")
+    assert preview["candidate_ref_target"] == preview["head"] == preview["expected_candidate"]
+    assert preview["retained_by"] == [preview["candidate_ref"]]
+    assert preview["receipt_present"] is False
+
+    # A commit on top of the frozen candidate is drift, even once a branch holds it.
+    worktree = Path(preview["path"])
+    _git(worktree, "commit", "-q", "--allow-empty", "-m", "after the freeze")
+    _git(cli_project["repo"], "branch", "keep-drift", _git(worktree, "rev-parse", "HEAD").strip())
+    drifted = _preview(cli_project, capsys, run_id)
+    assert drifted["allowed"] is False
+    assert [item["reason"] for item in drifted["refusals"]] == ["head_drift"], drifted["refusals"]

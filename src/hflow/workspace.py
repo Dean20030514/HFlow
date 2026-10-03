@@ -10,8 +10,9 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import os
+import re
 from collections.abc import Iterable
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from .contracts import RefusalCode, RefusedError, Scope, digest_of
 
@@ -56,7 +57,58 @@ _GLOB_CHARS = ("*", "?", "[")
 
 
 def _normalize(pattern: str) -> str:
-    return pattern.replace("\\", "/").strip().lstrip("/")
+    """Forward slashes, no leading ``/`` or ``./``, no ``.`` segments, no repeated ``/``.
+
+    Git spells a changed path without any of those, so a rule written ``./config/**`` must reach
+    the matcher as ``config/**``, or it would never match anything.
+    """
+    text = re.sub(r"/{2,}", "/", pattern.replace("\\", "/").strip()).lstrip("/")
+    while text.startswith("./"):
+        text = text[2:].lstrip("/")
+    while "/./" in text:
+        text = text.replace("/./", "/")
+    if text.endswith("/."):
+        text = text[:-2]
+    return "" if text == "." else text
+
+
+def write_deny_problems(entries: Iterable[str], *, owner: str) -> list[str]:
+    """``write_deny`` entries that could never match, or are ambiguous about what they match.
+
+    A deny rule that never matches silently does nothing, so it is refused instead of accepted:
+    empty after :func:`_normalize`, absolute, drive-qualified, or holding a ``..`` segment. A
+    leading ``/`` or ``\\`` with no drive or UNC prefix (gitignore-style ``/config/secrets/**``)
+    is refused with its own message: it may mean a host path or a root-anchored rule, and an
+    earlier build silently stripped the slash. ``owner`` ("project" or "task") names where the
+    entry came from.
+    """
+    problems: list[str] = []
+    for entry in entries:
+        raw = str(entry)
+        stripped = raw.strip()
+        normalized = _normalize(raw)
+        if not normalized:
+            problems.append(f"{owner} write_deny entry {raw!r} is empty after normalization")
+        elif stripped.startswith(("/", "\\")) and not PureWindowsPath(stripped).drive:
+            problems.append(
+                f"{owner} write_deny entry {raw!r} starts with {stripped[0]!r}; write it relative "
+                f"to the project root, e.g. {normalized!r}"
+            )
+        elif (
+            stripped.startswith(("/", "\\"))
+            or Path(stripped).is_absolute()
+            or PureWindowsPath(stripped).drive
+        ):
+            problems.append(
+                f"{owner} write_deny entry {raw!r} is absolute or drive-qualified; write_deny takes "
+                "paths or globs relative to the project root"
+            )
+        elif ".." in normalized.split("/"):
+            problems.append(
+                f"{owner} write_deny entry {raw!r} contains a parent traversal ('..'), so it could "
+                "never match a path inside the project root"
+            )
+    return problems
 
 
 def matches_pattern(path: str, patterns: list[str]) -> bool:
@@ -137,9 +189,14 @@ def check_scope(scope: Scope, root: Path, write_deny: list[str]) -> list[str]:
     ``write_allow`` entries are literal file or directory paths. The candidate freeze stages each
     entry as a path and the scoped fingerprint reads each one as a file or a directory, so a glob
     there would match the worker's writes while freezing and fingerprinting nothing. ``write_deny``
-    keeps its globs: it is only ever matched against changed paths.
+    keeps its globs: it is only ever matched against changed paths. A ``write_deny`` entry that
+    could never match one (see :func:`write_deny_problems`) is refused, the project's and the
+    task's alike.
     """
-    problems: list[str] = []
+    problems: list[str] = [
+        *write_deny_problems(write_deny, owner="project"),
+        *write_deny_problems(scope.write_deny, owner="task"),
+    ]
     if not scope.write_allow:
         problems.append("write_allow must list at least one path")
     for entry in scope.write_allow:

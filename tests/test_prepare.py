@@ -420,6 +420,172 @@ def test_prepare_and_run_resolve_one_configuration(
     assert through_override.effective_config.implementer_writes is False
 
 
+def test_editing_the_project_contract_after_prepare_refuses_a_previously_valid_artifact(
+    tmp_path: Path, live_project, worktree_task, project_root: Path, live_profile, acpx_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The contract `prepare` showed is part of the approval, not re-read on trust at `run`.
+
+    An artifact minted from the shown binding verifies until the project file changes; then a
+    no-op check argv, a dropped write_deny or a dropped review floor each refuse it.
+    """
+    import sys
+
+    from hflow.authorization import project_contract_digest
+    from hflow.contracts import CheckDef
+    from hflow.prepare import render_prepare_text
+
+    monkeypatch.setenv("HFLOW_ALLOW_WRITES", "true")
+    data_dir = tmp_path / "data"
+    write_profile(data_dir, live_profile)
+    task_file = write_task(tmp_path / "task.json", worktree_task)
+    project_file = write_project(tmp_path / "hflow" / "project.json", live_project)
+
+    def expected_binding():
+        resolved = resolve_run(
+            task_path=task_file,
+            project_root=project_root,
+            data_dir=data_dir,
+            project_path=project_file,
+            profile_id="dsh-local",
+        )
+        return current_binding(
+            mode="m2-live-change",
+            driver=resolved.effective.role("implementer").driver,
+            project=resolved.project,
+            request=resolved.request(),
+            spec_path=task_file,
+            effective=resolved.effective,
+        )
+
+    resolved = resolve_run(
+        task_path=task_file,
+        project_root=project_root,
+        data_dir=data_dir,
+        project_path=project_file,
+        profile_id="dsh-local",
+    )
+    shown = build_prepare_report(resolved)
+    contract = project_contract_digest(live_project)
+    assert shown.authorization.binding["project_contract_digest"] == contract
+    assert shown.authorization.binding["roles"] == ["implementer", "reviewer"]
+    assert f"contract    {contract}" in render_prepare_text(shown)
+
+    record = AuthorizationRecord(
+        authorization_id="AUTH-contract-prepare-1",
+        user_text="I approve this task on the contract prepare showed me.",
+        authorized_at="2026-10-03T00:00:00Z",
+        max_top_level_submissions=2,
+        binding=AuthorizationBinding.model_validate(shown.authorization.binding),
+    )
+    verify_authorization(record, expected=expected_binding())
+
+    no_op = [
+        CheckDef(id="unit", kind="command", argv=[sys.executable, "-c", "raise SystemExit(0)"]),
+        live_project.checks[1],
+    ]
+    for label, update in {
+        "check argv": {"checks": no_op},
+        "review_required": {"review_required": False},
+        "write_deny": {"write_deny": []},
+    }.items():
+        write_project(project_file, live_project.model_copy(update=update))
+        with pytest.raises(RefusedError) as excinfo:
+            verify_authorization(record, expected=expected_binding())
+        assert "project contract changed since approval" in excinfo.value.message, label
+    # Restoring the contract it was shown restores the approval: the digest is content, not time.
+    write_project(project_file, live_project)
+    verify_authorization(record, expected=expected_binding())
+
+
+def test_a_malformed_task_or_project_is_a_refusal_with_exit_2(
+    tmp_path: Path, live_project, task_spec, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A document that does not match its contract refuses at admission; no traceback, no exit 1."""
+    good_task = write_task(tmp_path / "task.json", task_spec)
+    good_project = write_project(tmp_path / "hflow" / "project.json", live_project)
+    no_goal = tmp_path / "no-goal.json"
+    document = task_spec.model_dump(mode="json")
+    del document["goal"]
+    no_goal.write_text(json.dumps(document), encoding="utf-8")
+    bad_project = tmp_path / "bad-project.json"
+    bad_project.write_text(json.dumps({"project_id": "p", "invented": 1}), encoding="utf-8")
+
+    for task_file, project_file, message in (
+        (no_goal, good_project, f"{no_goal} is not a valid task spec: goal: Field required"),
+        (good_task, bad_project, f"{bad_project} is not a valid project contract"),
+    ):
+        code = main(
+            [
+                "prepare",
+                "--task", str(task_file),
+                "--project", str(project_file),
+                "--project-root", str(tmp_path),
+                "--driver", "fake",
+                "--json",
+                "--data-dir", str(tmp_path / "data"),
+            ]
+        )
+        assert code == EXIT_REFUSED
+        err = capsys.readouterr().err
+        assert message in err
+        assert "Traceback" not in err
+    assert not (tmp_path / "data" / "hflow.sqlite").exists()
+
+
+def test_an_agent_provenance_authorization_is_a_refusal_with_exit_2_through_run(
+    tmp_path: Path, live_project, worktree_task, project_root: Path, live_profile, acpx_client,
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Past admission, a malformed artifact refuses (exit 2) before anything is recorded."""
+    monkeypatch.setenv("HFLOW_ALLOW_WRITES", "true")
+    data_dir = tmp_path / "data"
+    write_profile(data_dir, live_profile)
+    task_file = write_task(tmp_path / "task.json", worktree_task)
+    project_file = write_project(tmp_path / "hflow" / "project.json", live_project)
+    resolved = resolve_run(
+        task_path=task_file,
+        project_root=project_root,
+        data_dir=data_dir,
+        project_path=project_file,
+        profile_id="dsh-local",
+    )
+    assert resolved.admission.ok, "the artifact must be what refuses, not admission"
+    shown = build_prepare_report(resolved)
+    artifact = tmp_path / "auth.json"
+    artifact.write_text(
+        json.dumps(
+            {
+                "authorization_id": "AUTH-agent-1",
+                "provided_by": "agent",
+                "user_text": "the agent decided this was approved",
+                "authorized_at": "2026-10-03T00:00:00Z",
+                "max_top_level_submissions": 2,
+                "binding": shown.authorization.binding,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    code = main(
+        [
+            "run",
+            "--task", str(task_file),
+            "--project", str(project_file),
+            "--project-root", str(project_root),
+            "--profile", "dsh-local",
+            "--authorization-file", str(artifact),
+            "--json",
+            "--data-dir", str(data_dir),
+        ]
+    )
+    assert code == EXIT_REFUSED
+    err = capsys.readouterr().err
+    assert f"{artifact} is not a valid authorization: provided_by" in err
+    assert "Traceback" not in err
+    assert not (data_dir / "hflow.sqlite").exists()
+
+
 def _git(cwd: Path, *args: str) -> str:
     completed = subprocess.run(  # noqa: S603,S607 - fixed, test-local git commands
         ["git", *args],

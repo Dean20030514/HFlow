@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -36,6 +37,25 @@ ENV_PROFILE = "HFLOW_PROFILE"
 #: not ask for a review: a task revision can start asking, and a profile that cannot bind the
 #: reviewer is incomplete rather than "review-optional".
 RUN_ROLES = ("implementer", "reviewer")
+
+#: A profile id is a plain file name: an allowlist, not a blacklist of separators. A blacklist
+#: missed ``C:evil`` - on Windows ``profiles / "C:evil.json"`` discards the data-dir prefix and
+#: names a drive-relative file in the current directory, typically a checkout - and ``a:b``,
+#: which names an NTFS alternate data stream.
+_PROFILE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+#: Windows device names. ``NUL.json`` or ``CON`` opens the device, not a file, whatever the
+#: directory in front of it.
+_RESERVED_DEVICE_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{index}" for index in range(1, 10)}
+    | {f"LPT{index}" for index in range(1, 10)}
+)
+
+
+def _is_plain_profile_id(name: str) -> bool:
+    if not _PROFILE_ID.fullmatch(name):
+        return False
+    return name.split(".", 1)[0].upper() not in _RESERVED_DEVICE_NAMES
 
 
 def profiles_dir(data_dir: Path) -> Path:
@@ -82,13 +102,24 @@ def load_profile(data_dir: Path, profile_id: str) -> MachineProfile:
             f"{ENV_PROFILE}; this build has no default profile and does not pick one "
             "from the directory.",
         )
-    if name != profile_id or "/" in name or "\\" in name or name.startswith("."):
+    if name != profile_id or not _is_plain_profile_id(name):
         raise RefusedError(
             RefusalCode.INVALID_SPEC,
-            f"profile id {profile_id!r} is not a plain file name; profiles live at "
+            f"profile id {profile_id!r} is not a plain file name (letters, digits, '.', '_' "
+            f"and '-', not a Windows device name); profiles live at "
             f"{profiles_dir(data_dir)}/<id>.json",
         )
     path = profile_path(data_dir, name)
+    # Second, structural check: whatever the id, the file read must sit directly in the
+    # profiles directory. The allowlist should make this unreachable; it is here so a future
+    # relaxation of the allowlist cannot quietly reopen a read from inside a checkout. The
+    # parent is resolved, not the file, so a profile file that is itself a link still loads.
+    if path.parent.resolve() != profiles_dir(data_dir).resolve():
+        raise RefusedError(
+            RefusalCode.INVALID_SPEC,
+            f"profile id {profile_id!r} is not a plain file name: it resolves to {path}, "
+            f"outside {profiles_dir(data_dir)}",
+        )
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
@@ -111,7 +142,7 @@ def load_profile(data_dir: Path, profile_id: str) -> MachineProfile:
         raise RefusedError(
             RefusalCode.INVALID_SPEC,
             f"profile {name!r} at {path} does not match the MachineProfile contract: "
-            f"{_summarize(exc)}",
+            f"{summarize_validation_error(exc)}",
         ) from exc
     if profile.profile_id != name:
         # A file whose contents name a different profile would make the recorded identity
@@ -125,8 +156,12 @@ def load_profile(data_dir: Path, profile_id: str) -> MachineProfile:
     return profile
 
 
-def _summarize(exc: ValidationError) -> str:
-    """One line per rejected field: the reader needs the field, not the pydantic traceback."""
+def summarize_validation_error(exc: ValidationError) -> str:
+    """One line per rejected field: the reader needs the field, not the pydantic traceback.
+
+    Shared by every loader that turns a malformed input file into a refusal (profile, task
+    spec, project contract, authorization), so they all read the same way.
+    """
     parts = []
     for error in exc.errors()[:6]:
         location = ".".join(str(item) for item in error.get("loc", ())) or "(document)"

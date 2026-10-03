@@ -73,10 +73,67 @@ def test_an_empty_profile_id_says_no_profile_was_selected(tmp_path: Path) -> Non
 
 
 def test_a_profile_id_cannot_escape_the_profile_directory(tmp_path: Path) -> None:
-    for bad in ("../escape", "sub/dir", ".hidden"):
+    for bad in (
+        "../escape",
+        "sub/dir",
+        ".hidden",
+        # A drive letter: on Windows `profiles / "C:evil.json"` drops the data-dir prefix and
+        # names a drive-relative file in the current directory, typically a checkout.
+        "C:evil",
+        "D:x",
+        # An NTFS alternate data stream.
+        "a:b",
+        # Windows device names, with and without an extension, in any case.
+        "NUL",
+        "nul",
+        "con.txt",
+        "COM1",
+        "lpt9",
+        "aux.json",
+        "-leading-dash",
+        "x" * 129,
+        "has space",
+    ):
         with pytest.raises(RefusedError) as excinfo:
             load_profile(tmp_path, bad)
         assert "plain file name" in excinfo.value.message, bad
+
+
+def test_a_drive_letter_profile_id_never_reads_a_file_in_the_current_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reproduced escape: a profile planted in the checkout under the drive-relative name."""
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    drive = Path.cwd().drive or "C:"
+    planted = {
+        "profile_id": f"{drive}evil",
+        "role_bindings": {"implementer": "a", "reviewer": "a"},
+        "agents": {"a": {"harness": "dsh", "driver": "acpx-dsh"}},
+    }
+    (checkout / "evil.json").write_text(json.dumps(planted), encoding="utf-8")
+    monkeypatch.chdir(checkout)
+    data_dir = tmp_path / "data"
+    with pytest.raises(RefusedError) as excinfo:
+        load_profile(data_dir, f"{drive}evil")
+    assert "plain file name" in excinfo.value.message
+
+
+def test_ordinary_profile_ids_still_load(tmp_path: Path) -> None:
+    for good in ("dsh-local", "a", "Profile_2.v1", "console", "nullable", "com10"):
+        path = tmp_path / "profiles" / f"{good}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "profile_id": good,
+                    "role_bindings": {"implementer": "a", "reviewer": "a"},
+                    "agents": {"a": {"harness": "dsh", "driver": "acpx-dsh"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert load_profile(tmp_path, good).profile_id == good
 
 
 def test_a_malformed_profile_names_the_field_that_is_wrong(tmp_path: Path) -> None:

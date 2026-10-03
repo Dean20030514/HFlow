@@ -56,7 +56,7 @@ from hflow.contracts import (
     TaskSpec,
     TaskState,
 )
-from hflow.controller import Controller, inspect_run
+from hflow.controller import Controller, RunOutcome, inspect_run
 from hflow.drivers.acpx_dsh import AcpxDshDriver
 from hflow.drivers.fake import FakeDriver, FakeScript
 from hflow.report import report_json, status_text
@@ -2777,29 +2777,42 @@ def test_after_a_launch_time_refusal_only_a_new_revision_with_a_repair_left_runs
     assert any("identical TaskSpec" in note for note in again.notes), again.notes
 
     revised = task_spec.model_copy(update={"revision": 2})
-    second = _root_controller(
-        store,
-        driver,
-        binding=binding,
-        limits=limits,
-        authorization=_authorization(
-            spec=revised,
+
+    def submit_revision_two() -> RunOutcome:
+        return _root_controller(
+            store,
+            driver,
             binding=binding,
             limits=limits,
-            project_root=project_root,
-            authorization_id="AUTH-revision-2",
-        ),
-        data_dir=tmp_path / "data",
-    ).run_task(run_request.model_copy(update={"task": revised}))
+            authorization=_authorization(
+                spec=revised,
+                binding=binding,
+                limits=limits,
+                project_root=project_root,
+                authorization_id="AUTH-revision-2",
+            ),
+            data_dir=tmp_path / "data",
+        ).run_task(run_request.model_copy(update={"task": revised}))
 
-    assert second.run_id != first.run_id
     if max_repairs == 0:
-        assert second.block_code is RefusalCode.BUDGET_EXHAUSTED, second.block_reason
-        assert "repair" in (second.block_reason or "")
-    else:
-        assert second.block_code is not RefusalCode.BUDGET_EXHAUSTED, second.block_reason
-        implementers = [
-            entry for entry in store.invocations_for(second.run_id) if entry.role == "implementer"
-        ]
-        assert implementers and implementers[0].is_repair is True, implementers
-        assert implementers[0].state is not InvocationStartState.NOT_STARTED
+        # Decidable by reading the ledger, so refused before anything is written: no
+        # authorization record and no run row - an identical resubmission is not turned into a
+        # history query returning a blocked run, it is priced again and refused again.
+        for _ in range(2):
+            with pytest.raises(RefusedError) as refused:
+                submit_revision_two()
+            assert refused.value.code is RefusalCode.BUDGET_EXHAUSTED, refused.value
+            assert "charged as a repair" in str(refused.value), refused.value
+            assert store.find_run_by_spec_digest(PROJECT_ID, revised.spec_digest()) is None
+            assert store.authorization_state("AUTH-revision-2") is None
+        root = store.root_budget_view(binding.root_id)
+        assert root is not None and root.used_repairs == 0
+        return
+    second = submit_revision_two()
+    assert second.run_id != first.run_id
+    assert second.block_code is not RefusalCode.BUDGET_EXHAUSTED, second.block_reason
+    implementers = [
+        entry for entry in store.invocations_for(second.run_id) if entry.role == "implementer"
+    ]
+    assert implementers and implementers[0].is_repair is True, implementers
+    assert implementers[0].state is not InvocationStartState.NOT_STARTED

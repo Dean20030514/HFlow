@@ -1017,6 +1017,105 @@ def test_a_late_completed_after_an_unconfirmed_stop_changes_nothing(
         store.close()
 
 
+class StopThenCompleteCountingDriver(StopThenCompleteDriver):
+    """The same late ``COMPLETED``, self-reporting 40 turns; an applied round reports 12."""
+
+    def start(self, request):  # noqa: ANN001 - Protocol shape
+        if request.role == "implementer":
+            implementer_round = sum(label.startswith("implementer") for label in self.labels) + 1
+            self.script.agent_turns = 40 if implementer_round == self.stop_round else 12
+        else:
+            self.script.agent_turns = 1
+        return super().start(request)
+
+
+@pytest.mark.parametrize("stop_round", [1, 2], ids=["I1", "I2"])
+def test_a_late_result_after_an_unconfirmed_stop_adds_no_turns(
+    tmp_path: Path, sample_repo: Path, stop_round: int
+) -> None:
+    """AGENTS rule 4: a late result is a note, so its self-reported turns are not the run's.
+
+    Before the fix the turns were written before the stop-conditional apply, so the stopped run's
+    ``turns_observed`` (and its status line) showed the late result's 40.
+    """
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    spec = _spec(policy=_policy(), base_commit=base)
+    driver = StopThenCompleteCountingDriver(
+        sample_repo,
+        first_plan={"src/parser.py": FIXED_SOURCE} if stop_round == 1 else {},
+        repair_plan={"src/parser.py": FIXED_SOURCE},
+        stop_round=stop_round,
+    )
+    controller = _controller(
+        store, project_root=sample_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": FailingOnceThenPassing()}),
+    )
+    driver.controller = controller
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=sample_repo))
+        assert outcome.block_code is RefusalCode.OUTCOME_UNKNOWN, outcome.block_reason
+        assert any(note.startswith("late_result") for note in store.notes_for(outcome.run_id))
+
+        expected = None if stop_round == 1 else 12  # only an applied I1 counts
+        assert store.get_run(outcome.run_id)["turns_observed"] == expected
+        status = status_text(inspect_run(store, outcome.run_id))
+        assert f"implementer self-reported {expected if expected is not None else 'unknown'}" in (
+            status
+        ), status
+    finally:
+        store.close()
+
+
+class TurnsPerRoundDriver(RepairingDriver):
+    """A repairing driver whose implementer rounds self-report different turn counts."""
+
+    def __init__(self, *args, turns: list[int], **kwargs) -> None:  # noqa: ANN002, ANN003
+        super().__init__(*args, **kwargs)
+        self.turns = list(turns)
+
+    def start(self, request):  # noqa: ANN001 - Protocol shape
+        if request.role == "implementer":
+            self.script.agent_turns = self.turns.pop(0)
+        else:
+            self.script.agent_turns = 1
+        return super().start(request)
+
+
+def test_a_repaired_run_reports_the_sum_of_its_implementer_rounds(
+    tmp_path: Path, sample_repo: Path
+) -> None:
+    """I1 self-reports 12, I2 self-reports 2: the run, its status and its receipt say 14.
+
+    Before the fix each implementer result replaced the stored value and the receipt took the
+    final round's result alone, so a repaired run reported 2.
+    """
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    spec = _spec(policy=_policy(), base_commit=base)
+    driver = TurnsPerRoundDriver(
+        sample_repo, first_plan={}, repair_plan={"src/parser.py": FIXED_SOURCE}, turns=[12, 2]
+    )
+    controller = _controller(
+        store, project_root=sample_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": FailingOnceThenPassing()}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=sample_repo))
+        assert outcome.task_state is TaskState.ACCEPTED, outcome.block_reason
+        assert len(store.attempts_for(outcome.run_id)) == 2, "the run was repaired"
+
+        assert store.get_run(outcome.run_id)["turns_observed"] == 14
+        assert outcome.receipt is not None
+        assert outcome.receipt.usage.controller_turns_observed == 14
+        status = status_text(inspect_run(store, outcome.run_id))
+        assert "implementer self-reported 14" in status, status
+    finally:
+        store.close()
+
+
 @pytest.mark.parametrize("seam", ["settle_invocation", "advance_to_checking"])
 def test_a_stop_after_the_result_was_applied_freezes_nothing_more_and_returns(
     tmp_path: Path, sample_repo: Path, monkeypatch, seam: str
@@ -2707,9 +2806,10 @@ def test_a_later_revision_after_the_root_spent_its_repair_is_a_budget_refusal(
 ) -> None:
     """A later revision's I1 is the root's repair (E1), so a spent counter refuses it as budget.
 
-    Without a policy the store's own ceiling refuses the reservation, which must read as
-    BUDGET_EXHAUSTED rather than INTERNAL_ERROR. With a policy the run would need two repairs
-    (its I1 and its own repair), so it is refused before a run row exists.
+    Both are decidable by reading the ledger, so both are refused before a run row exists:
+    without a policy the revision's I1 alone needs the repair the root has spent, and with a
+    policy the run would need two repairs (its I1 and its own repair). The store's ceiling in the
+    dispatch transaction stays the real gate behind this check.
     """
     from hflow.contracts import RootBudgetLimits
 
@@ -2743,16 +2843,16 @@ def test_a_later_revision_after_the_root_spent_its_repair_is_a_budget_refusal(
 
         second = _spec(policy=None, base_commit=base, revision=2)
         second_driver = RepairingDriver(sample_repo, first_plan={}, repair_plan={})
-        outcome = controller_for(second, "AUTH-rev-2", second_driver).run_task(
-            _request(project=project, spec=second, project_root=sample_repo)
-        )
-        assert outcome.task_state is TaskState.BLOCKED
-        assert outcome.block_code is RefusalCode.BUDGET_EXHAUSTED, (
-            outcome.block_code,
-            outcome.block_reason,
-        )
-        assert "repair attempt" in (outcome.block_reason or ""), outcome.block_reason
+        with pytest.raises(RefusedError) as refused:
+            controller_for(second, "AUTH-rev-2", second_driver).run_task(
+                _request(project=project, spec=second, project_root=sample_repo)
+            )
+        assert refused.value.code is RefusalCode.BUDGET_EXHAUSTED, refused.value
+        assert "repair attempt" in str(refused.value), refused.value
+        assert "charged as a repair" in str(refused.value), refused.value
         assert second_driver.labels == [], "the refused revision must not start a driver"
+        assert store.find_run_by_spec_digest(project.project_id, second.spec_digest()) is None
+        assert store.authorization_state("AUTH-rev-2")["used_top_level_submissions"] == 0
 
         third = _spec(policy=_policy(), base_commit=base, revision=3)
         third_driver = RepairingDriver(sample_repo, first_plan={}, repair_plan={})
@@ -2769,6 +2869,96 @@ def test_a_later_revision_after_the_root_spent_its_repair_is_a_budget_refusal(
         assert (view.used_top_level_submissions, view.used_repairs) == (3, 1), (
             "neither refused revision may move the root's counters"
         )
+    finally:
+        store.close()
+
+
+def test_an_interrupted_revision_resubmitted_after_the_repair_was_spent_ends_blocked(
+    tmp_path: Path, sample_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An admitted-but-never-dispatched run the repair gate refuses ends BLOCKED, not DRAFT.
+
+    Revision 2 is admitted (a run row exists) and interrupted before any driver starts, so it
+    stays DRAFT with no invocation. Revision 3 then spends the root's one repair. Resubmitting
+    revision 2 reaches the existing-run branch, where the repair gate refuses it: the counter is
+    never raised, so no resubmission could ever pass. A plain refusal would leave the row DRAFT
+    and every retry exiting 2 although run state exists; the run must end through the
+    conditional block path with the gate's own code, dispatching nothing and moving no counter.
+    """
+    from hflow.contracts import RootBudgetLimits
+
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    limits = RootBudgetLimits(max_top_level_submissions=12, max_repairs=1)
+    revisions = {n: _spec(policy=None, base_commit=base, revision=n) for n in (1, 2, 3)}
+    binding = _root_binding_with(
+        store, spec=revisions[1], project_root=sample_repo, limits=limits
+    )
+    records = {
+        n: _artifact_for(
+            store, spec=spec, project_root=sample_repo, binding=binding, limits=limits,
+            authorization_id=f"AUTH-rev-{n}",
+        )
+        for n, spec in revisions.items()
+    }
+
+    def run(n: int, driver: FakeDriver):
+        controller = _controller_on_root(
+            store, project_root=sample_repo, binding=binding, limits=limits, record=records[n],
+            driver=driver, runners=CheckRunners({"fake": FailingOnceThenPassing(fail_first=None)}),
+        )
+        return controller.run_task(
+            _request(project=project, spec=revisions[n], project_root=sample_repo)
+        )
+
+    def fixing_driver() -> RepairingDriver:
+        return RepairingDriver(
+            sample_repo, first_plan={"src/parser.py": FIXED_SOURCE}, repair_plan={}
+        )
+
+    try:
+        assert run(1, fixing_driver()).task_state is TaskState.ACCEPTED
+
+        real_drive = Controller._drive
+
+        def interrupted(self, *args, **kwargs):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(Controller, "_drive", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            run(2, fixing_driver())
+        monkeypatch.setattr(Controller, "_drive", real_drive)
+        orphan = store.find_run_by_spec_digest(project.project_id, revisions[2].spec_digest())
+        assert orphan is not None and orphan["task_state"] == TaskState.DRAFT.value
+        run_id = orphan["run_id"]
+
+        assert run(3, fixing_driver()).task_state is TaskState.ACCEPTED
+        view = store.root_budget_view(binding.root_id)
+        assert view is not None and view.used_repairs == 1
+        counters = (view.used_top_level_submissions, view.used_repairs)
+
+        resubmit_driver = fixing_driver()
+        outcome = run(2, resubmit_driver)
+        assert outcome.run_id == run_id, "the existing run is continued, never a second one"
+        assert outcome.task_state is TaskState.BLOCKED, outcome
+        assert outcome.block_code is RefusalCode.BUDGET_EXHAUSTED, outcome.block_reason
+        assert "charged as a repair" in (outcome.block_reason or ""), outcome.block_reason
+        assert "admitted earlier but never dispatched" in (outcome.block_reason or "")
+        assert resubmit_driver.labels == [], "the refused run must not start a driver"
+        assert store.get_run(run_id)["task_state"] == TaskState.BLOCKED.value
+        assert store.invocation_counts(run_id) == (0, 0)
+        assert store.authorization_state("AUTH-rev-2")["used_top_level_submissions"] == 0
+        view = store.root_budget_view(binding.root_id)
+        assert (view.used_top_level_submissions, view.used_repairs) == counters, (
+            "ending the orphaned run must not move the root's counters"
+        )
+
+        # The run is now terminal: a further identical submission is a history query.
+        again = run(2, fixing_driver())
+        assert again.task_state is TaskState.BLOCKED
+        assert again.block_code is RefusalCode.BUDGET_EXHAUSTED
+        assert any("not re-dispatched" in note for note in again.notes or []), again.notes
     finally:
         store.close()
 

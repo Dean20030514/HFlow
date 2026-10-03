@@ -22,7 +22,7 @@ import json
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .contracts import (
     EffectiveConfig,
@@ -33,9 +33,11 @@ from .contracts import (
     RootBudgetLimits,
     RootBudgetPlan,
     RunRequest,
+    TaskSpec,
     canonical_json,
     digest_of,
 )
+from .profiles import summarize_validation_error
 
 SCHEMA_VERSION = 1
 #: Only this provenance may authorize a real model run. A model-authored note is refused.
@@ -50,7 +52,12 @@ ExecutionMode = Literal["stop-trial", "m2-live-change"]
 #: while empty so that an artifact written before they existed digests to exactly the same
 #: value as it did then - a different digest for an already-consumed authorization would make
 #: it look unused again, which is the one thing the single-use ledger must never allow.
-POST_BINDING_FIELDS = ("profile_id", "effective_config_digest", "root_budget")
+POST_BINDING_FIELDS = (
+    "profile_id",
+    "effective_config_digest",
+    "root_budget",
+    "project_contract_digest",
+)
 
 
 def resolve_root_binding(
@@ -102,6 +109,9 @@ class AuthorizationBinding(BaseModel):
     switching profile or model after approval changes the digest and the old approval stops
     applying. Artifacts written before that field existed still load; they simply cannot
     authorize a run that resolved a configuration (see :func:`verify_authorization`).
+
+    The same holds for the *project contract* (``project_contract_digest``) and for ``roles``,
+    which on a resolved run are the roles the task will actually dispatch.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -123,6 +133,11 @@ class AuthorizationBinding(BaseModel):
     #: from the digest while it is absent, so an artifact written before roots existed keeps
     #: the digest it always had and its consumed ledger row keeps matching.
     root_budget: RootBudgetBinding | None = None
+    #: ``project_contract_digest(project)`` of the contract this run resolved: its checks with
+    #: their argv and timeouts, ``write_deny``, limits and review floor. Without it the approved
+    #: check could be swapped for a no-op, or the review dropped, after the user saw them.
+    #: Dropped from the digest while empty, like the other post-binding fields.
+    project_contract_digest: str = ""
 
     def digest(self) -> str:
         """Identity of what this binding covers.
@@ -223,7 +238,13 @@ def load_authorization(path: Path) -> AuthorizationRecord:
         ) from exc
     except json.JSONDecodeError as exc:
         raise RefusedError(RefusalCode.INVALID_SPEC, f"{path} is not valid JSON: {exc}") from exc
-    record = AuthorizationRecord.model_validate(document)
+    try:
+        record = AuthorizationRecord.model_validate(document)
+    except ValidationError as exc:
+        raise RefusedError(
+            RefusalCode.INVALID_SPEC,
+            f"{path} is not a valid authorization: {summarize_validation_error(exc)}",
+        ) from exc
     if not record.user_text.strip():
         raise RefusedError(
             RefusalCode.RISK_DOWNGRADE,
@@ -260,6 +281,11 @@ def current_binding(
     so an approval names a commit rather than a branch that can move after it was given. A
     request without one - an in-place run, a ref that does not resolve, the historical tools -
     binds the task's own text, as before.
+
+    With a resolved configuration the binding also names the *project contract*
+    (``project_contract_digest``) and the roles the run will actually dispatch
+    (:func:`dispatched_roles`), so editing a check's argv, ``write_deny`` or the review floor
+    after approval - or a change that drops the reviewer - stops the old approval applying.
     """
     binding = AuthorizationBinding(
         mode=mode,
@@ -269,21 +295,36 @@ def current_binding(
         base_commit=request.base_commit or request.task.workspace.base_commit,
         spec_digest=request.task.spec_digest(),
         spec_path=str(Path(spec_path).resolve()),
-        roles=list(effective_roles(effective)),
+        roles=list(LEGACY_ROLES),
     )
     if effective is not None:
+        binding.roles = list(dispatched_roles(request.task, project))
         binding.effective_config_digest = effective.digest()
         binding.profile_id = effective.profile_id
+        binding.project_contract_digest = project_contract_digest(project)
     if root_binding is not None:
         binding.root_budget = root_binding
     return binding
 
 
-def effective_roles(effective: EffectiveConfig | None) -> tuple[str, ...]:
-    """Which roles the approval has to cover: the ones the configuration resolves."""
-    if effective is None:
-        return ("implementer", "reviewer")
-    return tuple(entry.role for entry in effective.roles) or ("implementer", "reviewer")
+#: The roles a binding names when no configuration was resolved: what every artifact written
+#: before roles were derived from the task carries, so those bindings digest as they always did.
+LEGACY_ROLES = ("implementer", "reviewer")
+
+
+def dispatched_roles(task: TaskSpec, project: ProjectConfig) -> tuple[str, ...]:
+    """The roles this task will actually dispatch, in dispatch order.
+
+    The same rule as ``ResolvedRun.roles``: the reviewer is dispatched exactly when
+    ``task.needs_review(project)``. Every role the profile *can* bind is not the point - an
+    approval shown a reviewer must not cover a run that skips it.
+    """
+    return ("implementer", "reviewer") if task.needs_review(project) else ("implementer",)
+
+
+def project_contract_digest(project: ProjectConfig) -> str:
+    """Content identity of the project contract a run resolved, as an approval binds it."""
+    return digest_of(project.model_dump(mode="json"))
 
 
 def verify_authorization(
@@ -318,6 +359,7 @@ def verify_authorization(
         "base_commit",
         "spec_digest",
         "spec_path",
+        "roles",
     ):
         left, right = getattr(actual, field), getattr(expected, field)
         if left != right:
@@ -328,7 +370,33 @@ def verify_authorization(
             "the authorization does not cover this run: " + "; ".join(mismatches),
         )
     _verify_effective_config(actual, expected)
+    _verify_project_contract(actual, expected)
     _verify_root_budget(actual, expected)
+
+
+def _verify_project_contract(actual: AuthorizationBinding, expected: AuthorizationBinding) -> None:
+    """The contract half of the check, on the same terms as the configuration half.
+
+    A run that resolved a contract refuses an artifact that names none: nothing in it says which
+    checks, write-deny rules or review floor the user approved, so it is re-issued, not reused.
+    """
+    if not expected.project_contract_digest:
+        return
+    if not actual.project_contract_digest:
+        raise RefusedError(
+            RefusalCode.RISK_DOWNGRADE,
+            "this authorization carries no project contract binding, so it does not say which "
+            "checks, write-deny rules, limits or review floor it approves. It predates contract "
+            "binding and cannot authorize this run; re-issue it against the current contract.",
+        )
+    if actual.project_contract_digest != expected.project_contract_digest:
+        raise RefusedError(
+            RefusalCode.RISK_DOWNGRADE,
+            "the project contract changed since approval: authorized "
+            f"{actual.project_contract_digest} != actual {expected.project_contract_digest}. "
+            "Editing a check, write_deny, a limit or review_required after approval does not "
+            "extend the approval; run `hflow prepare` again and re-issue it.",
+        )
 
 
 def _verify_root_budget(actual: AuthorizationBinding, expected: AuthorizationBinding) -> None:

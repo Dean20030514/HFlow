@@ -17,6 +17,7 @@ with a timeout; that limits blast radius but is not a security boundary.
 from __future__ import annotations
 
 import contextlib
+import os
 import re
 import subprocess
 import tempfile
@@ -64,6 +65,121 @@ DESCENDANT_SETTLE_SECONDS = 2.0
 BOUNDARY_EMPTY_SECONDS = 5.0
 #: How long the direct child is given to die after the boundary killed it.
 CHILD_REAP_SECONDS = 5.0
+#: The structured reason a worktree run's command check was not started because bytecode the
+#: worker may have left in the candidate worktree could not be removed safely (see
+#: :func:`remove_worker_bytecode`). It is not a clean completion, so it can never buy a repair.
+REASON_BYTECODE_NOT_CLEARED = "bytecode_not_cleared"
+#: The run note naming how much worker-left bytecode a verification removed.
+NOTE_BYTECODE_REMOVED = "bytecode_removed"
+
+
+class BytecodeRemoval:
+    """What :func:`remove_worker_bytecode` removed, and what it refused to touch."""
+
+    def __init__(
+        self, files: int = 0, directories: int = 0, refused: Iterable[str] = ()
+    ) -> None:
+        self.files = files
+        self.directories = directories
+        #: Bytecode-shaped entries that were left in place and that a check could still load: a
+        #: ``__pycache__`` that is a link or junction, a ``.pyc`` link, or a file that could not be
+        #: removed. Any entry here means the check must not run.
+        self.refused = tuple(refused)
+
+    def note(self) -> str:
+        return (
+            f"worker-left bytecode removed before this check: {self.files} ignored .pyc file(s), "
+            f"{self.directories} emptied __pycache__ director(ies)"
+        )
+
+
+def _is_link(entry: os.DirEntry[str]) -> bool:
+    """Is this entry a symbolic link or a junction? Neither is ever followed or removed."""
+    try:
+        return entry.is_symlink() or entry.is_junction()
+    except OSError:
+        return True
+
+
+def remove_worker_bytecode(root: Path, *, keep: Iterable[str] = ()) -> BytecodeRemoval:
+    """Remove the ``.pyc`` files directly inside every real ``__pycache__`` under ``root``.
+
+    Run before every command check of a worktree run. Python loads a ``__pycache__/*.pyc`` in
+    place of its source (an ``UNCHECKED_HASH`` one without even looking at the source), and that
+    bytecode is never committed and never fingerprinted - so a cache the worker left could make a
+    check verify code no candidate commit holds. Removing it changes neither the candidate commit
+    nor its fingerprint, and it holds whatever flags the check passes to Python (``-I``, ``-E``).
+
+    The walk follows no link and no junction and never enters ``.git``. Only regular files whose
+    name ends in ``.pyc`` and that sit directly in a ``__pycache__`` directory are removed, and the
+    directory is removed afterwards only if that left it empty. ``keep`` names relative paths
+    (POSIX spelling) that are tracked in the candidate commit; those are committed content and
+    stay. Anything else is never touched. A ``__pycache__`` that is a link or junction, or a
+    ``.pyc`` link inside a real one, is left alone and reported in ``refused``: Python would follow
+    it, so the caller must not run a check while it is there.
+    """
+    fold = os.name == "nt"
+
+    def key(relative: str) -> str:
+        return relative.casefold() if fold else relative
+
+    kept = {key(path) for path in keep}
+    base = Path(os.path.realpath(root))
+    files = 0
+    directories = 0
+    refused: list[str] = []
+
+    def relative(path: str) -> str:
+        return Path(path).relative_to(base).as_posix()
+
+    pending: list[str] = [str(base)]
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as iterator:
+                entries = list(iterator)
+        except OSError:
+            # A directory nothing can list cannot hand Python a cache either.
+            continue
+        is_cache = Path(directory).name.casefold() == "__pycache__" and directory != str(base)
+        removed_here = False
+        for entry in entries:
+            name = entry.name.casefold()
+            if name == ".git":
+                continue
+            if _is_link(entry):
+                if name == "__pycache__" or (is_cache and name.endswith(".pyc")):
+                    refused.append(f"{relative(entry.path)} (a link or junction; not followed)")
+                continue
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+                is_file = entry.is_file(follow_symlinks=False)
+            except OSError as exc:
+                if is_cache and name.endswith(".pyc"):
+                    refused.append(f"{relative(entry.path)} (unreadable: {exc})")
+                continue
+            if is_dir:
+                pending.append(entry.path)
+                continue
+            if not (is_cache and is_file and name.endswith(".pyc")):
+                continue
+            if key(relative(entry.path)) in kept:
+                continue
+            try:
+                os.unlink(entry.path)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                refused.append(f"{relative(entry.path)} (not removed: {exc})")
+                continue
+            files += 1
+            removed_here = True
+        if is_cache and removed_here:
+            with contextlib.suppress(OSError):
+                os.rmdir(directory)
+                directories += 1
+    return BytecodeRemoval(files=files, directories=directories, refused=refused)
+
 
 # --------------------------------------------------------------------------
 # Exit reasons: the structured execution fact a business failure is classified from
@@ -248,6 +364,10 @@ class CommandCheckRunner:
       whose *name* looks like a credential is dropped even if it was declared, and the fact that
       it was dropped is recorded.
 
+    The runner itself does nothing about Python bytecode. For a worktree run,
+    :func:`verify_candidate` removes the worker's ``__pycache__`` bytecode before every command
+    check (:func:`remove_worker_bytecode`), and the freeze refuses sourceless ``.pyc`` files.
+
     None of this is a sandbox: the check still runs with the current user's rights.
     """
 
@@ -285,7 +405,6 @@ class CommandCheckRunner:
         started = time.monotonic()
         deadline = started + max(0.0, float(timeout_seconds))
         env, withheld = child_environment(extra=self.extra_env)
-        summary = environment_summary(env, withheld=withheld)
         argv = list(check.argv)
 
         scratch, artifact_dir, keep_artifacts = self._resolve_artifact_dir(check)
@@ -300,9 +419,26 @@ class CommandCheckRunner:
                 ),
                 command=argv,
                 exit_reason="no_artifact_dir",
-                environment=summary,
+                environment=environment_summary(env, withheld=withheld),
             )
+        summary = environment_summary(env, withheld=withheld)
+        return self._run_in_environment(
+            check, cwd, argv, env, summary, started, deadline, artifact_dir, keep_artifacts
+        )
 
+    def _run_in_environment(
+        self,
+        check: CheckDef,
+        cwd: Path,
+        argv: list[str],
+        env: dict[str, str],
+        summary: str,
+        started: float,
+        deadline: float,
+        artifact_dir: Path,
+        keep_artifacts: bool,
+    ) -> CheckOutcome:
+        """One check's execution and evidence, in the environment :meth:`run` prepared."""
         out_sink = BoundedTextSink(artifact_dir / "stdout.txt", limit=self.stream_limit_bytes)
         err_sink = BoundedTextSink(artifact_dir / "stderr.txt", limit=self.stream_limit_bytes)
         try:
@@ -709,7 +845,8 @@ class CommandCheckRunner:
         if stderr.total_bytes:
             # The head of the stream, decoded for the evidence row; the retained stream stays in
             # the artifact file this row names.
-            detail += " stderr=" + stderr.head[: self.excerpt_limit]
+            # Under a marker that is not a reference spelling: these are the check's bytes.
+            detail += f" {STDERR_EXCERPT_MARKER}" + stderr.head[: self.excerpt_limit]
             if stderr.truncated:
                 detail += "… (stderr truncated for display)"
         return CheckOutcome(
@@ -781,6 +918,8 @@ def verify_candidate(
     artifact_factory: Callable[[str, str], Path] | None = None,
     force_refresh: bool = False,
     time_budget_seconds: int | None = None,
+    remove_bytecode: bool = False,
+    committed_bytecode: Iterable[str] = (),
 ) -> VerificationResult:
     """Execute every required check once for this candidate; store evidence.
 
@@ -806,6 +945,16 @@ def verify_candidate(
     run-scoped directory under its own data dir, so the log a reviewer is pointed at is a file in
     the run's record; without one (offline callers) the runner uses a private temporary directory
     and cleans it up.
+
+    ``remove_bytecode=True`` (a worktree run: ``project_root`` is the candidate's worktree) removes
+    the ``__pycache__`` bytecode in that worktree before **every** command check, so a cache the
+    worker left can never stand in for the committed source, whatever flags the check passes to
+    Python (see :func:`remove_worker_bytecode`). ``committed_bytecode`` names the bytecode paths the
+    candidate commit tracks, which are kept. Each such check's evidence says how much was removed,
+    and a run note records the total. When something bytecode-shaped could not be removed safely
+    (a link, a junction, a file that could not be deleted) the check is not started: it is recorded
+    as an error that never buys a repair. An in-place run passes ``False``: its working tree is the
+    user's checkout, and nothing in it is deleted.
     """
     check_map = project.check_map()
     required = spec.required_check_ids()
@@ -824,6 +973,7 @@ def verify_candidate(
         else None
     )
 
+    removed_files = 0
     for check_id in required:
         check = check_map.get(check_id)
         if check is None:
@@ -893,7 +1043,32 @@ def verify_candidate(
                 effective_timeout = 0
             else:
                 effective_timeout = min(int(check.timeout_seconds), int(remaining_budget))
-        if effective_timeout > 0:
+        if effective_timeout > 0 and remove_bytecode and check.kind == "command":
+            removal = remove_worker_bytecode(project_root, keep=committed_bytecode)
+            removed_files += removal.files
+            if removal.refused:
+                outcome = CheckOutcome(
+                    EvidenceStatus.ERROR,
+                    detail=(
+                        f"check {check_id!r} was not started: bytecode in the candidate worktree "
+                        "could not be removed safely, and Python could load it in place of the "
+                        "committed source ("
+                        + "; ".join(removal.refused[:5])
+                        + (
+                            f"; +{len(removal.refused) - 5} more"
+                            if len(removal.refused) > 5
+                            else ""
+                        )
+                        + "); nothing was deleted outside __pycache__ and no link was followed"
+                    ),
+                    exit_reason=REASON_BYTECODE_NOT_CLEARED,
+                )
+            else:
+                outcome = runner.run(check, project_root, effective_timeout)
+                outcome.detail = (
+                    f"{outcome.detail} ({removal.note()})" if outcome.detail else removal.note()
+                )
+        elif effective_timeout > 0:
             outcome = runner.run(check, project_root, effective_timeout)
 
         # The evidence row carries a human-readable reason and the *readable* artifact references,
@@ -924,6 +1099,13 @@ def verify_candidate(
             failure_details.append(f"{check_id}: {outcome.status.value} ({outcome.detail})")
             overall = EvidenceStatus.FAILED if overall is EvidenceStatus.PASSED else overall
 
+    if removed_files:
+        store.record_note(
+            run_id,
+            f"{NOTE_BYTECODE_REMOVED}: {removed_files} ignored .pyc file(s) under __pycache__ were "
+            "removed from the candidate worktree before its command checks; they are never "
+            "committed or fingerprinted, so the candidate commit and fingerprint are unchanged",
+        )
     if failure_details:
         return VerificationResult(
             status="failed",
@@ -994,23 +1176,15 @@ def evidence_is_current(
 # by ``run_id`` alone would let a previous candidate's failure describe the current one.
 #
 # The ``artifact``/``stdout``/``stderr`` references are decoded from the detail text that
-# ``_detail_with_references`` writes. The reader lives next to the writer (rather than being
-# imported from the controller, which imports this module) so the one format has exactly one
-# definition on each side of the write.
+# ``_detail_with_references`` writes. The reader lives next to the writer, and the controller
+# imports this one reader for the reviewer packet, so the format has exactly one reader.
 
-#: Field markers an evidence row's detail text uses. A reference value ends where the next marker
-#: begins - which is also what lets a path contain spaces: the path is not split on whitespace,
-#: because "C:/temp/run 1/artifact.json" is one value, not two tokens.
-_REFERENCE_MARKERS = (
-    "reason=",
-    "artifact=",
-    "stdout:",
-    "stdout=",
-    "stderr:",
-    "stderr=",
-    "env_names=",
-    "withheld_secret_like=",
-)
+#: The marker the check's own stderr head is written under, inside the free-text detail. It is
+#: deliberately *not* a reference spelling: a check controls these bytes, so they must never read
+#: as HFlow's ``stderr:`` capture reference. Rows written before this marker existed carry
+#: `` stderr=<head>`` instead; the reader below never searches the free text, so both kinds of
+#: row read back to HFlow's real reference.
+STDERR_EXCERPT_MARKER = "stderr_excerpt="
 
 #: The retained/total/truncated/digest shape of one stream reference. Both spellings are accepted
 #: on purpose: the evidence row writes ``stdout: 3000/3000 bytes`` (reading like a log line) and
@@ -1021,28 +1195,61 @@ _STREAM_REFERENCE = re.compile(
     r"\s+digest=(?P<digest>\S+)"
 )
 
+_STREAM_VALUE = r"\d+\s*/\s*\d+\s*B?(?:\s*bytes)?\s+truncated=\w+\s+digest=\S+"
+
+#: One stream segment of the reference block. ``name: value`` (the row's spelling) is tried before
+#: ``name=value`` (the packet's).
+_BLOCK_STREAM = re.compile(rf"(?P<name>[a-z_]+)(?::\s|=)(?P<value>{_STREAM_VALUE})(?= |$)")
+_BLOCK_REASON = re.compile(r"reason=(?P<value>\S+)(?= |$)")
+#: Where an ``artifact=`` value ends: at the next segment of the block (a stream reference or the
+#: environment summary), preceded by one space. A path may contain spaces, so it is never split
+#: on whitespace: "C:/temp/run 1/artifact.json" is one value, not two tokens.
+_ARTIFACT_END = re.compile(rf" (?=[a-z_]+(?::\s|=){_STREAM_VALUE}(?: |$)|env_names=)")
+#: The free text a command check's detail starts with. It bounds an artifact value that no block
+#: segment follows, so the value never runs on into text the check wrote.
+_FREE_TEXT_START = re.compile(r" (?=check \S)")
+
+
+def _reference_block(detail: str) -> dict[str, str]:
+    """The references in HFlow's **leading** block of an evidence row's detail text.
+
+    ``_detail_with_references`` writes, in this fixed order: ``reason=``, ``artifact=``, one
+    ``<stream>: R/T bytes truncated=.. digest=..`` per captured stream, the environment summary,
+    and only then the free-text detail, which carries text the check itself printed. The block is
+    read segment by segment from the start, and reading stops at the first segment that is not one
+    of these. So nothing a check wrote (a ``stderr=`` or ``stdout:`` look-alike in its stderr, for
+    example) can stand in for, or hide, HFlow's own reference.
+    """
+    fields: dict[str, str] = {}
+    position = 0
+    match = _BLOCK_REASON.match(detail, position)
+    if match is not None:
+        fields["reason"] = match.group("value")
+        position = match.end() + 1
+    if detail.startswith("artifact=", position):
+        value_start = position + len("artifact=")
+        end_match = _ARTIFACT_END.search(detail, value_start) or _FREE_TEXT_START.search(
+            detail, value_start
+        )
+        end = end_match.start() if end_match is not None else len(detail)
+        fields["artifact"] = detail[value_start:end].strip()
+        position = end + 1
+    while position < len(detail):
+        match = _BLOCK_STREAM.match(detail, position)
+        if match is None:
+            break
+        # The first reference of a name wins; a repeated name never overwrites it.
+        fields.setdefault(match.group("name"), match.group("value"))
+        position = match.end() + 1
+    return fields
+
 
 def _reference_field(detail: str, field: str) -> str:
-    """One ``field=value`` (or ``field: value``) reference out of an evidence row's detail text."""
-    for marker in (f"{field}=", f"{field}:"):
-        start = detail.find(marker)
-        while start != -1:
-            # Only a marker at a field boundary counts: "reason=" inside a word is not a field.
-            if start == 0 or detail[start - 1] == " ":
-                break
-            start = detail.find(marker, start + 1)
-        if start == -1:
-            continue
-        value_start = start + len(marker)
-        end = len(detail)
-        for other in _REFERENCE_MARKERS:
-            if other == marker:
-                continue
-            position = detail.find(other, value_start)
-            if position != -1 and (position == value_start or detail[position - 1] == " "):
-                end = min(end, position)
-        return detail[value_start:end].strip()
-    return ""
+    """One reference (``reason``, ``artifact``, ``stdout``, ``stderr``) from the leading block.
+
+    ``""`` when the block does not carry it. The free-text tail is never searched.
+    """
+    return _reference_block(detail).get(field, "")
 
 
 def _stream_reference(detail: str, name: str) -> dict[str, object]:

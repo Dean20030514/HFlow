@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -456,3 +457,285 @@ def test_a_hook_raising_an_unexpected_error_still_rolls_back_and_a_later_open_su
         _assert_legacy_rows_are_readable(later, task_spec)
     finally:
         later.close()
+
+
+# --------------------------------------------------------------------------
+# 4. only a whole, verified copy is ever trusted as the pre-migration snapshot
+# --------------------------------------------------------------------------
+
+
+class _BackupFailsPartway:
+    """A ledger connection whose backup copies one page and then fails, as a full disk would.
+
+    Everything but ``backup`` is the real connection, so the migration under test is the real one;
+    only the failure is staged, and it happens *after* SQLite has written into the destination.
+    """
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._connection, name)
+
+    def backup(self, target: sqlite3.Connection, **_kwargs: object) -> None:
+        def fail(_status: int, _remaining: int, _total: int) -> None:
+            raise OSError("test: no space left on device during the snapshot")
+
+        self._connection.backup(target, pages=1, progress=fail)
+
+
+def _assert_valid_snapshot(backup: Path, version: int) -> None:
+    assert migrate._snapshot_defect(backup, version) is None  # noqa: SLF001
+    connection = sqlite3.connect(str(backup))
+    try:
+        assert connection.execute("SELECT run_id FROM runs").fetchall() == [(RUN_ID,)]
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    finally:
+        connection.close()
+
+
+def _assert_ledger_untouched(path: Path, before: dict[str, str]) -> None:
+    assert _stored_version(path) is None, "a refused open must not stamp a version"
+    assert "root_budgets" not in _tables(path)
+    assert _content_digest(path) == before
+
+
+def test_a_backup_that_fails_partway_leaves_no_snapshot_and_a_later_open_makes_a_valid_one(
+    tmp_path: Path, task_spec: TaskSpec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupted copy never sits at the name a later open trusts as the restore point."""
+    import hflow.store as store_module
+
+    path = tmp_path / "data" / "hflow.sqlite"
+    _build_v1_database(path, task_spec)
+    before = _content_digest(path)
+    backup = migrate.backup_path_for(path, 1)
+    real_migrate = store_module.migrate
+
+    def migrate_with_failing_backup(connection, database, **kwargs):  # type: ignore[no-untyped-def]
+        return real_migrate(_BackupFailsPartway(connection), database, **kwargs)
+
+    monkeypatch.setattr(store_module, "migrate", migrate_with_failing_backup)
+    with pytest.raises(OSError, match="no space left on device"):
+        Store(path)
+    monkeypatch.undo()
+
+    assert not backup.exists(), "a failed copy must not be left at the snapshot's name"
+    assert _backups_next_to(path) == [], "no partial copy or its journal is left behind either"
+    _assert_ledger_untouched(path, before)
+
+    store = Store(path)
+    try:
+        assert store.migrated_from == 1
+        assert store.migration_backup == backup
+        _assert_legacy_rows_are_readable(store, task_spec)
+    finally:
+        store.close()
+    _assert_valid_snapshot(backup, 1)
+    assert _backups_next_to(path) == [backup.name]
+
+
+def test_a_stale_partial_copy_and_its_journal_do_not_leak_into_the_new_snapshot(
+    tmp_path: Path, task_spec: TaskSpec
+) -> None:
+    """A temp file (and a hot journal beside it) left by a killed process is discarded first."""
+    path = tmp_path / "data" / "hflow.sqlite"
+    _build_v1_database(path, task_spec)
+    backup = migrate.backup_path_for(path, 1)
+    partial = backup.with_name(backup.name + ".partial")
+    partial.write_bytes(b"half a database")
+    partial.with_name(partial.name + "-journal").write_bytes(b"a journal from a killed process")
+
+    store = Store(path)
+    try:
+        assert store.migration_backup == backup
+    finally:
+        store.close()
+    _assert_valid_snapshot(backup, 1)
+    assert _backups_next_to(path) == [backup.name]
+
+
+def _plant_empty(path: Path, backup: Path) -> None:
+    backup.write_bytes(b"")
+
+
+def _plant_truncated(path: Path, backup: Path) -> None:
+    source = sqlite3.connect(str(path))
+    destination = sqlite3.connect(str(backup))
+    try:
+        source.backup(destination)
+    finally:
+        destination.close()
+        source.close()
+    data = backup.read_bytes()
+    assert len(data) > 4096, "the fixture ledger must span more than one page"
+    backup.write_bytes(data[: len(data) // 2])
+
+
+def _plant_wrong_version(path: Path, backup: Path) -> None:
+    other = backup.parent / "unrelated" / "hflow.sqlite"
+    Store(other).close()  # a whole, healthy database - of the wrong version
+    source = sqlite3.connect(str(other))
+    destination = sqlite3.connect(str(backup))
+    try:
+        source.backup(destination)
+    finally:
+        destination.close()
+        source.close()
+
+
+@pytest.mark.parametrize(
+    ("plant", "reason"),
+    [
+        (_plant_empty, "it is empty (0 bytes)"),
+        (_plant_truncated, "it cannot be read as an HFlow database"),
+        (_plant_wrong_version, f"reads as storage version {migrate.STORAGE_VERSION}"),
+    ],
+    ids=["empty", "truncated", "wrong-version"],
+)
+def test_a_defective_file_at_the_snapshot_name_refuses_the_migration(
+    tmp_path: Path, task_spec: TaskSpec, plant: object, reason: str
+) -> None:
+    """A leftover file is never reported as the restore point, and never overwritten."""
+    path = tmp_path / "data" / "hflow.sqlite"
+    _build_v1_database(path, task_spec)
+    before = _content_digest(path)
+    backup = migrate.backup_path_for(path, 1)
+    plant(path, backup)  # type: ignore[operator]
+    planted = backup.read_bytes()
+
+    with pytest.raises(StoreError) as refused:
+        Store(path)
+
+    message = str(refused.value)
+    assert str(backup) in message
+    assert reason in message
+    assert "Move it aside" in message
+    assert "The ledger was not changed" in message
+    _assert_ledger_untouched(path, before)
+    assert backup.read_bytes() == planted, "the earliest snapshot's name is never overwritten"
+    assert _backups_next_to(path) == [backup.name], "the check leaves no side file behind"
+
+    # The documented way forward: move the bad file aside and open again.
+    backup.rename(backup.with_name("set-aside.bak"))
+    store = Store(path)
+    try:
+        assert store.migration_backup == backup
+        _assert_legacy_rows_are_readable(store, task_spec)
+    finally:
+        store.close()
+    _assert_valid_snapshot(backup, 1)
+
+
+def test_a_valid_wal_flagged_snapshot_from_an_earlier_build_is_trusted_and_left_clean(
+    tmp_path: Path, task_spec: TaskSpec
+) -> None:
+    """Snapshots written before this fix kept the ledger's WAL flag; they are still restorable.
+
+    Checking one read-only creates ``-wal``/``-shm`` files beside it; the check removes the ones it
+    made, so the snapshot stays one file and the bytes an operator restores are unchanged.
+    """
+    path = tmp_path / "data" / "hflow.sqlite"
+    _build_v1_database(path, task_spec)
+    connection = sqlite3.connect(str(path))
+    try:
+        assert connection.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
+        backup = migrate.backup_path_for(path, 1)
+        destination = sqlite3.connect(str(backup))
+        try:
+            connection.backup(destination)
+        finally:
+            destination.close()
+    finally:
+        connection.close()
+    snapshot = backup.read_bytes()
+
+    store = Store(path)
+    try:
+        assert store.migrated_from == 1
+        assert store.migration_backup == backup
+    finally:
+        store.close()
+    assert backup.read_bytes() == snapshot
+    assert _backups_next_to(path) == [backup.name]
+
+
+# --------------------------------------------------------------------------
+# the snapshot check opens the copy on a network path too (review G, R11)
+# --------------------------------------------------------------------------
+
+
+def _admin_share_path(path: Path) -> Path | None:
+    r"""``path`` addressed as ``\\localhost\<drive>$\...``, or ``None`` if that is unreachable."""
+    resolved = path.resolve()
+    drive = resolved.drive
+    if len(drive) != 2 or drive[1] != ":":
+        return None
+    unc = Path(r"\\localhost" + "\\" + drive[0] + "$\\" + str(resolved)[3:])
+    try:
+        return unc if unc.exists() else None
+    except OSError:
+        return None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="UNC paths and admin shares are Windows-only")
+def test_a_ledger_on_a_unc_path_migrates_and_its_snapshot_verifies(
+    tmp_path: Path, task_spec: TaskSpec
+) -> None:
+    r"""A ledger on ``\\server\share\...`` is backed up, verified and migrated like a local one.
+
+    The read-only check used to open the copy through ``Path.resolve().as_uri()``, which gives
+    ``file://localhost/C%24/...`` - a URI SQLite will not open - so every open of an old-version
+    ledger on a share was refused with a snapshot "failed verification" that was not true.
+    """
+    local = tmp_path / "data" / "hflow.sqlite"
+    _build_v1_database(local, task_spec)
+    path = _admin_share_path(local)
+    if path is None:
+        pytest.skip(r"the \\localhost\<drive>$ admin share is not reachable here")
+
+    store = Store(path)
+    try:
+        assert store.migrated_from == 1
+        backup = store.migration_backup
+        assert backup == migrate.backup_path_for(path, 1)
+        _assert_legacy_rows_are_readable(store, task_spec)
+    finally:
+        store.close()
+    _assert_valid_snapshot(backup, 1)
+    assert _backups_next_to(local) == [backup.name], "no partial copy or side file is left behind"
+
+    # An existing snapshot at the final name is verified through the same open, and trusted.
+    assert migrate._snapshot_defect(backup, 1) is None  # noqa: SLF001
+
+
+@pytest.mark.skipif(os.name != "nt", reason="drive letters and UNC paths are Windows-only")
+def test_the_read_only_uri_keeps_a_drive_or_unc_path_unresolved_and_escaped() -> None:
+    """A mapped drive stays a drive (``resolve()`` would rewrite it to UNC), a UNC path gets the
+    four-slash form SQLite reads, and ``#``/``%``/space stay part of the file name."""
+    uri = migrate._readonly_uri  # noqa: SLF001
+    assert uri(Path(r"Z:\ledgers\hflow.sqlite")) == "file:///Z:/ledgers/hflow.sqlite?mode=ro"
+    assert (
+        uri(Path(r"\\server\share\a b\h#1%.sqlite"))
+        == "file:////server/share/a%20b/h%231%25.sqlite?mode=ro"
+    )
+    assert (
+        uri(Path(r"\\?\UNC\server\share\hflow.sqlite"))
+        == "file:////server/share/hflow.sqlite?mode=ro"
+    )
+    assert uri(Path(r"\\?\C:\data\hflow.sqlite")) == "file:///C:/data/hflow.sqlite?mode=ro"
+
+
+def test_a_snapshot_whose_path_has_uri_special_characters_verifies(
+    tmp_path: Path, task_spec: TaskSpec
+) -> None:
+    """``#``, ``%`` and spaces in the data directory are path characters, not URI syntax."""
+    path = tmp_path / "data #1 100%" / "hflow.sqlite"
+    _build_v1_database(path, task_spec)
+    store = Store(path)
+    try:
+        assert store.migrated_from == 1
+        backup = store.migration_backup
+    finally:
+        store.close()
+    _assert_valid_snapshot(backup, 1)

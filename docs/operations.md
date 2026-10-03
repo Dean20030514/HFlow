@@ -21,7 +21,10 @@ hflow cancel <run_id>
 
 `run` prints a JSON payload that includes the receipt. Use `--receipt-out <path>` to
 write only the receipt, and check the exit code: `0` accepted, `2` refused at admission,
-`3` blocked after dispatch.
+`3` blocked after dispatch, `4` usage (any argument-parsing error), `5` the run exists and is
+not finished (`DRAFT`/`READY`/`RUNNING`/`CHECKING`: a history query for a run another
+controller still drives, or `resume` on a run a hard kill left `RUNNING`), `6` `status`/`report`
+found the run but a stored record of it no longer validates (nothing is rewritten).
 
 ## Configure once, then reuse it
 
@@ -188,6 +191,13 @@ Consequences worth knowing:
   because nothing in it says which one. Re-issue it.
 - The digest of an old artifact is unchanged by this build: the new fields are omitted while
   they are empty, so an already-consumed approval cannot look unused again.
+- **The project contract is bound too** (`project_contract_digest`, printed by `prepare` as
+  `contract`): every check with its argv and timeout, `write_deny`, the limits, the review floor
+  and `review_required`. Editing `.hflow/project.json` (or pointing `--project` at another file)
+  after approval refuses the artifact ("the project contract changed since approval"); an
+  artifact without the field cannot authorize a run that resolved a contract. Re-issue it.
+- The binding's `roles` are the roles the run will actually dispatch (the reviewer only when the
+  task needs a review) and `run` compares them, so a change that drops the reviewer is refused.
 - The launch is bound by *paths and argv*, not by program content: replacing a file at the same
   path does not change the approval.
 - **The base commit is bound as a SHA.** `workspace.base_commit` (or `--base-commit`) may name a
@@ -228,7 +238,7 @@ total. It is a JSON document with exactly two members:
 | Field | Meaning | Range |
 |---|---|---|
 | `max_top_level_submissions` | how many top-level dispatches (implementer + reviewer invocations) this root may buy in total | 1..64 |
-| `max_repairs` | how many *additional* implementer attempts the root may buy. The root's first implementer attempt is not a repair; every later one is, including a later revision's first implementer. **A ceiling, not a switch**: the dispatch transaction enforces it, but only a task's explicit `repair_policy` may spend it (see "When a repair may happen"). With the default 0 a root file used with a repair policy is refused before the first dispatch, and before the root is registered: set at least 1, and at least 2 for a later revision that wants its own repair, and resubmit (`prepare` reports the 0 case) | 0..8, default 0 |
+| `max_repairs` | how many *additional* implementer attempts the root may buy. The root's first implementer attempt is not a repair; every later one is, including a later revision's first implementer. **A ceiling, not a switch**: the dispatch transaction enforces it, and any later implementer on the root spends it whatever its `repair_policy`; only a task's explicit `repair_policy` arms the in-run repair round (see "When a repair may happen"). A later revision on a root with no repair left is refused `budget_exhausted` before its run row or authorization record exists (a policy-less one on a root that also has an unresolved invocation is instead blocked by the dispatch transaction's "unresolved invocation" refusal, as before). With the default 0 a root file used with a repair policy is refused before the first dispatch, and before the root is registered: set at least 1, and at least 2 for a later revision that wants its own repair, and resubmit (`prepare` reports the 0 case) | 0..8, default 0 |
 | `deadline_seconds` | wall-clock ceiling measured from the root's **first successful reservation**, recorded as `deadline_at` and never reset by a new run or revision (before that first reservation there is no clock yet, and a role gets the smaller of its configured value and this `deadline_seconds`, since the clock will start with exactly that much - "no clock" is not "no time left"). What it caps: a dispatch past it is refused; each role's invocation deadline (the implementer's configured value, the reviewer's 900 s) is the smaller of its own value and what the root has left, and the driver's local wait and forced stop follow that deadline; the checks share **one** countdown of the remaining time, so each check runs for at most what is actually left and a check with under a second left is not started (recorded as a `timed_out` error); the repair attempt is given the same capped deadline; and acceptance re-checks the clock, so a candidate finished after the deadline is not accepted (`budget_exhausted`). It does not stop a remote model request or a remote bill | >= 60, default 86400 |
 | `note` | free text the user keeps in the file. Never an approval: the approval is the authorization artifact's `user_text` | - |
 
@@ -370,7 +380,8 @@ buy another. A fully offline fake-driver run may still perform its one repair wi
 repair is charged to no root counter. With a root bound, the root must also be able to afford the
 repair before the first dispatch: `used_repairs + needed <= max_repairs`, where `needed` is 1, or 2
 when an earlier run already dispatched an implementer on this root (a later revision's first
-implementer is itself charged as a repair). Otherwise the run is refused `budget_exhausted` before
+implementer is itself charged as a repair; a later revision without a policy needs 1 for that
+reason alone). Otherwise the run is refused `budget_exhausted` before
 anything exists - no run row, no authorization record and no root row, so a corrected root file
 is not refused later as a different ceiling - and if the counter is found spent at the decision itself a `budget_exhausted`
 repair record is written instead of `allowed`.
@@ -454,8 +465,10 @@ compared before HFlow's git reads it again" below), records `workspace_drift`, b
 `scope_violation` and buys nothing; nothing is reset or
 overwritten. Ignored files the first round's checks or review left **outside** what the scoped
 fingerprint hashes (a `.ruff_cache` or `.mypy_cache` at the repository root, say) are not drift:
-the first freeze refused every ignored path off its allowlist, so whatever is ignored now came
-from HFlow's own checks, and the repair round's freeze accepts exactly those paths, as literal
+the first freeze refused every ignored path off its allowlist (and every freeze refuses an ignored
+file the scoped fingerprint hashes, and a sourceless `.pyc` outside `__pycache__`), so whatever
+else is ignored now came from HFlow's own checks or is a cache the allowlist names, and the repair
+round's freeze accepts exactly those paths, as literal
 entries. The worker may not change them (the round's manifest comparison still sees them and
 refuses a change as outside the scope), an ignored file is never staged, and an ignored path that
 appears during the repair round still refuses the freeze. An ignored file a previous check left
@@ -535,11 +548,17 @@ What happens on that first open:
    this build understands is refused with nothing touched - no snapshot, no write.
 2. If the file is at version > 0, it is copied first with the SQLite backup API to
    `<db>.pre-v<version>.bak` (for example `hflow.sqlite.pre-v1.bak`), next to the database. A
-   brand-new file gets no backup: there is nothing to protect.
+   brand-new file gets no backup: there is nothing to protect. The copy is written to
+   `<db>.pre-v<version>.bak.partial`, checked (`PRAGMA integrity_check` and its storage version),
+   flushed and only then renamed into place, so an interrupted copy never takes the `.bak` name.
 3. The migration runs inside one `BEGIN IMMEDIATE` transaction of plain statements. Any failure
    rolls the whole thing back, and re-opening an already-migrated file does nothing (no second
    backup, no rewrite). The backup is never overwritten, so the earliest pre-migration state
    stays restorable.
+   - An existing `.bak` is checked the same way before it is trusted. If it is empty, damaged
+     or of another version (for example left by an older build's interrupted backup), the open
+     is refused with the file named and the ledger unchanged. Move that file aside, then open
+     again to take a fresh snapshot.
 
 **Do not open a migrated database with an older binary.** A build that predates the version
 check has no idea what `root_budgets`/`invocations` mean and would read (and write) a layout it
@@ -583,10 +602,10 @@ actually meet today:
 | `evidence_stale` | the candidate changed after verification | re-run; do not reuse the old evidence |
 | `review_rejected` | the reviewer returned a validated `changes_requested` | read the finding, then submit a new revision |
 | `review_protocol_error` | the reviewer turn produced no usable verdict: missing, malformed or ambiguous output, a reviewer stream whose `messageId` resumes after another message started (the review evidence reads `invalid: agent_message_chunk on line N continues message ...`), or a final message holding two verdicts, for example one on each side of its own reasoning (`ambiguous`), a prompt-digest mismatch, a reviewer that could not be started, or a reviewer turn that `FAILED` (for example `model_rejected_before_prompt`, `cancelled_unrequested`, `stop_reason_max_tokens`), or a reviewer that sent an `agent_message_chunk` after its own prompt response, or whose output was not read to its end (`review_ambiguous`: the final answer is not identified). It is a wire failure, never the reviewer's judgment | read `block_reason` and the review evidence; fix the cause before a new revision |
-| `outcome_unknown` | nobody knows how an invocation ended: its stop was not confirmed (including every cross-process `hflow cancel`), the controller was interrupted while it ran, or the driver reported an unknown outcome (`unbound_completion`, `boundary_not_empty`, `no_stop_reason`, `prompt_error_response`, `unknown_stop_reason`, `output_limit_exceeded`, `unparseable_output`, `completion_timeout`) for either role | `hflow resume` to reconcile once no controller owns the run; the root stays blocked while the stopped invocation's ledger entry is open - a cross-process `hflow cancel` that lands during the checks or the review handoff leaves none, so the root then accepts a new revision even while the original controller is still finishing; submit a new revision only after it is resolved |
+| `outcome_unknown` | nobody knows how an invocation ended: its stop was not confirmed (including every cross-process `hflow cancel`), the controller was interrupted while it ran, or the driver reported an unknown outcome (`unbound_completion`, `boundary_not_empty`, `no_stop_reason`, `prompt_error_response`, `unknown_stop_reason`, `output_limit_exceeded`, `unparseable_output`, `completion_timeout`, `reader_failed`, `stream_not_drained` (implementer only; an undrained reviewer is `review_protocol_error` / `review_ambiguous`), `prompt_write_incomplete`) for either role | `hflow resume` to reconcile once no controller owns the run; the root stays blocked while the stopped invocation's ledger entry is open - a cross-process `hflow cancel` that lands during the checks or the review handoff leaves none, so the root then accepts a new revision even while the original controller is still finishing; submit a new revision only after it is resolved |
 | `cancelled_by_operator` | a stop was requested and confirmed (or the run was stopped before any dispatch) | nothing runs; the workspace and evidence are kept |
-| `driver_failed` | the implementer's driver reported a failure before/without a result (for example `model_rejected_before_prompt`: the profile's `--model` value is not one the agent advertises, so no prompt was sent) | read `block_reason`; fix the environment or the profile, do not blindly retry. An identical TaskSpec returns this blocked run; to run again submit a new revision, whose first implementer, under a root budget, is charged as a repair |
-| `workspace_client_config` | an entry named `.acpxrc.json` (in any letter case) appeared at the workspace root after admission (for the reviewer, in the candidate worktree), so the launch was refused at the driver's spawn gate before any process existed; the invocation is `not_started` and its allowance stays consumed. (A file already in the starting workspace never gets this far: it is refused before the run exists, see "What stops a run before it dispatches") | remove the file or directory, then submit a **new revision**: an identical TaskSpec returns this blocked run, and under a root budget the new revision's first implementer is charged as a repair, so the root needs a repair left |
+| `driver_failed` | the implementer's driver reported a failure before/without a result (for example `model_rejected_before_prompt`: the profile's `--model` value is not one the agent advertises, so no prompt was sent) | read `block_reason`; fix the environment or the profile, do not blindly retry. An identical TaskSpec returns this blocked run; to run again submit a new revision, whose first implementer, under a root budget, is charged as a repair (a root with none left refuses that revision before its run row exists) |
+| `workspace_client_config` | an entry named `.acpxrc.json` (in any letter case) appeared at the workspace root after admission (for the reviewer, in the candidate worktree), so the launch was refused at the driver's spawn gate before any process existed; the invocation is `not_started` and its allowance stays consumed. (A file already in the starting workspace never gets this far: it is refused before the run exists, see "What stops a run before it dispatches") | remove the file or directory, then submit a **new revision**: an identical TaskSpec returns this blocked run, and under a root budget the new revision's first implementer is charged as a repair, so the root needs a repair left (without one the revision is refused before its run row exists) |
 | `internal_error` | a controller step failed that is not the worker's result: the Git workspace could not be created, the candidate freeze failed or was incomplete (`freeze incomplete`), a prompt-digest mismatch on the implementer, an implementer driver that raised instead of returning a result (its ledger entry stays `requested`, which keeps the root blocked), an acceptance write that failed for a reason other than a stop, or a refused phase transition | read `block_reason`; it names the step |
 | `not_implemented` | the requested driver does not exist in this build, or the TaskSpec asked for a delivery level this build cannot reach | use `--driver fake`, request `local_candidate`, or wait for the implementation |
 
@@ -606,6 +625,9 @@ for an unknown outcome of either role the code is quoted with it. What each one 
 | `unknown_stop_reason` | `OUTCOME_UNKNOWN` | the prompt's own response carried a stop reason outside ACP v1's closed set (`end_turn`, `max_tokens`, `max_turn_requests`, `refusal`, `cancelled`). Before this build it was `FAILED stop_reason_<reason>`; it now blocks the root for both roles, and for the reviewer it is no longer `review_protocol_error` |
 | `prompt_error_response` | `OUTCOME_UNKNOWN` | the observed `session/prompt` was answered with a JSON-RPC error, ACP v1's failed-prompt shape. DSH sends -32603 `Internal error: turn failed: ...` / `assistant output delivery failed: ...` after the turn ran; before any model work it sends `prompt was not queued: ...` (-32603), invalid params (-32602), or a content-admission error with no fixed prefix (documented from DSH source, not observed). The code and the first 500 characters of the message (repr-quoted) go into `error_message`, the limitation and `block_reason`. The outcome stays unknown because whether a model call was made is not observable. A prompt answered with an error and a stop reason is unknown too. An error answering another id is not attributed, and one carrying the prompt's id after a request from the agent reused it is recorded as the limitation `prompt_error_unattributed` - DSH numbers its own permission requests from 0, so a long turn can hit this |
 | `no_stop_reason`, `output_limit_exceeded`, `unparseable_output`, `completion_timeout` | `OUTCOME_UNKNOWN` | the stream does not say how the turn ended - including a prompt response with no `stopReason` (such as the `{messageId}` insertion acknowledgement in an unreleased ACP v2 RFD sketch); a later `state_update` with a stop reason settles nothing |
+| `reader_failed` | `OUTCOME_UNKNOWN` | the driver's stream reader stopped before the end of the client's output (the exception class is named), or could not be started after the client was created; nothing is judged from the part it read |
+| `stream_not_drained` | `OUTCOME_UNKNOWN` | implementer only: the reader had not finished the client's output within the drain wait after the client exited, so a stop reason in the part read settles nothing (a reviewer keeps `COMPLETED` with no verdict, `review_ambiguous`) |
+| `prompt_write_incomplete` | `OUTCOME_UNKNOWN` | the turn settled with `end_turn`, but the prompt could not be fully written to the client's stdin (broken pipe), so the reported prompt digest is not what the client received. Recorded as a limitation on every other outcome. A client that reads part of its stdin and then closes it is not detected: the pipe accepts a write before the client reads it |
 
 `stream_order` (`prompt_response_line`, `updates_after_prompt_response`,
 `message_chunks_after_prompt_response`) is stored in `attempts.result_json` / `review_json` for
@@ -681,6 +703,25 @@ What the freeze commits, and what it refuses:
   and project) keeps its globs. An entry that only starts resolving outside the worktree during
   the run (the worker replaced it with a link) blocks the run `scope_violation` before the
   freeze, and the run ends instead of being left `RUNNING`.
+- A `write_deny` entry is matched after normalization (a leading `./`, `.` segments and repeated
+  `/` removed), so `./config/**` blocks like `config/**`. One that is empty after that, absolute,
+  drive-qualified or holds `..` could never match and is refused at admission and by `prepare`
+  (`scope_violation`), the task's and the project's alike.
+  An entry with a leading `/` or `\` (gitignore-style `/config/secrets/**`) is refused too, with
+  its own message; an earlier build stripped that slash silently, so drop it from such an entry.
+- **Ignored bytecode is not a candidate.** Every freeze, the first round's included, refuses
+  `scope_violation` on an ignored file the scoped fingerprint would hash and on a sourceless
+  `.pyc` outside `__pycache__` (Python imports it in place of a missing source, and no commit
+  holds it); the freeze deletes nothing. `__pycache__` and `.pytest_cache` stay allowed. Before
+  every `command` check of a worktree run, each regular `.pyc` directly inside a real
+  `__pycache__` of the worktree is deleted (an emptied `__pycache__` too), so worker-left bytecode
+  is never loaded, whether or not the check runs Python with `-I` or `-E`. Those files are never
+  committed or fingerprinted, so the candidate commit and fingerprint do not change; `.pyc` files
+  the candidate commit tracks stay, and `.git` and anything outside `__pycache__` are never
+  touched. The walk follows no link or junction: a `__pycache__` link or junction (or a `.pyc`
+  link) is left alone and the check is not started (`bytecode_not_cleared`, never a repair). Each
+  check's evidence says how many files were removed, and a `bytecode_removed` run note gives the
+  total. An in-place run deletes nothing in the user's checkout and gets no such protection.
 - **The worker may not move HEAD.** The freeze first checks that the worktree's HEAD is still the
   commit the round started from - the original base in round one, the previous candidate in a
   repair. A worker that ran `git commit`, `--amend`, `reset` or `checkout` inside the worktree is
@@ -773,7 +814,8 @@ What the freeze commits, and what it refuses:
   included files, and restore them before `hflow clean` or another worktree run - both read the
   metadata again, and HFlow restores nothing. If the edit was your own (any change counts, even
   `user.name`), submit a new revision: an identical TaskSpec returns the blocked run, and under a
-  root budget the new revision is charged as a repair. An in-scope `.gitattributes` the worker
+  root budget the new revision is charged as a repair (refused before its run row exists when the
+  root has none left). An in-scope `.gitattributes` the worker
   wrote is not refused; it appears in the receipt's `limitations`, because HFlow's `git add`
   applied it at the freeze. Requires Git 2.31+. Offline-tested only (README, "Not verified").
 - The worker packet still lists only the task's `write_deny` under forbidden paths; the project's
@@ -823,14 +865,16 @@ run's cleanup intent in a short transaction, and calls `git worktree remove` **w
 | `is_source_repository` | the path is the repository's main worktree |
 | `execution_active`, `run_in_flight` | an attempt or the run is still live |
 | `stop_unconfirmed` | a cancellation was requested but never confirmed: a stop that reached a live run and came back `unknown` or `still_running`, any `still_running` answer, or an intent with no receipt. A stop of a run that had **already ended**, answered `unknown` (what `hflow cancel` gets when it asks about an ended run's invocation - the CLI holds no handle) and recorded with `run_already_ended`, decided nothing about the run: it does not refuse, the preview says so, and the run faces exactly the gates it had before the stop |
-| `unfrozen_changes`, `head_drift` | the worktree holds changes that were never frozen |
+| `unfrozen_changes`, `head_drift` | the worktree holds changes that were never frozen. For a run without a receipt, `head_drift` means HEAD is neither the latest attempt's recorded frozen candidate nor the run's base |
+| `unretained_commit` | a run without a receipt whose HEAD is not its base commit, and no branch, tag or `refs/hflow/` ref contains HEAD (a worker commit, or a commit refused after the freeze, which gets no candidate ref). Removing the worktree would drop that commit. Inspect it; to keep it, create a ref (`git branch <name> <commit>`) and run `clean` again |
 | `unknown_ignored_files` | ignored files that are not known build artifacts (an `.env`, local data - and also a check's cache such as `.ruff_cache` or `.mypy_cache`: only `__pycache__`, `*.pyc` and `.pytest_cache` are known) |
 | `unsupported_status` | unmerged or submodule records that cannot be interpreted |
 
 A refusal keeps everything and releases the cleanup claim, so the same command works once
 you fix what blocked it. What survives a successful `clean`: the candidate commit (reachable
 through `refs/hflow/candidates/<run-id>/<attempt-id>`), its tree, the receipt, the evidence,
-and the run's history. Repeat `--apply` is idempotent; a path that vanished without a cleanup
+and the run's history. A run without a receipt has no receipt to keep; its HEAD is kept only
+because it is the run's base or a ref named in the preview contains it. Repeat `--apply` is idempotent; a path that vanished without a cleanup
 record is reported `MISSING`, never as a success.
 
 ## Known limits of `clean`
@@ -849,6 +893,10 @@ record is reported `MISSING`, never as a success.
   filter that metadata names. When `hflow status` shows a `git metadata` line, inspect and
   restore the metadata first (the "Shared Git metadata is compared ..." item under "M2 runs
   through the CLI").
+- For a run without a receipt, the base commit comes from the run's notes, its DSH context
+  record, or the task's own full `base_commit`. When none of them names it, a HEAD at the base
+  still needs a ref that contains it (normally the branch it came from); otherwise the run is
+  refused `unretained_commit`.
 
 ## Running a real Harness task (authorized only)
 
@@ -885,7 +933,12 @@ The examples in this file are illustrations; the shapes are generated. `hflow sc
 `AuthorizationRecord` (the artifact, defined in `authorization.py`), `RootBudgetPlan` (the root
 budget file) and `RepairPolicy` (the `--repair-policy-file` document) next to `TaskSpec`,
 `ProjectConfig`, `MachineProfile` and the rest. Write `base_commit` as the 40-hex SHA that
-`hflow prepare --json` prints under `authorization.binding`, never as a branch name.
+`hflow prepare --json` prints under `authorization.binding`, never as a branch name. The example
+binding above is not complete: a real run's artifact also carries `roles`,
+`effective_config_digest` and `project_contract_digest`, copied from `hflow prepare --json`
+together with the rest of `authorization.binding`. Without the two digests it cannot authorize a
+run that resolved a configuration and a contract, and a missing `roles` reads as implementer and
+reviewer, which a run that dispatches no reviewer refuses.
 
 For a run that spends against a **root ledger** (`--root-budget-file`, batch E1) the artifact
 carries two more members: the derived `binding.root_budget` and the approved `root_limits`. Write
@@ -922,7 +975,9 @@ task, so an agent could authorize itself. The artifact is refused unless
 
 - `provided_by` is exactly `user` (a model-written note is rejected by the schema);
 - the binding matches the run about to happen - mode, driver, project, repository path, base
-  commit, task digest and task path. Any mismatch lists the offending fields;
+  commit, task digest and task path, the roles the run will dispatch, the effective
+  configuration, the project contract and, for a root run, the root binding (see the
+  authorization section above). Any mismatch lists the offending fields;
 - allowance remains. Consumption is a single SQL UPDATE guarded by a CHECK constraint, so a
   restart, a new run id or a resubmitted identical spec cannot restore it.
 
@@ -1273,8 +1328,8 @@ What the launch path does, for both roles, since the 2026-10-02 refinement:
     `not_started` and its allowance stays consumed. The remedy is not "submit again": remove the
     file and submit a **new revision** - an identical TaskSpec returns the blocked run, and under a
     root budget the new revision's first implementer is charged as a repair, so the root needs a
-    repair left (`used_repairs < max_repairs`; with `max_repairs: 0` that revision's run blocks
-    `budget_exhausted` without dispatching).
+    repair left (`used_repairs < max_repairs`; otherwise that revision is refused
+    `budget_exhausted` before its run row or authorization record exists).
   The spawn-gate check runs just before the spawn, and acpx reads the file a moment later - a
   process writing the workspace in that window is not covered.
 - **Every launch program is an absolute file, and none may live in a workspace.** `dsh` - and
@@ -1468,8 +1523,10 @@ model_calls   0 (this command; provider-side requests are reported by the receip
 - `reserved 2/4` means two turns were *paid for* out of a ceiling of four: one for the
   implementer invocation and one for the reviewer invocation. Both were dispatched; a run that
   cannot afford the review turn blocks *before* the reviewer starts.
-- `implementer self-reported 1` is what the worker claimed for its own turn. It is not the
-  run total and it cannot return reserved budget. The controller's own **dispatch** count is
+- `implementer self-reported 1` is the sum of the implementer's self-reports across rounds (a
+  repaired run adds both rounds; a result that arrived after a stop adds nothing). It is not the
+  reserved total and it cannot return reserved budget. The receipt's `controller_turns_observed`
+  is the same sum. The controller's own **dispatch** count is
   the `invocations` line.
 - `configuration` is the effective configuration the run recorded once, with its digest; a run
   that predates config binding says `not recorded` instead of being back-filled.
@@ -1566,6 +1623,10 @@ What the stop does to the run depends on where the run is:
   process - does not make `hflow clean` refuse `stop_unconfirmed`: the run faces exactly the
   cleanup gates it had before the stop, and the preview says why. A `still_running` answer still
   refuses.
+- **Two stops that race** on one live run: the first to write ends the run, and its receipt and
+  block are the stored ones. The later stop returns its *own* receipt with `run_already_ended: true`
+  (a confirmed forced stop keeps that fact there and in its `cancel_target` note), but it does not
+  relabel the block or touch the attempt or any ledger entry, exactly like a stop of an ended run.
 - **An accepted run** is not reopened; the stop is recorded (`confirmed_stopped`,
   `mechanism=none`, `run_already_ended: true`), nothing is asked to stop and history is not
   rewritten.
@@ -1734,7 +1795,7 @@ the controller ended:
   re-dispatch. A second Ctrl+C during those writes can still interrupt them.
 - **Killed hard** (process kill, power loss, a crash outside a driver start, or an interrupt
   during the checks or the freeze). Nothing is recorded: the run stays `RUNNING` with its attempt
-  row and reservation (`reserved_expires_at`, `process_identity`), and `resume` is a no-op for
+  row and reservation (`reserved_expires_at`, `process_identity`), and `resume` is a no-op (exit `5`) for
   it, because it reconciles only `outcome_unknown` runs. Nothing re-dispatches automatically
   either, because a lease expiry alone does not prove the worker stopped. Reconciling an orphan by
   controller identity is not built.

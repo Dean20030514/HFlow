@@ -64,6 +64,12 @@ def emit(message: dict) -> None:
     sys.stdout.flush()
 
 
+def emit_raw(line: str) -> None:
+    """One line exactly as given, for wire shapes ``emit`` cannot produce."""
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+
+
 def _write_then_marker(path: Path, content: str) -> None:
     """Write content atomically enough that a watcher never reads a partial file.
 
@@ -310,8 +316,12 @@ def emit_trailing_updates(session_id: str, *, reviewer: bool, with_ids: bool) ->
     ``STUB_REVIEWER_TRAILING_UPDATES`` replaces it for the reviewer only. ``message`` is an
     assistant chunk under a new ``messageId`` carrying ``TRAILING_VERDICT``;
     ``message-other-session`` is the same chunk under another ``sessionId``; ``usage`` is a
-    ``usage_update`` with ``cost``; ``tool`` is a completed ``tool_call_update``. An unknown kind
-    ends the stub with an error, so a typo cannot pass as "no trailing updates".
+    ``usage_update`` with ``cost``; ``tool`` is a completed ``tool_call_update``. Three lines
+    Python's ``json`` cannot hand back as a plain message: ``deep`` nests arrays past the decoder's
+    depth (``RecursionError``), ``bigint`` is a ``usage_update`` whose ``used`` has 5000 digits
+    (``ValueError``, not ``JSONDecodeError``), and ``surrogate`` is an assistant chunk whose text
+    is one unpaired surrogate (U+D83D). An unknown kind ends the stub with an error, so a typo
+    cannot pass as "no trailing updates".
     """
     spec = os.environ.get("STUB_TRAILING_UPDATES", "")
     if reviewer:
@@ -327,6 +337,17 @@ def emit_trailing_updates(session_id: str, *, reviewer: bool, with_ids: bool) ->
             emit_usage_update(session_id)
         elif kind == "tool":
             emit_tool_result(session_id, "trailing tool output")
+        elif kind == "deep":
+            emit_raw("[" * 100_000 + "]" * 100_000)
+        elif kind == "bigint":
+            emit_raw(
+                '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":%s,'
+                '"update":{"sessionUpdate":"usage_update","used":%s,"size":1}}}'
+                % (json.dumps(session_id), "9" * 5000)
+            )
+        elif kind == "surrogate":
+            # json.dumps escapes the lone surrogate as a \u escape, as JSON.stringify does.
+            emit_message_chunk(session_id, chr(0xD83D), "m-9", with_id=with_ids)
         else:
             raise SystemExit(f"stub: unknown trailing update kind {kind!r}")
 

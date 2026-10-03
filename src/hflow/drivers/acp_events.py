@@ -64,7 +64,10 @@ def project_line(line: str, sequence: int, at: str) -> ObservedLine:
         return ObservedLine(True, None, None)
     try:
         message = json.loads(stripped)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
+        # JSONDecodeError is a ValueError; so is an integer literal past Python's digit limit,
+        # and nesting past the decoder's depth raises RecursionError. Each is a line this build
+        # cannot read - unparseable, never an exception out of the driver's reader thread.
         return ObservedLine(False, None, None)
     if not isinstance(message, dict):
         return ObservedLine(False, None, None)

@@ -256,6 +256,7 @@ def test_a_recorded_authorization_from_an_earlier_build_still_loads_and_digests_
     assert record.binding.effective_config_digest == ""
     assert record.binding.profile_id == ""
     assert record.binding.root_budget is None
+    assert record.binding.project_contract_digest == ""
     assert record.root_limits is None
     assert record.binding_digest() == LEGACY_FIXTURE_DIGEST
 
@@ -264,6 +265,7 @@ def test_a_recorded_authorization_from_an_earlier_build_still_loads_and_digests_
         "effective_config_digest",
         "profile_id",
         "root_budget",
+        "project_contract_digest",
     }
     old_recipe = digest_of({field: binding_document[field] for field in LEGACY_BINDING_FIELDS})
     assert old_recipe == LEGACY_FIXTURE_DIGEST
@@ -476,10 +478,13 @@ def test_schema_rejects_any_provenance_other_than_user(
     document["user_text"] = "the agent decided this was approved"
     path.write_text(json.dumps(document), encoding="utf-8")
 
-    with pytest.raises(Exception) as excinfo:
+    with pytest.raises(RefusedError) as excinfo:
         load_authorization(path)
-    # pydantic rejects the provenance outright: only "user" is a legal value.
-    assert "provided_by" in str(excinfo.value) or "agent" in str(excinfo.value)
+    # The contract rejects the provenance outright: only "user" is a legal value. It surfaces as
+    # an admission refusal naming the field, not as a pydantic traceback.
+    assert excinfo.value.code is RefusalCode.INVALID_SPEC
+    assert "is not a valid authorization" in excinfo.value.message
+    assert "provided_by" in excinfo.value.message
 
 
 def test_a_forged_user_provenance_is_accepted_which_is_the_stated_trust_limit(
@@ -664,3 +669,162 @@ def test_bare_flag_no_longer_authorizes_anything(tmp_path: Path) -> None:
     parser = build_parser()
     for action in parser._subparsers._group_actions[0].choices["run"]._actions:  # type: ignore[union-attr]
         assert action.dest != "live_authorized", "a model-writable flag must never authorize a real run"
+
+
+# --------------------------------------------------------------------------
+# the project contract and the dispatched roles are part of the approval
+# --------------------------------------------------------------------------
+
+
+def _configured_binding(project, task_spec, project_root: Path, spec_path: Path):  # noqa: ANN001, ANN202
+    from hflow.contracts import EffectiveConfig
+
+    request = RunRequest(
+        task=task_spec, project=project, project_root=project_root, workspace_root=project_root
+    )
+    return current_binding(
+        mode="m2-live-change",
+        driver="acpx-dsh",
+        project=project,
+        request=request,
+        spec_path=spec_path,
+        effective=EffectiveConfig(source="command_line"),
+    )
+
+
+def test_editing_the_project_contract_after_approval_refuses_the_artifact(
+    tmp_path: Path, project, task_spec, project_root: Path
+) -> None:
+    """The reproduced gap: a no-op check, a dropped write_deny or review floor kept the digest.
+
+    Every edit below leaves the task, the profile and the repository unchanged; only the
+    contract ``prepare`` showed differs. Each one must refuse the approval written for it.
+    """
+    from hflow.contracts import CheckDef
+
+    spec_path = tmp_path / "task.json"
+    shown = project.model_copy(
+        update={
+            "checks": [
+                CheckDef(id="unit", kind="command", argv=["python", "-m", "pytest", "-q"]),
+                CheckDef(id="docs-check", kind="fake"),
+            ]
+        }
+    )
+    approved = _configured_binding(shown, task_spec, project_root, spec_path)
+    assert approved.project_contract_digest.startswith("sha256:")
+    record = AuthorizationRecord(
+        authorization_id="AUTH-contract-1",
+        user_text=USER_TEXT,
+        authorized_at="2026-10-03T00:00:00Z",
+        max_top_level_submissions=2,
+        binding=approved,
+    )
+    verify_authorization(record, expected=approved)  # the contract it names is accepted
+
+    edits = {
+        "check argv": {
+            "checks": [
+                CheckDef(id="unit", kind="command", argv=["python", "-c", "pass"]),
+                CheckDef(id="docs-check", kind="fake"),
+            ]
+        },
+        "write_deny": {"write_deny": []},
+        "review_required": {"review_required": False},
+    }
+    for label, update in edits.items():
+        edited = shown.model_copy(update=update)
+        expected = _configured_binding(edited, task_spec, project_root, spec_path)
+        assert expected.digest() != approved.digest(), label
+        with pytest.raises(RefusedError) as excinfo:
+            verify_authorization(record, expected=expected)
+        assert excinfo.value.code is RefusalCode.RISK_DOWNGRADE, label
+        assert "project contract changed since approval" in excinfo.value.message, label
+
+
+def test_dropping_the_reviewer_after_approval_is_refused_by_roles(
+    tmp_path: Path, project, task_spec, project_root: Path
+) -> None:
+    """An approval shown a reviewer does not cover a run that skips it.
+
+    With ``review_required`` off in the contract and the task not asking for a review, the run
+    dispatches the implementer alone; the binding says so and the old artifact is refused for
+    its roles, not only for its contract digest.
+    """
+    spec_path = tmp_path / "task.json"
+    approved = _configured_binding(project, task_spec, project_root, spec_path)
+    assert approved.roles == ["implementer", "reviewer"]
+    record = AuthorizationRecord(
+        authorization_id="AUTH-roles-1",
+        user_text=USER_TEXT,
+        authorized_at="2026-10-03T00:00:00Z",
+        max_top_level_submissions=2,
+        binding=approved,
+    )
+    no_review_task = task_spec.model_copy(update={"review": ReviewRequirement(required=False)})
+    no_review_project = project.model_copy(update={"review_required": False})
+    expected = _configured_binding(no_review_project, no_review_task, project_root, spec_path)
+    assert expected.roles == ["implementer"]
+    with pytest.raises(RefusedError) as excinfo:
+        verify_authorization(record, expected=expected)
+    assert "roles: authorized ['implementer', 'reviewer'] != actual ['implementer']" in (
+        excinfo.value.message
+    )
+
+
+def test_an_artifact_without_a_contract_binding_cannot_authorize_a_configured_run(
+    tmp_path: Path, project, task_spec, project_root: Path
+) -> None:
+    """Like a pre-configuration artifact: it still loads, but it says nothing about the contract."""
+    spec_path = tmp_path / "task.json"
+    expected = _configured_binding(project, task_spec, project_root, spec_path)
+    legacy = expected.model_copy(update={"project_contract_digest": ""})
+    record = AuthorizationRecord(
+        authorization_id="AUTH-legacy-contract-1",
+        user_text=USER_TEXT,
+        authorized_at="2026-10-03T00:00:00Z",
+        max_top_level_submissions=2,
+        binding=legacy,
+    )
+    with pytest.raises(RefusedError) as excinfo:
+        verify_authorization(record, expected=expected)
+    assert "carries no project contract binding" in excinfo.value.message
+
+
+def test_a_binding_without_a_resolved_configuration_keeps_its_legacy_shape(
+    tmp_path: Path, project, task_spec, project_root: Path, real_request: RunRequest
+) -> None:
+    """The historical tools pass no configuration; their bindings must digest as before."""
+    binding = current_binding(
+        mode="m2-live-change",
+        driver="acpx-dsh",
+        project=project,
+        request=real_request,
+        spec_path=tmp_path / "task.json",
+    )
+    assert binding.project_contract_digest == ""
+    assert binding.roles == ["implementer", "reviewer"]
+    document = binding.model_dump(mode="json")
+    assert binding.digest() == digest_of({field: document[field] for field in LEGACY_BINDING_FIELDS})
+
+
+def test_a_malformed_authorization_is_an_admission_refusal(tmp_path: Path) -> None:
+    """Missing binding fields name the field; no pydantic traceback reaches the operator."""
+    path = tmp_path / "auth.json"
+    path.write_text(
+        json.dumps(
+            {
+                "authorization_id": "a",
+                "user_text": "yes",
+                "authorized_at": "now",
+                "max_top_level_submissions": 1,
+                "binding": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RefusedError) as excinfo:
+        load_authorization(path)
+    assert excinfo.value.code is RefusalCode.INVALID_SPEC
+    assert f"{path} is not a valid authorization" in excinfo.value.message
+    assert "binding.mode" in excinfo.value.message

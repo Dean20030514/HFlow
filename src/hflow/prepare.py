@@ -62,6 +62,7 @@ from .profiles import (
     profile_digest,
     requested_profile_id,
     resolve_role_bindings,
+    summarize_validation_error,
 )
 
 #: The write opt-in is a local, explicit decision; anything else is "no".
@@ -179,6 +180,34 @@ def load_json_file(path: Path, *, what: str) -> object:
         ) from exc
 
 
+def load_task_spec(path: Path) -> TaskSpec:
+    """Read one task file, refusing a document that does not match ``TaskSpec``.
+
+    A malformed task is an admission refusal (exit 2) naming the rejected fields, not a pydantic
+    traceback: scripts branch on the documented exit codes.
+    """
+    raw = load_json_file(Path(path), what="task spec")
+    try:
+        return TaskSpec.model_validate(raw)
+    except ValidationError as exc:
+        raise RefusedError(
+            RefusalCode.INVALID_SPEC,
+            f"{path} is not a valid task spec: {summarize_validation_error(exc)}",
+        ) from exc
+
+
+def load_project_contract(path: Path) -> ProjectConfig:
+    """Read one project contract, refusing a document that does not match ``ProjectConfig``."""
+    raw = load_json_file(Path(path), what="project contract")
+    try:
+        return ProjectConfig.model_validate(raw)
+    except ValidationError as exc:
+        raise RefusedError(
+            RefusalCode.INVALID_SPEC,
+            f"{path} is not a valid project contract: {summarize_validation_error(exc)}",
+        ) from exc
+
+
 def load_root_budget_plan(path: Path) -> RootBudgetPlan:
     """Read one root budget file: the user's ceilings for one root, never an approval.
 
@@ -281,9 +310,13 @@ def root_budget_preview(
         )
     else:
         repair_clause = (
-            "No repair is planned for this task: it carries no repair policy, so the "
-            f"{limits.max_repairs}-repair counter is recorded and enforced but nothing spends "
-            "it, and the normal count is also the maximum. This root allows at most "
+            "No repair is planned for this task: it carries no repair policy, so no in-run "
+            "repair round is armed and the normal count is also the maximum. The "
+            f"{limits.max_repairs}-repair counter is still spent: if an earlier run on this "
+            "root already dispatched an implementer, this revision's first implementer is "
+            "charged to it, and the run checks that against the ledger and refuses "
+            "budget_exhausted before writing anything when no repair is left (this preview "
+            "does not read the ledger). This root allows at most "
             f"{limits.max_top_level_submissions}"
         )
     detail = (
@@ -344,7 +377,14 @@ def effective_spec(
         }
     if repair_policy is not None:
         overrides["repair_policy"] = repair_policy.model_dump(mode="json")
-    return TaskSpec.model_validate({**spec.model_dump(mode="json"), **overrides})
+    try:
+        return TaskSpec.model_validate({**spec.model_dump(mode="json"), **overrides})
+    except ValidationError as exc:
+        raise RefusedError(
+            RefusalCode.INVALID_SPEC,
+            "the task with its command-line overrides is not a valid task spec: "
+            f"{summarize_validation_error(exc)}",
+        ) from exc
 
 
 def resolve_base_commit(spec: TaskSpec, project_root: Path) -> str:
@@ -690,7 +730,7 @@ def resolve_run(
     """
     root = Path(project_root).resolve()
     spec_path = Path(task_path)
-    spec = TaskSpec.model_validate(load_json_file(spec_path, what="task spec"))
+    spec = load_task_spec(spec_path)
     spec = effective_spec(
         spec,
         base_commit=base_commit,
@@ -701,9 +741,7 @@ def resolve_run(
     resolved_project_path = (
         Path(project_path) if project_path else root / ".hflow" / "project.json"
     )
-    project = ProjectConfig.model_validate(
-        load_json_file(resolved_project_path, what="project contract")
-    )
+    project = load_project_contract(resolved_project_path)
 
     machine = resolve_machine_bindings(
         data_dir=data_dir, profile_id=profile_id, driver=driver, env=env
@@ -1203,8 +1241,13 @@ def build_prepare_report(
             )
         else:
             notes.append(
-                "no repair is planned for this task: it carries no repair_policy, so the root's "
-                "repair counter is recorded and enforced but nothing spends it. "
+                "no repair is planned for this task: it carries no repair_policy, so no in-run "
+                "repair round is armed. The root's repair counter "
+                f"({root_preview.limits.max_repairs}) can still be spent: if an earlier run on "
+                "this root already dispatched an implementer, this revision's first implementer "
+                "is charged to it as a repair. The run checks that against the ledger and "
+                "refuses budget_exhausted before writing anything when no repair is left; "
+                "prepare does not read the ledger, so it cannot say which case applies. "
                 "budget.max_repair_cycles is a historical number and arms nothing"
             )
         if not resolved.is_real_driver:
@@ -1400,8 +1443,11 @@ def render_prepare_text(report: PrepareReport) -> str:
             )
         else:
             lines.append(
-                f"  repair      none planned - this task carries no repair policy, so the "
-                f"{root.limits.max_repairs}-repair counter is recorded but nothing spends it"
+                "  repair      none planned - this task carries no repair policy, so no "
+                "in-run repair round is armed; but if an earlier run on this root already "
+                "dispatched an implementer, this revision's first implementer is charged to "
+                f"the {root.limits.max_repairs}-repair counter, and run refuses "
+                "budget_exhausted before writing anything when none is left (not checked here)"
             )
         lines.append(
             f"  deadline    {root.limits.deadline_seconds}s counted from the root's first "
@@ -1445,6 +1491,14 @@ def render_prepare_text(report: PrepareReport) -> str:
             f"top-level submission(s), mode={report.authorization.mode}"
         )
         lines.append(f"  binding     {report.authorization.binding_digest}")
+        contract = report.authorization.binding.get("project_contract_digest")
+        if contract:
+            # The approval covers this contract (checks with argv, write_deny, limits, review
+            # floor); editing it after approval refuses the artifact.
+            lines.append(f"  contract    {contract}")
+        approved_roles = report.authorization.binding.get("roles")
+        if approved_roles:
+            lines.append(f"  roles       {', '.join(approved_roles)}")
         lines.append(
             "  pending     prepare did not create an authorization; only your own approval "
             "produces one"

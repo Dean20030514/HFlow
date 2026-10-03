@@ -408,10 +408,106 @@ def test_dirty_target_repository_is_left_alone(sample_repo: Path, tmp_path: Path
         # The controller recorded that the target was dirty instead of hiding it. Notes live
         # in the run's own audit table so they survive a terminal transition.
         assert any("uncommitted changes" in note for note in store.notes_for(outcome.run_id))
+        # HFlow's own run (its git reads, its data directory) does not make the comparison fire.
+        assert any("left untouched" in note for note in store.notes_for(outcome.run_id))
+        assert not any(note.startswith("WARNING") for note in store.notes_for(outcome.run_id))
         # Exactly one commit exists: the controller did not commit the user's work.
         assert _git(sample_repo, "rev-list", "--count", "HEAD").strip() == "1"
     finally:
         store.close()
+
+
+def test_a_dirty_checkout_overwritten_during_the_run_gets_the_warning_not_the_note(
+    sample_repo: Path, tmp_path: Path
+) -> None:
+    """Rewriting the user's dirty and ignored files in place is reported, never called "untouched".
+
+    The path list alone does not change when a file that is already modified, or an ignored file,
+    is rewritten: the fingerprint used to compare only that list, so the run recorded "left
+    untouched" over the user's overwritten work. Here an approved check - which runs with the
+    user's rights - rewrites both through absolute paths, keeping the tracked file's size.
+    """
+    (sample_repo / ".gitignore").write_text(".env\n", encoding="utf-8")
+    env_file = sample_repo / ".env"
+    env_file.write_text("TOKEN_NAME=user-value\n", encoding="utf-8")
+    dirty_file = sample_repo / "src" / "textkit" / "__init__.py"
+    dirty_text = dirty_file.read_text(encoding="utf-8") + "\n# user work in progress\n"
+    dirty_file.write_text(dirty_text, encoding="utf-8")
+    overwritten = dirty_text.replace("user work in progress", "USER WORK IN PROGRESS")
+    assert len(overwritten) == len(dirty_text)
+    porcelain_before = _git(sample_repo, "status", "--porcelain", "--ignored")
+
+    clobber = (
+        "from pathlib import Path; "
+        f"Path({str(dirty_file)!r}).write_text({overwritten!r}, encoding='utf-8'); "
+        f"Path({str(env_file)!r}).write_text('TOKEN_NAME=clobbered\\n', encoding='utf-8')"
+    )
+    project = _project(sample_repo).model_copy(
+        update={
+            "checks": [
+                CheckDef(
+                    id="unit",
+                    kind="command",
+                    argv=[sys.executable, "-c", clobber],
+                    timeout_seconds=120,
+                )
+            ]
+        }
+    )
+    store = Store(tmp_path / "data" / "hflow.sqlite")
+    base_commit = _git(sample_repo, "rev-parse", "HEAD").strip()
+    controller = _controller(store, sample_repo, tmp_path / "data")
+    try:
+        outcome = controller.run_task(
+            RunRequest(
+                task=_task(sample_repo, base_commit),
+                project=project,
+                project_root=sample_repo,
+                workspace_root=sample_repo,
+            )
+        )
+        assert outcome.task_state is TaskState.ACCEPTED, outcome.block_reason
+        assert "USER WORK IN PROGRESS" in dirty_file.read_text(encoding="utf-8")
+        assert env_file.read_text(encoding="utf-8") == "TOKEN_NAME=clobbered\n"
+        # The overwrite is invisible to the path list the old fingerprint compared.
+        assert _git(sample_repo, "status", "--porcelain", "--ignored") == porcelain_before
+
+        notes = store.notes_for(outcome.run_id)
+        assert any(
+            note.startswith("WARNING: the target repository's own state changed") for note in notes
+        )
+        assert not any("left untouched" in note for note in notes)
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("change", ["tracked", "ignored", "staged", "stash", "none"])
+def test_the_user_fingerprint_sees_in_place_rewrites_and_never_opens_a_file(
+    sample_repo: Path, change: str
+) -> None:
+    (sample_repo / ".gitignore").write_text(".env\n", encoding="utf-8")
+    (sample_repo / ".env").write_text("A=1\n", encoding="utf-8")
+    dirty_file = sample_repo / "src" / "textkit" / "__init__.py"
+    dirty_file.write_text(SCRIPT_SOURCE + "# wip\n", encoding="utf-8")
+    repo = GitRepo.discover(sample_repo)
+    index_before = (sample_repo / ".git" / "index").stat().st_mtime_ns
+    before = repo.user_change_fingerprint()
+    assert (sample_repo / ".git" / "index").stat().st_mtime_ns == index_before, (
+        "HFlow's status read must not rewrite the user's index"
+    )
+
+    if change == "tracked":
+        dirty_file.write_text(SCRIPT_SOURCE + "# WIP!\n", encoding="utf-8")
+    elif change == "ignored":
+        (sample_repo / ".env").write_text("A=22\n", encoding="utf-8")
+    elif change == "staged":
+        _git(sample_repo, "add", "src/textkit/__init__.py")
+    elif change == "stash":
+        # A new stash entry, without touching a working file.
+        _git(sample_repo, "update-ref", "refs/stash", "HEAD")
+
+    after = repo.user_change_fingerprint()
+    assert (after == before) is (change == "none")
 
 
 
@@ -444,15 +540,18 @@ def test_a_freeze_that_leaves_the_checked_change_behind_is_refused_as_incomplete
     [
         ("src/textkit/generated.py", ["src/textkit/generated.py"]),
         ("src/textkit/.acpxrc.json", []),
+        ("src/textkit/generated.py", ["./src/textkit/generated.py"]),
+        ("src/textkit/generated.py", ["./src/textkit/**"]),
     ],
-    ids=["declared-deny", "built-in-deny"],
+    ids=["declared-deny", "built-in-deny", "dot-slash-deny", "dot-slash-glob-deny"],
 )
 def test_a_denied_change_is_never_staged_by_the_freeze(
     sample_repo: Path, denied_path: str, deny: list[str]
 ) -> None:
     """A denied path inside an allowed directory refuses the freeze before anything is staged.
 
-    The built-in deny list applies even when the caller passes no rule of its own.
+    The built-in deny list applies even when the caller passes no rule of its own, and a rule
+    spelled with a leading ``./`` blocks exactly like the plain spelling.
     """
     repo = GitRepo.discover(sample_repo)
     base = repo.head

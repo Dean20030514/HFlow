@@ -118,7 +118,8 @@ the report come first.
    TaskSpec against the project contract as its first statement — before an authorization is
    registered, a run row inserted, a worktree attached or a turn reserved. A refusal is an
    `exit 2` with the issues listed, and leaves no run state at all; it is a different event
-   from a run that dispatches and then blocks (`exit 3`).
+   from a run that dispatches and then blocks (`exit 3`), from an argument-parsing error
+   (`exit 4`) and from a run that exists but is not finished (`exit 5`).
 2. **Budget before dispatch.** `store.reserve_dispatch` is the one dispatch transaction of
    batch E1, for both roles: in one `BEGIN IMMEDIATE` it checks ownership, phase, the absence of
    a stop, the root (unresolved invocations, deadline, room for the rest of the loop, repair
@@ -186,8 +187,10 @@ usable finding. The rules, the triggers and everything that stops a repair are i
   candidate (HEAD, tree, a clean status and no index entry flagged assume-unchanged or
   skip-worktree), and only while the shared Git metadata still matches the pre-dispatch
   snapshot, refusing otherwise as `workspace_drift` before anything is bought
-  (`_reconcile_repair_workspace`). Ignored files present then can only be the previous round's
-  check or review byproducts (the first freeze refused any ignored path off its allowlist). Those
+  (`_reconcile_repair_workspace`). Ignored files present then are the previous round's check or
+  review byproducts, or allowlisted caches the worker itself left (`__pycache__`, `.pytest_cache`):
+  the first freeze refused any ignored path off its allowlist and, as every freeze does, any
+  ignored file the scoped fingerprint hashes and any sourceless `.pyc` outside `__pycache__`. Those
   outside what the scoped fingerprint hashes are carried: the repair's freeze accepts exactly
   those paths, as literal entries, and the round's manifest comparison still refuses a worker
   change to them as outside the scope; nothing is deleted, an ignored file is never staged, and

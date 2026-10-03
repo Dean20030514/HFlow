@@ -801,6 +801,81 @@ def test_v2_terminal_rows_do_not_promote_request_timestamps_to_process_facts(
         connection.close()
 
 
+def _v2_started_ledger(path: Path, task_spec, invocation_ids: tuple[str, ...]) -> None:
+    """A v2 ledger holding ``started`` rows a v2 controller wrote before it died mid-dispatch."""
+    migration_helpers._build_v1_database(path, task_spec)
+    connection = sqlite3.connect(str(path), isolation_level=None)
+    try:
+        migrate(connection, path, supported=2)
+        for invocation_id in invocation_ids:
+            connection.execute(
+                """
+                INSERT INTO invocations
+                    (invocation_id, root_id, run_id, attempt_id, role, state, reserved_at,
+                     started_at)
+                VALUES (?, 'root-v2', ?, ?, 'implementer', 'started', ?, ?)
+                """,
+                (
+                    invocation_id,
+                    migration_helpers.RUN_ID,
+                    migration_helpers.ATTEMPT_ID,
+                    "2026-09-25T00:00:00Z",
+                    "2026-09-25T00:00:01Z",
+                ),
+            )
+    finally:
+        connection.close()
+
+
+def test_a_migrated_v2_started_row_is_reconciled_as_launch_unknown(
+    tmp_path: Path, task_spec
+) -> None:
+    """The v3 migration leaves a v2 ``started`` row as ``started`` with no ``started_at``.
+
+    That row records a launch request and no observed launch, so reconcile must close it as
+    ``launch_unknown`` - which keeps blocking the root - instead of leaving it open, where a later
+    settlement could close it as ``settled`` and unblock a root nobody reconciled.
+    """
+    path = tmp_path / "v2-started.sqlite"
+    _v2_started_ledger(path, task_spec, ("I-v2-started",))
+    store = Store(path)
+    try:
+        before = store.invocation("I-v2-started")
+        assert before is not None
+        assert before.state is InvocationStartState.STARTED and before.started_at is None, before
+
+        closed = store.mark_unsettled_invocations_unknown(
+            migration_helpers.RUN_ID, "reconciled after a v2 controller died mid-dispatch"
+        )
+
+        assert closed == 1
+        after = store.invocation("I-v2-started")
+        assert after is not None and after.state is InvocationStartState.LAUNCH_UNKNOWN, after
+        assert after.started_at is None, "no launch is invented for it"
+        assert store.settle_invocation(
+            "I-v2-started", outcome=InvocationOutcome.COMPLETED
+        ) is False, "a reconciled entry is not open, so no later settlement unblocks the root"
+        assert store.invocation("I-v2-started").state is InvocationStartState.LAUNCH_UNKNOWN
+    finally:
+        store.close()
+
+
+def test_a_migrated_v2_started_row_can_be_closed_as_an_unresolved_launch(
+    tmp_path: Path, task_spec
+) -> None:
+    """``mark_launch_unresolved`` - the confirmed stop's path - accepts the same migrated shape."""
+    path = tmp_path / "v2-started-stop.sqlite"
+    _v2_started_ledger(path, task_spec, ("I-v2-stop",))
+    store = Store(path)
+    try:
+        store.mark_launch_unresolved("I-v2-stop", "a confirmed stop of a migrated v2 launch")
+        row = store.invocation("I-v2-stop")
+        assert row is not None and row.state is InvocationStartState.LAUNCH_UNKNOWN, row
+        assert store.settle_invocation("I-v2-stop", outcome=InvocationOutcome.COMPLETED) is False
+    finally:
+        store.close()
+
+
 # --------------------------------------------------------------------------
 # 10. settling the same unresolved launch twice must not raise
 # --------------------------------------------------------------------------

@@ -22,6 +22,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -138,6 +139,20 @@ IGNORED_ARTIFACT_ALLOWLIST = (
     ".pytest_cache/**",
     "**/.pytest_cache/**",
 )
+
+
+def is_sourceless_bytecode(path: str) -> bool:
+    """Is ``path`` a ``.pyc`` file that does not sit in a ``__pycache__`` directory?
+
+    Python imports such a file as the module itself when no source file is beside it, and
+    CPython 3 never writes one there on its own (its cache lives in ``__pycache__``). So it is
+    allowlisted by ``**/*.pyc`` and yet cannot be a check byproduct. Letter case is ignored,
+    as Windows imports ignore it.
+    """
+    parts = path.replace("\\", "/").rstrip("/").split("/")
+    return parts[-1].casefold().endswith(".pyc") and not any(
+        part.casefold() == "__pycache__" for part in parts[:-1]
+    )
 
 
 @dataclass(frozen=True)
@@ -477,12 +492,76 @@ class GitRepo:
         """Does the user's own checkout have changes? Read-only: nothing is touched."""
         return bool(self.status_porcelain())
 
-    def user_change_fingerprint(self) -> str:
-        """Hash of the user's uncommitted state, so a run can prove it left it alone."""
+    def user_change_fingerprint(self, exclude: Iterable[Path] = ()) -> str:
+        """A stat-level digest of the user's checkout, compared before and after a run.
+
+        What it covers, and nothing more: HEAD as read now (its commit and the name it points
+        at, never the value cached when this handle was made), the ``refs/stash`` value, a digest
+        of ``git ls-files -s`` (every index entry's mode, blob id, stage and path), and for every
+        entry of ``git status --porcelain --ignored`` - changed, untracked and ignored, with
+        directories collapsed as git reports them - its path, its ``XY`` code, and the size and
+        ``mtime_ns`` that ``os.stat`` reports (``missing`` when there is nothing to stat). No
+        working file is opened, and the status read takes no optional lock, so it does not
+        rewrite ``.git/index``.
+
+        Not detected: a rewrite that keeps both a file's size and its mtime, and a change inside
+        a collapsed untracked or ignored directory that leaves the directory's own stat as it
+        was. ``exclude`` names HFlow's own directories (its data directory, for example); an
+        entry at or under one is left out, and a collapsed directory holding one is recorded
+        without its stat, since HFlow's writes change it legitimately.
+        """
+        root = Path(os.path.realpath(self.root))
+        fold_case = os.name == "nt"
+        excluded: list[str] = []
+        for path in exclude:
+            try:
+                relative = Path(os.path.realpath(path)).relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if relative != ".":
+                excluded.append(relative.casefold() if fold_case else relative)
+        stash = self._git_query(self.root, "rev-parse", "-q", "--verify", "refs/stash")
+        head_name = self._git_query(self.root, "symbolic-ref", "-q", "HEAD")
+        index = self.run("ls-files", "-s", "-z")
+        raw = self.run(
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=normal",
+            "--ignored",
+        )
+        records = [record for record in raw.split("\0") if record]
+        entries: list[list[object]] = []
+        position = 0
+        while position < len(records):
+            record = records[position]
+            position += 1
+            code, paths = record[:2], [record[3:]]
+            if code[:1] in {"R", "C"} and position < len(records):
+                paths.append(records[position])
+                position += 1
+            for path in paths:
+                key = path.rstrip("/").casefold() if fold_case else path.rstrip("/")
+                if any(key == prefix or key.startswith(prefix + "/") for prefix in excluded):
+                    continue
+                if any(prefix.startswith(key + "/") for prefix in excluded):
+                    entries.append([path, code, "holds an HFlow directory"])
+                    continue
+                try:
+                    info = os.stat(root / path.rstrip("/"), follow_symlinks=False)
+                except OSError:
+                    entries.append([path, code, "missing"])
+                    continue
+                entries.append([path, code, info.st_size, info.st_mtime_ns])
         return digest_of(
             {
-                "head": self.head,
-                "status": self.status_porcelain(),
+                "head": self._rev_parse("HEAD"),
+                "head_name": head_name.stdout.strip() if head_name.returncode == 0 else "",
+                "stash": stash.stdout.strip() if stash.returncode == 0 else "",
+                "index": "sha256:"
+                + hashlib.sha256(index.encode("utf-8", "surrogateescape")).hexdigest(),
+                "status": entries,
             }
         )
 
@@ -567,6 +646,21 @@ class GitRepo:
             "diff", "--no-renames", "--name-only", "-z", f"{base}..{candidate}", cwd=cwd
         )
         return [path for path in out.split("\0") if path.strip()]
+
+    def committed_bytecode_paths(self, commit: str) -> list[str]:
+        """The ``.pyc`` paths under a ``__pycache__`` directory that ``commit`` itself tracks.
+
+        Read from the commit's tree object (``ls-tree``), never from a working tree or the index,
+        so no filter, hook or fsmonitor configured in a worktree runs. These are committed bytes:
+        the bytecode removal before a worktree run's checks keeps them.
+        """
+        out = self.run("ls-tree", "-r", "-z", "--name-only", commit)
+        return [
+            path
+            for path in out.split("\0")
+            if path.casefold().endswith(".pyc")
+            and any(part.casefold() == "__pycache__" for part in path.split("/")[:-1])
+        ]
 
     def index_flagged_paths(self, worktree: Path) -> list[str]:
         """Index entries whose worktree changes git does not look at.
@@ -735,6 +829,7 @@ class GitRepo:
         *,
         deny: list[str] | None = None,
         allow_ignored: list[str] | None = None,
+        fingerprinted: Iterable[str] = (),
         expected_head: str,
     ) -> CandidateFreeze:
         """Commit the declared paths and return the candidate's explicit identity.
@@ -765,7 +860,11 @@ class GitRepo:
 
         ``allow_ignored`` lets a caller name ignored byproducts it accepts as check-generated
         noise (for example a bytecode cache). Anything ignored that is not named there makes
-        the freeze refuse: ignored is not the same as disposable.
+        the freeze refuse: ignored is not the same as disposable. Two kinds of ignored file
+        refuse even when ``allow_ignored`` names them, in every round, because the checks would
+        read bytes the commit does not hold: one listed in ``fingerprinted`` (the worktree-relative
+        paths :func:`~hflow.workspace.expand_scope` hashes into the scoped fingerprint), and
+        sourceless bytecode (:func:`is_sourceless_bytecode`).
 
         An index entry flagged assume-unchanged or skip-worktree (see
         :meth:`index_flagged_paths`) makes status, ``git add`` and the staged diff skip that
@@ -800,6 +899,29 @@ class GitRepo:
             raise GitStatusParseError(
                 "refusing to freeze with unrecognised ignored paths: "
                 + ", ".join(unexpected_ignored[:5])
+            )
+        # An allowlisted ignored file is never staged. Inside the scoped fingerprint it would be
+        # hashed and checked without any candidate commit holding it.
+        fingerprinted_set = set(fingerprinted)
+        covered = [path for path in report.ignored if path in fingerprinted_set]
+        if covered:
+            raise GitStatusParseError(
+                "ignored file(s) inside write_allow ("
+                + ", ".join(covered[:5])
+                + (f" (+{len(covered) - 5} more)" if len(covered) > 5 else "")
+                + "); the scoped fingerprint would cover bytes no candidate commit holds, so the "
+                "freeze is refused rather than deleting them"
+            )
+        # Bytecode outside ``__pycache__`` is imported in place of a missing source file, and
+        # CPython 3 never writes it there itself: it is a worker's file, not a check byproduct.
+        sourceless = [path for path in report.ignored if is_sourceless_bytecode(path)]
+        if sourceless:
+            raise GitStatusParseError(
+                "ignored sourceless bytecode outside __pycache__ ("
+                + ", ".join(sourceless[:5])
+                + (f" (+{len(sourceless) - 5} more)" if len(sourceless) > 5 else "")
+                + "); Python imports it in place of a missing source file and no candidate commit "
+                "holds it, so the freeze is refused rather than deleting it"
             )
         outside = [path for path in report.changed if not matches_pattern(path, allow)]
         if outside:

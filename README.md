@@ -172,7 +172,7 @@ hflow resume   R-xxxxxxxxxx               # reconcile an interrupted attempt; ne
 hflow cancel   R-xxxxxxxxxx               # for a run another process is executing: records
                                           # the stop, reports unknown, blocks outcome_unknown
 hflow clean    R-xxxxxxxxxx               # preview releasing the run's worktree
-hflow clean    R-xxxxxxxxxx --apply       # remove it; the candidate and receipt are kept
+hflow clean    R-xxxxxxxxxx --apply       # remove it; candidate ref and receipt (if any) kept
 hflow schema                              # generated JSON Schema, MachineProfile included
 ```
 
@@ -200,7 +200,12 @@ Runtime data (SQLite, evidence, profiles) goes to `%LOCALAPPDATA%\HFlow` on Wind
 `$XDG_DATA_HOME/hflow` elsewhere; override with `--data-dir` or `HFLOW_DATA_DIR`.
 It never lands inside a project checkout.
 
-Exit codes: `0` accepted, `2` refused at admission, `3` blocked after dispatch, `4` usage.
+Exit codes: `0` accepted, `2` refused at admission (no run state is created), `3` blocked after
+dispatch, `4` usage (including every argument-parsing error), `5` the run exists and is not
+finished (`DRAFT`/`READY`/`RUNNING`/`CHECKING`, e.g. `resume` on a run a hard kill left `RUNNING`).
+`6`: `status`/`report` found the run but a stored record of it no longer validates; one line names
+the record, nothing is rewritten, and `cancel`/`resume` still work from the run row.
+A `CANCELLED` task state, which this build never writes, would exit `3`.
 
 Without installing, run through the module path:
 
@@ -323,6 +328,18 @@ the project contract, the machine profile, the authorization artifact, the root 
   not require it. Only both saying no may skip it.
 - An unknown outcome blocks and never auto-retries.
 - Verification is bound to a candidate fingerprint and a checks digest.
+- Ignored bytecode never stands in for the committed source: every freeze refuses
+  `scope_violation` on an ignored file the scoped fingerprint would hash (no commit holds it) and
+  on a sourceless `.pyc` outside `__pycache__`, and in a worktree run every regular `.pyc`
+  directly inside a real `__pycache__` of the worktree is deleted before each `command` check
+  (whatever flags the check passes to Python, `-I` and `-E` included; never committed, never
+  fingerprinted, so the candidate commit and fingerprint do not change). `.pyc` files the
+  candidate commit tracks are kept; no link or junction is followed, and a `__pycache__` link or
+  junction makes the check refuse to start. The evidence and a run note record the count. An
+  in-place run deletes nothing in the user's checkout and does not get this protection.
+- A `write_deny` entry is matched after normalization (a leading `./`, `.` segments and repeated
+  `/` removed); an entry that is empty after that, absolute, drive-qualified or holds `..` is
+  refused `scope_violation` at admission, the project's and the task's alike.
 - The frozen candidate is the change that was checked: `write_allow` takes literal paths only (a
   glob, or an entry that is or passes through a symbolic link or junction, is refused at
   admission), a deleted listed file is committed as a deletion, a changed path under the task's or
@@ -381,7 +398,11 @@ the project contract, the machine profile, the authorization artifact, the root 
   `<data-dir>/invocations/<id>/home/.dsh` - no stored credentials, patch files, AGENTS.md or
   skills (inferred from upstream source, not observed); `prepare`, `doctor` and each invocation's
   record name it. An artifact written before config binding still loads and still keys its own
-  ledger row, but it cannot authorize a run that resolved a configuration.
+  ledger row, but it cannot authorize a run that resolved a configuration. The binding also
+  carries the project contract's digest and the roles the run will dispatch, so **every artifact
+  issued before the project-contract binding must be re-issued**, whenever it was written (one
+  without the contract digest is refused, naming why); copy a fresh binding from
+  `hflow prepare --json`.
 - The agent launch argv carries only the launcher path and fixed flags. A model id is the one
   value that goes on a command line from configuration: the acpx **client** gets `--model <value>`
   when the role's profile names one, which counts as a fixed flag under AGENTS.md rule 9 by the
@@ -568,7 +589,14 @@ Not built around configuration either:
   the run is no longer live once it is blocked, so the root accepts a new revision immediately -
   even while the original controller is still finishing its checks, in the same workspace for an
   in-place run. Keeping a root busy for as long as its run's controller still owns it (owner
-  identity across processes) is not built. A controller interrupted (Ctrl+C, `SystemExit`) while an invocation is
+  identity across processes) is not built. For the same reason two `hflow run` processes on the
+  identical TaskSpec (both on the default `--controller-id`) can both pass the claim and both run
+  setup (worktree, Git snapshot, packet). What is guarded: only one of them reserves the attempt -
+  the other returns the existing run with a note instead of blocking it - no writer that sets
+  `BLOCKED` relabels a run that already ended or carries a receipt, and a controller never records
+  its own refusal as the block of a run whose attempt another controller reserved. A refusal that
+  lands before either reserves (a setup failure in the second process) still blocks the run, and
+  the first then returns that blocked run. A controller interrupted (Ctrl+C, `SystemExit`) while an invocation is
   starting or running leaves an `outcome_unknown` run that `resume` reconciles, but a hard kill,
   a power loss or an interrupt outside a driver start records nothing and leaves the run
   `RUNNING`, which `resume` does not touch. And this covers the one driver that creates processes
@@ -594,7 +622,8 @@ Not built around configuration either:
   base. A file that appears only after admission (in the reviewer's candidate worktree, say) is
   refused at the driver's spawn gate with the dispatch already reserved: the run stays blocked,
   an identical TaskSpec returns that blocked run, and the next step is a new revision - whose
-  first implementer, under a root budget, is charged as a repair, so the root needs one left.
+  first implementer, under a root budget, is charged as a repair, so the root needs one left
+  (without one the revision is refused `budget_exhausted` before its run row exists).
 - **A candidate that changes the files DSH loads as context is recorded, not refused.** The list
   is `AGENTS.md`, `CLAUDE.md`, `AGENTS.local.md` and `CLAUDE.local.md` at any depth, the root
   `.dsh/skills/**` and `.agents/skills/**`, and a root `.env`, in any letter case; it is read from
@@ -659,7 +688,8 @@ Not verified, even where something works on one binding:
     dispatch; HFlow does not decode it any other way.
   - False positives fail closed: your own `git config`, `push -u`, an IDE writing `branch.*`, a
     global-config edit or a check that runs `git config` during a run all block it. Each costs a
-    new revision; under a root budget, that revision's first implementer is charged as a repair.
+    new revision; under a root budget, that revision's first implementer is charged as a repair
+    (a root with none left refuses it before its run row exists).
   - Not compared: ignore rules, system attributes (`GIT_ATTR_SYSTEM`, still read because
     `GIT_CONFIG_NOSYSTEM` does not drop it; they can only select a filter defined in the compared
     config), hooks (already neutralised), and object or ref metadata.
@@ -695,6 +725,13 @@ Not verified, even where something works on one binding:
   rights: no filesystem confinement, no credential confinement, and no protection against
   another process of the same user changing the workspace, the authorization artifact or the
   SQLite ledger.
+- **Your checkout is compared by stat, not by content.** An **accepted** worktree run compares
+  HEAD, the stash ref, the index entries and, for every `git status --ignored` entry, its path,
+  status code, size and mtime, before dispatch and after acceptance; a difference records a
+  WARNING, and the "left untouched" note is written only without one. A run that blocks or stops
+  before acceptance records no after-comparison: no WARNING and no "left untouched" note, whatever
+  happened to your checkout meanwhile. A rewrite that keeps both size and mtime, or a change
+  inside an untracked or ignored directory git reports collapsed, is not detected.
 - **A stop is local.** It stops a process on this machine; it does not prove that a remote
   model request stopped, that remote billing stopped, or that any usage figure is known.
 - **Remote termination and billed usage remain unknown**, recorded as `null` and never as `0`.
@@ -723,7 +760,7 @@ python -m pytest -q tests/test_saved_review_replay.py    # 9 tests: the recorded
 python -m pytest -q tests/test_local_finalization.py     # 25 tests: one later decision, recorded through the Store
 python -m pytest -q tests/test_concurrency.py            # 8 deterministic thread/cancel-orderings tests
 python -m pytest -q tests/test_m2_slice.py               # 70 tests: Git worktree -> frozen candidate, complete and deny-aware freeze
-python -m pytest -q tests/test_cli_m2_cleanup.py         # 18 tests: the same flow through the CLI + guarded clean
+python -m pytest -q tests/test_cli_m2_cleanup.py         # 21 tests: the same flow through the CLI + guarded clean
 python -m pytest -q tests/test_dispatch_gates.py         # 19 tests: pre-dispatch gates, loop allowance, packet bound
 python -m pytest -q tests/test_check_resources.py        # 22 tests: bounded output, artifacts, minimal environment, reference round-trip
 python -m pytest -q tests/test_batch_e_dispatch.py       # 52 tests: the one dispatch transaction, open-state settlement, stop/ledger races

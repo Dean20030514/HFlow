@@ -138,6 +138,16 @@ INVOCATION_OPEN_STATES: tuple[str, ...] = (
     InvocationStartState.STARTED.value,
 )
 
+_TERMINAL_STATES: tuple[str, ...] = (
+    TaskState.ACCEPTED.value,
+    TaskState.BLOCKED.value,
+    TaskState.CANCELLED.value,
+)
+#: The guard every writer that sets ``BLOCKED`` carries: an outcome already recorded - a terminal
+#: state, or a delivery receipt - is never relabelled. Its three placeholders take
+#: ``_TERMINAL_STATES``.
+_LIVE_RUN_GUARD = "task_state NOT IN (?, ?, ?) AND receipt_json IS NULL"
+
 
 def _add_seconds(timestamp: str, seconds: int) -> str:
     """``timestamp`` (a stored UTC string) plus ``seconds``, in the same textual form."""
@@ -444,20 +454,37 @@ class Store:
             return conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
 
     def set_blocked(self, run_id: str, code: RefusalCode, reason: str) -> sqlite3.Row:
+        """Block a live run; a run that already ended keeps its outcome.
+
+        The write carries the same terminal guard as :meth:`block_unless_stopped`: an
+        ``ACCEPTED``, ``BLOCKED`` or ``CANCELLED`` run, or one that carries a delivery receipt, is
+        never relabelled. The stored row is returned either way, so a caller can see which of the
+        two happened.
+        """
         now = utc_now()
         with self.transaction() as conn:
             conn.execute(
-                """
+                f"""
                 UPDATE runs
                    SET task_state = ?, block_code = ?, block_reason = ?, updated_at = ?
-                 WHERE run_id = ?
+                 WHERE run_id = ? AND {_LIVE_RUN_GUARD}
                 """,
-                (TaskState.BLOCKED.value, code.value, reason, now, run_id),
+                (TaskState.BLOCKED.value, code.value, reason, now, run_id, *_TERMINAL_STATES),
             )
-            return conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                raise RunNotFound(run_id)
+            return row
 
-    def block_unless_stopped(self, run_id: str, code: RefusalCode, reason: str) -> bool:
-        """Record a block **unless a stop already decided this run's state**, atomically.
+    def block_unless_stopped(
+        self,
+        run_id: str,
+        code: RefusalCode,
+        reason: str,
+        *,
+        held_attempts: Sequence[str] | None = None,
+    ) -> bool:
+        """Record a block **unless a stop or an earlier outcome already decided this run**.
 
         The stop decision and this write are one statement, so they cannot interleave: a
         cancellation committed before it wins and this returns ``False``, and a cancellation
@@ -466,18 +493,40 @@ class Store:
         writing unconditionally is exactly the race this replaces - the check and the write
         must be the same transaction.
 
-        ``WHERE cancel_intent_at IS NULL`` is the whole guard: once a stop is durable, no later
-        failure - a driver error, a protocol failure, a rejected review - may relabel the run.
+        The guard, in full, all in the one ``WHERE`` clause:
+
+        * ``cancel_intent_at IS NULL`` - once a stop is durable, no later failure (a driver
+          error, a protocol failure, a rejected review) may relabel the run;
+        * the run is not ``ACCEPTED``/``BLOCKED``/``CANCELLED`` and carries no delivery receipt -
+          an outcome already recorded is never relabelled, whoever writes next (a concurrent
+          identical submission's refusal, a late failure);
+        * with ``held_attempts`` (the attempts the calling controller reserved for this run,
+          possibly none): the run has no attempt row outside that set. A controller that did not
+          reserve the run's attempt is not the one driving it, so its refusal is not the run's
+          outcome.
+
+        ``False`` means nothing was written; the caller reads the row to say which guard held.
         """
         now = utc_now()
+        params: list[Any] = [TaskState.BLOCKED.value, code.value, reason, now, run_id]
+        params.extend(_TERMINAL_STATES)
+        foreign = ""
+        if held_attempts is not None:
+            held = list(held_attempts)
+            foreign = "AND NOT EXISTS (SELECT 1 FROM attempts WHERE attempts.run_id = runs.run_id"
+            if held:
+                foreign += f" AND attempts.attempt_id NOT IN ({','.join('?' for _ in held)})"
+                params.extend(held)
+            foreign += ")"
         with self.transaction() as conn:
             cur = conn.execute(
-                """
+                f"""
                 UPDATE runs
                    SET task_state = ?, block_code = ?, block_reason = ?, updated_at = ?
-                 WHERE run_id = ? AND cancel_intent_at IS NULL
+                 WHERE run_id = ? AND cancel_intent_at IS NULL AND {_LIVE_RUN_GUARD}
+                   {foreign}
                 """,
-                (TaskState.BLOCKED.value, code.value, reason, now, run_id),
+                params,
             )
             return cur.rowcount == 1
 
@@ -527,11 +576,17 @@ class Store:
                 (canonical_json(receipt.model_dump(mode="json")), utc_now(), run_id),
             )
 
-    def set_turns_observed(self, run_id: str, turns: int | None) -> None:
+    def add_turns_observed(self, run_id: str, turns: int) -> None:
+        """Add one applied implementer result's self-reported turns to the run's total.
+
+        Called only for a result that was applied, so a late result never moves it, and added
+        rather than replaced, so a repaired run reports the sum of its implementer rounds.
+        """
         with self.transaction() as conn:
             conn.execute(
-                "UPDATE runs SET turns_observed = ?, updated_at = ? WHERE run_id = ?",
-                (turns, utc_now(), run_id),
+                "UPDATE runs SET turns_observed = COALESCE(turns_observed, 0) + ?, updated_at = ? "
+                "WHERE run_id = ?",
+                (int(turns), utc_now(), run_id),
             )
 
     def finalize_acceptance(
@@ -2061,7 +2116,8 @@ class Store:
         """
         with self.transaction() as conn:
             row = conn.execute(
-                "SELECT state FROM invocations WHERE invocation_id = ?", (invocation_id,)
+                "SELECT state, started_at FROM invocations WHERE invocation_id = ?",
+                (invocation_id,),
             ).fetchone()
             if row is None:
                 raise StoreError(f"unknown invocation {invocation_id}")
@@ -2076,7 +2132,13 @@ class Store:
                     ),
                 )
                 return
-            if current not in {
+            # A ``started`` row with no ``started_at`` is what the v3 migration leaves of a v2
+            # ``started`` row (v2 wrote that state before any process existed): it records a launch
+            # request and no observed launch or process - exactly what ``launch_unknown`` means.
+            unobserved_start = (
+                current is InvocationStartState.STARTED and row["started_at"] is None
+            )
+            if not unobserved_start and current not in {
                 InvocationStartState.REQUESTED,
                 InvocationStartState.RESERVED,
             }:
@@ -2087,7 +2149,8 @@ class Store:
             conn.execute(
                 """
                 UPDATE invocations SET state = ?, detail = ?
-                 WHERE invocation_id = ? AND state IN (?, ?)
+                 WHERE invocation_id = ?
+                   AND (state IN (?, ?) OR (state = ? AND started_at IS NULL))
                 """,
                 (
                     InvocationStartState.LAUNCH_UNKNOWN.value,
@@ -2095,6 +2158,7 @@ class Store:
                     invocation_id,
                     InvocationStartState.REQUESTED.value,
                     InvocationStartState.RESERVED.value,
+                    InvocationStartState.STARTED.value,
                 ),
             )
 
@@ -2150,14 +2214,16 @@ class Store:
                     InvocationStartState.STARTED.value,
                 ),
             )
-            # Everything with no recorded launch is a requested-but-unconfirmed one: a launch may
-            # have happened, so the root stays blocked, and no process is known, so no process
-            # count may include it.
+            # Every open row with no recorded launch (``started_at`` empty) is a
+            # requested-but-unconfirmed one: ``requested`` and ``reserved``, and the ``started``
+            # row a v2 ledger leaves after the v3 migration cleared its ``started_at`` (v2 wrote
+            # that state before any process existed). A launch may have happened, so the root
+            # stays blocked, and no process is known, so no process count may include it.
             launch_only = conn.execute(
                 """
                 UPDATE invocations
                    SET state = ?, detail = ?
-                 WHERE run_id = ? AND state IN (?, ?) AND started_at IS NULL
+                 WHERE run_id = ? AND state IN (?, ?, ?) AND started_at IS NULL
                 """,
                 (
                     InvocationStartState.LAUNCH_UNKNOWN.value,
@@ -2165,6 +2231,7 @@ class Store:
                     run_id,
                     InvocationStartState.REQUESTED.value,
                     InvocationStartState.RESERVED.value,
+                    InvocationStartState.STARTED.value,
                 ),
             )
             return int(launched.rowcount + launch_only.rowcount)
@@ -2483,7 +2550,7 @@ class Store:
 
     def record_cancel_outcome(
         self, run_id: str, receipt: CancellationReceipt, code: RefusalCode, reason: str
-    ) -> None:
+    ) -> bool:
         """Record a stop's receipt **and** the terminal block it implies, in one statement.
 
         The receipt is the stop's idempotency key: once it exists, a repeated ``cancel``
@@ -2491,14 +2558,19 @@ class Store:
         ``database is locked`` from another process, a Ctrl+C - after which the run kept a
         receipt and no block, and every later ``cancel`` returned that receipt while the run
         stayed ``RUNNING``. One ``UPDATE`` makes the two facts appear together or not at all.
+
+        Only a live run is ended this way. A run that is already ``ACCEPTED``/``BLOCKED``/
+        ``CANCELLED`` or carries a delivery receipt (another stop or writer got there first) is
+        not relabelled, and ``False`` says nothing - neither the block nor this receipt - was
+        written.
         """
         with self.transaction() as conn:
             cur = conn.execute(
-                """
+                f"""
                 UPDATE runs
                    SET cancel_receipt_json = ?, task_state = ?, block_code = ?,
                        block_reason = ?, updated_at = ?
-                 WHERE run_id = ?
+                 WHERE run_id = ? AND {_LIVE_RUN_GUARD}
                 """,
                 (
                     canonical_json(receipt.model_dump(mode="json")),
@@ -2507,10 +2579,14 @@ class Store:
                     reason,
                     utc_now(),
                     run_id,
+                    *_TERMINAL_STATES,
                 ),
             )
-            if cur.rowcount != 1:
+            if cur.rowcount == 1:
+                return True
+            if conn.execute("SELECT 1 FROM runs WHERE run_id = ?", (run_id,)).fetchone() is None:
                 raise RunNotFound(run_id)
+            return False
 
     def cancel_state(self, run_id: str) -> tuple[str | None, CancellationReceipt | None]:
         row = self.get_run(run_id)

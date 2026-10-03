@@ -12,8 +12,11 @@ undone by re-running something:
    looks right;
 2. no managed execution may be active or unconfirmed (`BLOCKED` is a state name, not proof
    that a process stopped);
-3. HEAD must still be the frozen candidate, with no unfrozen changes;
-4. the candidate must be reachable through a ref that outlives the worktree;
+3. HEAD must still be the frozen candidate, with no unfrozen changes (for a run without a
+   receipt: the latest attempt's recorded frozen candidate, or the run's base commit);
+4. the candidate must be reachable through a ref that outlives the worktree. A run without a
+   receipt whose HEAD is not its base needs a branch, tag or HFlow ref that contains HEAD;
+   otherwise the commit would be dropped, and cleanup refuses ``unretained_commit``;
 5. untracked and ignored files are refused unless they match the explicit artifact policy -
    an ignored `.env` is a user's file, not garbage.
 
@@ -22,13 +25,14 @@ Anything unclear refuses and keeps the scene, which is the correct outcome.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .contracts import AttemptState, RefusalCode, RefusedError, ResultReceipt, TaskSpec, TaskState
 from .gitworkspace import IGNORED_ARTIFACT_ALLOWLIST, GitError, GitRepo
-from .store import Store
+from .store import Store, StoreError
 from .workspace import matches_pattern
 
 #: Workspace lifecycle, kept separate from the business task state.
@@ -59,6 +63,10 @@ class CleanPlan:
     unsupported: list[str] = field(default_factory=list)
     keeps: list[str] = field(default_factory=list)
     already_removed: bool = False
+    receipt_present: bool = False
+    #: The refs (``refs/heads``, ``refs/tags``, ``refs/hflow``) that contain HEAD, when that was
+    #: what allowed a run without a receipt to be cleaned. Empty when it was not checked.
+    retained_by: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return {
@@ -80,6 +88,8 @@ class CleanPlan:
             "unsupported_status": self.unsupported,
             "keeps": self.keeps,
             "already_removed": self.already_removed,
+            "receipt_present": self.receipt_present,
+            "retained_by": self.retained_by,
         }
 
 
@@ -88,23 +98,125 @@ def _refuse(plan: CleanPlan, code: str, detail: str) -> None:
     plan.refusals.append({"reason": code, "detail": detail})
 
 
+#: A full commit id (SHA-1 or SHA-256 object format).
+_FULL_COMMIT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+#: The note the controller writes when it resolves the task's base name to a commit.
+_BASE_NOTE = re.compile(r"base .+ -> (?P<commit>[0-9a-f]{40}(?:[0-9a-f]{24})?)")
+#: The namespaces whose refs count as keeping a commit: a branch, a tag, or an HFlow ref. A
+#: remote-tracking ref is not one - a fetch may prune it - and neither is a worktree's own HEAD.
+_RETAINING_NAMESPACES = ("refs/heads", "refs/tags", "refs/hflow")
+
+
+def _recorded_base_commit(store: Store, run_id: str, spec: TaskSpec) -> str:
+    """The commit the run's worktree was created at, from stored facts only, or ``""``.
+
+    The controller records ``base '<name>' -> <commit>`` when the base name differs from the
+    commit it resolved to; when it does not, the task's own ``base_commit`` already is that full
+    commit. A frozen candidate's DSH context record names the same base. Nothing is read from the
+    worktree, which the worker controlled. ``""`` (unknown) only ever makes cleanup stricter.
+    """
+    for note in store.notes_for(run_id):
+        match = _BASE_NOTE.fullmatch(note)
+        if match is not None:
+            return match.group("commit")
+    try:
+        for record in store.dsh_context_for(run_id):
+            if record.base_commit:
+                return record.base_commit
+    except StoreError:
+        pass  # unreadable is "not recorded", which keeps the stricter gate
+    named = spec.workspace.base_commit
+    return named if _FULL_COMMIT.fullmatch(named) else ""
+
+
+def _recorded_frozen_commit(store: Store, run_id: str, attempt_id: str) -> str:
+    """The candidate commit ``attempt_id`` froze and kept a candidate ref for, or ``""``.
+
+    Read from the DSH context record the controller writes right after the candidate ref. A commit
+    made but refused after the freeze has no record and no ref, so it is not "expected": such a
+    HEAD has to be retained by some ref, or cleanup refuses ``unretained_commit``.
+    """
+    try:
+        records = store.dsh_context_for(run_id)
+    except StoreError:
+        return ""
+    frozen = [record.candidate_commit for record in records if record.attempt_id == attempt_id]
+    return frozen[-1] if frozen else ""
+
+
+def _refs_containing(repo: GitRepo, commit: str) -> list[str]:
+    """Every branch, tag or HFlow ref whose history contains ``commit``."""
+    out = repo.run(
+        "for-each-ref", "--contains", commit, "--format=%(refname)", *_RETAINING_NAMESPACES
+    )
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def _check_head_retained(plan: CleanPlan, repo: GitRepo, base_commit: str) -> None:
+    """For a run without a receipt: allow only if removing the worktree drops no commit.
+
+    That holds when HEAD is still the run's base (nothing was committed), or when a ref in
+    :data:`_RETAINING_NAMESPACES` contains HEAD. Anything else refuses ``unretained_commit``: the
+    commit is the only trace of what the worker did, and the operator decides whether to keep it.
+    """
+    head = plan.head
+    if base_commit and head == base_commit:
+        plan.reasons.append(
+            f"no receipt: HEAD is still the run's base commit {head[:12]}, so nothing was "
+            "committed in the worktree and removing it drops no commit"
+        )
+        return
+    if plan.candidate_ref and plan.candidate_ref_target == head:
+        plan.retained_by = [plan.candidate_ref]
+        plan.reasons.append(
+            f"no receipt: this run delivered nothing; HEAD {head[:12]} is the latest attempt's "
+            f"frozen candidate and {plan.candidate_ref} points at it, so the commit stays "
+            "reachable after the worktree is removed"
+        )
+        return
+    try:
+        refs = _refs_containing(repo, head)
+    except GitError as exc:
+        _refuse(plan, "git_query_failed", f"could not list the refs that contain HEAD: {exc}")
+        return
+    if refs:
+        plan.retained_by = refs
+        plan.reasons.append(
+            f"no receipt: HEAD {head[:12]} is not the run's base, but "
+            + ", ".join(refs[:3])
+            + (f" (+{len(refs) - 3} more)" if len(refs) > 3 else "")
+            + " contains it, so the commit stays reachable after the worktree is removed"
+        )
+        return
+    _refuse(
+        plan,
+        "unretained_commit",
+        f"HEAD {head} is not the run's base commit ({base_commit[:12] or 'not recorded'}) and no "
+        "branch, tag or HFlow ref contains it, so removing the worktree would leave that commit "
+        f"unreferenced. Inspect it (git -C \"{plan.path}\" show {head[:12]}); to keep it, create "
+        f"a ref (for example git branch <name> {head}), then run clean again",
+    )
+
+
 def plan_cleanup(store: Store, run_id: str) -> CleanPlan:
     """Inspect a run's workspace and decide whether removal is allowed. Changes nothing."""
     row = store.get_run(run_id)
     plan = CleanPlan(run_id=run_id, allowed=True)
     plan.workspace_state = str(row["worktree_state"])
     plan.task_state = str(row["task_state"])
-    plan.keeps = [
-        "the candidate commit and its ref (delivery is not deleted by clean)",
-        "the receipt and its evidence, stored outside the worktree",
-        "the run's history, notes and any cleanup record",
-    ]
-
     receipt = (
         ResultReceipt.model_validate(__import__("json").loads(row["receipt_json"]))
         if row["receipt_json"]
         else None
     )
+    plan.receipt_present = receipt is not None
+    # Only facts: the candidate commit and its ref are added once a ref was resolved (below).
+    plan.keeps = [
+        "the receipt and its evidence, stored outside the worktree"
+        if receipt is not None
+        else "the run's evidence, stored outside the worktree (this run has no receipt)",
+        "the run's history, notes and any cleanup record",
+    ]
     spec = TaskSpec.model_validate(__import__("json").loads(row["task_spec_json"]))
     recorded_path = row["worktree_path"] or (receipt.candidate.worktree if receipt else "")
 
@@ -208,16 +320,36 @@ def plan_cleanup(store: Store, run_id: str) -> CleanPlan:
 
     # --- 3. HEAD must still be the frozen candidate, with nothing unfrozen
     plan.head = repo.worktree_commit(worktree)
+    base_commit = ""
     if receipt is not None:
         plan.expected_candidate = receipt.candidate.git_commit
         plan.candidate_ref = repo.candidate_ref(run_id, receipt.attempt_id)
         plan.candidate_ref_target = repo.ref_target(plan.candidate_ref) or ""
-    if plan.expected_candidate and plan.head != plan.expected_candidate:
-        _refuse(
-            plan,
-            "head_drift",
-            f"HEAD is {plan.head[:12]} but the frozen candidate is {plan.expected_candidate[:12]}",
-        )
+        if plan.expected_candidate and plan.head != plan.expected_candidate:
+            _refuse(
+                plan,
+                "head_drift",
+                f"HEAD is {plan.head[:12]} but the frozen candidate is "
+                f"{plan.expected_candidate[:12]}",
+            )
+    else:
+        # No receipt: the expected HEAD comes from stored facts - the latest attempt's frozen
+        # candidate when one was recorded, and the run's base commit (nothing committed yet).
+        base_commit = _recorded_base_commit(store, run_id, spec)
+        if attempt is not None:
+            frozen = _recorded_frozen_commit(store, run_id, str(attempt["attempt_id"]))
+            if frozen:
+                plan.expected_candidate = frozen
+                plan.candidate_ref = repo.candidate_ref(run_id, str(attempt["attempt_id"]))
+                plan.candidate_ref_target = repo.ref_target(plan.candidate_ref) or ""
+        if plan.expected_candidate and plan.head not in {plan.expected_candidate, base_commit}:
+            _refuse(
+                plan,
+                "head_drift",
+                f"HEAD is {plan.head[:12]} but the latest attempt's frozen candidate is "
+                f"{plan.expected_candidate[:12]} and the run's base is "
+                f"{base_commit[:12] or 'not recorded'}",
+            )
     try:
         status = repo.status_report(worktree)
     except (GitError, Exception) as exc:  # noqa: BLE001 - a failed read must refuse, not guess
@@ -247,11 +379,23 @@ def plan_cleanup(store: Store, run_id: str) -> CleanPlan:
                 f"{plan.candidate_ref} points at {plan.candidate_ref_target[:12] or 'nothing'}, "
                 f"not the candidate {receipt.candidate.git_commit[:12]}",
             )
-    elif receipt is None:
-        # A failed candidate has no receipt; it still must not be silently discarded.
-        plan.reasons.append(
-            "no receipt: this run has no delivered candidate, so cleanup would discard an "
-            "unaccepted result - allowed only because the candidate ref keeps it reachable"
+    elif receipt is None and not any(item["reason"] == "head_drift" for item in plan.refusals):
+        # A failed candidate has no receipt; it still must not be silently discarded. Removing
+        # the worktree drops the only reference HFlow knows to HEAD unless a ref outlives it.
+        _check_head_retained(plan, repo, base_commit)
+    if plan.candidate_ref and plan.candidate_ref_target:
+        plan.keeps.insert(
+            0,
+            f"the candidate commit {plan.candidate_ref_target[:12]} and its ref "
+            f"{plan.candidate_ref} (clean deletes no commit and no ref)",
+        )
+    other_refs = [ref for ref in plan.retained_by if ref != plan.candidate_ref]
+    if other_refs:
+        plan.keeps.insert(
+            0,
+            f"the commit at HEAD {plan.head[:12]}, reachable through "
+            + ", ".join(other_refs[:3])
+            + (f" (+{len(other_refs) - 3} more)" if len(other_refs) > 3 else ""),
         )
 
     # --- 5. ignored is not disposable
@@ -350,12 +494,19 @@ def apply_cleanup(store: Store, run_id: str, *, operator: str = "local-controlle
         still_registered = True
     if gone and not still_registered:
         store.finish_cleanup(run_id)
+        # Only what exists is named: a run without a receipt has no receipt to keep, and a run
+        # that never froze a candidate has no candidate ref.
+        kept: list[str] = []
+        if plan.candidate_ref and plan.candidate_ref_target:
+            kept.append(f"the candidate ref {plan.candidate_ref}")
+        kept.extend(ref for ref in plan.retained_by if ref != plan.candidate_ref)
+        kept.append("the receipt and its evidence" if plan.receipt_present else "the run's evidence")
         return {
             "applied": True,
             "status": WORKSPACE_REMOVED,
             "path": str(worktree),
             "candidate_ref": plan.candidate_ref,
-            "detail": "workspace removed; the candidate ref and the receipt were kept",
+            "detail": "workspace removed; kept " + ", ".join(kept),
         }
     store.finish_cleanup(
         run_id,

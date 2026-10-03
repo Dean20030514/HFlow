@@ -972,3 +972,82 @@ def test_the_output_contract_note_is_the_one_the_parser_accepts() -> None:
     example = json.dumps({"verdict": "accepted", "findings": []})
     assert "```json" in OUTPUT_CONTRACT_NOTE
     assert decode_review(f"```json\n{example}\n```").verdict == "accepted"
+
+
+def test_the_reviewer_packet_schema_requires_every_key_the_note_calls_required() -> None:
+    """The note says "Required keys: verdict, findings."; the embedded schema must agree."""
+    from hflow.contracts import ReviewOutput
+
+    prompt = render_reviewer_packet(
+        task_id="T-1",
+        task_revision=1,
+        goal=GOAL,
+        acceptance=[AcceptanceCriterion(id="AC-1", statement="unit passes", check_ids=["unit"])],
+        scope=Scope(write_allow=["src/parser.py"]),
+        workspace="/tmp/frozen-worktree",
+        spec_digest="sha256:test",
+        candidate_fingerprint="sha256:deadbeef",
+        deadline_seconds=120,
+    )
+    schema_text = prompt.text.rsplit("```json\n", 1)[1].split("\n```", 1)[0]
+    schema = json.loads(schema_text)
+
+    assert schema["required"] == ReviewOutput.model_json_schema()["required"]
+    assert set(schema["required"]) == {"verdict", "findings"}
+    assert OUTPUT_CONTRACT_FRAGMENT in prompt.text
+
+
+def _repair_packet_failing_with(detail: str) -> str:
+    from hflow.contracts import RepairContext, RepairTrigger
+
+    return render_implementer_packet(
+        task_id="T-REPAIR",
+        task_revision=1,
+        goal=GOAL,
+        acceptance=[AcceptanceCriterion(id="AC-1", statement="unit passes", check_ids=["unit"])],
+        scope=Scope(write_allow=["src/parser.py"]),
+        workspace="/work",
+        spec_digest="sha256:test",
+        deadline_seconds=60,
+        writes_allowed=True,
+        repair=RepairContext(
+            trigger=RepairTrigger.BUSINESS_CHECK_FAILED,
+            failed_checks=[
+                {
+                    "check_id": "unit",
+                    "status": "failed",
+                    "exit_code": 1,
+                    "exit_reason": "exited",
+                    "detail": detail,
+                    "artifact": "runs/R-1/unit.json",
+                }
+            ],
+        ),
+    ).text
+
+
+def test_a_long_failed_check_detail_in_the_repair_packet_says_it_was_cut() -> None:
+    from hflow.packet import MAX_DETAIL_CHARS
+
+    detail = "AssertionError: " + "x" * MAX_DETAIL_CHARS + " HIDDEN_TAIL expected 3 got 4"
+    text = _repair_packet_failing_with(detail)
+    [line] = [line for line in text.splitlines() if line.startswith("  detail: ")]
+
+    assert line == (
+        "  detail: "
+        + detail[:MAX_DETAIL_CHARS]
+        + "… (detail truncated; see the artifact reference)"
+    )
+    assert "HIDDEN_TAIL" not in text
+    assert "  artifact: runs/R-1/unit.json" in text
+
+
+def test_a_failed_check_detail_that_fits_is_rendered_whole_without_a_marker() -> None:
+    from hflow.packet import MAX_DETAIL_CHARS
+
+    detail = "AssertionError: " + "y" * (MAX_DETAIL_CHARS - len("AssertionError: "))
+    assert len(detail) == MAX_DETAIL_CHARS
+    text = _repair_packet_failing_with(detail)
+
+    assert f"  detail: {detail}\n" in text
+    assert "detail truncated" not in text

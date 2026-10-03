@@ -481,7 +481,7 @@ def test_run_has_no_force_flag(
                 "--force",
             ]
         )
-    assert excinfo.value.code == 2
+    assert excinfo.value.code == EXIT_USAGE
     assert "--force" in capsys.readouterr().err
     assert not cli_env["data_dir"].exists()
 
@@ -951,3 +951,254 @@ def test_zero_model_preflight_refuses_an_unanswered_client_exit() -> None:
     assert ok is False
     assert "role implementer" in detail
     assert "did not settle" in detail
+
+
+# --------------------------------------------------------------------------
+# exit codes and --data-dir position (the documented table, not argparse's defaults)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["run"],
+        ["frob"],
+        ["run", "--task", "task.json", "--bogus"],
+        ["status"],
+        ["prepare", "--task", "task.json", "--workspace", "nowhere"],
+        ["--data-dir"],
+    ],
+    ids=["missing-required", "unknown-subcommand", "unknown-flag", "missing-positional",
+         "bad-choice", "flag-without-value"],
+)
+def test_a_usage_error_exits_usage_not_refused(
+    argv: list[str], capsys: pytest.CaptureFixture[str], _isolated_default_data_dir: Path
+) -> None:
+    """argparse's own exit 2 is ``EXIT_REFUSED``, which promises "admission refused".
+
+    A parse error never reaches admission, so it must exit ``EXIT_USAGE`` and create nothing.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        main(argv)
+    assert excinfo.value.code == EXIT_USAGE
+    assert "error:" in capsys.readouterr().err
+    assert not (_isolated_default_data_dir / "hflow.sqlite").exists()
+
+
+def test_help_still_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
+    for argv in (["--help"], ["run", "--help"]):
+        with pytest.raises(SystemExit) as excinfo:
+            main(argv)
+        assert excinfo.value.code == EXIT_OK
+        assert "usage:" in capsys.readouterr().out
+
+
+def test_every_task_state_has_an_explicit_exit_code() -> None:
+    """No run outcome is ever ``EXIT_REFUSED``: that code means nothing was created."""
+    from hflow.cli import EXIT_IN_PROGRESS, EXIT_RECORD_UNREADABLE, _STATE_EXIT_CODES
+    from hflow.contracts import TaskState
+
+    assert set(_STATE_EXIT_CODES) == set(TaskState)
+    assert _STATE_EXIT_CODES[TaskState.ACCEPTED] == EXIT_OK
+    assert _STATE_EXIT_CODES[TaskState.BLOCKED] == EXIT_BLOCKED
+    assert _STATE_EXIT_CODES[TaskState.CANCELLED] == EXIT_BLOCKED
+    for state in (TaskState.DRAFT, TaskState.READY, TaskState.RUNNING, TaskState.CHECKING):
+        assert _STATE_EXIT_CODES[state] == EXIT_IN_PROGRESS
+    assert EXIT_REFUSED not in _STATE_EXIT_CODES.values()
+    assert (
+        len(
+            {
+                EXIT_OK, EXIT_REFUSED, EXIT_BLOCKED, EXIT_USAGE, EXIT_IN_PROGRESS,
+                EXIT_RECORD_UNREADABLE,
+            }
+        )
+        == 6
+    )
+    assert EXIT_RECORD_UNREADABLE != 1, "1 is what an uncaught traceback exits with"
+
+
+def test_resume_of_a_running_run_exits_in_progress(
+    cli_env: dict[str, Path], project_root: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A hard kill leaves a run ``RUNNING`` and ``resume`` does not touch it (README).
+
+    The run exists with a dispatched attempt, so the no-op answer must not read as
+    "refused at admission"; it exits ``EXIT_IN_PROGRESS``.
+    """
+    import sqlite3
+
+    from hflow.cli import EXIT_IN_PROGRESS
+    from hflow.paths import database_path
+
+    data_dir = cli_env["data_dir"]
+    exit_code = main(
+        [
+            "run", "--task", str(cli_env["task"]), "--project", str(cli_env["project"]),
+            "--project-root", str(project_root), "--driver", "fake", "--json",
+            "--data-dir", str(data_dir),
+        ]
+    )
+    assert exit_code == EXIT_OK
+    run_id = json.loads(capsys.readouterr().out)["run_id"]
+    # The state a hard kill leaves behind: no controller reached a terminal write.
+    connection = sqlite3.connect(database_path(data_dir))
+    try:
+        connection.execute(
+            "UPDATE runs SET task_state = 'RUNNING', receipt_json = NULL WHERE run_id = ?",
+            (run_id,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    exit_code = main(["resume", run_id, "--json", "--data-dir", str(data_dir)])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["task_state"] == "RUNNING", payload
+    assert exit_code == EXIT_IN_PROGRESS, payload
+    assert exit_code != EXIT_REFUSED
+
+
+def test_a_malformed_task_file_on_the_run_path_is_refused_by_its_loader(
+    cli_env: dict[str, Path], project_root: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Exit 2 comes from the task loader's own RefusedError: one line, no run state."""
+    from hflow.paths import database_path
+
+    document = json.loads(cli_env["task"].read_text(encoding="utf-8"))
+    document.pop("goal", None)
+    document["unexpected_field"] = 1
+    cli_env["task"].write_text(json.dumps(document), encoding="utf-8")
+    data_dir = cli_env["data_dir"]
+
+    exit_code = main(
+        [
+            "run", "--task", str(cli_env["task"]), "--project", str(cli_env["project"]),
+            "--project-root", str(project_root), "--driver", "fake", "--json",
+            "--data-dir", str(data_dir),
+        ]
+    )
+    err = capsys.readouterr().err
+    assert exit_code == EXIT_REFUSED
+    assert err.startswith("refused:"), err
+    assert "is not a valid task spec" in err and "goal" in err, err
+    assert "Traceback" not in err
+    database = database_path(data_dir)
+    if database.exists():
+        store = Store(database)
+        try:
+            assert store.conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+        finally:
+            store.close()
+
+
+@pytest.mark.parametrize("verb", ["status", "report"])
+def test_an_unreadable_stored_record_is_not_reported_as_refused(
+    verb: str, cli_env: dict[str, Path], project_root: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The run exists, so a stored task spec that no longer validates is never exit 2.
+
+    Exit 2 promises "refused at admission, no run state"; a script following the table would
+    conclude the run does not exist although it has attempts and ledger charges.
+    """
+    import sqlite3
+
+    from hflow.cli import EXIT_RECORD_UNREADABLE
+    from hflow.paths import database_path
+
+    data_dir = cli_env["data_dir"]
+    exit_code = main(
+        [
+            "run", "--task", str(cli_env["task"]), "--project", str(cli_env["project"]),
+            "--project-root", str(project_root), "--driver", "fake", "--json",
+            "--data-dir", str(data_dir),
+        ]
+    )
+    assert exit_code == EXIT_OK
+    run_id = json.loads(capsys.readouterr().out)["run_id"]
+    connection = sqlite3.connect(database_path(data_dir))
+    try:
+        (stored,) = connection.execute(
+            "SELECT task_spec_json FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        spec = json.loads(stored)
+        spec.pop("goal", None)
+        spec["unexpected_field_from_another_build"] = 1
+        connection.execute(
+            "UPDATE runs SET task_spec_json = ? WHERE run_id = ?", (json.dumps(spec), run_id)
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    exit_code = main([verb, run_id, "--project-root", str(project_root), "--data-dir", str(data_dir)])
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_RECORD_UNREADABLE
+    assert exit_code not in (EXIT_REFUSED, EXIT_OK)
+    assert captured.err.startswith(f"stored record unreadable for run {run_id}: invalid TaskSpec:")
+    assert "goal" in captured.err
+    assert len(captured.err.strip().splitlines()) == 1, captured.err
+    assert "Traceback" not in captured.err
+    assert captured.out == ""
+
+
+@pytest.mark.parametrize("position", ["before", "after"])
+def test_data_dir_works_before_and_after_the_subcommand(
+    position: str,
+    cli_env: dict[str, Path],
+    project_root: Path,
+    capsys: pytest.CaptureFixture[str],
+    _isolated_default_data_dir: Path,
+) -> None:
+    """docs/operations.md: `run`/`status`/`report` accept `--data-dir` on either side of the verb."""
+    data_dir = cli_env["data_dir"]
+
+    def argv(*verb: str) -> list[str]:
+        flag = ["--data-dir", str(data_dir)]
+        return [*flag, *verb] if position == "before" else [*verb, *flag]
+
+    exit_code = main(
+        argv(
+            "run", "--task", str(cli_env["task"]), "--project", str(cli_env["project"]),
+            "--project-root", str(project_root), "--driver", "fake", "--json",
+        )
+    )
+    assert exit_code == EXIT_OK
+    run_id = json.loads(capsys.readouterr().out)["run_id"]
+    assert (data_dir / "hflow.sqlite").exists()
+    assert not (_isolated_default_data_dir / "hflow.sqlite").exists(), "the flag was ignored"
+
+    assert main(argv("status", run_id)) == EXIT_OK
+    assert "state         ACCEPTED" in capsys.readouterr().out
+    assert main(argv("report", run_id)) == EXIT_OK
+    assert "verification  passed" in capsys.readouterr().out
+    assert not (_isolated_default_data_dir / "hflow.sqlite").exists()
+
+
+def test_data_dir_default_still_applies_when_neither_position_names_it(
+    cli_env: dict[str, Path],
+    project_root: Path,
+    capsys: pytest.CaptureFixture[str],
+    _isolated_default_data_dir: Path,
+) -> None:
+    exit_code = main(
+        [
+            "run", "--task", str(cli_env["task"]), "--project", str(cli_env["project"]),
+            "--project-root", str(project_root), "--driver", "fake", "--json",
+        ]
+    )
+    assert exit_code == EXIT_OK
+    run_id = json.loads(capsys.readouterr().out)["run_id"]
+    assert (_isolated_default_data_dir / "hflow.sqlite").exists()
+    assert main(["status", run_id]) == EXIT_OK
+    assert main(["--data-dir", str(cli_env["data_dir"]), "status", run_id]) == EXIT_USAGE
+    assert "unknown run" in capsys.readouterr().err
+
+
+def test_data_dir_after_the_subcommand_wins_over_one_before_it(tmp_path: Path) -> None:
+    from hflow.cli import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(["--data-dir", "A", "status", "R", "--data-dir", "B"])
+    assert args.data_dir == "B"
+    assert parser.parse_args(["--data-dir", "A", "status", "R"]).data_dir == "A"
+    assert parser.parse_args(["status", "R"]).data_dir is None

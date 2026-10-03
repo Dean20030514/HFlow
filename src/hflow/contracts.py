@@ -915,10 +915,14 @@ class CandidateRef(BaseModel):
 class ReviewOutput(BaseModel):
     """Shortest structured reviewer output (plan 16.5)."""
 
+    # The docstring above is embedded in the reviewer packet's schema, so notes live here.
+    # Both keys are required, as the packet's output contract says: a verdict without
+    # ``findings`` is refused, never completed with an empty list on the model's behalf.
+
     model_config = Strict
 
     verdict: Literal["accepted", "changes_requested"]
-    findings: list[dict[str, Any]] = Field(default_factory=list)
+    findings: list[dict[str, Any]]
 
 
 class InvocationRequest(BaseModel):

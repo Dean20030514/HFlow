@@ -25,13 +25,29 @@ Nothing here decides acceptance, and nothing here is allowed to fill in a missin
 verdict: a missing, malformed or ambiguous answer is an error the controller reports as
 a protocol problem, never as the reviewer's substantive rejection.
 
-Supported answer grammar (documented and tested; no other form is accepted):
+Supported answer grammar (documented and tested; no other form is accepted). Every fenced
+block is masked first; the remaining prose is searched for top-level JSON objects by trying a
+decode at every ``{`` (leftmost first, resuming after each object found), never by tracking
+string or brace state across prose, so an inch mark (``27"``) or a stray ``{`` cannot hide an
+object. A *verdict object* is one of those objects that has a ``verdict`` key.
 
-* the answer *is* one JSON object;
-* the answer is exactly one fenced code block (``` or ```` ```json ````) whose content is
-  one JSON object - the form the reviewer output contract asks for;
-* a prose answer ending in one JSON object - the parser identifies objects by
-  structure, so a single trailing object is unambiguous and is accepted verbatim.
+* the answer holds exactly one result block - a fenced code block (``` or ```` ```json ````)
+  whose content is one JSON object, the form the reviewer output contract asks for - and no
+  verdict object outside its fences. Other JSON in the prose (``{}``, a config snippet) is
+  allowed and never read;
+* the answer holds no result block and exactly one verdict object (the answer may *be* that
+  object). Other objects in the prose are not read;
+* the answer holds no result block, no verdict object and exactly one JSON object: it is the
+  result, so a misspelt key is reported as invalid rather than missing.
+
+Prose may come before or after the result, in every form; the parser never interprets prose,
+so the result is accepted verbatim whatever the surrounding text says. A fence with any other
+label (``python``, ``text``, ...) is decoration: its body is never read, so an example object
+inside it is neither the verdict nor a competitor. Refused as ambiguous: two result blocks, a
+result block next to a verdict object outside it, two verdict objects, two objects of which
+none has a verdict key, and an answer with more than :data:`MAX_FAILED_OBJECT_STARTS` places
+that begin like an object but do not decode. Prose braces that do not decode as a JSON object,
+such as ``{x}``, are never an object.
 
 Wrapper removal never rewrites the object's bytes: the decoded text's digest is
 recorded next to the parsed verdict by the offline replay tool.
@@ -56,6 +72,15 @@ MAX_ANSWER_BYTES = 4 * 1024 * 1024
 REVIEW_MISSING = "missing"
 REVIEW_INVALID = "invalid"
 REVIEW_AMBIGUOUS = "ambiguous"
+
+#: Bound on places in the prose that begin like a JSON object (``{`` then a key or ``}``) but
+#: do not decode. Each failed decode costs time proportional to the answer, so without a bound
+#: an answer full of them makes classification quadratic. Past it the answer is refused as
+#: ambiguous - never accepted - because a competing verdict may not have been looked for.
+MAX_FAILED_OBJECT_STARTS = 64
+
+#: JSON whitespace (RFC 8259): the only characters allowed between ``{`` and its first token.
+_JSON_WHITESPACE = " \t\n\r"
 
 #: Fence languages accepted around the Review object. An empty info string is the plain
 #: triple-backtick form; ``json`` is the labelled form.
@@ -252,6 +277,22 @@ class AnswerTranscript:
                 f"({update.get('content')!r})"
             )
             return
+        try:
+            size = len(text.encode("utf-8"))
+        except UnicodeEncodeError:
+            # The check is per chunk: a chunk whose text alone does not encode as UTF-8 (it holds
+            # an unpaired surrogate, such as a \uD83D escape) is rejected, even when the next chunk
+            # would complete the surrogate pair. That is fail-closed on purpose: DSH emits one
+            # agent_message_chunk per committed text block, so a pair split across chunks is not
+            # expected. (A driver that streamed delta-level chunks would need the pair check on
+            # the joined text instead.) Measuring the text must not raise out of the driver's
+            # reader thread, and keeping it would carry an unencodable string into stored
+            # evidence, so the answer is unusable.
+            self.reject(
+                f"agent_message_chunk on line {line_index} carries text with an unpaired "
+                "surrogate, which is not valid Unicode, so the answer is not readable text"
+            )
+            return
 
         message_id = update.get("messageId")
         identity = message_id if isinstance(message_id, str) and message_id else ""
@@ -267,7 +308,6 @@ class AnswerTranscript:
             text=text,
         )
         group.append(chunk)
-        size = len(text.encode("utf-8"))
         if not self._truncated:
             # Counted once per chunk: beyond the cap the content is unusable (never
             # truncated-and-kept), and the counter itself must stay bounded.
@@ -402,11 +442,22 @@ def _result_region(answer: str) -> tuple[str, bool]:
     """Return the text that must contain the Review object, and whether it was fenced.
 
     A fenced block is a *result block* when its info string is empty or ``json``. Any other
-    label (``python``, ``text``, ...) is prose decoration, not the result - which is why one
-    ```` ```json ```` verdict block inside an answer that also shows code samples is not
-    ambiguous. Two candidate result blocks, or two bare objects, is refused instead of
-    guessed: choosing the object that validates is exactly the behaviour this parser must
-    not have.
+    label (``python``, ``text``, ...) is prose decoration, not the result. Every fenced block
+    is masked out before the prose is searched for JSON objects (:func:`_top_level_objects`),
+    so an example object inside a ```` ```text ```` block is never the verdict and never a
+    competitor. A *verdict object* is a JSON object in the prose that has a ``verdict`` key.
+
+    * Two or more candidate result blocks: ambiguous.
+    * One candidate result block: its body is the result. A verdict object outside it is a
+      competing result and makes the answer ambiguous; any other JSON in the prose (``{}``, a
+      config snippet) is allowed and never read.
+    * No candidate result block: one verdict object is the result and other objects in the
+      prose are not read; two or more verdict objects are ambiguous. Without any verdict
+      object, a single JSON object is the result (so a misspelt key is reported as invalid,
+      not missing) and several are ambiguous.
+
+    Conflicts are refused instead of guessed: choosing the object that validates is exactly
+    the behaviour this parser must not have.
     """
     spans = _fenced_spans(answer)
     candidates = [span for span in spans if span.info.lower() in _JSON_FENCE_LANGUAGES]
@@ -416,47 +467,93 @@ def _result_region(answer: str) -> tuple[str, bool]:
             f"the answer contains {len(candidates)} candidate result blocks "
             "(unlabelled or json-fenced); the Review object is not identified",
         )
+    outside = _mask_fences(answer, spans)
+    objects, first_error = _top_level_objects(outside)
+    verdicts = [found for found in objects if found.has_verdict]
     if candidates:
+        if verdicts:
+            raise ReviewDecodeError(
+                REVIEW_AMBIGUOUS,
+                f"the answer contains a fenced result block and {len(verdicts)} JSON object(s) "
+                'with a "verdict" key outside it; the Review object is not identified',
+            )
         return candidates[0].body, True
 
-    objects = _object_spans(answer)
-    if not objects:
-        if spans:
-            labels = ", ".join(sorted({span.info or "<unlabelled>" for span in spans}))
-            raise ReviewDecodeError(
-                REVIEW_MISSING,
-                f"the answer carries no structured verdict: its fenced block(s) are labelled {labels} "
-                "and it has no top-level JSON object",
-            )
-        if not _has_json_value(answer):
-            raise ReviewDecodeError(
-                REVIEW_MISSING, "the answer contains no JSON object, so it carries no structured verdict"
-            )
+    if len(verdicts) > 1:
         raise ReviewDecodeError(
-            REVIEW_INVALID, "the answer's JSON is not an object, so it is not a review result"
+            REVIEW_AMBIGUOUS,
+            f'the answer contains {len(verdicts)} top-level JSON objects with a "verdict" key '
+            "and no result block; the Review object is not identified",
         )
+    if verdicts:
+        return verdicts[0].text, False
     if len(objects) > 1:
         raise ReviewDecodeError(
             REVIEW_AMBIGUOUS,
-            f"the answer contains {len(objects)} top-level JSON objects; the Review object is not "
-            "identified",
+            f"the answer contains {len(objects)} top-level JSON objects, none with a "
+            '"verdict" key, and no result block; the Review object is not identified',
         )
-    return objects[0], False
+    if objects:
+        # One object without a verdict key: decoding it reports what the contract misses.
+        return objects[0].text, False
+    if first_error is not None:
+        raise ReviewDecodeError(
+            REVIEW_INVALID,
+            "the answer has a '{' outside its fences but no JSON object starts at any of them; "
+            f"the first one is not valid JSON: {first_error}",
+        )
+    if spans:
+        labels = ", ".join(sorted({span.info or "<unlabelled>" for span in spans}))
+        raise ReviewDecodeError(
+            REVIEW_MISSING,
+            f"the answer carries no structured verdict: its fenced block(s) are labelled {labels} "
+            "and it has no top-level JSON object",
+        )
+    if not _has_json_value(outside):
+        raise ReviewDecodeError(
+            REVIEW_MISSING, "the answer contains no JSON object, so it carries no structured verdict"
+        )
+    raise ReviewDecodeError(
+        REVIEW_INVALID, "the answer's JSON is not an object, so it is not a review result"
+    )
+
+
+def _mask_fences(text: str, spans: list[_FenceSpan]) -> str:
+    """The text with every fenced block, fence lines included, blanked out.
+
+    Line breaks are kept and every other character becomes a space, so what remains is
+    exactly the answer's prose, at unchanged offsets.
+    """
+    if not spans:
+        return text
+    pieces: list[str] = []
+    cursor = 0
+    for span in spans:
+        pieces.append(text[cursor : span.start])
+        pieces.append(
+            "".join(ch if ch in "\r\n" else " " for ch in text[span.start : span.end])
+        )
+        cursor = span.end
+    pieces.append(text[cursor:])
+    return "".join(pieces)
 
 
 @dataclass(frozen=True)
 class _FenceSpan:
     info: str
     body: str
+    #: Offset of the opening fence line, and offset just past the closing fence line.
     start: int
+    end: int
 
 
 def _fenced_spans(text: str) -> list[_FenceSpan]:
     """Top-level fenced code blocks, in order.
 
-    A fence is a run of three or more backticks or tildes at the start of a line. Anything
-    inside a fence is skipped, so a brace or a marker in a code sample cannot be mistaken
-    for the result object.
+    A fence is a run of three or more backticks or tildes at the start of a line. Only a
+    block labelled ``json`` or left unlabelled is ever read; :func:`_mask_fences` blanks every
+    block before the answer is scanned for bare objects, so a brace or a marker in a code
+    sample cannot be mistaken for the result object.
     """
     spans: list[_FenceSpan] = []
     lines = text.splitlines(keepends=True)
@@ -473,7 +570,12 @@ def _fenced_spans(text: str) -> list[_FenceSpan]:
             closing, info, body_start, opened_at = open_fence
             if marker is not None and marker[0] == closing and stripped.strip() == marker:
                 spans.append(
-                    _FenceSpan(info=info.strip(), body=text[body_start:offset], start=opened_at)
+                    _FenceSpan(
+                        info=info.strip(),
+                        body=text[body_start:offset],
+                        start=opened_at,
+                        end=offset + len(line),
+                    )
                 )
                 open_fence = None
         offset += len(line)
@@ -493,39 +595,80 @@ def _fence_marker(stripped_line: str) -> str | None:
     return None
 
 
-def _object_spans(text: str) -> list[str]:
-    """Every top-level ``{...}`` in the text, found by structural scanning.
+@dataclass(frozen=True)
+class _ObjectSpan:
+    #: The object's text exactly as it appears in the scanned (fence-masked) text.
+    text: str
+    has_verdict: bool
 
-    String literals and escapes are respected, so a brace inside a quoted value is not a
-    boundary. A bare (unfenced) answer that contains two objects is ambiguous by design.
+
+def _top_level_objects(text: str) -> tuple[list[_ObjectSpan], str | None]:
+    """Every top-level JSON object in the prose, leftmost first, and the first decode error.
+
+    The prose is never scanned with JSON string or depth state: an inch mark (``27"``) or an
+    unbalanced ``{`` in a sentence would otherwise hide every object after it. Instead a
+    decode is attempted at every ``{`` offset; a position where an object decodes records
+    that object and the search resumes after its end (so objects nested inside it are part
+    of it), and any other position is skipped. The caller passes the answer with its fences
+    masked, so a fenced body is never found here.
+
+    Lenient on purpose: this only *finds and classifies* objects. The object that is finally
+    decoded goes through the strict loader, which refuses repeated keys and non-finite
+    constants. The second value is the decode error at the first ``{`` that did not start an
+    object, or ``None`` when every ``{`` did (or there was none).
     """
-    spans: list[str] = []
-    depth = 0
-    start = -1
-    in_string = False
-    escaped = False
-    for index, character in enumerate(text):
-        if in_string:
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == '"':
-                in_string = False
+    decoder = json.JSONDecoder()
+    found: list[_ObjectSpan] = []
+    first_error: str | None = None
+    failed_starts = 0
+    index = text.find("{")
+    while index >= 0:
+        cursor = index + 1
+        while cursor < len(text) and text[cursor] in _JSON_WHITESPACE:
+            cursor += 1
+        if cursor >= len(text) or text[cursor] not in '"}':
+            # The JSON grammar allows only a key or "}" after "{": no object starts here, and
+            # a decode attempt (whose error costs time proportional to the offset) is skipped.
+            if first_error is None:
+                first_error = _decode_error(decoder, text, index)
+            index = text.find("{", index + 1)
             continue
-        if character == '"':
-            in_string = True
-        elif character == "{":
-            if depth == 0:
-                start = index
-            depth += 1
-        elif character == "}":
-            if depth > 0:
-                depth -= 1
-                if depth == 0 and start >= 0:
-                    spans.append(text[start : index + 1])
-                    start = -1
-    return spans
+        value: Any = None
+        end = index
+        try:
+            value, end = decoder.raw_decode(text, index)
+        except RecursionError:
+            if first_error is None:
+                first_error = "the object nests too deeply to decode"
+        except ValueError as exc:  # json.JSONDecodeError is a ValueError
+            if first_error is None:
+                first_error = str(exc)
+        if not isinstance(value, dict):
+            failed_starts += 1
+            if failed_starts > MAX_FAILED_OBJECT_STARTS:
+                raise ReviewDecodeError(
+                    REVIEW_AMBIGUOUS,
+                    f"more than {MAX_FAILED_OBJECT_STARTS} places outside the answer's fences "
+                    "begin like a JSON object but do not decode; the search for a competing "
+                    "verdict stopped, so the Review object is not identified",
+                )
+        if isinstance(value, dict):
+            found.append(_ObjectSpan(text=text[index:end], has_verdict="verdict" in value))
+            index = text.find("{", end)
+        else:
+            index = text.find("{", index + 1)
+    return found, first_error
+
+
+def _decode_error(decoder: json.JSONDecoder, text: str, index: int) -> str:
+    """The decoder's own message for the failed decode at ``index``."""
+    try:
+        decoder.raw_decode(text, index)
+    except RecursionError:
+        return "the object nests too deeply to decode"
+    except ValueError as exc:
+        return str(exc)
+    return "the value there is not a JSON object"
 
 
 def _has_json_value(text: str) -> bool:
