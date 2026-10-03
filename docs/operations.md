@@ -442,7 +442,9 @@ still be exactly the previous candidate: same HEAD, same tree, nothing changed, 
 flagged assume-unchanged or skip-worktree (`git ls-files -v`; git's status cannot show whether a
 flagged file still holds the checked bytes, and HFlow never clears the flag). A worktree that
 moved or became dirty after the freeze - for example a check that wrote a file git does not
-ignore - records `workspace_drift`, blocks `scope_violation` and buys nothing; nothing is reset or
+ignore - or when the shared Git metadata changed since dispatch (see "Shared Git metadata is
+compared before HFlow's git reads it again" below), records `workspace_drift`, blocks
+`scope_violation` and buys nothing; nothing is reset or
 overwritten. Ignored files the first round's checks or review left **outside** what the scoped
 fingerprint hashes (a `.ruff_cache` or `.mypy_cache` at the repository root, say) are not drift:
 the first freeze refused every ignored path off its allowlist, so whatever is ignored now came
@@ -570,7 +572,7 @@ actually meet today:
 |---|---|---|
 | `budget_exhausted` | the turn ceiling, the authorization or the root could not cover the next dispatch: root submissions or repairs spent, the root's deadline passed (at a dispatch, during the checks, or at acceptance), or a rootless run of a task whose root was registered after the run was admitted (a rootless run of a task that already has a root is normally refused before its run row exists) | split the task, or raise `limits` deliberately; for a root, pass `--root-budget-file` with a fresh approval - nothing tops a root up |
 | `verification_failed` | an approved check failed; the worker's exit code is irrelevant. Also a repair round that changed nothing | read the evidence detail, fix the code or the check, submit a new revision |
-| `scope_violation` | files changed that the TaskSpec did not authorize, or a changed path matches the task's or the project's `write_deny` or the built-in deny list (`.git`, `.hflow`, `.acpxrc.json`) - even inside an allowed directory, and before anything is frozen. Also: the worker moved the worktree's HEAD (its own commit, amend, reset or checkout: "the worker moved HEAD from X to Y"); an index entry flagged assume-unchanged or skip-worktree ("index flags hide worktree changes from the freeze"); the candidate commit or the delivery changes a path outside the scope or under a deny rule (checked after the freeze and again at acceptance); a `write_allow` entry that started resolving outside the worktree during the run; a repair round that moved the tree but not the scoped content; a repair refused as `workspace_drift` | inspect the reported paths; nothing was accepted, and no receipt was written |
+| `scope_violation` | files changed that the TaskSpec did not authorize, or a changed path matches the task's or the project's `write_deny` or the built-in deny list (`.git`, `.hflow`, `.acpxrc.json`) - even inside an allowed directory, and before anything is frozen. Also: the worker moved the worktree's HEAD (its own commit, amend, reset or checkout: "the worker moved HEAD from X to Y"); an index entry flagged assume-unchanged or skip-worktree ("index flags hide worktree changes from the freeze"); the candidate commit or the delivery changes a path outside the scope or under a deny rule (checked after the freeze and again at acceptance); a `write_allow` entry that started resolving outside the worktree during the run; a repair round that moved the tree but not the scoped content; a repair refused as `workspace_drift`; the shared Git metadata changed after dispatch ("shared Git metadata changed ...", before the freeze, before a repair round or at acceptance) | inspect the reported paths; nothing was accepted, and no receipt was written; for a metadata change, restore it before `hflow clean` or another worktree run |
 | `evidence_stale` | the candidate changed after verification | re-run; do not reuse the old evidence |
 | `review_rejected` | the reviewer returned a validated `changes_requested` | read the finding, then submit a new revision |
 | `review_protocol_error` | the reviewer turn produced no usable verdict: missing, malformed or ambiguous output, a reviewer stream whose `messageId` resumes after another message started (the review evidence reads `invalid: agent_message_chunk on line N continues message ...`), or a final message holding two verdicts, for example one on each side of its own reasoning (`ambiguous`), a prompt-digest mismatch, a reviewer that could not be started, or a reviewer turn that `FAILED` (for example `model_rejected_before_prompt`, `cancelled_unrequested`, `stop_reason_max_tokens`), or a reviewer that sent an `agent_message_chunk` after its own prompt response, or whose output was not read to its end (`review_ambiguous`: the final answer is not identified). It is a wire failure, never the reviewer's judgment | read `block_reason` and the review evidence; fix the cause before a new revision |
@@ -725,8 +727,35 @@ What the freeze commits, and what it refuses:
   signer runs during `worktree add`, the freeze or a ref write, and HFlow's own `worktree add`
   never checks an entry out flagged assume-unchanged or skip-worktree (a flag set any other way
   refuses the freeze, above). The user's global config is still read for everything else, and
-  clean/smudge filters a worker writes into the shared `.git/config` are not disabled (README,
-  "Not verified").
+  filters cannot be switched off without breaking legitimate ones such as LFS, so a filter a
+  worker configures is caught by comparison instead (next bullet).
+- Shared Git metadata is compared before HFlow's git reads it again. A worktree shares
+  `.git/config` with your checkout, and a worker (or a check, or the reviewer) can configure a
+  clean, smudge or process filter there and select it through `.git/info/attributes` or
+  `core.attributesFile` - no `.gitattributes` needed - so HFlow's own status, add or commit would
+  run it. Right after `worktree add` (which can itself write `extensions.relativeWorktrees` under
+  `worktree.useRelativePaths`, or the run's `config.worktree`) and before the first dispatch,
+  HFlow snapshots every configuration key `git config --list` reports in your checkout and in the
+  run's worktree, the files they come from (includes and `includeIf` targets too), both
+  `config.worktree` files, `.git/info/attributes` and the global attributes file, and records
+  only a digest: `git_metadata: snapshot before dispatch sha256:...` (never values). It compares
+  again before the freeze, before a repair round (which records `workspace_drift` and buys
+  nothing) and at acceptance (which writes no receipt); any difference blocks `scope_violation`
+  with a reason that starts "shared Git metadata changed since the pre-dispatch snapshot (...)"
+  or "... or became unreadable". Keys are shown with the subsection hidden (`filter.*.clean`,
+  `url.*.insteadof`), plus file paths, at most five. The `git_metadata: changed <where>` notes
+  carry the same list, because a stop that already decided the run keeps its own reason. A run
+  that ends without a receipt for another reason (a failed check or a rejection that buys no
+  repair, a driver failure, an unknown outcome, a stop while the worker ran) is compared once
+  more and gets only a note, `git_metadata: changed when the run ended ...`; it never relabels the
+  block, so an `outcome_unknown` stays. What to do: run `git config --list --show-origin
+  --show-scope`, inspect `.git/info/attributes`, the file `git var GIT_ATTR_GLOBAL` names and any
+  included files, and restore them before `hflow clean` or another worktree run - both read the
+  metadata again, and HFlow restores nothing. If the edit was your own (any change counts, even
+  `user.name`), submit a new revision: an identical TaskSpec returns the blocked run, and under a
+  root budget the new revision is charged as a repair. An in-scope `.gitattributes` the worker
+  wrote is not refused; it appears in the receipt's `limitations`, because HFlow's `git add`
+  applied it at the freeze. Requires Git 2.31+. Offline-tested only (README, "Not verified").
 - The worker packet still lists only the task's `write_deny` under forbidden paths; the project's
   and the built-in deny lists are enforced, not shown.
 

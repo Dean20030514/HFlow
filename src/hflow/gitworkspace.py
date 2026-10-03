@@ -16,8 +16,10 @@ Deliberately absent: branch management, merging, rebasing, remotes, publishing, 
 from __future__ import annotations
 
 import atexit
+import hashlib
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -148,6 +150,108 @@ class CandidateFreeze:
     paths: tuple[str, ...]
     serial: int
     tree_digest: str
+
+
+#: How a block reason that refuses on changed shared Git metadata begins (see
+#: :meth:`GitRepo.metadata_snapshot`). Every such reason starts with it, so an operator, a test and
+#: the docs grep the same words.
+GIT_METADATA_CHANGED = "shared Git metadata changed"
+
+
+@dataclass(frozen=True)
+class GitMetadataSnapshot:
+    """What HFlow's own git commands read from outside the candidate's tree, as digests.
+
+    ``entries`` are ``(label, digest)`` pairs, sorted by label. ``config@checkout:<key>`` and
+    ``config@worktree:<key>`` cover one configuration key as ``git config --list`` reports it in
+    the user's checkout and in the run's worktree - every scope, origin and value recorded for it,
+    includes expanded. ``file:<path>`` covers one file that configuration or an attribute mapping
+    is read from: ``sha256:<hex>`` of its bytes, ``absent``, or the type of a non-regular file.
+    Values exist only inside a digest, because a configuration value can be a credential; the
+    snapshot lives in the controller's memory for one run and is never stored.
+    """
+
+    entries: tuple[tuple[str, str], ...]
+
+    @property
+    def digest(self) -> str:
+        return digest_of([list(entry) for entry in self.entries])
+
+    def changes_since(self, before: GitMetadataSnapshot) -> list[str]:
+        """What differs from ``before`` - added, removed or changed - by label, sorted.
+
+        A configuration key is named by its section and name only (``filter.*.clean``): a
+        subsection can carry a URL with a credential in it (``url.<base>.insteadOf``).
+        """
+        old, new = dict(before.entries), dict(self.entries)
+        changed = sorted(label for label in old.keys() | new.keys() if old.get(label) != new.get(label))
+        return list(dict.fromkeys(_redacted_label(label) for label in changed))
+
+
+def _redacted_label(label: str) -> str:
+    kind, _, name = label.partition(":")
+    if not kind.startswith("config@"):
+        return label
+    section, _, rest = name.partition(".")
+    subsection, dot, key = rest.rpartition(".")
+    return f"{kind}:{section}.*.{key}" if dot and subsection else label
+
+
+def _config_records(listing: str) -> list[tuple[str, str, str, str | None]]:
+    """``git config --list -z --show-scope --show-origin`` as ``(scope, origin, key, value)``.
+
+    Each record is three NUL-terminated fields: the scope, the origin, and the key followed by a
+    newline and its value (no newline for a key written without ``=``). Anything else raises: a
+    listing this cannot read must not pass for an empty configuration.
+    """
+    fields = listing.split("\0")
+    if fields and fields[-1] == "":
+        fields.pop()
+    if len(fields) % 3:
+        raise GitError(f"unreadable git config listing ({len(fields)} fields)")
+    records: list[tuple[str, str, str, str | None]] = []
+    for index in range(0, len(fields), 3):
+        scope, origin, entry = fields[index : index + 3]
+        key, newline, value = entry.partition("\n")
+        records.append((scope, origin, key, value if newline else None))
+    return records
+
+
+def _metadata_path(cwd: Path, text: str) -> str:
+    """One spelling per file, whichever context named it; a relative origin is relative to ``cwd``."""
+    return Path(os.path.normcase(os.path.abspath(Path(cwd) / text.strip()))).as_posix()
+
+
+def _file_digest(path: Path) -> str:
+    """``sha256:<hex>`` of a regular file's bytes, ``absent``, or the type of anything else.
+
+    A FIFO, a device (``/dev/zero``) or a directory is recorded by its type and never opened:
+    reading one can block forever or never end, before any refusal is written. A changed type
+    still counts as a change. Present but unreadable raises, because it cannot be shown unchanged.
+    """
+    try:
+        info = os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return "absent"
+    except OSError as exc:
+        raise GitError(f"cannot read {path}: {exc}") from exc
+    if not stat.S_ISREG(info.st_mode):
+        return f"not-a-regular-file:{stat.S_IFMT(info.st_mode):o}"
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0))
+    except (FileNotFoundError, NotADirectoryError):
+        return "absent"
+    except OSError as exc:
+        raise GitError(f"cannot read {path}: {exc}") from exc
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            # Swapped for something else between the stat and the open: record what is there now.
+            opened = os.fstat(handle.fileno()).st_mode
+            if not stat.S_ISREG(opened):
+                return f"not-a-regular-file:{stat.S_IFMT(opened):o}"
+            return "sha256:" + hashlib.file_digest(handle, "sha256").hexdigest()
+    except OSError as exc:
+        raise GitError(f"cannot read {path}: {exc}") from exc
 
 
 _EMPTY_HOOKS_DIR: str | None = None
@@ -461,6 +565,121 @@ class GitRepo:
             if tag.islower() or tag == "S":
                 flagged.append(path)
         return flagged
+
+    def _git_query(self, cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        """A read-only git query whose exit code the caller interprets (``run`` raises on any)."""
+        try:
+            return subprocess.run(  # noqa: S603,S607 - fixed read-only query
+                ["git", *args],
+                cwd=str(cwd),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+                env=_base_env(),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise GitError(f"git {' '.join(args)} timed out after {exc.timeout}s") from exc
+
+    def _global_attributes_file(self, cwd: Path) -> str:
+        """The global attributes file git reads in ``cwd``, or ``""`` when it reads none."""
+        query = self._git_query(cwd, "var", "GIT_ATTR_GLOBAL")
+        if query.returncode == 0:
+            return query.stdout.strip()
+        if query.returncode == 1 and not query.stdout.strip():
+            # Git 2.42+ names no file when ``core.attributesFile`` is unset and neither
+            # XDG_CONFIG_HOME nor HOME is set; git then reads none.
+            return ""
+        if query.returncode != 129:
+            raise GitError(f"git var GIT_ATTR_GLOBAL failed: {query.stderr.strip()[:200]}")
+        # 129: a Git older than 2.42, which does not know the variable. Git's own rule, by hand:
+        # ``core.attributesFile``, else ``$XDG_CONFIG_HOME/git/attributes``, else
+        # ``~/.config/git/attributes``.
+        configured = self._git_query(cwd, "config", "--type=path", "--get", "core.attributesFile")
+        if configured.returncode == 0:
+            return configured.stdout.strip()
+        if configured.returncode != 1:
+            raise GitError(
+                f"git config --get core.attributesFile failed: {configured.stderr.strip()[:200]}"
+            )
+        xdg = _base_env().get("XDG_CONFIG_HOME", "")
+        if xdg:
+            return (Path(xdg) / "git" / "attributes").as_posix()
+        # Git expands ``~`` with its own idea of HOME, which Git for Windows derives when HOME is
+        # unset; with no home at all the expansion fails and git reads no global file.
+        default = self._git_query(
+            cwd,
+            "config",
+            "--type=path",
+            "--default",
+            "~/.config/git/attributes",
+            "--get",
+            "core.attributesFile",
+        )
+        return default.stdout.strip() if default.returncode == 0 else ""
+
+    def metadata_snapshot(self, worktree: Path) -> GitMetadataSnapshot:
+        """Digest the shared metadata HFlow's own git commands read from outside the candidate.
+
+        A worker can write all of it from inside its worktree - the repository's config is shared
+        by every worktree - and it decides what HFlow's later ``git add`` / ``git status`` execute
+        and stage: a ``filter.<driver>.clean`` / ``smudge`` / ``process`` program, the attribute
+        mapping that selects one (``info/attributes`` or ``core.attributesFile``; no
+        ``.gitattributes`` is needed), ``include.path`` / ``includeIf`` files, and
+        ``extensions.worktreeConfig`` with the ``config.worktree`` files it enables. Filters cannot
+        be switched off generically without breaking legitimate ones such as LFS, so the controller
+        compares this snapshot instead and refuses to run git on metadata that changed.
+
+        Read in both places HFlow runs git after a worker: the user's checkout (the acceptance's
+        status read, ref writes) and the run's worktree (the freeze). Per place: every key
+        ``git config --list`` reports, includes expanded - ``command``-scope entries are skipped,
+        being HFlow's own environment (the forced keys) rather than a file - and every file it
+        names as an origin, plus ``config``, ``config.worktree`` and ``info/attributes`` under
+        ``git rev-parse --git-path`` and the global attributes file, present or not. Read-only:
+        none of these commands runs a filter. Any failure, a timeout included, raises
+        :class:`GitError`.
+
+        Needs Git 2.31+ (``rev-parse --path-format=absolute``; ``--show-scope`` is 2.26). The
+        global attributes file comes from ``git var GIT_ATTR_GLOBAL`` on Git 2.42+ and from git's
+        own rule on older Git.
+        """
+        entries: dict[str, str] = {}
+        files: set[str] = set()
+        try:
+            for context, cwd in (("checkout", self.root), ("worktree", Path(worktree))):
+                by_key: dict[str, list[list[str | None]]] = {}
+                listing = self.run("config", "--list", "-z", "--show-scope", "--show-origin", cwd=cwd)
+                for scope, origin, key, value in _config_records(listing):
+                    if scope == "command":
+                        continue
+                    by_key.setdefault(key, []).append([scope, origin, value])
+                    if origin.startswith("file:"):
+                        files.add(_metadata_path(cwd, origin[len("file:") :]))
+                for key, records in by_key.items():
+                    entries[f"config@{context}:{key}"] = digest_of(records)
+                located = self.run(
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    "config",
+                    "--git-path",
+                    "config.worktree",
+                    "--git-path",
+                    "info/attributes",
+                    cwd=cwd,
+                )
+                files.update(_metadata_path(cwd, line) for line in located.splitlines() if line.strip())
+                attributes = self._global_attributes_file(cwd)
+                if attributes:
+                    files.add(_metadata_path(cwd, attributes))
+        except subprocess.TimeoutExpired as exc:
+            # A hung read fails closed like any unreadable metadata.
+            raise GitError(
+                f"git {' '.join(str(part) for part in exc.cmd[1:4])} timed out after {exc.timeout}s"
+            ) from exc
+        for path in files:
+            entries[f"file:{path}"] = _file_digest(Path(path))
+        return GitMetadataSnapshot(tuple(sorted(entries.items())))
 
     def worktree_changes(self, worktree: Path, allow: list[str]) -> list[str]:
         """Changed paths in the worktree that the TaskSpec did not authorize.

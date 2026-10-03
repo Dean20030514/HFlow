@@ -20,7 +20,7 @@ not restate the design; read the plan and `docs/architecture.md` when the task n
 | Approved checks and evidence | `src/hflow/verify.py` |
 | Bounded output capture and the check environment | `src/hflow/artifacts.py` |
 | Scope containment and candidate fingerprints | `src/hflow/workspace.py` |
-| Git worktree isolation and candidate freezing | `src/hflow/gitworkspace.py` |
+| Git worktree isolation, candidate freezing, shared-metadata snapshot | `src/hflow/gitworkspace.py` |
 | Guarded worktree release (`hflow clean`) | `src/hflow/cleanup.py` |
 | `status` / `report` text from stored facts | `src/hflow/report.py` |
 | Commands and exit codes | `src/hflow/cli.py` |

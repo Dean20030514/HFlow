@@ -182,7 +182,8 @@ usable finding. The rules, the triggers and everything that stops a repair are i
   `workspace_drift`);
 - the repair round reuses the first round's worktree only while it is exactly the previous
   candidate (HEAD, tree, a clean status and no index entry flagged assume-unchanged or
-  skip-worktree), refusing otherwise as `workspace_drift` before anything is bought
+  skip-worktree), and only while the shared Git metadata still matches the pre-dispatch
+  snapshot, refusing otherwise as `workspace_drift` before anything is bought
   (`_reconcile_repair_workspace`). Ignored files present then can only be the previous round's
   check or review byproducts (the first freeze refused any ignored path off its allowlist). Those
   outside what the scoped fingerprint hashes are carried: the repair's freeze accepts exactly
@@ -247,8 +248,16 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
   are dropped, because every call names its repository by its working directory. The freeze commit also passes
   `--no-verify`. No repository, user, worker or caller hook, monitor command or signer runs during
   `worktree add`, the freeze or a ref write; the user's global config is still read for everything
-  else, and clean/smudge filters a worker configures in the shared `.git/config` are not disabled.
-  (`hflow clean`'s read-only `git worktree list` does not go through `GitRepo`.) The user's HEAD,
+  else. Filters are not disabled (that would break LFS); instead `GitRepo.metadata_snapshot`
+  digests the shared metadata HFlow's git reads from outside the tree - every non-`command`
+  configuration key in the checkout and the worktree, the files they come from, both
+  `config.worktree` files, `info/attributes` and the global attributes file - into a
+  `GitMetadataSnapshot` held in controller memory for the run (never stored), taken right after
+  `worktree add`. `Controller._git_metadata_refusal` compares it before the freeze, before the
+  repair reconcile and at acceptance and refuses `scope_violation` on any difference;
+  `Controller._note_git_metadata_at_exit` compares once more, note-only, when a worktree run ends
+  without a receipt for another reason. An in-scope `.gitattributes` in the delivery is recorded
+  as a receipt limitation, not refused. (`hflow clean`'s read-only `git worktree list` does not go through `GitRepo`.) The user's HEAD,
   index, working files, stash and branches are not written to — but the worktree shares the
   source repository's Git objects and admin files, and a process running as this user can still
   read and write outside it. A `write_allow` entry that is, or passes through, a symbolic link or

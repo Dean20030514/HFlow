@@ -100,7 +100,10 @@ stand-in for acpx / the installed pinned acpx).
 ## Install and test
 
 Python 3.12+ (developed on 3.14.7). Runtime dependency: `pydantic>=2.12,<3`.
-Development dependency: `pytest>=9.0,<10`.
+Development dependency: `pytest>=9.0,<10`. Git 2.31 or later for worktree runs (`git rev-parse
+--path-format=absolute`; `git config --show-scope` needs 2.26). The global attributes file is
+located with `git var GIT_ATTR_GLOBAL` on Git 2.42+, and on older Git from `core.attributesFile`,
+else `$XDG_CONFIG_HOME/git/attributes`, else `~/.config/git/attributes`.
 
 ```sh
 python -m pytest -q            # see the recorded snapshot below
@@ -136,8 +139,10 @@ preconditions were missing, not that the suite failed:
 | `node` on `PATH` and the pinned acpx at `.probe/acpx` (gitignored) | 11 | all 9 in `test_real_client_review.py`, 2 `real_acpx` cases in `test_packet_wire.py` |
 | the recorded M2 ledger at `.probe/m2-live/attempt-2-data` (gitignored) | 14 | all 8 in `test_saved_review_replay.py`, 6 in `test_local_finalization.py` |
 | Windows (a Job Object, or the batch-shim launch) | 13 | 4 in `test_check_process_lifecycle.py`, 6 in `test_driver_acpx_dsh.py`, 2 in `test_batch_e_repair.py`, 1 in `test_batch_e_verify.py` |
+| Git 2.48+ (`worktree.useRelativePaths` records `extensions.relativeWorktrees`) | 1 | `test_m2_slice.py` |
 
-A fresh clone on another platform, without `.probe/`, therefore skips up to 39 tests.
+A fresh clone on another platform, without `.probe/`, therefore skips up to 39 tests, and one more
+with a Git older than 2.48.
 
 ## Commands
 
@@ -322,8 +327,15 @@ the project contract, the machine profile, the authorization artifact, the root 
   taken with `--no-renames`, so a moved file names both its old and its new path. HFlow's own Git
   commands run with hooks, `core.fsmonitor`, commit signing, `core.ignoreStat` and sparse
   checkout switched off - settings a caller's `git -c` cannot override - and without an inherited
-  `GIT_DIR` or other repository-locating variable (see "Not verified" for what that does not
-  cover).
+  `GIT_DIR` or other repository-locating variable. The shared Git metadata those commands read
+  from outside the worktree - every configuration key in your checkout and the run's worktree, the
+  files it comes from, both `config.worktree` files, `.git/info/attributes` and the global
+  attributes file - is snapshotted after `worktree add` and before the first dispatch, and
+  compared before the freeze, before a repair round (`workspace_drift`) and at acceptance. Any
+  change blocks `scope_violation` ("shared Git metadata changed ...") before HFlow's status, add
+  or commit reads it again. A run that ends without a receipt for another reason is compared once
+  more and the result is a note (`git_metadata: changed when the run ended`); it never relabels
+  the block (see "Not verified" for what that does not cover).
 - The implementer and the reviewer are resolved from the profile **independently** and
   dispatched through their own driver object; a role the profile does not bind is refused rather
   than inheriting the other's agent. A binding's declared **harness** must be one its driver
@@ -578,7 +590,7 @@ Not verified, even where something works on one binding:
   access-denied answer has only been injected in offline tests, never observed on a real client.
   Off Windows the boundary degrades to `direct_child_only`, whose terminate does nothing, so there
   a forced stop or a deadline teardown (`completion_timeout`) does not kill even the direct child.
-- **A worker can still change the shared Git configuration.** Every Git command HFlow runs through
+- **Shared Git metadata is compared, not confined.** Every Git command HFlow runs through
   its repository handle forces `core.hooksPath` to an empty HFlow-owned directory,
   `core.fsmonitor=false`, `commit.gpgsign=false`, `core.ignoreStat=false` and
   `core.sparseCheckout=false` - through `GIT_CONFIG_COUNT`, and appended to an inherited
@@ -590,10 +602,33 @@ Not verified, even where something works on one binding:
   created, a candidate is frozen or a ref is written, HFlow's own `worktree add` never checks an
   entry out flagged assume-unchanged or skip-worktree (a flag set any other way refuses the
   freeze), and the user's global config is still read for everything else. But a worktree shares
-  `.git/config` with the repository, a worker can write it, and nothing detects that change after
-  the run: clean/smudge filter drivers it configures (with a `.gitattributes` inside its scope)
-  would still run on HFlow's `git add` / `worktree add`, because filters cannot be switched off
-  generically without breaking legitimate ones such as LFS.
+  `.git/config` with the repository and a worker can write it: it can configure a clean, smudge or
+  process filter there and select it through `.git/info/attributes` or `core.attributesFile`,
+  with no `.gitattributes` in its scope. A status read can run such a filter, not only `git add` -
+  including the acceptance-time status read of your checkout - and filters cannot be switched off
+  generically without breaking legitimate ones such as LFS. So the metadata is snapshotted after
+  `worktree add` and compared before the freeze, before a repair round and at acceptance (see
+  "Non-negotiables"); a change blocks `scope_violation` before HFlow's status, add or commit reads
+  it again. Offline tests only (fake driver plus test-issued git, verified on Windows); not
+  observed against a real DSH worker. What stays unverified:
+  - The comparison is point-in-time: a process still running as you (an escaped descendant,
+    another process, you) can change the metadata between a comparison and HFlow's next git
+    command.
+  - Nothing is restored and there is no cross-run baseline. A later or concurrent run that starts
+    after the change takes it as its baseline: its own status read of your checkout and its
+    `worktree add` run before its snapshot. After a block, `hflow clean` (status, then `worktree
+    remove`) and your own git read the changed metadata until you restore it.
+  - False positives fail closed: your own `git config`, `push -u`, an IDE writing `branch.*`, a
+    global-config edit or a check that runs `git config` during a run all block it. Each costs a
+    new revision; under a root budget, that revision's first implementer is charged as a repair.
+  - Not compared: ignore rules, system attributes (`GIT_ATTR_SYSTEM`, still read because
+    `GIT_CONFIG_NOSYSTEM` does not drop it; they can only select a filter defined in the compared
+    config), hooks (already neutralised), and object or ref metadata.
+  - A FIFO, device or directory in a metadata path is recorded by its type, never read.
+  - An in-scope `.gitattributes` is recorded as a receipt limitation, not refused: a filter your
+    unchanged config defines, or a line-ending rule, can make the committed bytes differ from the
+    checked ones.
+  - In-place runs make no git call, so there is nothing to compare.
 - **What the harness itself does** (documented upstream, not observed here): under the
   implementer's `approve-all`, DSH's permission escalations - up to unconfined commands - are
   auto-approved; DSH uploads session logs to DeepSeek by default; DSH reports blocked and aborted

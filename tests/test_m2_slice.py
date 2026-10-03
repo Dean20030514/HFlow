@@ -700,3 +700,300 @@ def test_inherited_repository_locating_variables_do_not_redirect_hflows_git_call
 
 def json_dumps(value: str) -> str:
     return value
+
+
+# --------------------------------------------------------------------------
+# shared Git metadata: what HFlow's own git reads from outside the candidate
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def isolated_git_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the global config and the XDG directory at this test, so only the test writes them."""
+    home = tmp_path / "git-home"
+    home.mkdir()
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(home / "global.gitconfig"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "xdg"))
+    return home
+
+
+def test_hflows_own_freeze_ref_and_status_reads_leave_the_metadata_snapshot_unchanged(
+    sample_repo: Path, isolated_git_home: Path
+) -> None:
+    """The comparison must not fire on HFlow's own git: a self-inflicted change would block every run."""
+    repo = GitRepo.discover(sample_repo)
+    base = repo.head
+    worktree = repo.create_worktree("R-metadata-own", base)
+    before = repo.metadata_snapshot(worktree)
+    (worktree / "src" / "textkit" / "__init__.py").write_text(FIXED_SOURCE, encoding="utf-8")
+
+    freeze = repo.freeze_candidate(worktree, ["src"], expected_head=base)
+    repo.ensure_candidate_ref(repo.candidate_ref("R-metadata-own", "A1"), freeze.candidate_commit)
+    repo.diff_paths(base, freeze.candidate_commit, cwd=sample_repo)
+    repo.user_change_fingerprint()
+
+    after = repo.metadata_snapshot(worktree)
+    assert after.changes_since(before) == []
+    assert after.digest == before.digest
+
+
+def _write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "shared-config",
+        "info-attributes",
+        "attributes-file-pointer",
+        "global-attributes",
+        "include-target",
+        "inactive-includeif",
+        "worktree-config",
+        "global-config",
+    ],
+)
+def test_the_metadata_snapshot_names_each_shared_source_a_worker_can_write(
+    sample_repo: Path, tmp_path: Path, isolated_git_home: Path, source: str
+) -> None:
+    """Every place git reads a filter driver, or the mapping that selects one, from outside the tree."""
+    include = tmp_path / "included.gitconfig"
+    _write(include, "[hflow]\n\tprobe = 1\n")
+    global_config = isolated_git_home / "global.gitconfig"
+    _write(global_config, "[hflow]\n\tglobal = 1\n")
+    if source == "include-target":
+        _git(sample_repo, "config", "include.path", include.as_posix())
+    if source == "worktree-config":
+        _git(sample_repo, "config", "extensions.worktreeConfig", "true")
+    repo = GitRepo.discover(sample_repo)
+    worktree = repo.create_worktree(f"R-metadata-{source}", repo.head)
+    before = repo.metadata_snapshot(worktree)
+
+    # What a worker can do from inside its worktree, with no `.gitattributes` in its scope.
+    if source == "shared-config":
+        _git(worktree, "config", "filter.hflowprobe.clean", "cat")
+        expected = ["config@checkout:filter.*.clean", "config@worktree:filter.*.clean"]
+    elif source == "info-attributes":
+        _write(sample_repo / ".git" / "info" / "attributes", "* filter=hflowprobe\n")
+        expected = ["/.git/info/attributes"]
+    elif source == "attributes-file-pointer":
+        _write(tmp_path / "worker-attributes", "* filter=hflowprobe\n")
+        _git(worktree, "config", "core.attributesFile", (tmp_path / "worker-attributes").as_posix())
+        expected = ["config@worktree:core.attributesfile", "/worker-attributes"]
+    elif source == "global-attributes":
+        _write(isolated_git_home / "xdg" / "git" / "attributes", "* filter=hflowprobe\n")
+        expected = ["/xdg/git/attributes"]
+    elif source == "include-target":
+        _write(include, '[hflow]\n\tprobe = 1\n[filter "hflowprobe"]\n\tclean = cat\n')
+        expected = ["config@worktree:filter.*.clean", "/included.gitconfig"]
+    elif source == "inactive-includeif":
+        _git(worktree, "config", "includeIf.onbranch:no-such-branch.path", include.as_posix())
+        expected = ["config@worktree:includeif.*.path"]
+    elif source == "worktree-config":
+        _git(worktree, "config", "--worktree", "filter.hflowprobe.clean", "cat")
+        expected = ["config@worktree:filter.*.clean", "/config.worktree"]
+    else:
+        _write(global_config, '[hflow]\n\tglobal = 1\n[filter "hflowprobe"]\n\tclean = cat\n')
+        expected = ["config@checkout:filter.*.clean", "/global.gitconfig"]
+
+    changes = repo.metadata_snapshot(worktree).changes_since(before)
+    for item in expected:
+        assert any(change == item or change.endswith(item) for change in changes), (item, changes)
+    if source == "worktree-config":
+        assert "config@checkout:filter.*.clean" not in changes, "the checkout does not read it"
+
+
+def test_a_metadata_change_is_named_by_key_without_its_value_or_subsection(
+    sample_repo: Path, isolated_git_home: Path
+) -> None:
+    """A subsection can be a URL carrying a credential; the refusal must not copy it into the ledger."""
+    repo = GitRepo.discover(sample_repo)
+    worktree = repo.create_worktree("R-metadata-redacted", repo.head)
+    before = repo.metadata_snapshot(worktree)
+    _git(
+        worktree,
+        "config",
+        "url.https://hflow:s3cr3t@example.invalid/.insteadOf",
+        "https://hflow-value.example.invalid/",
+    )
+
+    changes = repo.metadata_snapshot(worktree).changes_since(before)
+    assert "config@worktree:url.*.insteadof" in changes
+    assert not any("s3cr3t" in change or "hflow-value" in change for change in changes)
+
+
+@pytest.mark.parametrize("setting", ["worktree-config-copy", "relative-worktrees"])
+def test_hflows_own_worktree_add_writes_are_not_reported_as_a_metadata_change(
+    sample_repo: Path, tmp_path: Path, isolated_git_home: Path, setting: str
+) -> None:
+    """``worktree add`` itself can write metadata; the snapshot is taken after it, so a run is accepted.
+
+    With ``extensions.worktreeConfig`` git copies the checkout's ``config.worktree`` into the new
+    worktree's; with ``worktree.useRelativePaths`` (Git 2.48+) it records
+    ``extensions.relativeWorktrees`` in the shared config.
+    """
+    if setting == "worktree-config-copy":
+        _git(sample_repo, "config", "extensions.worktreeConfig", "true")
+        _git(sample_repo, "config", "--worktree", "hflow.checkout-only", "1")
+    else:
+        _git(sample_repo, "config", "worktree.useRelativePaths", "true")
+    config_before = (sample_repo / ".git" / "config").read_text(encoding="utf-8")
+    store = Store(tmp_path / "data" / "hflow.sqlite")
+    base_commit = _git(sample_repo, "rev-parse", "HEAD").strip()
+    controller = _controller(store, sample_repo, tmp_path / "data")
+    try:
+        outcome = controller.run_task(
+            RunRequest(
+                task=_task(sample_repo, base_commit),
+                project=_project(sample_repo),
+                project_root=sample_repo,
+                workspace_root=sample_repo,
+            )
+        )
+        if setting == "relative-worktrees":
+            config_after = (sample_repo / ".git" / "config").read_text(encoding="utf-8")
+            if "relativeworktrees" not in config_after.lower():
+                pytest.skip("this Git does not record extensions.relativeWorktrees (Git < 2.48)")
+            assert config_after != config_before, "HFlow's own worktree add wrote the shared config"
+        assert outcome.task_state is TaskState.ACCEPTED, outcome.block_reason
+        assert any(
+            note.startswith("git_metadata: snapshot before dispatch sha256:")
+            for note in store.notes_for(outcome.run_id)
+        )
+    finally:
+        store.close()
+
+
+def test_a_gitattributes_change_inside_the_scope_is_recorded_on_the_receipt_not_blocked(
+    sample_repo: Path, tmp_path: Path, isolated_git_home: Path
+) -> None:
+    """In-tree attributes travel with the candidate, so the delivery shows them; the receipt says so."""
+    store = Store(tmp_path / "data" / "hflow.sqlite")
+    base_commit = _git(sample_repo, "rev-parse", "HEAD").strip()
+    task = _task(sample_repo, base_commit).model_copy(
+        update={"scope": Scope(write_allow=["src/textkit"], write_deny=[".git/**"])}
+    )
+    script = FakeScript(
+        write_plan={
+            "src/textkit/__init__.py": FIXED_SOURCE,
+            "src/textkit/.gitattributes": "*.txt -diff\n",
+        },
+        agent_turns=1,
+    )
+    controller = Controller(
+        store,
+        FakeDriver(sample_repo, script),
+        controller_build="m2-test-build",
+        runners=CheckRunners.offline_default(),
+        data_dir=tmp_path / "data",
+        production=False,
+    )
+    try:
+        outcome = controller.run_task(
+            RunRequest(
+                task=task,
+                project=_project(sample_repo),
+                project_root=sample_repo,
+                workspace_root=sample_repo,
+            )
+        )
+        assert outcome.task_state is TaskState.ACCEPTED, outcome.block_reason
+        receipt = outcome.receipt
+        assert receipt is not None
+        assert "src/textkit/.gitattributes" in receipt.candidate_paths
+        assert any(
+            "src/textkit/.gitattributes" in item and "git add applied those attributes" in item
+            for item in receipt.limitations
+        ), receipt.limitations
+    finally:
+        store.close()
+
+
+def test_the_metadata_snapshot_reads_no_global_attributes_file_when_git_names_none(
+    sample_repo: Path, isolated_git_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no home directory at all git reads no global attributes file; that is not a failure.
+
+    ``git var GIT_ATTR_GLOBAL`` then exits 1 with no output. Read as an error, it would block every
+    worktree run in a HOME-less environment (a service account, a stripped CI job).
+    """
+    repo = GitRepo.discover(sample_repo)
+    worktree = repo.create_worktree("R-metadata-homeless", repo.head)
+    for name in ("HOME", "XDG_CONFIG_HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"):
+        monkeypatch.delenv(name, raising=False)
+
+    before = repo.metadata_snapshot(worktree)
+    after = repo.metadata_snapshot(worktree)
+    assert after.changes_since(before) == []
+    assert not any(label.endswith("/git/attributes") for label, _ in after.entries)
+
+
+def test_an_older_git_without_git_attr_global_locates_the_global_attributes_file_by_hand(
+    sample_repo: Path, tmp_path: Path, isolated_git_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Git older than 2.42 answers ``git var GIT_ATTR_GLOBAL`` with usage and exit 129.
+
+    The snapshot then follows git's own rule: ``core.attributesFile``, else
+    ``$XDG_CONFIG_HOME/git/attributes``, else ``~/.config/git/attributes`` as git expands ``~``.
+    """
+    repo = GitRepo.discover(sample_repo)
+    worktree = repo.create_worktree("R-metadata-old-git", repo.head)
+    real_run = subprocess.run
+
+    def older_git(argv, *args, **kwargs):  # noqa: ANN001,ANN002,ANN003 - subprocess.run shape
+        if list(argv[:3]) == ["git", "var", "GIT_ATTR_GLOBAL"]:
+            return subprocess.CompletedProcess(argv, 129, "", "usage: git var (-l | <variable>)\n")
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", older_git)
+
+    def labels() -> list[str]:
+        return [label for label, _ in repo.metadata_snapshot(worktree).entries]
+
+    assert any(label.endswith("/xdg/git/attributes") for label in labels())
+    monkeypatch.delenv("XDG_CONFIG_HOME")
+    assert any(label.endswith("/.config/git/attributes") for label in labels())
+    attributes = tmp_path / "attrs"
+    _git(worktree, "config", "core.attributesFile", attributes.as_posix())
+    found = labels()
+    assert any(label.endswith("/attrs") for label in found), found
+    assert not any(label.endswith("/xdg/git/attributes") for label in found)
+
+
+def test_a_metadata_path_that_is_not_a_regular_file_is_recorded_by_type_without_being_read(
+    sample_repo: Path, tmp_path: Path, isolated_git_home: Path
+) -> None:
+    """A FIFO or device (``/dev/zero``) could hang the read forever; a directory stands in for them."""
+    repo = GitRepo.discover(sample_repo)
+    worktree = repo.create_worktree("R-metadata-not-a-file", repo.head)
+    before = repo.metadata_snapshot(worktree)
+    directory = tmp_path / "attrs-dir"
+    directory.mkdir()
+    _git(worktree, "config", "core.attributesFile", directory.as_posix())
+
+    after = repo.metadata_snapshot(worktree)
+    recorded = [value for label, value in after.entries if label.endswith("/attrs-dir")]
+    assert recorded and recorded[0].startswith("not-a-regular-file:"), after.entries
+    changes = after.changes_since(before)
+    assert any(change.endswith("/attrs-dir") for change in changes), changes
+    assert "config@worktree:core.attributesfile" in changes
+
+
+def test_a_git_timeout_inside_the_metadata_snapshot_is_a_git_error(
+    sample_repo: Path, isolated_git_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``TimeoutExpired`` is not a ``GitError``; unconverted it would escape and leave the run RUNNING."""
+    repo = GitRepo.discover(sample_repo)
+    worktree = repo.create_worktree("R-metadata-timeout", repo.head)
+    real_run = subprocess.run
+
+    def hung_listing(argv, *args, **kwargs):  # noqa: ANN001,ANN002,ANN003 - subprocess.run shape
+        if "--list" in argv:
+            raise subprocess.TimeoutExpired(argv, 300)
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", hung_listing)
+    with pytest.raises(GitError, match="timed out"):
+        repo.metadata_snapshot(worktree)

@@ -88,7 +88,15 @@ from .review import REVIEW_MISSING, review_input_error
 from .drivers.base import assert_driver_shape
 from .drivers.acpx_dsh import ENV_ALLOW_WRITES
 from .drivers.fake import ProcessGuard
-from .gitworkspace import IGNORED_ARTIFACT_ALLOWLIST, CandidateFreeze, GitError, GitRepo, GitStatusParseError
+from .gitworkspace import (
+    GIT_METADATA_CHANGED,
+    IGNORED_ARTIFACT_ALLOWLIST,
+    CandidateFreeze,
+    GitError,
+    GitMetadataSnapshot,
+    GitRepo,
+    GitStatusParseError,
+)
 from .store import INVOCATION_OPEN_STATES, RunNotFound, Store, StoreError
 from .verify import CLEAN_EXIT_REASONS, CheckRunners, failed_check_facts, verify_candidate
 from .workspace import (
@@ -207,6 +215,12 @@ def _stream_reference(detail: str, name: str) -> dict[str, object]:
         "digest": match.group("digest"),
     }
 
+
+def _change_list(items: list[str]) -> str:
+    """At most five changed labels, then a count: what a block reason or a note names."""
+    return ", ".join(items[:5]) + (f" (+{len(items) - 5} more)" if len(items) > 5 else "")
+
+
 #: Note prefixes written by the controller. They are read back mechanically (by tests and by
 #: an operator grepping a run), so they are constants rather than inline strings.
 NOTE_PACKET = "role_input_packet"
@@ -226,6 +240,10 @@ NOTE_DISPATCH = "dispatch"
 #: record *and* as a note, so an operator grepping a run finds the decision where they look while
 #: `status`/`report` can still print it as a decision rather than a log line.
 NOTE_REPAIR = "repair"
+#: The shared Git metadata HFlow's own git reads (``GitRepo.metadata_snapshot``). The digest is
+#: taken before the first dispatch; each later comparison that found a change records the digests
+#: and the changed keys and files, never values.
+NOTE_GIT_METADATA = "git_metadata"
 
 
 class RunOutcome:
@@ -1839,6 +1857,7 @@ class Controller:
         # ``request.base_commit`` is the commit the caller already resolved (and checked its
         # approval against); it is used as given rather than resolved from the name again.
         resolved_base = ""
+        git_metadata_before: GitMetadataSnapshot | None = None
         if spec.workspace.mode == "worktree":
             base_name = spec.workspace.base_commit or "HEAD"
             try:
@@ -1847,8 +1866,17 @@ class Controller:
                 resolved_base = repo.resolve_commit(request.base_commit or base_name)
                 worktree = repo.create_worktree(run_id, resolved_base)
                 self.store.record_worktree(run_id, worktree)
+                # Taken after HFlow's own ``worktree add`` - which can itself write the shared config
+                # (``extensions.relativeWorktrees`` under ``worktree.useRelativePaths``) and the
+                # run's ``config.worktree`` - and before anything HFlow does not control runs.
+                git_metadata_before = repo.metadata_snapshot(worktree)
             except (GitError, RefusedError) as exc:
                 return self._blocked(run_id, RefusalCode.INTERNAL_ERROR, f"git workspace failed: {exc}")
+            self.store.record_note(
+                run_id,
+                f"{NOTE_GIT_METADATA}: snapshot before dispatch {git_metadata_before.digest} "
+                f"({len(git_metadata_before.entries)} entries)",
+            )
             if base_name != resolved_base:
                 self.store.record_note(run_id, f"base {base_name!r} -> {resolved_base}")
             if repo.is_dirty():
@@ -1914,6 +1942,7 @@ class Controller:
                 original_base_ref=original_base_ref,
                 policy=policy,
                 repair_context=repair_context,
+                git_metadata_before=git_metadata_before,
             )
             if cycle.repair is None:
                 if cycle.outcome is None:  # pragma: no cover - the cycle always returns one
@@ -1921,6 +1950,19 @@ class Controller:
                         RefusalCode.INTERNAL_ERROR,
                         "the attempt cycle returned neither an outcome nor a repair context",
                     )
+                if (
+                    repo is not None
+                    and worktree is not None
+                    and cycle.outcome.task_state is not TaskState.ACCEPTED
+                    and not (cycle.outcome.block_reason or "").startswith(GIT_METADATA_CHANGED)
+                ):
+                    # A run that ends without a receipt for any other reason - a failed check or a
+                    # rejection that buys no repair, a driver failure, an unknown outcome, a stop
+                    # while the worker ran - never reached a comparison after its last worker,
+                    # check or reviewer. ``hflow clean`` and the next worktree run read the
+                    # metadata next, so it is compared once more and the answer is a note. It never
+                    # relabels the block: an ``outcome_unknown`` stays one (AGENTS rules 5 and 8).
+                    self._note_git_metadata_at_exit(run_id, repo, worktree, git_metadata_before)
                 return cycle.outcome
             if round_number > 1:
                 # A second repair is not a thing this build does. The cycle only asks for a repair
@@ -2422,6 +2464,96 @@ class Controller:
             ), ()
         return None, tuple(report.ignored)
 
+    def _git_metadata_refusal(
+        self,
+        run_id: str,
+        repo: GitRepo,
+        worktree: Path,
+        before: GitMetadataSnapshot | None,
+        *,
+        where: str,
+        consequence: str,
+    ) -> tuple[RefusalCode, str] | None:
+        """Why HFlow's own git must not run here, or ``None`` when the shared metadata is unchanged.
+
+        Asked right before HFlow's git reads that metadata again after something it does not
+        control ran - the implementer, an approved check, the reviewer: before the freeze stages
+        anything, before a repair round reads the worktree's status, and at acceptance, before the
+        status read of the user's checkout (a status read runs a clean filter on a file whose stat
+        data changed). Any difference refuses, whoever made it - a worker, a check, or the user's
+        own concurrent ``git config``, which is a false positive this accepts to fail closed.
+        Nothing is restored: that would write the user's repository. The refusal names what
+        changed by key and file, never by value.
+        """
+        if before is None:
+            return RefusalCode.INTERNAL_ERROR, (
+                f"no pre-dispatch snapshot of the shared Git metadata exists to compare with "
+                f"{where}, so {consequence}"
+            )
+        tail = (
+            "This is configuration or attribute data outside the worktree that HFlow's own git "
+            "reads - it can name a program git would run - so HFlow ran no git status, add or "
+            "commit on it and restored nothing: inspect and restore it (git config --list "
+            "--show-origin --show-scope) before hflow clean or the next worktree run, which read "
+            "it again"
+        )
+        try:
+            after = repo.metadata_snapshot(worktree)
+        except GitError as exc:
+            # It was readable before dispatch, so a read that fails now is treated as a change.
+            self.store.record_note(
+                run_id,
+                f"{NOTE_GIT_METADATA}: unreadable {where}: {before.digest} -> ({exc}); restore it "
+                "before hflow clean or the next worktree run",
+            )
+            return RefusalCode.SCOPE_VIOLATION, (
+                f"{GIT_METADATA_CHANGED} or became unreadable since the pre-dispatch snapshot "
+                f"({exc}); found {where}, so {consequence}. {tail}"
+            )
+        changes = after.changes_since(before)
+        if not changes:
+            return None
+        # The note carries the change list too: when a stop already decided the run, ``_blocked``
+        # keeps the stop's reason and this note is the only place the change is named.
+        self.store.record_note(
+            run_id,
+            f"{NOTE_GIT_METADATA}: changed {where}: {before.digest} -> {after.digest} "
+            f"({_change_list(changes)}); restore it before hflow clean or the next worktree run",
+        )
+        return RefusalCode.SCOPE_VIOLATION, (
+            f"{GIT_METADATA_CHANGED} since the pre-dispatch snapshot ({_change_list(changes)}); "
+            f"found {where}, so {consequence}. {tail}"
+        )
+
+    def _note_git_metadata_at_exit(
+        self, run_id: str, repo: GitRepo, worktree: Path, before: GitMetadataSnapshot | None
+    ) -> None:
+        """Compare the shared Git metadata once more as a run ends without a receipt: record, never decide.
+
+        Never calls ``_blocked`` or any store transition, so the run's block stays what it was.
+        """
+        if before is None:
+            return
+        try:
+            after = repo.metadata_snapshot(worktree)
+        except GitError as exc:
+            self.store.record_note(
+                run_id,
+                f"{NOTE_GIT_METADATA}: unreadable when the run ended: {before.digest} -> ({exc}); "
+                "inspect and restore it before hflow clean or the next worktree run",
+            )
+            return
+        changes = after.changes_since(before)
+        if not changes:
+            return
+        self.store.record_note(
+            run_id,
+            f"{NOTE_GIT_METADATA}: changed when the run ended: {before.digest} -> {after.digest} "
+            f"({_change_list(changes)}); the run's block is unchanged - inspect and restore it "
+            "(git config --list --show-origin --show-scope) before hflow clean or the next "
+            "worktree run, which read it again",
+        )
+
     # -- steps ---------------------------------------------------------------
 
 
@@ -2446,6 +2578,7 @@ class Controller:
         original_base_ref: str,
         policy: RepairPolicy | None,
         repair_context: RepairContext | None = None,
+        git_metadata_before: GitMetadataSnapshot | None = None,
     ) -> _CycleResult:
         """One implementer attempt: dispatch, launch, freeze, check, review, decide.
 
@@ -2472,9 +2605,44 @@ class Controller:
         # checked *before* the dispatch, so a refusal costs nothing.
         # Ignored paths the previous round's checks left in the worktree, accepted (literally) by
         # this round's freeze; empty for a first round, which starts from a fresh worktree.
+        if repo is not None and worktree is not None and git_metadata_before is None:
+            # Without the pre-dispatch snapshot no later comparison could show that HFlow's own
+            # git reads the metadata it read before the worker ran; refused before anything is
+            # bought.
+            return _CycleResult(
+                outcome=self._blocked(
+                    run_id,
+                    RefusalCode.INTERNAL_ERROR,
+                    "a worktree attempt was reached without the pre-dispatch snapshot of the "
+                    "shared Git metadata, so it was refused before any dispatch",
+                )
+            )
         carried_ignored: tuple[str, ...] = ()
         if previous is not None:
             if repo is not None and worktree is not None:
+                # Before the reconcile's status read: an approved check or the reviewer ran since
+                # the last comparison, and a filter it configured would run inside that read.
+                metadata = self._git_metadata_refusal(
+                    run_id,
+                    repo,
+                    worktree,
+                    git_metadata_before,
+                    where="before the repair round",
+                    consequence="no repair was bought and nothing was dispatched",
+                )
+                if metadata is not None:
+                    self._record_repair_decision(
+                        run_id,
+                        RepairRecord(
+                            decision=RepairDecision.WORKSPACE_DRIFT,
+                            trigger=trigger,
+                            reason=metadata[1],
+                            policy_digest=policy.digest() if policy is not None else "",
+                            round=round_number,
+                            decided_at=utc_now(),
+                        ),
+                    )
+                    return _CycleResult(outcome=self._blocked(run_id, *metadata))
                 refusal, carried_ignored = self._reconcile_repair_workspace(
                     repo=repo, worktree=worktree, previous=previous, scope=spec.scope
                 )
@@ -2806,6 +2974,26 @@ class Controller:
             # note, the attempt and the ledger entry keep the state the stop left, and the run
             # keeps the decision the operator made; nothing here freezes or resumes the loop.
             return _CycleResult(outcome=self._outcome_for(run_id))
+
+        # The freeze's ``git status`` / ``git add`` read the shared Git metadata. A filter the
+        # worker configured there would run inside them, in this process, after the worker's own
+        # process boundary is gone - so any change since dispatch refuses the run here, first:
+        # ahead of the fingerprint and manifest scope checks, so the change that outlives the run
+        # is the one reported, and ahead of the stop check, so a stop recorded after the
+        # implementer's result was applied still gets its note (``_blocked`` keeps the stop's
+        # state). A stop recorded while the implementer ran returned just above, before this
+        # point; the exit note in ``_drive`` covers that case.
+        if repo is not None and worktree is not None:
+            metadata = self._git_metadata_refusal(
+                run_id,
+                repo,
+                worktree,
+                git_metadata_before,
+                where="before the candidate freeze",
+                consequence="nothing was staged, committed or checked",
+            )
+            if metadata is not None:
+                return _CycleResult(outcome=self._blocked(run_id, *metadata))
 
         # --- freeze the candidate the controller actually observed -------------
         try:
@@ -3153,6 +3341,7 @@ class Controller:
             identity=identity,
             original_base_commit=original_base_commit,
             project_write_deny=list(project.write_deny),
+            git_metadata_before=git_metadata_before,
         )
         return _CycleResult(outcome=accepted, identity=identity, review=review, accepted=True)
 
@@ -3658,6 +3847,7 @@ class Controller:
         identity: CandidateIdentity | None = None,
         original_base_commit: str = "",
         project_write_deny: list[str] | None = None,
+        git_metadata_before: GitMetadataSnapshot | None = None,
     ) -> RunOutcome:
         """Admission gate. Every field of the receipt is re-derived from stored facts.
 
@@ -3710,6 +3900,21 @@ class Controller:
                 "a cancellation intent was recorded; a late success cannot be accepted "
                 f"(intent at {row['cancel_intent_at']})",
             )
+
+        if repo is not None:
+            # Checks and the reviewer ran after the freeze's comparison, and the status read of the
+            # user's checkout runs after the receipt, so the metadata is compared first. Here
+            # ``project_root`` is the run's worktree.
+            metadata = self._git_metadata_refusal(
+                run_id,
+                repo,
+                project_root,
+                git_metadata_before,
+                where="at acceptance",
+                consequence="no receipt was written",
+            )
+            if metadata is not None:
+                return self._blocked(run_id, *metadata)
 
         try:
             fresh_fingerprint = candidate_fingerprint(project_root, spec.scope)
@@ -3779,6 +3984,13 @@ class Controller:
                 + ", ".join(undelivered[:5])
                 + (f" (+{len(undelivered) - 5} more)" if len(undelivered) > 5 else ""),
             )
+        # In-tree attribute files travel with the candidate and show in the delivery, so they are
+        # recorded rather than refused; ``freeze`` is set only when HFlow's own git staged them.
+        attribute_files = (
+            [path for path in delivery_paths if path.rsplit("/", 1)[-1].lower() == ".gitattributes"]
+            if freeze is not None
+            else []
+        )
 
         receipt = ResultReceipt(
             run_id=run_id,
@@ -3820,6 +4032,18 @@ class Controller:
                         "candidate snapshot is a workspace fingerprint, not a Git tree hash "
                         "(this run did not use a Git worktree)",
                     ]
+                ),
+                *(
+                    [
+                        "the delivery changes "
+                        + ", ".join(attribute_files[:5])
+                        + ": HFlow's own git add applied those attributes when it froze the "
+                        "candidate, under Git configuration verified unchanged since dispatch, so a "
+                        "filter or line-ending rule they name can make the committed bytes differ "
+                        "from the bytes the checks and the fingerprint read"
+                    ]
+                    if attribute_files
+                    else []
                 ),
                 "review ran in the implementer's invocations' workspace; its isolation is not "
                 "independently enforced",

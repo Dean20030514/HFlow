@@ -50,6 +50,7 @@ from hflow.contracts import AttemptState, CancellationReceipt, InvocationStartSt
 from hflow.controller import Controller
 from hflow.drivers.acpx_dsh import AcpxDshDriver
 from hflow.drivers.fake import FakeDriver, FakeScript
+from hflow.gitworkspace import GIT_METADATA_CHANGED, GitRepo
 from hflow.store import Store
 from hflow.verify import CheckOutcome, CheckRunners, FakeCheckRunner
 
@@ -3456,3 +3457,262 @@ def test_an_expired_deadline_stops_the_whole_process_tree_not_just_the_client(
                 timeout=30,
             )
         driver.release(handle.invocation_id)
+
+
+# --------------------------------------------------------------------------
+# shared Git metadata changed after dispatch: HFlow's own git does not run on it
+# --------------------------------------------------------------------------
+
+
+def _isolate_git_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the test writes the global config or the XDG attributes file."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "no-global-gitconfig"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-xdg-config"))
+
+
+def test_a_worker_configured_git_filter_blocks_the_run_before_hflow_stages_anything(
+    tmp_path: Path, scoped_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A clean filter the worker configures in the shared config would run inside HFlow's git add.
+
+    No `.gitattributes` is needed: ``core.attributesFile`` names a mapping file outside the
+    worktree. The run is refused before the freeze's first status read, so the filter never runs
+    in the controller's process, nothing is committed, no ref keeps anything and no reviewer is
+    bought.
+    """
+    _isolate_git_home(tmp_path, monkeypatch)
+    marker = tmp_path / "filter-ran.txt"
+    attributes = tmp_path / "worker-attributes"
+    attributes.write_text("* filter=hflowprobe\n", encoding="utf-8")
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(scoped_repo, "rev-parse", "HEAD").strip()
+    spec = _scoped_spec(base, allow=["src"])
+    driver = CommittingDriver(
+        scoped_repo,
+        base=base,
+        first_git=[
+            ["config", "filter.hflowprobe.clean", f"echo ran >> '{marker.as_posix()}'; cat"],
+            ["config", "core.attributesFile", attributes.as_posix()],
+        ],
+        first_plan={"src/parser.py": FIXED_SOURCE},
+        repair_plan={},
+    )
+    controller = _controller(
+        store, project_root=scoped_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": FailingOnceThenPassing(fail_first=None)}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=scoped_repo))
+        assert outcome.task_state is TaskState.BLOCKED, outcome.receipt
+        assert outcome.block_code is RefusalCode.SCOPE_VIOLATION, outcome.block_reason
+        reason = outcome.block_reason or ""
+        assert reason.startswith(GIT_METADATA_CHANGED), reason
+        assert "before the candidate freeze" in reason
+        assert "config@worktree:filter.*.clean" in reason
+        assert "config@worktree:core.attributesfile" in reason
+        assert not marker.exists(), "the worker's filter ran inside HFlow's own git"
+        worktree = _run_worktree(scoped_repo, outcome.run_id)
+        assert _git(worktree, "rev-parse", "HEAD").strip() == base, "nothing was committed"
+        assert _git(worktree, "diff", "--cached", "--name-only").strip() == "", "nothing was staged"
+        assert _git(scoped_repo, "for-each-ref", "refs/hflow/").strip() == ""
+        assert [entry.role for entry in store.invocations_for(outcome.run_id)] == ["implementer"]
+        notes = store.notes_for(outcome.run_id)
+        changed = [
+            note for note in notes
+            if note.startswith("git_metadata: changed before the candidate freeze: sha256:")
+        ]
+        assert len(changed) == 1, notes
+        assert "config@worktree:filter.*.clean" in changed[0] and "hflow clean" in changed[0]
+        assert not any(note.startswith("git_metadata: changed when the run ended") for note in notes)
+        # The filter is live: HFlow's own staging runs it now, so its absence above is the guard's.
+        GitRepo.discover(scoped_repo).run("add", "-A", "--", "src", cwd=worktree)
+        assert marker.exists()
+    finally:
+        store.close()
+
+
+class ChecksEditSharedConfig(FailingOnceThenPassing):
+    """``unit`` writes the shared config on its first execution: test code the worker controls."""
+
+    def run(self, check, cwd, timeout_seconds):  # noqa: ANN001 - Protocol shape
+        if check.id == "unit" and check.id not in self.seen:
+            _git(Path(cwd), "config", "filter.hflowprobe.clean", "cat")
+        return super().run(check, cwd, timeout_seconds)
+
+
+def test_a_shared_config_change_during_the_checks_refuses_the_repair_before_it_is_bought(
+    tmp_path: Path, sample_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The repair round's reconcile reads the worktree's status, so the metadata is compared first."""
+    _isolate_git_home(tmp_path, monkeypatch)
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    spec = _spec(policy=_policy(), base_commit=base)
+    driver = RepairingDriver(sample_repo, first_plan={}, repair_plan={"src/parser.py": FIXED_SOURCE})
+    controller = _controller(
+        store, project_root=sample_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": ChecksEditSharedConfig()}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=sample_repo))
+        assert outcome.task_state is TaskState.BLOCKED
+        assert outcome.block_code is RefusalCode.SCOPE_VIOLATION, outcome.block_reason
+        reason = outcome.block_reason or ""
+        assert reason.startswith(GIT_METADATA_CHANGED), reason
+        assert "before the repair round" in reason
+        assert "config@worktree:filter.*.clean" in reason
+        decisions = [record.decision for record in store.repair_records_for(outcome.run_id)]
+        assert decisions == [RepairDecision.ALLOWED, RepairDecision.WORKSPACE_DRIFT]
+        assert driver.labels == ["implementer"], "nothing is dispatched for the repair"
+        view = store.root_budget_view(controller.root_binding.root_id)
+        assert view is not None and view.used_repairs == 0
+    finally:
+        store.close()
+
+
+class ReviewerEditsSharedConfig(RepairingDriver):
+    """The reviewer's turn changes the shared config: to HFlow, the same as the user's own edit."""
+
+    def start(self, request):  # noqa: ANN001 - Protocol shape
+        result = super().start(request)
+        if request.role == "reviewer":
+            _git(Path(request.workspace), "config", "user.name", "Concurrent Edit")
+        return result
+
+
+def test_any_shared_config_change_after_the_freeze_refuses_acceptance_even_a_benign_one(
+    tmp_path: Path, sample_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail-closed: a harmless key is refused too, because HFlow cannot tell who wrote it or why."""
+    _isolate_git_home(tmp_path, monkeypatch)
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    spec = _spec(policy=None, base_commit=base)
+    driver = ReviewerEditsSharedConfig(
+        sample_repo, first_plan={"src/parser.py": FIXED_SOURCE}, repair_plan={}
+    )
+    controller = _controller(
+        store, project_root=sample_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": FailingOnceThenPassing(fail_first=None)}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=sample_repo))
+        assert outcome.task_state is TaskState.BLOCKED, outcome.receipt
+        assert outcome.block_code is RefusalCode.SCOPE_VIOLATION, outcome.block_reason
+        reason = outcome.block_reason or ""
+        assert reason.startswith(GIT_METADATA_CHANGED), reason
+        assert "at acceptance" in reason and "no receipt was written" in reason
+        assert "config@checkout:user.name" in reason
+        assert outcome.receipt is None
+        assert driver.labels == ["implementer", "reviewer"]
+        assert _git(sample_repo, "for-each-ref", "refs/hflow/").strip(), (
+            "the frozen candidate stays reachable through its ref"
+        )
+    finally:
+        store.close()
+
+
+class BreaksSharedConfig(RepairingDriver):
+    """The implementer leaves the shared config unparseable, and writes a file outside its scope."""
+
+    def start(self, request):  # noqa: ANN001 - Protocol shape
+        result = super().start(request)
+        if request.role == "implementer":
+            worktree = Path(request.workspace)
+            common = Path(
+                _git(worktree, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+            )
+            with (common / "config").open("a", encoding="utf-8") as handle:
+                handle.write("\n[broken\n")
+            (worktree / "outside.txt").write_text("not in scope\n", encoding="utf-8")
+        return result
+
+
+def test_unreadable_shared_config_is_refused_as_a_metadata_change_ahead_of_other_violations(
+    tmp_path: Path, sample_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Readable before dispatch and unreadable now is a change; it is the violation that outlives the run."""
+    _isolate_git_home(tmp_path, monkeypatch)
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    spec = _spec(policy=None, base_commit=base)
+    driver = BreaksSharedConfig(sample_repo, first_plan={"src/parser.py": FIXED_SOURCE}, repair_plan={})
+    controller = _controller(
+        store, project_root=sample_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": FailingOnceThenPassing(fail_first=None)}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=sample_repo))
+        assert outcome.task_state is TaskState.BLOCKED
+        assert outcome.block_code is RefusalCode.SCOPE_VIOLATION, outcome.block_reason
+        reason = outcome.block_reason or ""
+        assert reason.startswith(f"{GIT_METADATA_CHANGED} or became unreadable"), reason
+        assert "outside.txt" not in reason, "the metadata change is reported first"
+        assert driver.labels == ["implementer"]
+    finally:
+        store.close()
+
+
+class StopsAfterEditingSharedConfig(StopThenCompleteDriver):
+    """The implementer writes the shared config, then an unconfirmable stop decides the run."""
+
+    def start(self, request):  # noqa: ANN001 - Protocol shape
+        if request.role == "implementer":
+            _git(Path(request.workspace), "config", "filter.hflowprobe.clean", "cat")
+        return super().start(request)
+
+
+@pytest.mark.parametrize("ending", ["verification_failed", "stopped_outcome_unknown"])
+def test_a_run_that_ends_without_a_receipt_notes_a_shared_config_change_and_keeps_its_block(
+    tmp_path: Path, sample_repo: Path, monkeypatch: pytest.MonkeyPatch, ending: str
+) -> None:
+    """A run that ends before any comparison is compared once more; the answer is a note only.
+
+    ``hflow clean`` and the next worktree run read the metadata next, so the operator is told. The
+    block is never relabelled: an ``outcome_unknown`` stays one (AGENTS rules 5 and 8).
+    """
+    _isolate_git_home(tmp_path, monkeypatch)
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    spec = _spec(policy=None, base_commit=base)
+    if ending == "verification_failed":
+        driver: RepairingDriver = RepairingDriver(sample_repo, first_plan={}, repair_plan={})
+        runners = CheckRunners({"fake": ChecksEditSharedConfig()})
+    else:
+        driver = StopsAfterEditingSharedConfig(
+            sample_repo, first_plan={"src/parser.py": FIXED_SOURCE}, repair_plan={}, stop_round=1
+        )
+        runners = CheckRunners({"fake": FailingOnceThenPassing(fail_first=None)})
+    controller = _controller(
+        store, project_root=sample_repo, spec=spec, driver=driver, runners=runners
+    )
+    if isinstance(driver, StopThenCompleteDriver):
+        driver.controller = controller
+    try:
+        outcome = controller.run_task(_request(project=project, spec=spec, project_root=sample_repo))
+        assert outcome.task_state is TaskState.BLOCKED, outcome
+        if ending == "verification_failed":
+            assert outcome.block_code is RefusalCode.VERIFICATION_FAILED, outcome.block_reason
+            decisions = [record.decision for record in store.repair_records_for(outcome.run_id)]
+            assert decisions == [RepairDecision.NOT_ENABLED]
+        else:
+            assert outcome.block_code is RefusalCode.OUTCOME_UNKNOWN, outcome.block_reason
+        assert driver.labels == ["implementer"]
+        assert not (outcome.block_reason or "").startswith(GIT_METADATA_CHANGED)
+        notes = store.notes_for(outcome.run_id)
+        at_exit = [
+            note for note in notes
+            if note.startswith("git_metadata: changed when the run ended: sha256:")
+        ]
+        assert len(at_exit) == 1, notes
+        assert "config@worktree:filter.*.clean" in at_exit[0] and "hflow clean" in at_exit[0]
+        assert not any(
+            note.startswith("git_metadata: changed before the candidate freeze") for note in notes
+        )
+    finally:
+        store.close()
