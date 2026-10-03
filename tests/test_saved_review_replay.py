@@ -158,6 +158,40 @@ def test_saved_review_replays_to_a_validated_verdict(
     assert len(answer.text) > 1000, "the whole final message, not a fragment"
 
 
+def test_the_session_bound_extraction_decodes_the_recording_exactly_as_before(
+    no_child_processes: None,
+) -> None:
+    """The tool binds its transcript to the prompt's session, as the driver now does.
+
+    The recording has one prompt, one session and every chunk after the prompt, so the bound
+    extraction must give the very answer the unbound one above pins - and nothing to refuse.
+    """
+    _require_saved_evidence()
+    tool = _load_tool()
+    stream = PROBE / "attempt-2-data" / "invocations" / "I-vc5pcccfog" / "events.ndjson"
+    messages, unparseable = tool._load_messages(stream)
+
+    extraction = tool.extract_reviewer_answer(messages)
+
+    assert unparseable == []
+    transcript = extraction["transcript"]
+    answer = extraction["answer"]
+    assert extraction["prompt_session_id"] == "c8fa7994-56ea-419a-8ef5-798508ccb178"
+    assert transcript.session_id == extraction["prompt_session_id"]
+    assert transcript.skipped_other_session == 0
+    assert transcript.rejected == ""
+    assert transcript.observed_message_count == 17
+    assert answer is not None
+    assert answer.message_id == "eb6ade90-750b-4bf3-8733-e9ccd164d89b"
+    assert hashlib.sha256(answer.text.encode("utf-8")).hexdigest() == (
+        "6c7cb3c9f9f080bfff0a653c2fde92330257eca532664e30d97fa42c4cb7fa2c"
+    )
+    assert extraction["bound"] is True
+    assert extraction["prompt_stop_reason"] == "end_turn"
+    assert extraction["prompt_error_ids"] == []
+    assert extraction["message_chunks_after_prompt_response"] == 0
+
+
 def test_saved_review_replays_through_the_acceptance_predicates(
     ledger_copy: Path, no_child_processes: None
 ) -> None:

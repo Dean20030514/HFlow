@@ -14,7 +14,12 @@ What this does, and what it deliberately refuses to do:
 * it evaluates the controller's acceptance predicates in an isolated temporary store, so a
   receipt produced there is explicitly a *test artifact*;
 * it refuses a reviewer stream with message text after the bound prompt response, as the
-  production driver does (``review_ambiguous``): the final answer is then not identified.
+  production driver does (``review_ambiguous``): the final answer is then not identified;
+* it reads the answer from the session the first ``session/prompt`` request named, as the
+  production driver does, and refuses a stream with a message chunk before that request, or
+  with chunks it excluded because they name another session or no usable ``sessionId``;
+* it refuses a reviewer prompt answered with a JSON-RPC error or settled with a stop reason
+  other than ``end_turn``: the production driver decodes no verdict from either.
 
 It never dispatches, resumes, reconciles or cancels anything, never reads a credential, never
 touches the original store or worktree, and never rewrites the run's history. Replay is bytes
@@ -129,17 +134,30 @@ def _load_messages(stream_path: Path) -> tuple[list[dict[str, Any]], list[str]]:
     return messages, unparseable
 
 
-def extract_reviewer_answer(messages: list[dict[str, Any]], session_id: str | None):
-    """The reviewer's final answer, using the production extractor on the saved stream."""
-    transcript = AnswerTranscript(session_id=session_id, role="reviewer")
+def extract_reviewer_answer(messages: list[dict[str, Any]]):
+    """The reviewer's final answer, using the production extractor on the saved stream.
+
+    The transcript is bound the way the production driver binds it: to the session the first
+    ``session/prompt`` request names, so a message chunk before that request, or for any other
+    session, or with no usable ``sessionId`` (counted in ``skipped_other_session``), leaves the
+    answer unusable.
+    """
+    transcript = AnswerTranscript(role="reviewer", require_session=True)
     prompt_request_ids: set[Any] = set()
-    # ``(id, stream message index)`` of every response carrying a ``stopReason``.
-    terminals: list[tuple[Any, int]] = []
+    prompt_session_id: str | None = None
+    # ``(id, stream message index, stopReason)`` of every response carrying a ``stopReason``.
+    terminals: list[tuple[Any, int, Any]] = []
+    # Ids of every error response (a JSON-RPC answer carrying ``error``, not a request).
+    error_ids: list[Any] = []
     sequence = 0
     for line_index, message in enumerate(messages):
         params = message.get("params") if isinstance(message.get("params"), dict) else {}
         if message.get("method") == "session/prompt":
             if message.get("id") is not None:
+                if not prompt_request_ids:
+                    session = params.get("sessionId")
+                    prompt_session_id = session if isinstance(session, str) else ""
+                    transcript.bind_session(prompt_session_id)
                 prompt_request_ids.add(message["id"])
             continue
         if message.get("method") == "session/update":
@@ -151,20 +169,34 @@ def extract_reviewer_answer(messages: list[dict[str, Any]], session_id: str | No
             )
             sequence += 1
             continue
+        if "method" not in message and "error" in message:
+            error_ids.append(message.get("id"))
+            continue
         result = message.get("result")
         if isinstance(result, dict) and "stopReason" in result:
-            terminals.append((message.get("id"), line_index))
-    terminal_ids = [response_id for response_id, _ in terminals]
-    bound_line = next(
-        (index for response_id, index in terminals if response_id in prompt_request_ids), None
+            terminals.append((message.get("id"), line_index, result.get("stopReason")))
+    terminal_ids = [response_id for response_id, _, _ in terminals]
+    bound_terminal = next(
+        (
+            (index, stop_reason)
+            for response_id, index, stop_reason in terminals
+            if response_id in prompt_request_ids
+        ),
+        None,
     )
+    bound_line = bound_terminal[0] if bound_terminal is not None else None
     return {
         "transcript": transcript,
         "answer": transcript.final_answer(),
         "prompt_request_ids": sorted(str(item) for item in prompt_request_ids),
+        "prompt_session_id": prompt_session_id,
         "terminal_response_ids": sorted(str(item) for item in terminal_ids),
         "bound": any(item in prompt_request_ids for item in terminal_ids),
         "prompt_response_line": bound_line,
+        "prompt_stop_reason": bound_terminal[1] if bound_terminal is not None else None,
+        # Stricter than the driver, which does not attribute an error whose id a request from the
+        # agent reused: a tool that only refuses may refuse that stream too.
+        "prompt_error_ids": sorted(str(item) for item in error_ids if item in prompt_request_ids),
         "message_chunks_after_prompt_response": transcript.chunks_after(bound_line)
         if bound_line is not None
         else None,
@@ -809,11 +841,21 @@ def _check_reviewer_and_extract(
             f"the reviewer stream spans {len(session_ids)} sessions; a single-session binding is "
             "required to attribute the answer"
         )
-    extraction = extract_reviewer_answer(messages, session_ids[0] if len(session_ids) == 1 else None)
+    extraction = extract_reviewer_answer(messages)
     transcript = extraction["transcript"]
     answer = extraction["answer"]
     checks["assistant_messages"] = transcript.observed_message_count
+    checks["prompt_session_id"] = extraction["prompt_session_id"]
     checks["skipped_other_session"] = transcript.skipped_other_session
+    if transcript.skipped_other_session:
+        diagnostic["blockers"].append(
+            f"{transcript.skipped_other_session} agent_message_chunk update(s) name a session "
+            "other than the one the reviewer's session/prompt request named, or no usable "
+            "sessionId; the reviewer's final answer is not attributed to a single session"
+        )
+    checks["answer_rejected"] = transcript.rejected
+    if transcript.rejected:
+        diagnostic["blockers"].append(f"the reviewer's answer is unusable: {transcript.rejected}")
     checks["answer_truncated"] = transcript.truncated
     checks["prompt_request_ids"] = extraction["prompt_request_ids"]
     checks["terminal_response_ids"] = extraction["terminal_response_ids"]
@@ -829,6 +871,20 @@ def _check_reviewer_and_extract(
             f"{trailing} agent_message_chunk update(s) arrived after the session/prompt response "
             f"(stream message {extraction['prompt_response_line']}); the reviewer's final answer "
             "is not identified, which the production driver also refuses (review_ambiguous)"
+        )
+    checks["prompt_stop_reason"] = extraction["prompt_stop_reason"]
+    checks["prompt_error_ids"] = extraction["prompt_error_ids"]
+    if extraction["bound"] and extraction["prompt_stop_reason"] != "end_turn":
+        diagnostic["blockers"].append(
+            "the reviewer's session/prompt settled with "
+            f"stopReason={extraction['prompt_stop_reason']!r}, not end_turn; the production "
+            "driver decodes no verdict from it (unknown_stop_reason / stop_reason_*)"
+        )
+    if extraction["prompt_error_ids"]:
+        diagnostic["blockers"].append(
+            f"the reviewer's session/prompt request id(s) {extraction['prompt_error_ids']} were "
+            "answered with a JSON-RPC error; the production driver takes no verdict from an error "
+            "answer, nor from a request answered both ways (prompt_error_response, outcome_unknown)"
         )
     if answer is None:
         diagnostic["blockers"].append("the reviewer stream contains no assistant answer text")

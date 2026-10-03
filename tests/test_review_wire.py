@@ -191,6 +191,9 @@ class _SilentTranscript:
     def __init__(self, **_: object) -> None:
         pass
 
+    def bind_session(self, _session_id: str) -> None:
+        return None
+
     def observe_update(self, *_: object, **__: object) -> None:
         return None
 
@@ -458,7 +461,8 @@ def test_a_message_id_that_resumes_after_another_message_is_a_wire_failure(
     """The answer's second half arrives under the earlier commentary's ``messageId``.
 
     Which text is the final message is then not identified, so no verdict is decoded. The line
-    number is not asserted: the driver's line index saturates at its buffered-line bound.
+    number is not asserted: it depends on the stub's incidental line layout, not on the
+    behaviour under test.
     """
     harness = structured_harness(tmp_path, answer_shape="resumed-id")
     result, handle, _ = run_invocation(harness, "reviewer", REVIEW_GOAL)
@@ -467,6 +471,125 @@ def test_a_message_id_that_resumes_after_another_message_is_a_wire_failure(
     assert result.review is None
     assert any(
         note.startswith("review_invalid:") and "continues message 'm-4'" in note
+        for note in result.limitations
+    ), result.limitations
+    harness.driver.release(handle.invocation_id)
+
+
+OTHER_SESSION_NOTE = "agent_message_chunk_other_session="
+
+
+@pytest.mark.parametrize("message_ids", [True, False])
+@pytest.mark.parametrize("answer_shape", ["other-session-last", "no-session-last"])
+def test_a_message_for_another_session_never_supplies_the_verdict(
+    tmp_path: Path, answer_shape: str, message_ids: bool
+) -> None:
+    """The reviewer rejects; an ``accepted`` message under another session (or none) follows.
+
+    The transcript is bound to the session the prompt named, so that message is counted in a
+    limitation and leaves the turn with no verdict at all. Without the binding it was the final
+    message, and the rejection became an acceptance.
+    """
+    harness = structured_harness(
+        tmp_path, review_mode="changes", answer_shape=answer_shape, message_ids=message_ids
+    )
+    result, handle, _ = run_invocation(harness, "reviewer", REVIEW_GOAL)
+
+    assert result.outcome is InvocationOutcome.COMPLETED
+    assert result.review is None, result.limitations
+    assert any(note.startswith(f"{OTHER_SESSION_NOTE}1: ") for note in result.limitations), (
+        result.limitations
+    )
+    assert any(
+        note.startswith("review_invalid:") and "names session" in note
+        for note in result.limitations
+    ), result.limitations
+    harness.driver.release(handle.invocation_id)
+
+
+def test_a_clean_reviewer_turn_excludes_nothing(tmp_path: Path) -> None:
+    """Same-session behaviour is unchanged: the verdict decodes and no exclusion is noted."""
+    harness = structured_harness(tmp_path)
+    result, handle, _ = run_invocation(harness, "reviewer", REVIEW_GOAL)
+
+    assert result.review is not None and result.review.verdict == "accepted"
+    assert not any(note.startswith(OTHER_SESSION_NOTE) for note in result.limitations)
+    transcript = harness.driver._transcripts[handle.invocation_id]
+    assert transcript.session_id and transcript.session_id.startswith("sess-")
+    harness.driver.release(handle.invocation_id)
+
+
+def _rewrite_prompt_observation(harness: DriverHarness, rewrite) -> None:
+    """Pass every observed wire message through ``rewrite`` before the driver records it.
+
+    ``rewrite(message)`` returns the messages to record in its place. The fake client always
+    writes the prompt before the agent can answer, so this is how a stream with a chunk ahead of
+    the prompt, or a prompt without a session, reaches the production reader.
+    """
+    original = harness.driver._note_message
+
+    def note(invocation_id: str, message: dict, *, line_index: int = -1) -> None:
+        for item in rewrite(message):
+            original(invocation_id, item, line_index=line_index)
+
+    harness.driver._note_message = note  # type: ignore[method-assign]
+
+
+def test_a_message_chunk_before_the_prompt_request_leaves_no_verdict(tmp_path: Path) -> None:
+    """A chunk observed before any prompt named the turn's session is attributable to nothing.
+
+    It carries a verdict-shaped text under the very session the prompt then names; the turn's
+    own answer would decode cleanly. The transcript is unusable instead, so no verdict at all.
+    """
+    harness = structured_harness(tmp_path)
+
+    def early_chunk(message: dict) -> list[dict]:
+        if message.get("method") != "session/prompt":
+            return [message]
+        chunk = {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": message["params"]["sessionId"],
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": "m-0",
+                    "content": {"type": "text", "text": '{"verdict": "accepted", "findings": []}'},
+                },
+            },
+        }
+        return [chunk, message]
+
+    _rewrite_prompt_observation(harness, early_chunk)
+    result, handle, _ = run_invocation(harness, "reviewer", REVIEW_GOAL)
+
+    assert result.outcome is InvocationOutcome.COMPLETED
+    assert result.review is None
+    assert any(
+        note.startswith("review_invalid:") and "before the session/prompt request" in note
+        for note in result.limitations
+    ), result.limitations
+    harness.driver.release(handle.invocation_id)
+
+
+def test_a_prompt_that_names_no_session_leaves_no_verdict(tmp_path: Path) -> None:
+    """With no session named, no chunk can be told apart from another session's."""
+    harness = structured_harness(tmp_path)
+
+    def without_session(message: dict) -> list[dict]:
+        if message.get("method") != "session/prompt":
+            return [message]
+        params = {key: value for key, value in message["params"].items() if key != "sessionId"}
+        return [{**message, "params": params}]
+
+    _rewrite_prompt_observation(harness, without_session)
+    result, handle, _ = run_invocation(harness, "reviewer", REVIEW_GOAL)
+
+    assert handle.dispatched is True
+    assert result.outcome is InvocationOutcome.COMPLETED
+    assert result.review is None
+    assert any(
+        note.startswith("review_invalid:") and "named no sessionId" in note
         for note in result.limitations
     ), result.limitations
     harness.driver.release(handle.invocation_id)

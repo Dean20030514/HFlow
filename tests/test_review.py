@@ -487,6 +487,79 @@ def test_updates_from_another_session_are_excluded() -> None:
     assert answer is not None and "accepted" not in answer.text
 
 
+def _observe(instance: AnswerTranscript, *updates: tuple[dict, dict], start: int = 0) -> None:
+    for offset, (payload, params) in enumerate(updates):
+        line = start + offset
+        instance.observe_update(payload, params=params, sequence=line, line_index=line)
+
+
+def test_a_bound_transcript_rejects_any_other_session() -> None:
+    """What the driver does: bind on the first prompt; any other session's chunk is unusable.
+
+    A chunk with no ``sessionId`` belongs to no session, so it counts too. A later binding does
+    not move the turn to another session, and the reviewer's own rejection does not survive an
+    ``accepted`` chunk that another session streamed after it: nothing decides the answer.
+    """
+    instance = AnswerTranscript(role="reviewer", require_session=True)
+    instance.bind_session("sess-1")
+    instance.bind_session("sess-2")
+    no_session = update(ACCEPTED, message_id="m-3")
+    del no_session[1]["sessionId"]
+    _observe(
+        instance,
+        update(REJECTED, message_id="m-1"),
+        update(ACCEPTED, message_id="m-2", session_id="sess-2"),
+        no_session,
+    )
+
+    assert instance.session_id == "sess-1"
+    assert instance.skipped_other_session == 2
+    assert "line 1 names session 'sess-2', not the turn's 'sess-1'" in instance.rejected
+    assert instance.final_answer() is None
+
+
+def test_a_message_chunk_before_the_binding_rejects_a_transcript_that_requires_one() -> None:
+    instance = AnswerTranscript(role="reviewer", require_session=True)
+    _observe(instance, update(ACCEPTED, message_id="m-0"))
+    instance.bind_session("sess-1")
+    _observe(instance, update(ACCEPTED, message_id="m-1"), start=1)
+
+    assert "line 0 arrived before the session/prompt request" in instance.rejected
+    assert instance.final_answer() is None
+
+
+def test_a_non_message_update_before_the_binding_changes_nothing() -> None:
+    """Only a message chunk needs a session to be attributed; a usage update is not answer text."""
+    instance = AnswerTranscript(role="reviewer", require_session=True)
+    _observe(instance, usage())
+    instance.bind_session("sess-1")
+    _observe(instance, update(ACCEPTED, message_id="m-1"), start=1)
+
+    assert instance.rejected == ""
+    assert review_of(instance).verdict == "accepted"
+
+
+def test_a_prompt_that_names_no_session_leaves_nothing_attributable() -> None:
+    instance = AnswerTranscript(role="reviewer", require_session=True)
+    instance.bind_session("")
+    _observe(instance, update(ACCEPTED, message_id="m-1"))
+
+    assert "named no sessionId" in instance.rejected
+    assert instance.final_answer() is None
+
+
+def test_a_transcript_without_a_session_requirement_reads_every_session() -> None:
+    """The unbound form saved bytes are replayed with in tests: no filter, nothing rejected."""
+    instance = transcript(
+        update(REJECTED, message_id="m-1"),
+        update(ACCEPTED, message_id="m-2", session_id="sess-2"),
+        session_id=None,
+    )
+
+    assert instance.skipped_other_session == 0
+    assert review_of(instance).verdict == "accepted"
+
+
 def test_chunks_after_counts_only_retained_message_chunks_past_a_line() -> None:
     """What the driver asks with the line of the turn's own prompt response."""
     instance = transcript(

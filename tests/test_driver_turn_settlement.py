@@ -161,22 +161,31 @@ def test_without_the_after_response_check_the_trailing_text_would_be_the_verdict
     harness.driver.release(handle.invocation_id)
 
 
-def test_a_message_for_another_session_after_the_response_is_caught_too(tmp_path: Path) -> None:
-    """The count is per prompt session; the verdict check asks the transcript itself.
+def test_a_message_for_another_session_after_the_response_leaves_no_verdict(
+    tmp_path: Path,
+) -> None:
+    """The count is per prompt session, and the transcript is bound to that session.
 
-    This relies on the production transcript having no session filter (``acpx exec`` runs one
-    session, and the driver builds its transcript without a session id): a trailing chunk under
-    another ``sessionId`` is retained and would become the final message. It is not counted as
-    one of the prompt session's updates, and it still leaves the turn without a verdict. Revisit
-    this test if the production transcript gains a session filter.
+    A trailing ``accepted`` chunk under another ``sessionId`` is not one of the prompt session's
+    updates, so the after-response count stays 0. It still leaves the reviewer without a verdict:
+    a one-session turn that streams another session's message has no identified final answer.
+    Before the binding it was retained and would have been the final message.
     """
-    harness = structured_harness(tmp_path, trailing_updates="message-other-session")
+    harness = structured_harness(
+        tmp_path, review_mode="changes", trailing_updates="message-other-session"
+    )
     result, handle, _ = run_invocation(harness, "reviewer", REVIEW_GOAL)
 
     assert result.stream_order is not None
     assert result.stream_order.updates_after_prompt_response == 0
     assert result.review is None
-    assert any(note.startswith("review_ambiguous:") for note in result.limitations)
+    assert any(
+        note.startswith("agent_message_chunk_other_session=1: ") for note in result.limitations
+    ), result.limitations
+    assert any(
+        note.startswith("review_invalid:") and "names session" in note
+        for note in result.limitations
+    ), result.limitations
     harness.driver.release(handle.invocation_id)
 
 
@@ -278,19 +287,10 @@ class _NeverDrained(dict):
         super().__setitem__(key, False)
 
 
-def test_a_stream_not_read_to_its_end_records_no_order_and_gives_no_verdict(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``collect`` folds a result after a bounded drain wait even if the reader is not done.
-
-    "Nothing followed the response" is then not known: no stream order is recorded, and no
-    verdict is decoded - the after-response check would otherwise pass on unread lines.
-    """
-    monkeypatch.setattr(driver_module, "STREAM_DRAIN_TIMEOUT_SECONDS", 0.1)
-    harness = structured_harness(tmp_path)
-    harness.driver._stream_drained = _NeverDrained()
+def _undrained_reviewer(harness, invocation_id: str):
+    """Start a reviewer whose reader never reports the stream drained; wait for the reader."""
     request = InvocationRequest(
-        invocation_id="I-undrained",
+        invocation_id=invocation_id,
         attempt_id="A-1",
         run_id="R-1",
         role="reviewer",
@@ -306,20 +306,106 @@ def test_a_stream_not_read_to_its_end_records_no_order_and_gives_no_verdict(
         writes_allowed=False,
         data_dir=str(harness.data_dir),
     )
-
+    harness.driver._stream_drained = _NeverDrained()
     handle = harness.driver.start_handle(request)
     reader: threading.Thread = harness.driver._threads[request.invocation_id]
     reader.join(timeout=30)
     assert not reader.is_alive()
+    return handle
+
+
+UNDRAINED_NOTE = "review_ambiguous: the client's output was not read to its end"
+
+
+def test_a_stream_not_read_to_its_end_records_no_order_and_gives_no_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``collect`` folds a result after a bounded drain wait even if the reader is not done.
+
+    "Nothing followed the response" is then not known: no stream order is recorded, and no
+    verdict is decoded - the after-response check would otherwise pass on unread lines.
+    """
+    monkeypatch.setattr(driver_module, "STREAM_DRAIN_TIMEOUT_SECONDS", 0.1)
+    harness = structured_harness(tmp_path)
+    handle = _undrained_reviewer(harness, "I-undrained")
+
     result = harness.driver.collect(handle)
 
     assert result.outcome is InvocationOutcome.COMPLETED
     assert result.stream_order is None
     assert result.review is None
-    assert any(
-        note.startswith("review_ambiguous: the client's output was not read to its end")
-        for note in result.limitations
-    ), result.limitations
+    assert any(note.startswith(UNDRAINED_NOTE) for note in result.limitations), result.limitations
+    harness.driver.release(handle.invocation_id)
+
+
+def test_a_reader_that_finishes_during_collect_still_gives_no_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The drain flag is read once: the stream order and the verdict cannot disagree.
+
+    The reader finishes right after the stream order was decided without it. The verdict check
+    used to read the flag again, find it set and decode a verdict next to a record that said the
+    stream was not read to its end.
+    """
+    monkeypatch.setattr(driver_module, "STREAM_DRAIN_TIMEOUT_SECONDS", 0.1)
+    harness = structured_harness(tmp_path)
+    handle = _undrained_reviewer(harness, "I-late-drain")
+    original = harness.driver._stream_order
+
+    def order_then_drained(*args, **kwargs):
+        order = original(*args, **kwargs)
+        dict.__setitem__(harness.driver._stream_drained, handle.invocation_id, True)
+        return order
+
+    harness.driver._stream_order = order_then_drained  # type: ignore[method-assign]
+    result = harness.driver.collect(handle)
+
+    assert harness.driver._stream_drained[handle.invocation_id] is True, "the flag did flip"
+    assert result.stream_order is None
+    assert result.review is None
+    assert any(note.startswith(UNDRAINED_NOTE) for note in result.limitations), result.limitations
+    assert not any(note.startswith("review_decoded") for note in result.limitations)
+    harness.driver.release(handle.invocation_id)
+
+
+def test_a_chunk_the_reader_adds_during_collect_cannot_leave_a_stale_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The drain is checked before the transcript is read, so the answer read is final.
+
+    Here the reader handles one more line just after the answer was read: a chunk that resumes
+    the commentary's ``messageId`` and rejects the transcript, which also clears the chunks the
+    after-response check counts. Then it reports the stream drained. Read in the old order, the
+    drain check passed, nothing counted as trailing, and the stale answer's verdict was decoded.
+    """
+    monkeypatch.setattr(driver_module, "STREAM_DRAIN_TIMEOUT_SECONDS", 0.1)
+    harness = structured_harness(tmp_path)
+    handle = _undrained_reviewer(harness, "I-late-reject")
+    transcript = harness.driver._transcripts[handle.invocation_id]
+    read_answer = transcript.final_answer
+
+    def answer_then_late_line():
+        answer = read_answer()
+        transcript.observe_update(
+            {
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": "m-4",
+                "content": {"type": "text", "text": "late"},
+            },
+            params={"sessionId": transcript.session_id},
+            sequence=10_000,
+            line_index=10_000,
+        )
+        dict.__setitem__(harness.driver._stream_drained, handle.invocation_id, True)
+        return answer
+
+    transcript.final_answer = answer_then_late_line  # type: ignore[method-assign]
+    result = harness.driver.collect(handle)
+
+    assert result.stream_order is None
+    assert result.review is None
+    assert any(note.startswith(UNDRAINED_NOTE) for note in result.limitations), result.limitations
+    assert not any(note.startswith("review_decoded") for note in result.limitations)
     harness.driver.release(handle.invocation_id)
 
 

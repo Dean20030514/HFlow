@@ -9,11 +9,15 @@ invocation, so a real reviewer could never reach acceptance.
 Two stages, both deterministic and both reusable for offline replay of saved bytes:
 
 1. :class:`AnswerTranscript` reassembles the invocation's **final answer** from the
-   chunks the driver actually observed. It reads only ``agent_message_chunk`` updates, and
-   when it is constructed with a session id (the offline replay tool does this) only that
-   session's, so user prompts, thoughts, tool results and the implementer transcript cannot
-   supply a verdict. The production driver constructs it without one (``acpx exec`` runs
-   one session).
+   chunks the driver actually observed. It reads only ``agent_message_chunk`` updates, so
+   user prompts, thoughts, tool results and the implementer transcript cannot supply a
+   verdict. The production driver and the offline replay tool build it with
+   ``require_session`` and bind it (``bind_session``) to the session the turn's first
+   ``session/prompt`` request named: a chunk for any other session, or with no usable
+   ``sessionId``, is counted (``skipped_other_session``) and leaves the answer unusable, as
+   does a chunk observed before that request or a request that named no session. A transcript
+   given a ``session_id`` without ``require_session`` excludes other sessions' chunks, and one
+   built with neither reads every session's chunks.
 2. :func:`decode_review` parses exactly one Review object out of that answer and
    validates it against the canonical model in ``contracts.py``.
 
@@ -139,10 +143,18 @@ class AnswerTranscript:
     The answer is the **last** message: the text of its ``agent_message_chunk`` updates,
     concatenated in stream order with nothing inserted. Thought text is never part of it,
     and intermediate commentary (an earlier message) is never concatenated into it.
+
+    Session attribution: with a ``session_id`` (given, or bound by ``bind_session``) only that
+    session's message chunks are read. With ``require_session``, a message chunk that arrives
+    before the binding, or names another session, rejects the transcript.
     """
 
     session_id: str | None = None
     role: str = ""
+    #: The session must come from ``bind_session`` before any message chunk is read. Until it
+    #: is bound, no chunk can be attributed to the turn, so one that arrives first rejects the
+    #: transcript instead of being kept or dropped.
+    require_session: bool = False
     _groups: list[list[AnswerChunk]] = field(default_factory=list, repr=False)
     _retained_bytes: int = 0
     _truncated: bool = False
@@ -151,11 +163,36 @@ class AnswerTranscript:
     #: Every ``messageId`` that has started a message. One that returns after a different
     #: message started leaves the final message unidentified and rejects the transcript.
     _message_ids: set[str] = field(default_factory=set, repr=False)
-    #: Incremented for message chunks rejected because they belong to another session, so
-    #: replay can report what it excluded instead of silently dropping it.
+    #: Incremented for message chunks excluded because they name another session, or no usable
+    #: ``sessionId``, so the driver and replay can report what was excluded instead of silently
+    #: dropping it.
     skipped_other_session: int = 0
+    #: Whether the session is settled: given at construction, or by the first ``bind_session``.
+    _bound: bool = field(default=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._bound = self.session_id is not None
 
     # -- ingest --------------------------------------------------------------
+
+    def bind_session(self, session_id: str) -> None:
+        """Attribute message chunks to ``session_id``: the one the turn's first prompt named.
+
+        Only the first binding counts; a later prompt does not move the turn to another session.
+        An empty id binds nothing attributable, so the transcript is rejected: no chunk could be
+        told apart from another session's.
+        """
+        if self._bound:
+            return
+        self._bound = True
+        if not session_id:
+            if not self._rejected:
+                self.reject(
+                    "the session/prompt request named no sessionId, so no agent_message_chunk "
+                    "can be attributed to the turn"
+                )
+            return
+        self.session_id = session_id
 
     def observe_update(
         self,
@@ -177,10 +214,29 @@ class AnswerTranscript:
             self._end_group()
             return
 
+        if self.require_session and not self._bound:
+            # Before the prompt named its session nothing says whose message this is, and
+            # dropping it would silently choose for the turn.
+            if not self._rejected:
+                self.reject(
+                    f"agent_message_chunk on line {line_index} arrived before the session/prompt "
+                    "request named the turn's session, so it cannot be attributed to the turn"
+                )
+            return
+
         if self.session_id is not None:
             session = params.get("sessionId")
             if session != self.session_id:
                 self.skipped_other_session += 1
+                if self.require_session and not self._rejected:
+                    # A one-session turn that streams another session's message is not a stream
+                    # whose final answer can be identified: excluding the chunk would let the
+                    # rest of the stream decide, so the answer is unusable instead.
+                    self.reject(
+                        f"agent_message_chunk on line {line_index} names session "
+                        f"{session!r}, not the turn's {self.session_id!r}, so the turn's final "
+                        "answer is not identified"
+                    )
                 return
 
         if self._rejected:

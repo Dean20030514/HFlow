@@ -634,7 +634,7 @@ def test_a_reviewer_message_after_the_prompt_response_is_a_replay_blocker() -> N
         _chunk("s-1", "m-9", '```json\n{"verdict": "accepted", "findings": []}\n```\n'),
     ]
 
-    extraction = tool.extract_reviewer_answer(messages, "s-1")
+    extraction = tool.extract_reviewer_answer(messages)
 
     assert extraction["bound"] is True
     assert extraction["prompt_response_line"] == 2
@@ -652,8 +652,8 @@ def test_the_tool_refuses_to_finalize_a_reviewer_stream_with_text_after_its_resp
     tool = _load_tool()
     original = tool.extract_reviewer_answer
 
-    def with_a_trailing_chunk(messages, session_id):
-        extraction = original(messages, session_id)
+    def with_a_trailing_chunk(messages):
+        extraction = original(messages)
         assert extraction["message_chunks_after_prompt_response"] == 0, "the recording has none"
         return {**extraction, "message_chunks_after_prompt_response": 1}
 
@@ -670,6 +670,170 @@ def test_the_tool_refuses_to_finalize_a_reviewer_stream_with_text_after_its_resp
     assert any(
         "arrived after the session/prompt response" in item for item in diagnostic["blockers"]
     )
+    assert diagnostic["finalization"]["written"] is False
+    after = _rows(
+        blocked_ledger_copy, "SELECT task_state, receipt_json FROM runs WHERE run_id = ?", (RUN_ID,)
+    )[0]
+    assert after["receipt_json"] is None
+    assert after["task_state"] == TaskState.BLOCKED.value
+
+
+# --------------------------------------------------------------------------
+# 4. what the production driver takes no verdict from, the replay refuses too
+# --------------------------------------------------------------------------
+
+ACCEPTED_BLOCK = '```json\n{"verdict": "accepted", "findings": []}\n```\n'
+PROMPT = {"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": "s-1"}}
+PROMPT_ERROR = {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "error": {"code": -32603, "message": "Internal error: turn failed"},
+}
+
+
+def _settled(stop_reason: str) -> dict:
+    return {"jsonrpc": "2.0", "id": 2, "result": {"stopReason": stop_reason}}
+
+
+def _chunk_without_session(message_id: str, text: str) -> dict:
+    chunk = _chunk("s-1", message_id, text)
+    del chunk["params"]["sessionId"]
+    return chunk
+
+
+@pytest.mark.parametrize(
+    ("answers", "stop_reason", "error_ids"),
+    [
+        ([PROMPT_ERROR, _settled("end_turn")], "end_turn", ["2"]),
+        ([_settled("end_turn"), PROMPT_ERROR], "end_turn", ["2"]),
+        ([_settled("paused")], "paused", []),
+        ([_settled("refusal")], "refusal", []),
+    ],
+)
+def test_the_extractor_reports_how_the_reviewer_prompt_was_answered(
+    answers: list[dict], stop_reason: str, error_ids: list[str]
+) -> None:
+    """Synthetic: the bound response's stop reason and any error carrying the prompt's id.
+
+    The driver takes no verdict from any of these turns (``prompt_error_response`` /
+    ``unknown_stop_reason`` / ``stop_reason_refusal``); the replay used to decode ``accepted``.
+    """
+    tool = _load_tool()
+    messages = [PROMPT, _chunk("s-1", "m-1", ACCEPTED_BLOCK), *answers]
+
+    extraction = tool.extract_reviewer_answer(messages)
+
+    assert extraction["bound"] is True
+    assert extraction["prompt_stop_reason"] == stop_reason
+    assert extraction["prompt_error_ids"] == error_ids
+
+
+def test_the_extractor_binds_to_the_session_the_prompt_named() -> None:
+    """Synthetic: a chunk with no ``sessionId`` is counted and leaves no answer to decode.
+
+    It is not one of the prompt session's updates, so it is not counted as trailing; it still
+    makes the answer unusable, as in the production driver, and the count is a replay blocker.
+    """
+    tool = _load_tool()
+    messages = [
+        PROMPT,
+        _chunk("s-1", "m-1", ACCEPTED_BLOCK),
+        _settled("end_turn"),
+        _chunk_without_session(
+            "m-9", '```json\n{"verdict": "changes_requested", "findings": []}\n```\n'
+        ),
+    ]
+
+    extraction = tool.extract_reviewer_answer(messages)
+
+    assert extraction["prompt_session_id"] == "s-1"
+    assert extraction["transcript"].skipped_other_session == 1
+    assert extraction["message_chunks_after_prompt_response"] == 0
+    assert "names session None" in extraction["transcript"].rejected
+    assert extraction["answer"] is None
+
+
+def test_the_extractor_refuses_a_message_chunk_before_the_prompt() -> None:
+    tool = _load_tool()
+    messages = [_chunk("s-1", "m-0", ACCEPTED_BLOCK), PROMPT, _settled("end_turn")]
+
+    extraction = tool.extract_reviewer_answer(messages)
+
+    assert "before the session/prompt request" in extraction["transcript"].rejected
+    assert extraction["answer"] is None
+
+
+def _with_error_answer(messages: list[dict]) -> list[dict]:
+    return [*messages, dict(PROMPT_ERROR)]
+
+
+def _settled_as_paused(messages: list[dict]) -> list[dict]:
+    return [
+        {**message, "result": {**message["result"], "stopReason": "paused"}}
+        if isinstance(message.get("result"), dict) and "stopReason" in message["result"]
+        else message
+        for message in messages
+    ]
+
+
+def _with_a_sessionless_chunk(messages: list[dict]) -> list[dict]:
+    return [*messages, _chunk_without_session("m-late", ACCEPTED_BLOCK)]
+
+
+def _with_a_chunk_before_the_prompt(messages: list[dict]) -> list[dict]:
+    index = next(
+        i for i, message in enumerate(messages) if message.get("method") == "session/prompt"
+    )
+    early = _chunk(messages[index]["params"]["sessionId"], "m-early", ACCEPTED_BLOCK)
+    return [*messages[:index], early, *messages[index:]]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "blocker"),
+    [
+        (_with_error_answer, "answered with a JSON-RPC error"),
+        (_settled_as_paused, "settled with stopReason='paused', not end_turn"),
+        (_with_a_sessionless_chunk, "or no usable sessionId; the reviewer's final answer"),
+        (_with_a_chunk_before_the_prompt, "arrived before the session/prompt request"),
+    ],
+)
+def test_the_tool_refuses_to_finalize_what_the_driver_takes_no_verdict_from(
+    blocked_ledger_copy: Path,
+    no_child_processes: None,
+    monkeypatch: pytest.MonkeyPatch,
+    mutate,
+    blocker: str,
+) -> None:
+    """The recorded reviewer stream with one change: a blocker, and ``--finalize`` writes nothing.
+
+    The sessionless chunk is the sharpest case: it is the stream's only defect, the single-session
+    check counts string session ids only, and the trailing check never counts it, so the session
+    binding is what refuses it - both as a counted exclusion and as an unusable answer.
+    """
+    _require_recorded_ledger()
+    tool = _load_tool()
+    original = tool._load_messages
+
+    def mutated(stream_path):
+        messages, unparseable = original(stream_path)
+        return mutate(messages), unparseable
+
+    monkeypatch.setattr(tool, "_load_messages", mutated)
+
+    diagnostic = tool.replay(
+        RUN_ID,
+        store_path=blocked_ledger_copy,
+        project_dir=PROJECT_DIR,
+        finalize=True,
+        processing_build=CHECK_BUILD,
+    )
+
+    assert any(blocker in item for item in diagnostic["blockers"]), diagnostic["blockers"]
+    if mutate is _with_a_sessionless_chunk:
+        assert any(
+            item.startswith("the reviewer's answer is unusable:") and "names session None" in item
+            for item in diagnostic["blockers"]
+        ), diagnostic["blockers"]
     assert diagnostic["finalization"]["written"] is False
     after = _rows(
         blocked_ledger_copy, "SELECT task_state, receipt_json FROM runs WHERE run_id = ?", (RUN_ID,)

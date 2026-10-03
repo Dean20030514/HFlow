@@ -1421,7 +1421,11 @@ class AcpxDshDriver:
         # the client's own file back to that share: a looping client keeps writing, and the file
         # keeps being returned to the budget instead of growing with it.
         self._events[request.invocation_id] = []
-        self._transcripts[request.invocation_id] = AnswerTranscript(role=request.role)
+        # Bound in ``_note_message`` to the session the first ``session/prompt`` names: no message
+        # chunk is read before that, and another session's are excluded and counted.
+        self._transcripts[request.invocation_id] = AnswerTranscript(
+            role=request.role, require_session=True
+        )
         self._prompt_request_ids[request.invocation_id] = []
         self._model_watches[request.invocation_id] = _ModelWatch(self.launch.model or None)
         self._terminal_responses[request.invocation_id] = []
@@ -1670,10 +1674,11 @@ class AcpxDshDriver:
         """Record what one wire message means for this invocation.
 
         Neutral facts, no policy: the dispatch marker and the prompt's request id, the session
-        identity, the assistant text of the turn (which is where a reviewer's verdict actually
-        travels), each terminal response together with the request id it answered and where in
-        the stream it arrived, each error response that carries an observed prompt id, and what
-        the stream says about the session's model option.
+        identity (the first prompt's session binds the turn's transcript), the assistant text of
+        the turn (which is where a reviewer's verdict actually travels), each terminal response
+        together with the request id it answered and where in the stream it arrived, each error
+        response that carries an observed prompt id, and what the stream says about the
+        session's model option.
         """
         handle = self._handles[invocation_id]
         watch = self._model_watches.get(invocation_id)
@@ -1685,8 +1690,15 @@ class AcpxDshDriver:
             handle.dispatched_at = handle.dispatched_at or utc_now()
             request_id = message.get("id")
             if request_id is not None:
-                self._prompt_request_ids.setdefault(invocation_id, []).append(request_id)
+                prompt_ids = self._prompt_request_ids.setdefault(invocation_id, [])
+                prompt_ids.append(request_id)
                 session = _session_of(params)
+                if len(prompt_ids) == 1:
+                    transcript = self._transcripts.get(invocation_id)
+                    if transcript is not None:
+                        # The turn's answer is attributed to the session its first prompt named
+                        # (an empty name leaves nothing attributable; see ``bind_session``).
+                        transcript.bind_session(session)
                 self._prompt_sessions[invocation_id] = session
                 self._prompt_session_updates.setdefault(invocation_id, {}).setdefault(
                     session, [0, 0]
@@ -1911,6 +1923,11 @@ class AcpxDshDriver:
             self._close_boundary(invocation_id, exit_boundary)
         close_output_handles(process)
 
+        # Read once, before anything derived from the stream. Setting the flag is the reader's last
+        # write, so once this is True every value read below is final; while it is False the reader
+        # may still be adding lines, and every decision that needs a whole stream (the stream order,
+        # the verdict, the model refusal) uses this one answer instead of asking again later.
+        drained = bool(self._stream_drained.get(invocation_id))
         unparsed = self._unparsed.get(invocation_id, 0)
         oversized = self._oversized.get(invocation_id, 0)
         overflowed = self._overflow.get(invocation_id, False)
@@ -1925,7 +1942,7 @@ class AcpxDshDriver:
             if prompt_error is not None
             else ""
         )
-        stream_order = self._stream_order(invocation_id)
+        stream_order = self._stream_order(invocation_id, drained)
         receipt = self._receipts.get(invocation_id)
 
         if receipt is not None and receipt.status == "confirmed_stopped":
@@ -1974,7 +1991,7 @@ class AcpxDshDriver:
             outcome = InvocationOutcome.OUTCOME_UNKNOWN
             error_code = "unbound_completion"
             error_message = self._unbound_detail(invocation_id)
-        elif self._model_rejected_before_prompt(invocation_id, handle, process):
+        elif self._model_rejected_before_prompt(invocation_id, handle, process, drained):
             # Narrow on purpose: a model was passed, the client refused it (or relayed the agent's
             # refusal) and exited with its error, no session/prompt left the client in a complete
             # stream, and the process tree is gone. Nothing reached a model, so this is a definite
@@ -2086,7 +2103,19 @@ class AcpxDshDriver:
                 f"{stream_order.prompt_response_line}; stable ACP v1 sends a turn's updates before "
                 "its response, so these are outside the settled turn"
             )
-        review, note = self._review_output(handle, outcome)
+        transcript = self._transcripts.get(invocation_id)
+        if transcript is not None and transcript.skipped_other_session:
+            # Recorded for either role. Not prefixed ``review_``: the transcript's own rejection
+            # carries the reviewer's ``review_invalid`` note, and ``review_input_error`` would read
+            # this prefix as a second wire failure.
+            limitations.append(
+                f"agent_message_chunk_other_session={transcript.skipped_other_session}: "
+                f"{transcript.skipped_other_session} agent_message_chunk update(s) named a session "
+                f"other than {transcript.session_id!r}, the one the first session/prompt request "
+                "named, or no session; none is the turn's answer, and a reviewer's final answer "
+                "is then not identified"
+            )
+        review, note = self._review_output(handle, outcome, drained)
         if note:
             limitations.append(note)
         if self._surface_notes.get(invocation_id):
@@ -2117,23 +2146,23 @@ class AcpxDshDriver:
         return result
 
     def _model_rejected_before_prompt(
-        self, invocation_id: str, handle: DriverHandle, process: subprocess.Popen
+        self, invocation_id: str, handle: DriverHandle, process: subprocess.Popen, drained: bool
     ) -> bool:
         """The one no-stop-reason case that is a definite failure. All conditions must hold.
 
         Called after the boundary, overflow, unparseable-line and unbound-completion checks, so
         the boundary is known empty and the retained stream is whole and parsed. On top of that:
-        a model was passed; the stream was drained; the session was created; no ``session/prompt``
-        left the client; the model was refused - by the client before any change request (no
-        model option advertised, or the value not among the advertised ones), or by the agent
-        answering that request with an error; the client printed its own JSON-RPC error line
-        (null id); and it exited non-zero.
+        a model was passed; the stream was drained (``collect``'s one reading of the flag); the
+        session was created; no ``session/prompt`` left the client; the model was refused - by
+        the client before any change request (no model option advertised, or the value not among
+        the advertised ones), or by the agent answering that request with an error; the client
+        printed its own JSON-RPC error line (null id); and it exited non-zero.
         """
         watch = self._model_watches.get(invocation_id)
         return bool(
             self.launch.model
             and watch is not None
-            and self._stream_drained.get(invocation_id)
+            and drained
             and process.returncode not in (None, 0)
             and not handle.dispatched
             and not self._prompt_request_ids.get(invocation_id)
@@ -2182,17 +2211,18 @@ class AcpxDshDriver:
                 return response
         return None
 
-    def _stream_order(self, invocation_id: str) -> StreamOrder | None:
+    def _stream_order(self, invocation_id: str, drained: bool) -> StreamOrder | None:
         """Where the bound prompt response fell in the stream, and what came after it.
 
         Counted for the session the latest ``session/prompt`` named when that response arrived -
         for ``exec``, the one session of its one prompt - from the response to the end of the
         stream. ``None`` when no response answers the prompt, or none had been preceded by a
-        prompt: there is nothing to count from. ``None`` too when the reader has not finished the
-        stream: "nothing followed the response" is a fact only about a stream read to its end, and
-        ``collect`` can fold a result after STREAM_DRAIN_TIMEOUT_SECONDS without that.
+        prompt: there is nothing to count from. ``None`` too when the reader had not finished the
+        stream when ``collect`` read the flag (``drained``): "nothing followed the response" is a
+        fact only about a stream read to its end, and ``collect`` can fold a result after
+        STREAM_DRAIN_TIMEOUT_SECONDS without that.
         """
-        if not self._stream_drained.get(invocation_id):
+        if not drained:
             return None
         response = self._bound_response(invocation_id)
         if response is None or response.session_id is None:
@@ -2256,7 +2286,7 @@ class AcpxDshDriver:
         return detail
 
     def _review_output(
-        self, handle: DriverHandle, outcome: InvocationOutcome
+        self, handle: DriverHandle, outcome: InvocationOutcome, drained: bool
     ) -> tuple[ReviewOutput | None, str]:
         """Decode a verdict from a reviewer's *final answer*, or explain why there is none.
 
@@ -2266,6 +2296,9 @@ class AcpxDshDriver:
         wrong role, unfinished turn, unreadable answer - yields ``None`` plus a machine
         readable reason, so the controller never has to read a model's prose to find out
         whether the wire was intact.
+
+        ``drained`` is ``collect``'s one reading of the reader's flag, the same one the stream
+        order was decided from.
         """
         transcript = self._transcripts.get(handle.invocation_id)
         if transcript is None:
@@ -2275,6 +2308,16 @@ class AcpxDshDriver:
             # review invocation may produce review evidence. Nothing to explain here - the
             # absent review is the expected result for this role.
             return None, ""
+        if not drained:
+            # Asked before the transcript is read at all: while the reader may still be adding
+            # lines, the transcript can still change (a later chunk can reject it, which also
+            # clears what the after-response check counts), and what followed the response is not
+            # known. Once drained, nothing changes it any more.
+            return None, (
+                f"review_{REVIEW_AMBIGUOUS}: the client's output was not read to its end within "
+                f"{STREAM_DRAIN_TIMEOUT_SECONDS}s of the client's exit, so what followed the "
+                "session/prompt response is not known and no verdict is decoded"
+            )
         if transcript.truncated:
             return None, (
                 f"review_{REVIEW_MISSING}: the reviewer's assistant output exceeded "
@@ -2304,21 +2347,13 @@ class AcpxDshDriver:
                 f"review_{REVIEW_MISSING}: the terminal response was not matched to an observed "
                 "session/prompt request for this invocation"
             )
-        if not self._stream_drained.get(handle.invocation_id):
-            # What followed the response is only known for a stream read to its end; the check
-            # below would otherwise pass on lines nobody has read yet.
-            return None, (
-                f"review_{REVIEW_AMBIGUOUS}: the client's output was not read to its end within "
-                f"{STREAM_DRAIN_TIMEOUT_SECONDS}s of the client's exit, so what followed the "
-                "session/prompt response is not known and no verdict is decoded"
-            )
         trailing = transcript.chunks_after(response.line_index)
         if trailing:
             # ACP v1 sends a turn's updates before its response. Text that arrived after it is
             # outside the settled turn, and it can replace, extend or be the final message, so the
             # turn's final answer is not identified: no verdict, rather than a guess either way.
-            # The check reads the transcript, so it catches any chunk the transcript accepted -
-            # another session's too, since the production transcript has no session filter.
+            # The check reads the transcript, so it catches every chunk the transcript kept; a chunk
+            # for another session was excluded by its session binding and is noted in ``collect``.
             return None, (
                 f"review_{REVIEW_AMBIGUOUS}: {trailing} agent_message_chunk update(s) arrived "
                 f"after the session/prompt response on stream line {response.line_index}, so the "

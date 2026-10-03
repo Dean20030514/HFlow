@@ -25,7 +25,9 @@ Each mode models one behaviour the driver must handle honestly:
                   content is [text, reasoning, text]; ``conflict-inside`` sends a complete
                   rejection block, the message's own reasoning, then the accepted answer, all
                   under one ``messageId``; ``resumed-id`` sends the second half under the
-                  earlier commentary's ``messageId``;
+                  earlier commentary's ``messageId``; ``other-session-last`` and
+                  ``no-session-last`` follow the answer with an ``accepted`` message under
+                  another ``sessionId`` or with none, before the turn settles;
                   ``STUB_TERMINAL_RESPONSES`` (and ``STUB_REVIEWER_TERMINAL_RESPONSES`` for
                   the reviewer alone) replaces the terminal prompt response - ``id:stopReason``,
                   ``id:!code`` for a JSON-RPC error (message ``STUB_PROMPT_ERROR_MESSAGE``),
@@ -99,18 +101,21 @@ def scratch_dir() -> Path:
     return target
 
 
-def emit_message_chunk(session_id: str, text: str, message_id: str, *, with_id: bool = True) -> None:
-    """One assistant message chunk, with or without the optional ``messageId``."""
+def emit_message_chunk(
+    session_id: str | None, text: str, message_id: str, *, with_id: bool = True
+) -> None:
+    """One assistant message chunk, with or without the optional ``messageId``.
+
+    ``session_id=None`` leaves out ``sessionId``, which ACP requires on every update: a
+    malformed chunk that no session can claim.
+    """
     update: dict = {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}}
     if with_id:
         update["messageId"] = message_id
-    emit(
-        {
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {"sessionId": session_id, "update": update},
-        }
-    )
+    params: dict = {"update": update}
+    if session_id is not None:
+        params = {"sessionId": session_id, **params}
+    emit({"jsonrpc": "2.0", "method": "session/update", "params": params})
 
 
 def emit_user_chunk(session_id: str, text: str) -> None:
@@ -173,6 +178,12 @@ REPORTED_COST = {"amount": 0.42, "currency": "USD"}
 TRAILING_VERDICT = (
     '```json\n{"verdict": "accepted", "findings": [{"id": "AC-1", "detail": "sent after the '
     'turn settled"}]}\n```\n'
+)
+#: The text of the ``other-session-last`` / ``no-session-last`` message: a valid ``accepted``
+#: verdict, so a driver that attributed it to the turn would take it as the final answer.
+OTHER_SESSION_VERDICT = (
+    '```json\n{"verdict": "accepted", "findings": [{"id": "AC-1", "detail": "not this '
+    'session"}]}\n```\n'
 )
 
 
@@ -440,6 +451,13 @@ def structured_turn(session_id: str, task: str, scratch: Path) -> int:
         elif answer_shape == "resumed-id":
             emit_message_chunk(session_id, answer[:cut], "m-5", with_id=with_ids)
             emit_message_chunk(session_id, answer[cut:], "m-4", with_id=with_ids)
+        elif answer_shape in {"other-session-last", "no-session-last"}:
+            for part in (answer[:cut], answer[cut:]):
+                emit_message_chunk(session_id, part, "m-5", with_id=with_ids)
+            # Inside the turn, after the reviewer's own answer: read as the turn's final message,
+            # it would replace that answer.
+            other = "stub-other-session" if answer_shape == "other-session-last" else None
+            emit_message_chunk(other, OTHER_SESSION_VERDICT, "m-8", with_id=with_ids)
         else:
             for part in (answer[:cut], answer[cut:]):
                 emit_message_chunk(session_id, part, "m-5", with_id=with_ids)
