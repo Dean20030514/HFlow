@@ -1017,6 +1017,26 @@ class ModelObservation(BaseModel):
     thought_level: str | None = None
 
 
+class StreamOrder(BaseModel):
+    """Where the response answering an invocation's prompt fell in its stream, and what followed.
+
+    Observed, not assumed, and recorded only for a stream the driver read to its end. Stable ACP
+    v1 sends a turn's updates before the prompt response, and ACP #554 records agents that do
+    not. A count above zero is what the stream showed, not a claim about why.
+    """
+
+    model_config = Strict
+
+    #: 0-based index, among the non-empty lines the client wrote, of the response that answers
+    #: the invocation's ``session/prompt``. While the retained log is whole it equals that line's
+    #: number in ``events.ndjson``.
+    prompt_response_line: int
+    #: ``session/update`` notifications after that response for the session the prompt named.
+    updates_after_prompt_response: int = 0
+    #: The ``agent_message_chunk`` updates among those.
+    message_chunks_after_prompt_response: int = 0
+
+
 class InvocationResult(BaseModel):
     """What a driver may report. Note the absence of any task/acceptance state."""
 
@@ -1044,6 +1064,10 @@ class InvocationResult(BaseModel):
     #: never happened, a result recorded before these fields existed).
     model_observation: ModelObservation | None = None
     model_applied: ModelApplied | None = None
+    #: ``None`` when no response answered the observed ``session/prompt``, when the driver's
+    #: reader had not finished the stream when the result was folded, when the driver observed no
+    #: stream (offline driver), or for a result recorded before this field existed.
+    stream_order: StreamOrder | None = None
 
 
 class CancellationReceipt(BaseModel):
@@ -1853,6 +1877,10 @@ class AttemptRecord(BaseModel):
     model_applied: ModelApplied | None = None
     review_model_observation: ModelObservation | None = None
     review_model_applied: ModelApplied | None = None
+    #: Where each invocation's bound prompt response fell and what followed it. ``None`` means
+    #: not recorded, never "0 updates".
+    stream_order: StreamOrder | None = None
+    review_stream_order: StreamOrder | None = None
 
 
 class RunInspection(BaseModel):

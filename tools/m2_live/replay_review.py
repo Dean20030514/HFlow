@@ -12,7 +12,9 @@ What this does, and what it deliberately refuses to do:
   evidence, reviewer permissions and no-write observations) and reports each one separately,
   including the ones it cannot confirm;
 * it evaluates the controller's acceptance predicates in an isolated temporary store, so a
-  receipt produced there is explicitly a *test artifact*.
+  receipt produced there is explicitly a *test artifact*;
+* it refuses a reviewer stream with message text after the bound prompt response, as the
+  production driver does (``review_ambiguous``): the final answer is then not identified.
 
 It never dispatches, resumes, reconciles or cancels anything, never reads a credential, never
 touches the original store or worktree, and never rewrites the run's history. Replay is bytes
@@ -131,7 +133,8 @@ def extract_reviewer_answer(messages: list[dict[str, Any]], session_id: str | No
     """The reviewer's final answer, using the production extractor on the saved stream."""
     transcript = AnswerTranscript(session_id=session_id, role="reviewer")
     prompt_request_ids: set[Any] = set()
-    terminal_ids: list[Any] = []
+    # ``(id, stream message index)`` of every response carrying a ``stopReason``.
+    terminals: list[tuple[Any, int]] = []
     sequence = 0
     for line_index, message in enumerate(messages):
         params = message.get("params") if isinstance(message.get("params"), dict) else {}
@@ -150,13 +153,21 @@ def extract_reviewer_answer(messages: list[dict[str, Any]], session_id: str | No
             continue
         result = message.get("result")
         if isinstance(result, dict) and "stopReason" in result:
-            terminal_ids.append(message.get("id"))
+            terminals.append((message.get("id"), line_index))
+    terminal_ids = [response_id for response_id, _ in terminals]
+    bound_line = next(
+        (index for response_id, index in terminals if response_id in prompt_request_ids), None
+    )
     return {
         "transcript": transcript,
         "answer": transcript.final_answer(),
         "prompt_request_ids": sorted(str(item) for item in prompt_request_ids),
         "terminal_response_ids": sorted(str(item) for item in terminal_ids),
         "bound": any(item in prompt_request_ids for item in terminal_ids),
+        "prompt_response_line": bound_line,
+        "message_chunks_after_prompt_response": transcript.chunks_after(bound_line)
+        if bound_line is not None
+        else None,
     }
 
 
@@ -810,6 +821,14 @@ def _check_reviewer_and_extract(
     if not extraction["bound"]:
         diagnostic["blockers"].append(
             "the terminal response is not matched to the reviewer's session/prompt request"
+        )
+    trailing = extraction["message_chunks_after_prompt_response"]
+    checks["message_chunks_after_prompt_response"] = trailing
+    if trailing:
+        diagnostic["blockers"].append(
+            f"{trailing} agent_message_chunk update(s) arrived after the session/prompt response "
+            f"(stream message {extraction['prompt_response_line']}); the reviewer's final answer "
+            "is not identified, which the production driver also refuses (review_ambiguous)"
         )
     if answer is None:
         diagnostic["blockers"].append("the reviewer stream contains no assistant answer text")

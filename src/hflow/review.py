@@ -9,9 +9,11 @@ invocation, so a real reviewer could never reach acceptance.
 Two stages, both deterministic and both reusable for offline replay of saved bytes:
 
 1. :class:`AnswerTranscript` reassembles the invocation's **final answer** from the
-   chunks the driver actually observed. It reads only ``agent_message_chunk`` updates
-   that carry the invocation's own session id, so user prompts, thoughts, tool results,
-   other sessions and the implementer transcript cannot supply a verdict.
+   chunks the driver actually observed. It reads only ``agent_message_chunk`` updates, and
+   when it is constructed with a session id (the offline replay tool does this) only that
+   session's, so user prompts, thoughts, tool results and the implementer transcript cannot
+   supply a verdict. The production driver constructs it without one (``acpx exec`` runs
+   one session).
 2. :func:`decode_review` parses exactly one Review object out of that answer and
    validates it against the canonical model in ``contracts.py``.
 
@@ -225,6 +227,14 @@ class AnswerTranscript:
     @property
     def observed_message_count(self) -> int:
         return len([group for group in self._groups if group])
+
+    def chunks_after(self, line_index: int) -> int:
+        """Retained message chunks observed on a stream line after ``line_index``.
+
+        The caller asks with the line of the turn's own prompt response: a chunk after it was
+        sent outside the settled turn and can change which message reads as the final one.
+        """
+        return sum(1 for group in self._groups for chunk in group if chunk.line_index > line_index)
 
     def final_answer(self) -> FinalAnswer | None:
         """The last assistant message, or ``None`` when the invocation never spoke."""

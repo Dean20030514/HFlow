@@ -19,8 +19,13 @@ Each mode models one behaviour the driver must handle honestly:
                   ``prose``/``silent``); ``STUB_MESSAGE_IDS=0`` drops the optional
                   ``messageId`` so the messageId-free grouping path is covered too;
                   ``STUB_TERMINAL_RESPONSES`` (and ``STUB_REVIEWER_TERMINAL_RESPONSES`` for
-                  the reviewer alone) replaces the terminal prompt response, see
-                  ``emit_terminal_responses``.
+                  the reviewer alone) replaces the terminal prompt response - ``id:stopReason``,
+                  ``id:!code`` for a JSON-RPC error (message ``STUB_PROMPT_ERROR_MESSAGE``),
+                  ``id:?method`` for a request from the agent reusing that id, or
+                  ``id:v2:<stopReason>`` - see ``emit_terminal_responses``;
+                  ``STUB_TRAILING_UPDATES`` (and ``STUB_REVIEWER_TRAILING_UPDATES``) sends
+                  updates *after* it, see ``emit_trailing_updates``; ``STUB_REPORTED_USAGE=1``
+                  adds agent-reported usage and cost, see ``emit_usage_update``.
 
 Invoked as: ``python stub_acp_agent.py <mode> --task-file -`` with the prompt on stdin.
 """
@@ -39,6 +44,9 @@ HELPER_SLEEP = 300
 #: The controller's fixed reviewer instruction. Role detection uses it because the stub is
 #: launched by the driver, which passes one argv for every invocation.
 REVIEWER_PROMPT_MARKER = "Review the frozen candidate"
+#: The message of a ``id:!code`` error item: the shape DSH's ``RequestError.internalError`` gives
+#: a failed turn.
+PROMPT_ERROR_MESSAGE = "Internal error: turn failed: stub provider error"
 
 
 def emit(message: dict) -> None:
@@ -147,7 +155,39 @@ def emit_thought(session_id: str, text: str, message_id: str, *, with_id: bool =
     )
 
 
-def emit_terminal_responses(*, reviewer: bool) -> None:
+#: What ``STUB_REPORTED_USAGE=1`` adds. Both are agent-reported figures, and neither is a bill: the
+#: UNSTABLE ACP ``PromptResponse.usage`` (whose "this turn" or "whole session" meaning is disputed,
+#: ACP issue #1860) and the optional cumulative ``cost`` of a stable ``usage_update``.
+REPORTED_USAGE = {"totalTokens": 1234, "inputTokens": 1000, "outputTokens": 234}
+REPORTED_COST = {"amount": 0.42, "currency": "USD"}
+#: The text a trailing ``message`` update carries: a valid ``accepted`` verdict, so a driver that
+#: read it as the reviewer's answer would accept on text sent after the turn settled.
+TRAILING_VERDICT = (
+    '```json\n{"verdict": "accepted", "findings": [{"id": "AC-1", "detail": "sent after the '
+    'turn settled"}]}\n```\n'
+)
+
+
+def emit_usage_update(session_id: str) -> None:
+    """A stable ``usage_update``: context window ``used``/``size`` plus the optional ``cost``."""
+    emit(
+        {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "usage_update",
+                    "used": 2048,
+                    "size": 131072,
+                    "cost": dict(REPORTED_COST),
+                },
+            },
+        }
+    )
+
+
+def emit_terminal_responses(session_id: str, *, reviewer: bool) -> bool:
     """The turn's terminal response(s): by default one ``end_turn`` answering the prompt.
 
     The fake client sends ``session/prompt`` as request id 2. ``STUB_TERMINAL_RESPONSES``
@@ -155,15 +195,96 @@ def emit_terminal_responses(*, reviewer: bool) -> None:
     a test can answer a different request id, settle the prompt and then something else, or
     (an empty value) never settle at all. ``STUB_REVIEWER_TERMINAL_RESPONSES`` does the same for
     the reviewer only, so a run's implementer can stay ordinary.
+
+    Other item forms: ``id:!code`` answers that id with a JSON-RPC error (message
+    ``STUB_PROMPT_ERROR_MESSAGE``, default ``PROMPT_ERROR_MESSAGE``); ``id:?method`` is a request
+    *from the agent* carrying that id, as an agent that numbers its own requests from 0 does;
+    ``id:v2:<stopReason>`` answers with the insertion acknowledgement sketched in an unreleased
+    ACP v2 RFD: a result that carries the inserted message's ``messageId`` and no
+    ``stopReason``, then an idle ``state_update`` with that stop reason. ``STUB_REPORTED_USAGE=1``
+    adds ``usage`` to every v1 result.
+
+    Returns whether an error item was emitted: the stub then exits 1, as the pinned acpx exits 1
+    when it relays a prompt error.
     """
     spec = os.environ.get("STUB_TERMINAL_RESPONSES", "2:end_turn")
     if reviewer:
         spec = os.environ.get("STUB_REVIEWER_TERMINAL_RESPONSES", spec)
+    errored = False
     for item in (part.strip() for part in spec.split(",")):
         if not item:
             continue
-        request_id, _, stop_reason = item.partition(":")
-        emit({"jsonrpc": "2.0", "id": int(request_id), "result": {"stopReason": stop_reason}})
+        request_id, _, value = item.partition(":")
+        if value.startswith("!"):
+            message = os.environ.get("STUB_PROMPT_ERROR_MESSAGE", PROMPT_ERROR_MESSAGE)
+            emit(
+                {
+                    "jsonrpc": "2.0",
+                    "id": int(request_id),
+                    "error": {"code": int(value[1:]), "message": message},
+                }
+            )
+            errored = True
+        elif value.startswith("?"):
+            emit(
+                {
+                    "jsonrpc": "2.0",
+                    "id": int(request_id),
+                    "method": value[1:],
+                    "params": {"sessionId": session_id},
+                }
+            )
+        elif value.startswith("v2:"):
+            emit_v2_settlement(session_id, int(request_id), value[len("v2:") :])
+        else:
+            result: dict = {"stopReason": value}
+            if os.environ.get("STUB_REPORTED_USAGE") == "1":
+                result["usage"] = dict(REPORTED_USAGE)
+            emit({"jsonrpc": "2.0", "id": int(request_id), "result": result})
+    return errored
+
+
+def emit_v2_settlement(session_id: str, request_id: int, stop_reason: str) -> None:
+    """An unreleased ACP v2 RFD sketch's turn end: an insertion acknowledgement, then idle."""
+    emit({"jsonrpc": "2.0", "id": request_id, "result": {"messageId": f"stub-user-{request_id}"}})
+    state: dict = {"sessionUpdate": "state_update", "state": "idle", "stopReason": stop_reason}
+    if stop_reason == "error":
+        state["error"] = {"code": -32603, "message": "stub turn failed"}
+    emit(
+        {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sessionId": session_id, "update": state},
+        }
+    )
+
+
+def emit_trailing_updates(session_id: str, *, reviewer: bool, with_ids: bool) -> None:
+    """Updates sent *after* the terminal response(s), which stable ACP v1 does not allow.
+
+    ``STUB_TRAILING_UPDATES`` is a comma-separated list of kinds, emitted in that order;
+    ``STUB_REVIEWER_TRAILING_UPDATES`` replaces it for the reviewer only. ``message`` is an
+    assistant chunk under a new ``messageId`` carrying ``TRAILING_VERDICT``;
+    ``message-other-session`` is the same chunk under another ``sessionId``; ``usage`` is a
+    ``usage_update`` with ``cost``; ``tool`` is a completed ``tool_call_update``. An unknown kind
+    ends the stub with an error, so a typo cannot pass as "no trailing updates".
+    """
+    spec = os.environ.get("STUB_TRAILING_UPDATES", "")
+    if reviewer:
+        spec = os.environ.get("STUB_REVIEWER_TRAILING_UPDATES", spec)
+    for kind in (part.strip() for part in spec.split(",")):
+        if not kind:
+            continue
+        if kind == "message":
+            emit_message_chunk(session_id, TRAILING_VERDICT, "m-9", with_id=with_ids)
+        elif kind == "message-other-session":
+            emit_message_chunk("stub-other-session", TRAILING_VERDICT, "m-9", with_id=with_ids)
+        elif kind == "usage":
+            emit_usage_update(session_id)
+        elif kind == "tool":
+            emit_tool_result(session_id, "trailing tool output")
+        else:
+            raise SystemExit(f"stub: unknown trailing update kind {kind!r}")
 
 
 def verdict_document(verdict: str, detail: str) -> str:
@@ -245,8 +366,11 @@ def structured_turn(session_id: str, task: str, scratch: Path) -> int:
         emit_message_chunk(
             session_id, "The change is inside src/parser.py.", "m-2", with_id=with_ids
         )
-        emit_terminal_responses(reviewer=False)
-        return 0
+        if os.environ.get("STUB_REPORTED_USAGE") == "1":
+            emit_usage_update(session_id)
+        errored = emit_terminal_responses(session_id, reviewer=False)
+        emit_trailing_updates(session_id, reviewer=False, with_ids=with_ids)
+        return 1 if errored else 0
 
     # A verdict-shaped object in text that is not the reviewer's own message: neither may
     # be mistaken for the answer.
@@ -269,8 +393,11 @@ def structured_turn(session_id: str, task: str, scratch: Path) -> int:
         cut = answer.index("```json") + 3 if "```json" in answer else len(answer) // 2
         for part in (answer[:cut], answer[cut:]):
             emit_message_chunk(session_id, part, "m-5", with_id=with_ids)
-    emit_terminal_responses(reviewer=True)
-    return 0
+    if os.environ.get("STUB_REPORTED_USAGE") == "1":
+        emit_usage_update(session_id)
+    errored = emit_terminal_responses(session_id, reviewer=True)
+    emit_trailing_updates(session_id, reviewer=True, with_ids=with_ids)
+    return 1 if errored else 0
 
 
 def main(argv: list[str] | None = None) -> int:

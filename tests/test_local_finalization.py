@@ -595,3 +595,84 @@ def test_the_tool_refuses_to_finalize_when_the_candidate_moved(
     assert after == before
     assert after["receipt_json"] is None
     assert after["task_state"] == TaskState.BLOCKED.value
+
+
+# --------------------------------------------------------------------------
+# 3. a reviewer message after the prompt response is a replay blocker
+# --------------------------------------------------------------------------
+
+
+def _chunk(session_id: str, message_id: str, text: str) -> dict:
+    return {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "messageId": message_id,
+                "content": {"type": "text", "text": text},
+            },
+        },
+    }
+
+
+def test_a_reviewer_message_after_the_prompt_response_is_a_replay_blocker() -> None:
+    """Synthetic, no recorded ledger: the extractor reports text after the bound response.
+
+    The last message group is the trailing ``accepted``, so without the count the replay would
+    decode it as the verdict over the in-turn ``changes_requested``. The caller turns a non-zero
+    count into a blocker, and blockers gate ``--finalize``.
+    """
+    from hflow.review import decode_review
+
+    tool = _load_tool()
+    messages = [
+        {"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": "s-1"}},
+        _chunk("s-1", "m-1", '```json\n{"verdict": "changes_requested", "findings": []}\n```\n'),
+        {"jsonrpc": "2.0", "id": 2, "result": {"stopReason": "end_turn"}},
+        _chunk("s-1", "m-9", '```json\n{"verdict": "accepted", "findings": []}\n```\n'),
+    ]
+
+    extraction = tool.extract_reviewer_answer(messages, "s-1")
+
+    assert extraction["bound"] is True
+    assert extraction["prompt_response_line"] == 2
+    assert extraction["message_chunks_after_prompt_response"] == 1
+    assert decode_review(extraction["answer"].text).verdict == "accepted", (
+        "the trailing text is what the replay would otherwise take as the verdict"
+    )
+
+
+def test_the_tool_refuses_to_finalize_a_reviewer_stream_with_text_after_its_response(
+    blocked_ledger_copy: Path, no_child_processes: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The recorded stream with one after-response chunk reported: a blocker, nothing written."""
+    _require_recorded_ledger()
+    tool = _load_tool()
+    original = tool.extract_reviewer_answer
+
+    def with_a_trailing_chunk(messages, session_id):
+        extraction = original(messages, session_id)
+        assert extraction["message_chunks_after_prompt_response"] == 0, "the recording has none"
+        return {**extraction, "message_chunks_after_prompt_response": 1}
+
+    monkeypatch.setattr(tool, "extract_reviewer_answer", with_a_trailing_chunk)
+
+    diagnostic = tool.replay(
+        RUN_ID,
+        store_path=blocked_ledger_copy,
+        project_dir=PROJECT_DIR,
+        finalize=True,
+        processing_build=CHECK_BUILD,
+    )
+
+    assert any(
+        "arrived after the session/prompt response" in item for item in diagnostic["blockers"]
+    )
+    assert diagnostic["finalization"]["written"] is False
+    after = _rows(
+        blocked_ledger_copy, "SELECT task_state, receipt_json FROM runs WHERE run_id = ?", (RUN_ID,)
+    )[0]
+    assert after["receipt_json"] is None
+    assert after["task_state"] == TaskState.BLOCKED.value

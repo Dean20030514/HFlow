@@ -573,8 +573,8 @@ actually meet today:
 | `scope_violation` | files changed that the TaskSpec did not authorize, or a changed path matches the task's or the project's `write_deny` or the built-in deny list (`.git`, `.hflow`, `.acpxrc.json`) - even inside an allowed directory, and before anything is frozen. Also: the worker moved the worktree's HEAD (its own commit, amend, reset or checkout: "the worker moved HEAD from X to Y"); an index entry flagged assume-unchanged or skip-worktree ("index flags hide worktree changes from the freeze"); the candidate commit or the delivery changes a path outside the scope or under a deny rule (checked after the freeze and again at acceptance); a `write_allow` entry that started resolving outside the worktree during the run; a repair round that moved the tree but not the scoped content; a repair refused as `workspace_drift` | inspect the reported paths; nothing was accepted, and no receipt was written |
 | `evidence_stale` | the candidate changed after verification | re-run; do not reuse the old evidence |
 | `review_rejected` | the reviewer returned a validated `changes_requested` | read the finding, then submit a new revision |
-| `review_protocol_error` | the reviewer turn produced no usable verdict: missing, malformed or ambiguous output, a prompt-digest mismatch, a reviewer that could not be started, or a reviewer turn that `FAILED` (for example `model_rejected_before_prompt`, `cancelled_unrequested`, `stop_reason_max_tokens`). It is a wire failure, never the reviewer's judgment | read `block_reason` and the review evidence; fix the cause before a new revision |
-| `outcome_unknown` | nobody knows how an invocation ended: its stop was not confirmed (including every cross-process `hflow cancel`), the controller was interrupted while it ran, or the driver reported an unknown outcome (`unbound_completion`, `boundary_not_empty`, `no_stop_reason`, `output_limit_exceeded`, `unparseable_output`, `completion_timeout`) for either role | `hflow resume` to reconcile once no controller owns the run; the root stays blocked while the stopped invocation's ledger entry is open - a cross-process `hflow cancel` that lands during the checks or the review handoff leaves none, so the root then accepts a new revision even while the original controller is still finishing; submit a new revision only after it is resolved |
+| `review_protocol_error` | the reviewer turn produced no usable verdict: missing, malformed or ambiguous output, a prompt-digest mismatch, a reviewer that could not be started, or a reviewer turn that `FAILED` (for example `model_rejected_before_prompt`, `cancelled_unrequested`, `stop_reason_max_tokens`), or a reviewer that sent an `agent_message_chunk` after its own prompt response, or whose output was not read to its end (`review_ambiguous`: the final answer is not identified). It is a wire failure, never the reviewer's judgment | read `block_reason` and the review evidence; fix the cause before a new revision |
+| `outcome_unknown` | nobody knows how an invocation ended: its stop was not confirmed (including every cross-process `hflow cancel`), the controller was interrupted while it ran, or the driver reported an unknown outcome (`unbound_completion`, `boundary_not_empty`, `no_stop_reason`, `prompt_error_response`, `unknown_stop_reason`, `output_limit_exceeded`, `unparseable_output`, `completion_timeout`) for either role | `hflow resume` to reconcile once no controller owns the run; the root stays blocked while the stopped invocation's ledger entry is open - a cross-process `hflow cancel` that lands during the checks or the review handoff leaves none, so the root then accepts a new revision even while the original controller is still finishing; submit a new revision only after it is resolved |
 | `cancelled_by_operator` | a stop was requested and confirmed (or the run was stopped before any dispatch) | nothing runs; the workspace and evidence are kept |
 | `driver_failed` | the implementer's driver reported a failure before/without a result (for example `model_rejected_before_prompt`: the profile's `--model` value is not one the agent advertises, so no prompt was sent) | read `block_reason`; fix the environment or the profile, do not blindly retry. An identical TaskSpec returns this blocked run; to run again submit a new revision, whose first implementer, under a root budget, is charged as a repair |
 | `workspace_client_config` | an entry named `.acpxrc.json` (in any letter case) appeared at the workspace root after admission (for the reviewer, in the candidate worktree), so the launch was refused at the driver's spawn gate before any process existed; the invocation is `not_started` and its allowance stays consumed. (A file already in the starting workspace never gets this far: it is refused before the run exists, see "What stops a run before it dispatches") | remove the file or directory, then submit a **new revision**: an identical TaskSpec returns this blocked run, and under a root budget the new revision's first implementer is charged as a repair, so the root needs a repair left |
@@ -584,8 +584,8 @@ actually meet today:
 The driver's own `error_code` (`unbound_completion`, `model_rejected_before_prompt`,
 `boundary_not_empty`, `cancelled_unrequested`, `stop_reason_<reason>`, ...) is not a block code.
 It is stored with the invocation's result in the ledger (`attempts.result_json`, and
-`review_json` for the reviewer), and the driver's message - or, for an unknown reviewer turn, the
-code itself - is usually quoted in `block_reason`. What each one means:
+`review_json` for the reviewer), and the driver's message is usually quoted in `block_reason`, and
+for an unknown outcome of either role the code is quoted with it. What each one means:
 
 | Driver `error_code` | Outcome | Meaning |
 |---|---|---|
@@ -593,8 +593,21 @@ code itself - is usually quoted in `block_reason`. What each one means:
 | `model_rejected_before_prompt` | `FAILED` | a `--model` value was passed, acpx refused it (or relayed the agent's refusal) with its own JSON-RPC error and exited, no `session/prompt` was sent, and the process tree is gone. Nothing reached a model; nothing is refunded |
 | `boundary_not_empty` | `OUTCOME_UNKNOWN` | the client exited, but its Job could not be confirmed empty afterwards; work it started may still be running |
 | `cancelled_unrequested` | `FAILED` | the harness settled the prompt as `cancelled` although no stop was requested for this invocation (DSH also does that when it disposes of a session) |
-| `stop_reason_<reason>` | `FAILED` | the prompt's own response settled with a reason other than `end_turn`/`cancelled` (for example `max_tokens`) |
-| `no_stop_reason`, `output_limit_exceeded`, `unparseable_output`, `completion_timeout` | `OUTCOME_UNKNOWN` | the stream does not say how the turn ended |
+| `stop_reason_<reason>` | `FAILED` | the prompt's own response settled as `max_tokens`, `max_turn_requests` or `refusal` |
+| `unknown_stop_reason` | `OUTCOME_UNKNOWN` | the prompt's own response carried a stop reason outside ACP v1's closed set (`end_turn`, `max_tokens`, `max_turn_requests`, `refusal`, `cancelled`). Before this build it was `FAILED stop_reason_<reason>`; it now blocks the root for both roles, and for the reviewer it is no longer `review_protocol_error` |
+| `prompt_error_response` | `OUTCOME_UNKNOWN` | the observed `session/prompt` was answered with a JSON-RPC error, ACP v1's failed-prompt shape. DSH sends -32603 `Internal error: turn failed: ...` / `assistant output delivery failed: ...` after the turn ran; before any model work it sends `prompt was not queued: ...` (-32603), invalid params (-32602), or a content-admission error with no fixed prefix (documented from DSH source, not observed). The code and the first 500 characters of the message (repr-quoted) go into `error_message`, the limitation and `block_reason`. The outcome stays unknown because whether a model call was made is not observable. A prompt answered with an error and a stop reason is unknown too. An error answering another id is not attributed, and one carrying the prompt's id after a request from the agent reused it is recorded as the limitation `prompt_error_unattributed` - DSH numbers its own permission requests from 0, so a long turn can hit this |
+| `no_stop_reason`, `output_limit_exceeded`, `unparseable_output`, `completion_timeout` | `OUTCOME_UNKNOWN` | the stream does not say how the turn ended - including a prompt response with no `stopReason` (such as the `{messageId}` insertion acknowledgement in an unreleased ACP v2 RFD sketch); a later `state_update` with a stop reason settles nothing |
+
+`stream_order` (`prompt_response_line`, `updates_after_prompt_response`,
+`message_chunks_after_prompt_response`) is stored in `attempts.result_json` / `review_json` for
+every bound result whose stream was read to its end, and `status` prints it as a `stream` line per
+invocation. A count above zero adds the limitation `updates_after_prompt_response=N: ...`. It
+changes no outcome except the reviewer case above (`review_ambiguous`). What is pinned:
+`test_real_client_prints_an_update_sent_right_after_the_prompt_response` shows that, with the
+installed acpx 0.17.1 and the mock agent, a chunk written right after the response is printed after
+it. From the 0.17.1 source (documented, not a timing guarantee): `exec` does not wait for idle after
+the response and keeps reading while it closes the agent - 100 ms after ending its stdin, then
+SIGTERM with a 1.5 s grace. The five recorded live DSH streams had no update after the response.
 
 `end_turn` means the turn settled, not that the work succeeded (DSH maps blocked and aborted turns
 to `end_turn` too - documented, not observed); acceptance is decided by checks and review.
@@ -927,7 +940,7 @@ Three facts about this wiring:
 | offline fake driver | the controller's state machine, budget, evidence and receipt rules | `tests/test_controller.py` and most of the suite |
 | production driver + Python stand-in for acpx | the driver's launch, framing, event projection, stop and reconcile logic | `tests/test_packet_wire.py` (most cases), `tests/test_driver_acpx_dsh.py` |
 | **installed pinned acpx + input-sensitive ACP stub** | the real Node client carries the rendered packet, and the agent checks the values it received | `tests/test_packet_wire.py`, the two `real_acpx` cases |
-| **installed pinned acpx + the project's mock agent** | the hardened launch (absolute `cmd.exe`, stripped `DSH_*` mode variables) completes a turn with the exact packet bytes; a workspace `.acpxrc.json` is never launched on; `--model` is applied with `session/set_config_option` before the prompt against the mock's DSH-shaped `dsh-catalog` (placeholder ids), an unadvertised value fails before any prompt, and a missing catalog is recorded as not advertised | `tests/test_real_client_review.py` |
+| **installed pinned acpx + the project's mock agent** | the hardened launch (absolute `cmd.exe`, stripped `DSH_*` mode variables) completes a turn with the exact packet bytes; a workspace `.acpxrc.json` is never launched on; `--model` is applied with `session/set_config_option` before the prompt against the mock's DSH-shaped `dsh-catalog` (placeholder ids), an unadvertised value fails before any prompt, and a missing catalog is recorded as not advertised; a prompt answered with a JSON-RPC error (`prompt-error` scenario) is relayed with the prompt's id and no client error line of its own, and is recorded as `prompt_error_response`; a chunk the agent writes right after its prompt response is printed and counted after it (`trailing-update`) | `tests/test_real_client_review.py` |
 | real DSH with a model | nothing in this repository claims it: a live task needs its own explicit approval | `docs/m2-live-acceptance-result.md` (historical) |
 
 A fake client result is never presented as a real-client proof, and a real-client result is never
@@ -1123,6 +1136,19 @@ a run on this machine; they are stated so nobody claims the opposite:
 - **`end_turn` is turn settlement, not success.** DSH maps blocked and aborted turns to
   `end_turn` as well as completed ones. HFlow reports such a turn as `completed` and decides
   acceptance from checks and review only.
+- **A failed DSH turn is a JSON-RPC error, not a stop reason.** DSH answers `session/prompt` with
+  `RequestError.internalError` (-32603) `turn failed: ...` after the turn, or `prompt was not
+  queued: ...` (and other admission errors) before it; only blocked and aborted turns settle as
+  `end_turn`. HFlow records `prompt_error_response`, leaves the outcome unknown and does not tell
+  the pre-model form from the post-model one.
+- **Turn order is the agent's.** Stable ACP v1 requires a turn's updates before its prompt
+  response, and ACP #554 records agents that send the response first. From reading DSH
+  0.2.0-rc.2's `dsh_session.ts`: DSH settles a prompt only once its agent is idle and its output
+  queue has drained, but queues a model-catalog `config_option_update` off that chain, so one can
+  follow the response. From the acpx 0.17.1 source: `exec` does not wait for idle after the
+  response, but keeps reading while it closes the agent (100 ms after closing its stdin, then
+  1.5 s after SIGTERM). HFlow records what arrives (`stream_order`) and gives a reviewer whose
+  message arrives late no verdict.
 - **acpx `--timeout` is per phase.** It bounds start-up, session creation, the model change and
   the prompt separately, not the whole call, and its expiry sends no `session/cancel`. HFlow's own
   invocation deadline - capped by the root's clock - is the bound, enforced by the local wait and
@@ -1301,7 +1327,9 @@ candidate     workspace still matches the accepted fingerprint
 attempts
   A-2432mgtqqj  revision=1 role=implementer state=SUCCEEDED outcome=completed repair=False
     model         implementer not recorded (this result carries no model observation)
+    stream        implementer updates_after_prompt_response=unknown (not recorded: no bound prompt response, no stream read to its end, or a result without this record)
     model         reviewer not recorded (this result carries no model observation)
+    stream        reviewer updates_after_prompt_response=unknown (not recorded: no bound prompt response, no stream read to its end, or a result without this record)
 repair        no repair decision recorded
 evidence
   E-69hb2f96cn  kind=verification check=unit status=passed exit=0
@@ -1336,7 +1364,9 @@ model_calls   0 (this command; provider-side requests are reported by the receip
     process is never counted as one.
 - Whether a Harness makes internal model requests per turn is not observable here, so billed
   usage stays `null` and "billed model requests" stays `unknown`. Do not read `null` as `0`.
-  ACP `usage_update.used/size` is context-window usage, not a bill.
+  ACP `usage_update.used/size` is context-window usage, not a bill, and an agent-reported
+  `PromptResponse.usage` (UNSTABLE in ACP) or `usage_update.cost` is not a bill either: neither
+  ever fills `provider_billed_tokens` / `provider_cost` / `subscription_quota_remaining`.
 - A run with no root ledger row (any run recorded before E1, or one that never used a root
   budget file) prints `legacy / not recorded` for both the root budget and the dispatch ledger.
   That is **not** "0 used": there is no root, no invocation row and no counter to read, and
@@ -1344,6 +1374,10 @@ model_calls   0 (this command; provider-side requests are reported by the receip
 - `model` lines: one per invocation, from the stream the driver observed (see "Model
   selection"). The offline driver and runs recorded before model observation print `not
   recorded`.
+- `stream` lines: one per invocation, showing where its bound prompt response fell in the stream
+  and how many updates for the prompt's session followed it (see "Driver `error_code`" above).
+  They read `unknown`, never `0`, for the offline driver, older runs, unbound turns and streams
+  not read to their end.
 - `repair` lists every repair decision the run recorded, refusals included, or says `no repair
   decision recorded`.
 - `candidate` compares the workspace against the fingerprint the run was accepted at. If it

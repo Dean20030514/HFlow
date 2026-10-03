@@ -45,6 +45,7 @@ from hflow.drivers.acpx_dsh import (
     resolve_launch_config,
 )
 from hflow.drivers import winjob
+from hflow.drivers.acp_events import V1_STOP_REASONS, project_line
 from hflow.drivers.winjob import process_gone
 from hflow.store import Store
 from hflow.verify import CheckRunners, FakeCheckRunner
@@ -1030,6 +1031,34 @@ def test_missing_stop_reason_is_unknown_not_success(harness_factory) -> None:
     assert result.outcome is InvocationOutcome.OUTCOME_UNKNOWN
     assert result.error_code == "no_stop_reason"
     harness.driver.release(handle.invocation_id)
+
+
+@pytest.mark.parametrize("payload", ['"boom"', "null", "[1]", "1", "true"])
+def test_a_malformed_error_response_is_projected_not_raised(payload: str) -> None:
+    """An ``error`` that is not an object is still an error line.
+
+    The string, list, ``1`` and ``true`` payloads used to raise ``AttributeError`` out of the
+    projection - and out of the driver's reader thread, which then never counted what followed.
+    """
+    observed = project_line('{"jsonrpc":"2.0","id":2,"error":%s}' % payload, 0, "t")
+
+    assert observed.parsed is True
+    assert observed.event is not None and observed.event.kind is EventKind.FAILED
+
+
+def test_the_event_projection_and_the_result_share_acp_v1_stop_reasons() -> None:
+    """One closed set decides which stop reasons are known, for the event and for ``collect``."""
+    assert V1_STOP_REASONS == {"end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled"}
+
+    def kind_of(reason: str) -> EventKind:
+        observed = project_line(json.dumps({"id": 2, "result": {"stopReason": reason}}), 0, "t")
+        assert observed.event is not None
+        return observed.event.kind
+
+    for reason in V1_STOP_REASONS:
+        assert kind_of(reason) is not EventKind.OUTCOME_UNKNOWN, reason
+    for reason in ("paused", "error"):
+        assert kind_of(reason) is EventKind.OUTCOME_UNKNOWN, reason
 
 
 # --------------------------------------------------------------------------

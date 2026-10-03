@@ -152,9 +152,10 @@ the report come first.
 6. **Unknown means stop.** An interrupted invocation becomes `OUTCOME_UNKNOWN` with its
    reservation intact, the run blocks, and `resume` only reconciles. It never
    re-dispatches (A04). The same block follows a completion that answers no observed prompt
-   (`unbound_completion`, either role), a client whose boundary could not be confirmed empty
-   (`boundary_not_empty`), and a controller interrupted (Ctrl+C, `SystemExit`) while a driver
-   was starting or running an invocation.
+   (`unbound_completion`, either role), a prompt answered with a JSON-RPC error
+   (`prompt_error_response`) or with a stop reason outside ACP v1's set (`unknown_stop_reason`),
+   a client whose boundary could not be confirmed empty (`boundary_not_empty`), and a controller
+   interrupted (Ctrl+C, `SystemExit`) while a driver was starting or running an invocation.
 
 ## Bounded repair (batch E2)
 
@@ -272,16 +273,26 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
   turn's stop reason only from the response whose id equals the last observed `session/prompt`
   id: a terminal response that answers no observed prompt is `OUTCOME_UNKNOWN` /
   `unbound_completion` for implementer and reviewer alike (no freeze, no checks, no verdict); a
-  prompt settled as `max_tokens` (or any other non-`end_turn` reason) stays `FAILED
-  stop_reason_<reason>` whatever a later response says; and `stopReason=cancelled` with no stop
-  requested for that invocation is `FAILED cancelled_unrequested`, because DSH also settles a
-  prompt as cancelled when it disposes of a session. `end_turn` is turn settlement, not success
-  - acceptance is decided by checks and review. The reviewer's verdict is reassembled from
-  eligible `agent_message_chunk` updates of that invocation's own session and decoded into one
-  canonical `ReviewOutput` (`src/hflow/review.py`). Missing, malformed or ambiguous output, or a
-  reviewer turn that `FAILED`, blocks as `review_protocol_error` and is recorded as failed review
-  evidence - it is never described as the reviewer requesting changes, and a verdict can never
-  be filled in on the model's behalf. A reviewer turn whose outcome is unknown blocks as
+  prompt settled as `max_tokens`, `max_turn_requests` or `refusal` stays `FAILED
+  stop_reason_<reason>` whatever a later response says; a stop reason outside ACP v1's closed set
+  is `OUTCOME_UNKNOWN` / `unknown_stop_reason`, and the event projection and the result share the
+  set (`acp_events.V1_STOP_REASONS`); a JSON-RPC error answering the prompt is `OUTCOME_UNKNOWN` /
+  `prompt_error_response`, with its code and bounded message recorded, while an error with another
+  id, or with the prompt's id after a request from the agent reused it, is not attributed; a
+  response with no `stopReason` settles nothing (`no_stop_reason`); and `stopReason=cancelled`
+  with no stop requested for that invocation is `FAILED cancelled_unrequested`, because DSH also
+  settles a prompt as cancelled when it disposes of a session. `end_turn` is turn settlement, not
+  success - acceptance is decided by checks and review. Every bound result whose stream was read
+  to its end records where the prompt response fell and how many updates for the prompt's session
+  followed it (`stream_order`). The reviewer's verdict is reassembled from the `agent_message_chunk`
+  updates the driver observed - the production driver does not filter them by session, since
+  `acpx exec` runs one session, and the offline replay tool requires a single session - and
+  decoded into one canonical `ReviewOutput` (`src/hflow/review.py`). A message chunk after the
+  bound prompt response, or a stream not read to its end, means no verdict (`review_protocol_error`
+  / `review_ambiguous`). Missing, malformed or ambiguous output, or a reviewer turn that `FAILED`,
+  blocks as `review_protocol_error` and is recorded as failed review evidence - it is never
+  described as the reviewer requesting changes, and a verdict can never be filled in on the
+  model's behalf. A reviewer turn whose outcome is unknown blocks as
   `outcome_unknown`, and its ledger entry is settled as unknown (the ledger records the
   controller's classification, not the driver's raw outcome), so `resume` can reconcile it.
   Only the review invocation may produce a verdict: an implementer whose output happens to
@@ -385,7 +396,8 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
   shim's bare `node`) nor Node's spawn looks in the workspace first.
 - **Billing is unknown.** `provider_billed_tokens`, `provider_cost` and
   `subscription_quota_remaining` are `null` because nothing observes them. Do not read `null`
-  as `0`.
+  as `0`. An agent-reported `usage` on the prompt response (UNSTABLE in ACP) or the `cost` of a
+  `usage_update` is never read into them.
 - **Authorization is trusted-local.** A real run needs a one-shot artifact bound to that exact
   execution and carrying the user's own text (`authorization.py`). What is enforced is the
   binding, the per-id consumption cap and the literal `provided_by: user`; what is *not*

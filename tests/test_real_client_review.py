@@ -320,6 +320,57 @@ def test_real_client_refuses_an_unadvertised_model_without_sending_the_prompt(
     assert result.model_observation.effective_value == MOCK_INITIAL_MODEL
 
 
+def test_real_client_relays_a_prompt_error_with_the_prompts_id(tmp_path: Path) -> None:
+    """The pinned client relays the agent's error answering the prompt, with the prompt's id.
+
+    The mock answers ``session/prompt`` the way DSH reports a failed turn (``-32603``, no stop
+    reason). This is the repo-recorded offline observation of the pinned client's relay - one
+    error, carrying the prompt's id, and no null-id error line of the client's own - not a DSH
+    observation.
+    """
+    from hflow.contracts import InvocationOutcome
+
+    result, handle, stream, _ = _run_model_invocation(
+        tmp_path, scenario="prompt-error", model_selection="native_profile"
+    )
+
+    prompt_ids = [
+        message.get("id") for message in stream if message.get("method") == "session/prompt"
+    ]
+    errors = [
+        message
+        for message in stream
+        if "error" in message and not isinstance(message.get("method"), str)
+    ]
+    assert prompt_ids, "the prompt was sent"
+    assert [message.get("id") for message in errors] == [prompt_ids[-1]]
+    assert errors[0]["error"]["code"] == -32603
+    assert handle.dispatched is True
+    assert result.outcome is InvocationOutcome.OUTCOME_UNKNOWN
+    assert result.error_code == "prompt_error_response", result.error_message
+    assert "-32603" in (result.error_message or "")
+
+
+def test_real_client_prints_an_update_sent_right_after_the_prompt_response(
+    tmp_path: Path,
+) -> None:
+    """A chunk the agent writes right after its prompt response is printed after it.
+
+    The pinned ``exec`` keeps reading while it closes the agent, so the chunk reaches the stream,
+    and the driver counts it after the bound response. This depends on the client's close path
+    (0.17.1), not on a protocol guarantee; a client upgrade must re-run it.
+    """
+    result, _, stream, _ = _run_model_invocation(
+        tmp_path, scenario="trailing-update", model_selection="native_profile"
+    )
+
+    assert stream[-1].get("method") == "session/update", "the trailing chunk was printed last"
+    assert result.stream_order is not None
+    assert result.stream_order.updates_after_prompt_response == 1
+    assert result.stream_order.message_chunks_after_prompt_response == 1
+    assert stream[result.stream_order.prompt_response_line]["result"] == {"stopReason": "end_turn"}
+
+
 def test_real_client_without_a_catalog_records_that_none_was_advertised(tmp_path: Path) -> None:
     from hflow.contracts import InvocationOutcome, ModelApplied
 

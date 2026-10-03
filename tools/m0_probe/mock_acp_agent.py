@@ -47,6 +47,8 @@ SCENARIOS = (
     "bad-init",  # initialize returns an unrelated shape
     "exit-after-init",  # exits immediately after initialize succeeds
     "dsh-catalog",  # like normal, but session/new advertises a DSH-shaped grouped model catalog
+    "prompt-error",  # asks permission, then answers the prompt with DSH's -32603 turn error
+    "trailing-update",  # like normal, then one more message chunk right after the end_turn result
 )
 
 #: ``role-answer`` settings, taken from the environment so the mock stays a fixed program:
@@ -255,6 +257,11 @@ class MockAgent:
         # whatever comes back was decided by the client from its configuration. It says nothing
         # about DSH's native tool enforcement, only about the client's permission mediation.
         decision = self.ask_permission(session_id)
+        if self.scenario == "prompt-error":
+            # DSH's failed-turn shape: RequestError.internalError answering the prompt, never a stop
+            # reason.
+            self.wire.error(request_id, -32603, "Internal error: turn failed: mock provider error")
+            return
 
         self.wire.notify(
             "session/update",
@@ -284,6 +291,18 @@ class MockAgent:
             },
         )
         self.wire.result(request_id, {"stopReason": "end_turn"})
+        if self.scenario == "trailing-update":
+            # Stable ACP v1 sends a turn's updates before its response; this one does not.
+            self.wire.notify(
+                "session/update",
+                {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "mock text after the response"},
+                    },
+                },
+            )
 
     def ask_permission(self, session_id: str) -> dict[str, Any]:
         """Send ``session/request_permission`` and wait for the client's own answer.

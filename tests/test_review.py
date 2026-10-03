@@ -314,6 +314,23 @@ def test_updates_from_another_session_are_excluded() -> None:
     assert answer is not None and "accepted" not in answer.text
 
 
+def test_chunks_after_counts_only_retained_message_chunks_past_a_line() -> None:
+    """What the driver asks with the line of the turn's own prompt response."""
+    instance = transcript(
+        update("commentary", message_id="m-1"),
+        update("thinking", message_id="t-1", kind="agent_thought_chunk"),
+        update('{"verdict": "accepted"}', message_id="m-2", session_id="other-session"),
+        update("final", message_id="m-3"),
+        update("after", message_id="m-4"),
+    )
+
+    # Lines 0, 3 and 4 hold retained message chunks: the thought is not one, and the transcript
+    # skipped the other session's chunk.
+    assert instance.chunks_after(-1) == 3
+    assert instance.chunks_after(3) == 1
+    assert instance.chunks_after(4) == 0
+
+
 def test_a_message_without_text_content_is_rejected_not_guessed() -> None:
     instance = AnswerTranscript(session_id="sess-1", role="reviewer")
     payload = {"sessionUpdate": "agent_message_chunk", "content": {"type": "image"}}

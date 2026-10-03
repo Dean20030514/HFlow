@@ -282,6 +282,7 @@ the rest is reasoned, not measured. The state stays `unsupported`.
 | ACP removed the unstable `session/set_model` method (ACP 0.13.5); the stable model channel is a `configOptions` entry with category `model`, changed through `session/set_config_option`. DSH implements exactly that: option id `model`, value the opaque `JSON.stringify([provider, model])` (for example `["deepseek-official","deepseek-v4-pro"]`), plus a `reasoning_effort` option with category `thought_level`. DSH has no model CLI flag, environment variable or `_meta` field | documented |
 | The live catalog in "Facts observed on this machine" was observed on DSH 0.1.5; at 0.2.0 the `model` select may carry a second provider group (`deepseek-account`), and the 0.2.0-rc.2 release notes say some older model ids were removed | documented |
 | DSH maps `blocked` and `aborted` turns to `end_turn`, and can settle a prompt as `cancelled` without a client cancel (session disposal) | documented |
+| DSH answers a failed prompt with a JSON-RPC error, not a stop reason: `RequestError.internalError` (-32603) gives `turn failed: ...` / `assistant output delivery failed: ...` after the turn and `prompt was not queued: ...` (plus invalid-params and content-admission errors) before any model work (`packages/acp/acp/src/session.ts` @639ed015). DSH uses `@agentclientprotocol/sdk` 1.4.0, which numbers each side's requests from 0, so DSH's permission request ids can equal acpx's prompt id. ACP 59172baf adds a v1 test commented "v1 reports prompt failures as JSON-RPC errors" | documented |
 | DSH's permission requests carry only a tool-call id; DSH reads its sandbox mode from `DSH_PERMISSION_MODE` (default `workspace-write`, approval `ask`) and its tools mode from `DSH_TOOLS_MODE`; its session-log upload to DeepSeek is enabled by default | documented |
 | This machine has only DeepSeek Harness Desktop 0.2.0.0 installed (bundled `dsh.cmd` shim, not on `PATH`); there is no npm-global `@deepseek-ai/dsh` and no `dsh` on `PATH`, so the npm `dsh.CMD` recorded at M0 is gone. At the time of the survey HFlow's launch resolution (`shutil.which("dsh")`) would then have fallen back to the bare name; it no longer does - it searches only absolute `PATH` entries and, with no `dsh` there, reports the launch not resolvable | observed read-only (a file-system listing; nothing was executed) |
 
@@ -297,9 +298,12 @@ acpx 0.17.1 against the project's mock agent); none of it is live evidence.
   validated `model_selection` other than `native_profile` is passed as the client's `--model`,
   bound in the launch digest (a user ruling, 2026-10-02, that such a value is a fixed flag under
   AGENTS.md rule 9); a turn's stop reason is taken only from the response to the observed
-  `session/prompt` id (otherwise `OUTCOME_UNKNOWN` / `unbound_completion`); an unrequested
-  `cancelled` is `FAILED`; a stop asks the Job Object before confirming, and descendants left
-  inside the Job after the client exits are terminated.
+  `session/prompt` id (otherwise `OUTCOME_UNKNOWN` / `unbound_completion`); an error answering
+  that id is recorded as `prompt_error_response` and a stop reason outside ACP v1's set as
+  `unknown_stop_reason`, both still `OUTCOME_UNKNOWN` (the pinned acpx relaying the error is
+  covered against the mock agent); an unrequested `cancelled` is `FAILED`; a stop asks the Job
+  Object before confirming, and descendants left inside the Job after the client exits are
+  terminated.
 - **Observed per invocation:** the `session/new` `configOptions` model entry and the
   `thought_level` entry, outbound `session/set_config_option` and its response, and
   `config_option_update` notifications, recorded as `model_observation` / `model_applied`.

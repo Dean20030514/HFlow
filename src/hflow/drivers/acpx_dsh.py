@@ -84,6 +84,7 @@ from ..contracts import (
     RefusedError,
     SpawnFact,
     SpawnKind,
+    StreamOrder,
     ReviewOutput,
     launch_model,
 )
@@ -93,13 +94,14 @@ from ..packet import packet_digest
 from ..paths import ENV_ALLOW_WRITES  # noqa: F401 - re-exported for existing importers
 from ..review import (
     MAX_ANSWER_BYTES,
+    REVIEW_AMBIGUOUS,
     REVIEW_INVALID,
     REVIEW_MISSING,
     AnswerTranscript,
     ReviewDecodeError,
     decode_review,
 )
-from .acp_events import project_line
+from .acp_events import V1_STOP_REASONS, project_line
 from .winjob import ProcessBoundary, close_output_handles, popen_in_boundary, process_gone
 
 DRIVER_ID = "acpx-dsh-acp"
@@ -154,6 +156,9 @@ WORKSPACE_CLIENT_CONFIG_NAME = ".acpxrc.json"
 #: bare ``goal`` (a direct driver call) is still traceable to the request it came from. The
 #: digest covers the prompt text alone, so this envelope cannot change what the digest means.
 PROMPT_ENVELOPE = "HFLOW-PROMPT-DIGEST"
+#: How much of a JSON-RPC error message answering the prompt is kept: it is agent text, quoted
+#: (repr) in error_message, a limitation and block_reason.
+MAX_PROMPT_ERROR_MESSAGE_CHARS = 500
 
 
 def effective_prompt(request: InvocationRequest) -> str:
@@ -184,6 +189,46 @@ class ExitBoundary(NamedTuple):
     #: Processes still in the boundary after the client exited (``None``: the job could not say).
     left_behind: int | None
     detail: str
+
+
+class PromptErrorResponse(NamedTuple):
+    """A JSON-RPC error response carrying an observed ``session/prompt`` request id."""
+
+    #: The id exactly as the stream carried it.
+    request_id: Any
+    #: ``error.code`` when it is an int (not a bool), else ``None``.
+    code: int | None
+    #: ``error.message`` cut to MAX_PROMPT_ERROR_MESSAGE_CHARS; "" when absent or not a string.
+    message: str
+    #: Method of a request other than the prompt that carried the same id after the prompt was sent
+    #: ("" when none did). The agent numbers its own requests from 0 too (ACP SDK), so the error may
+    #: answer that request and is not attributed.
+    reused_by: str
+
+    @property
+    def code_text(self) -> str:
+        return "(no integer code)" if self.code is None else str(self.code)
+
+
+class _TerminalResponse(NamedTuple):
+    """One response that carried a ``stopReason``, and where in the stream it arrived."""
+
+    request_id: Any
+    stop_reason: Any
+    #: Stream index of its line (see ``AcpxDshDriver._line_counts``).
+    line_index: int
+    #: The session the latest ``session/prompt`` named when it arrived (``None``: no prompt yet),
+    #: and that session's update counts at that moment, so what came after it can be counted at
+    #: the end without keeping every update.
+    session_id: str | None
+    updates_before: int
+    message_chunks_before: int
+
+
+def _session_of(params: dict[str, Any]) -> str:
+    """The ``sessionId`` a message's params name, or ``""`` when they name none."""
+    session = params.get("sessionId")
+    return session if isinstance(session, str) else ""
 
 
 def _needs_batch_wrapper(dsh_executable: str) -> bool:
@@ -824,10 +869,26 @@ class AcpxDshDriver:
         self._prompt_request_ids: dict[str, list[Any]] = {}
         #: What the stream showed about each invocation's model option (see ``_ModelWatch``).
         self._model_watches: dict[str, _ModelWatch] = {}
-        #: Every response that carried a ``stopReason``, as ``(id, stopReason)`` in stream order,
-        #: whatever request it answered. Which of them settles the turn is decided in
-        #: ``_prompt_response``, not by the order they arrived in.
-        self._terminal_responses: dict[str, list[tuple[Any, Any]]] = {}
+        #: Every response that carried a ``stopReason``, in stream order, whatever request it
+        #: answered. Which of them settles the turn is decided in ``_bound_response``, not by the
+        #: order they arrived in.
+        self._terminal_responses: dict[str, list[_TerminalResponse]] = {}
+        #: The first error response per observed prompt id, in stream order. Which one answers the
+        #: turn is decided in ``_prompt_error``.
+        self._prompt_errors: dict[str, list[PromptErrorResponse]] = {}
+        #: Prompt ids that another request carried after the prompt was sent, with that request's
+        #: method. JSON-RPC ids are per direction, and the stream carries both directions.
+        self._prompt_id_reused_by: dict[str, dict[tuple[str, Any], str]] = {}
+        #: Non-empty protocol lines read so far: the next line's stream index. ``_lines`` is a
+        #: bounded deque and ``_events`` is capped, so neither can number a line once it is full;
+        #: this never saturates, and while the retained log is whole it is the line's 0-based
+        #: number in ``events.ndjson``.
+        self._line_counts: dict[str, int] = {}
+        #: The session the latest ``session/prompt`` named, and ``[updates, agent_message_chunk
+        #: updates]`` per session a prompt named, counted from that prompt on. Bounded by the
+        #: number of prompt requests, which is one for ``exec``.
+        self._prompt_sessions: dict[str, str] = {}
+        self._prompt_session_updates: dict[str, dict[str, list[int]]] = {}
         self._lines: dict[str, list[str]] = {}
         self._unparsed: dict[str, int] = {}
         self._overflow: dict[str, bool] = {}
@@ -1276,6 +1337,10 @@ class AcpxDshDriver:
         self._prompt_request_ids[request.invocation_id] = []
         self._model_watches[request.invocation_id] = _ModelWatch(self.launch.model or None)
         self._terminal_responses[request.invocation_id] = []
+        self._prompt_errors[request.invocation_id] = []
+        self._prompt_id_reused_by[request.invocation_id] = {}
+        self._line_counts[request.invocation_id] = 0
+        self._prompt_session_updates[request.invocation_id] = {}
         self._lines[request.invocation_id] = deque(maxlen=MAX_BUFFERED_LINES)
         self._unparsed[request.invocation_id] = 0
         self._overflow[request.invocation_id] = False
@@ -1454,14 +1519,15 @@ class AcpxDshDriver:
         # total describe HFlow's copy instead of the stream HFlow actually read.
         sink.write(text.encode("utf-8") + b"\n")
         self._lines[invocation_id].append(text)
+        # Numbered before parsing, so unparseable and message-less lines take a number too.
+        line_index = self._line_counts[invocation_id]
+        self._line_counts[invocation_id] = line_index + 1
         observed = project_line(text, len(self._events[invocation_id]), utc_now())
         if not observed.parsed:
             self._unparsed[invocation_id] += 1
             return
         if observed.message is not None:
-            self._note_message(
-                invocation_id, observed.message, line_index=len(self._lines[invocation_id]) - 1
-            )
+            self._note_message(invocation_id, observed.message, line_index=line_index)
         if observed.event is not None:
             if self._events_capped[invocation_id]:
                 return
@@ -1517,22 +1583,42 @@ class AcpxDshDriver:
 
         Neutral facts, no policy: the dispatch marker and the prompt's request id, the session
         identity, the assistant text of the turn (which is where a reviewer's verdict actually
-        travels), each terminal response together with the request id it answered, and what the
-        stream says about the session's model option.
+        travels), each terminal response together with the request id it answered and where in
+        the stream it arrived, each error response that carries an observed prompt id, and what
+        the stream says about the session's model option.
         """
         handle = self._handles[invocation_id]
         watch = self._model_watches.get(invocation_id)
         if watch is not None:
             watch.observe(message)
+        params = message.get("params") if isinstance(message.get("params"), dict) else {}
         if message.get("method") == "session/prompt":
             handle.dispatched = True
             handle.dispatched_at = handle.dispatched_at or utc_now()
             request_id = message.get("id")
             if request_id is not None:
                 self._prompt_request_ids.setdefault(invocation_id, []).append(request_id)
+                session = _session_of(params)
+                self._prompt_sessions[invocation_id] = session
+                self._prompt_session_updates.setdefault(invocation_id, {}).setdefault(
+                    session, [0, 0]
+                )
+        elif isinstance(message.get("method"), str):
+            # Another request carrying an observed prompt's id: the agent numbers its own requests
+            # (permission) from 0 independently of the client, so an error with that id may
+            # answer it.
+            key = _rpc_id(message.get("id"))
+            if key is not None and key in self._prompt_keys(invocation_id):
+                self._prompt_id_reused_by.setdefault(invocation_id, {}).setdefault(
+                    key, str(message["method"])
+                )
         if message.get("method") == "session/update":
-            params = message.get("params") if isinstance(message.get("params"), dict) else {}
             update = params.get("update") if isinstance(params.get("update"), dict) else {}
+            counts = self._prompt_session_updates.get(invocation_id, {}).get(_session_of(params))
+            if counts is not None:
+                counts[0] += 1
+                if update.get("sessionUpdate") == "agent_message_chunk":
+                    counts[1] += 1
             transcript = self._transcripts.get(invocation_id)
             if transcript is not None:
                 # A shape this build cannot read must not kill the reader thread: it is
@@ -1550,9 +1636,55 @@ class AcpxDshDriver:
         if isinstance(result, dict) and isinstance(result.get("sessionId"), str):
             handle.session_id = result["sessionId"]
         if isinstance(result, dict) and "stopReason" in result:
-            self._terminal_responses.setdefault(invocation_id, []).append(
-                (message.get("id"), result.get("stopReason"))
+            session = self._prompt_sessions.get(invocation_id)
+            before = (
+                self._prompt_session_updates.get(invocation_id, {}).get(session, [0, 0])
+                if session is not None
+                else [0, 0]
             )
+            self._terminal_responses.setdefault(invocation_id, []).append(
+                _TerminalResponse(
+                    request_id=message.get("id"),
+                    stop_reason=result.get("stopReason"),
+                    line_index=line_index,
+                    session_id=session,
+                    updates_before=before[0],
+                    message_chunks_before=before[1],
+                )
+            )
+        if "error" in message and not isinstance(message.get("method"), str):
+            self._note_prompt_error(invocation_id, message)
+
+    def _prompt_keys(self, invocation_id: str) -> set[tuple[str, Any]]:
+        """The observed ``session/prompt`` ids as type-keeping keys (see ``_rpc_id``)."""
+        keys = (_rpc_id(value) for value in self._prompt_request_ids.get(invocation_id) or [])
+        return {key for key in keys if key is not None}
+
+    def _note_prompt_error(self, invocation_id: str, message: dict[str, Any]) -> None:
+        """Keep an error response that carries an observed prompt id.
+
+        ACP v1 reports a failed prompt as an error answering it. Only an id echoed exactly (type
+        included, as in ``_prompt_response``) is kept. An error for any other request, including
+        the client's own null-id line, says nothing about the turn. JSON-RPC answers a request
+        once, so only the first error per id is kept.
+        """
+        key = _rpc_id(message.get("id"))
+        if key is None or key not in self._prompt_keys(invocation_id):
+            return
+        records = self._prompt_errors.setdefault(invocation_id, [])
+        if any(_rpc_id(record.request_id) == key for record in records):
+            return
+        error = message.get("error") if isinstance(message.get("error"), dict) else {}
+        code = error.get("code")
+        text = error.get("message")
+        records.append(
+            PromptErrorResponse(
+                request_id=message.get("id"),
+                code=code if isinstance(code, int) and not isinstance(code, bool) else None,
+                message=text[:MAX_PROMPT_ERROR_MESSAGE_CHARS] if isinstance(text, str) else "",
+                reused_by=self._prompt_id_reused_by.get(invocation_id, {}).get(key, ""),
+            )
+        )
 
     def observe(self, handle: DriverHandle, *, poll_seconds: float = 0.1) -> Iterator[NormalizedEvent]:
         """Yield events as they arrive, until the invocation reaches a terminal state."""
@@ -1695,6 +1827,13 @@ class AcpxDshDriver:
         # turn. A settled response that answers nothing observed is an unbound completion.
         answered, stop_reason = self._prompt_response(invocation_id)
         unbound = bool(self._terminal_responses.get(invocation_id)) and not answered
+        prompt_error = self._prompt_error(invocation_id)
+        prompt_error_detail = (
+            self._prompt_error_detail(prompt_error, process.returncode, answered, stop_reason)
+            if prompt_error is not None
+            else ""
+        )
+        stream_order = self._stream_order(invocation_id)
         receipt = self._receipts.get(invocation_id)
 
         if receipt is not None and receipt.status == "confirmed_stopped":
@@ -1725,6 +1864,17 @@ class AcpxDshDriver:
             error_message = f"{unparsed} unparseable line(s) in the client output stream"
             if oversized:
                 error_message += f" ({oversized} of them exceeded the {MAX_PENDING_LINE_BYTES} byte line cap)"
+        elif prompt_error is not None:
+            # ACP v1 reports a failed prompt as a JSON-RPC error answering it (DSH: -32603 "Internal
+            # error: turn failed: ..." after the turn ran; "prompt was not queued: ...", invalid
+            # params or a content-admission error before any model work). The code and message are
+            # recorded, but the outcome stays unknown: whether a model call was made is not
+            # observable, and an error is not a stop reason; calling it FAILED is a separate
+            # decision (rule 5). A prompt answered with an error and a stop reason was answered
+            # twice, so neither answer is taken.
+            outcome = InvocationOutcome.OUTCOME_UNKNOWN
+            error_code = "prompt_error_response"
+            error_message = prompt_error_detail
         elif unbound:
             # Something settled, but not this invocation's prompt: whatever the turn did, the
             # stream does not say it finished. Unknown for every role - an implementer's unbound
@@ -1751,6 +1901,17 @@ class AcpxDshDriver:
                 if process.returncode == 0
                 else f"client exited {process.returncode} before the turn settled"
             )
+        elif stop_reason not in V1_STOP_REASONS:
+            # Outside ACP v1's closed StopReason set (a custom, later-protocol or malformed value):
+            # the response does not say how the turn ended in terms this build reads. That is
+            # unknown, as the event projection already says - like an unparseable line - not a
+            # failure whose meaning is known.
+            outcome = InvocationOutcome.OUTCOME_UNKNOWN
+            error_code = "unknown_stop_reason"
+            error_message = (
+                f"the prompt's own response settled with stopReason={stop_reason[:80]!r}, which "
+                "is not an ACP v1 stop reason"
+            )
         elif stop_reason == "end_turn":
             # Turn settlement, not success: DSH settles blocked and aborted turns as end_turn too.
             # COMPLETED says only that the turn ended; checks and review decide acceptance.
@@ -1770,6 +1931,8 @@ class AcpxDshDriver:
                 "invocation"
             )
         else:
+            # max_tokens, max_turn_requests, refusal: v1 reasons for a turn that ended without
+            # finishing.
             outcome = InvocationOutcome.FAILED
             error_code, error_message = f"stop_reason_{stop_reason}", f"turn settled as {stop_reason}"
 
@@ -1804,6 +1967,33 @@ class AcpxDshDriver:
                 f"unbound_completion: {self._unbound_detail(invocation_id)}; the turn's completion "
                 "is not bound to this invocation's prompt"
             )
+        if prompt_error is not None:
+            limitations.append(
+                f"prompt_error_response: {prompt_error_detail}; ACP v1 reports a failed prompt this "
+                "way, but whether a model call was made before it failed is not observable here, so "
+                "the outcome is unknown rather than failed"
+            )
+        for record in self._prompt_errors.get(invocation_id) or []:
+            if record.reused_by:
+                limitations.append(
+                    f"prompt_error_unattributed: an error response ({record.code_text}: "
+                    f"{record.message!r}) carries the session/prompt request id "
+                    f"{record.request_id!r}, which a {record.reused_by} request also used after the "
+                    "prompt was sent; JSON-RPC ids are per direction, so it may answer that request "
+                    "and is not attributed to the prompt"
+                )
+        if stream_order is not None and stream_order.updates_after_prompt_response:
+            # Recorded, never judged here: only a reviewer's after-response message changes what
+            # the turn yields (see ``_review_output``). Not prefixed ``review_``, which
+            # ``review_input_error`` reads as a wire failure.
+            limitations.append(
+                f"updates_after_prompt_response={stream_order.updates_after_prompt_response}: "
+                f"{stream_order.updates_after_prompt_response} session/update notification(s) "
+                f"({stream_order.message_chunks_after_prompt_response} agent_message_chunk) for "
+                "the prompt's session arrived after the session/prompt response on stream line "
+                f"{stream_order.prompt_response_line}; stable ACP v1 sends a turn's updates before "
+                "its response, so these are outside the settled turn"
+            )
         review, note = self._review_output(handle, outcome)
         if note:
             limitations.append(note)
@@ -1825,6 +2015,7 @@ class AcpxDshDriver:
             error_message=error_message,
             model_observation=observation,
             model_applied=applied,
+            stream_order=stream_order,
         )
         handle.finished = True
         self._results[invocation_id] = result
@@ -1878,22 +2069,51 @@ class AcpxDshDriver:
         ``answered`` is False when no response carries that id, including when no prompt with an
         id was observed at all: then there is nothing a completion could be bound to.
         """
+        response = self._bound_response(invocation_id)
+        if response is None:
+            return False, None
+        return True, None if response.stop_reason is None else str(response.stop_reason)
+
+    def _bound_response(self, invocation_id: str) -> _TerminalResponse | None:
+        """The response ``_prompt_response`` binds the turn to, or ``None``."""
         prompt_ids = self._prompt_request_ids.get(invocation_id) or []
         if not prompt_ids:
-            return False, None
+            return None
         prompt_id = prompt_ids[-1]
-        for response_id, stop_reason in self._terminal_responses.get(invocation_id) or []:
+        for response in self._terminal_responses.get(invocation_id) or []:
             # The type is compared too: ``2``, ``2.0`` and ``True`` are equal in Python, and an id
             # that is not echoed exactly does not answer the request.
-            if type(response_id) is type(prompt_id) and response_id == prompt_id:
-                return True, None if stop_reason is None else str(stop_reason)
-        return False, None
+            if type(response.request_id) is type(prompt_id) and response.request_id == prompt_id:
+                return response
+        return None
+
+    def _stream_order(self, invocation_id: str) -> StreamOrder | None:
+        """Where the bound prompt response fell in the stream, and what came after it.
+
+        Counted for the session the latest ``session/prompt`` named when that response arrived -
+        for ``exec``, the one session of its one prompt - from the response to the end of the
+        stream. ``None`` when no response answers the prompt, or none had been preceded by a
+        prompt: there is nothing to count from. ``None`` too when the reader has not finished the
+        stream: "nothing followed the response" is a fact only about a stream read to its end, and
+        ``collect`` can fold a result after STREAM_DRAIN_TIMEOUT_SECONDS without that.
+        """
+        if not self._stream_drained.get(invocation_id):
+            return None
+        response = self._bound_response(invocation_id)
+        if response is None or response.session_id is None:
+            return None
+        updates, chunks = self._prompt_session_updates[invocation_id][response.session_id]
+        return StreamOrder(
+            prompt_response_line=response.line_index,
+            updates_after_prompt_response=updates - response.updates_before,
+            message_chunks_after_prompt_response=chunks - response.message_chunks_before,
+        )
 
     def _unbound_detail(self, invocation_id: str) -> str:
         """Which ids were seen, for a completion that answers no observed prompt."""
         prompt_ids = self._prompt_request_ids.get(invocation_id) or []
         responses = self._terminal_responses.get(invocation_id) or []
-        response_ids = [response_id for response_id, _ in responses]
+        response_ids = [response.request_id for response in responses]
         if not prompt_ids:
             return (
                 f"terminal response id(s) {response_ids!r} arrived, but no session/prompt request "
@@ -1903,6 +2123,42 @@ class AcpxDshDriver:
             f"no response answers the observed session/prompt request id {prompt_ids[-1]!r}; "
             f"terminal response id(s) {response_ids!r}"
         )
+
+    def _prompt_error(self, invocation_id: str) -> PromptErrorResponse | None:
+        """The attributable error answering this invocation's prompt, or ``None``.
+
+        The prompt is the same request ``_prompt_response`` binds to (the last observed
+        ``session/prompt``). An error whose id a peer request reused is not returned: it may answer
+        that request instead.
+        """
+        prompt_ids = self._prompt_request_ids.get(invocation_id) or []
+        if not prompt_ids:
+            return None
+        key = _rpc_id(prompt_ids[-1])
+        for record in self._prompt_errors.get(invocation_id) or []:
+            if _rpc_id(record.request_id) == key and not record.reused_by:
+                return record
+        return None
+
+    @staticmethod
+    def _prompt_error_detail(
+        record: PromptErrorResponse, returncode: int | None, answered: bool, stop_reason: str | None
+    ) -> str:
+        """What answered the prompt with an error.
+
+        The agent's message is repr-quoted, so it cannot carry control or ANSI sequences into
+        ``status``.
+        """
+        detail = (
+            f"session/prompt request {record.request_id!r} was answered with JSON-RPC error "
+            f"{record.code_text}: {record.message!r}; client exited {returncode}"
+        )
+        if answered:
+            detail += (
+                f"; the same request id was also answered with stopReason={stop_reason!r}, and a "
+                "request is answered once, so neither answer is taken"
+            )
+        return detail
 
     def _review_output(
         self, handle: DriverHandle, outcome: InvocationOutcome
@@ -1945,12 +2201,33 @@ class AcpxDshDriver:
                 f"review_{REVIEW_MISSING}: the reviewer turn did not complete "
                 f"({outcome.value}); its text is not a verdict"
             )
-        if not self._prompt_response(handle.invocation_id)[0]:
+        response = self._bound_response(handle.invocation_id)
+        if response is None:
             # A completed outcome is only ever taken from the prompt's own response, so this holds
             # already; it is asked again because this is the one place a verdict can come from.
             return None, (
                 f"review_{REVIEW_MISSING}: the terminal response was not matched to an observed "
                 "session/prompt request for this invocation"
+            )
+        if not self._stream_drained.get(handle.invocation_id):
+            # What followed the response is only known for a stream read to its end; the check
+            # below would otherwise pass on lines nobody has read yet.
+            return None, (
+                f"review_{REVIEW_AMBIGUOUS}: the client's output was not read to its end within "
+                f"{STREAM_DRAIN_TIMEOUT_SECONDS}s of the client's exit, so what followed the "
+                "session/prompt response is not known and no verdict is decoded"
+            )
+        trailing = transcript.chunks_after(response.line_index)
+        if trailing:
+            # ACP v1 sends a turn's updates before its response. Text that arrived after it is
+            # outside the settled turn, and it can replace, extend or be the final message, so the
+            # turn's final answer is not identified: no verdict, rather than a guess either way.
+            # The check reads the transcript, so it catches any chunk the transcript accepted -
+            # another session's too, since the production transcript has no session filter.
+            return None, (
+                f"review_{REVIEW_AMBIGUOUS}: {trailing} agent_message_chunk update(s) arrived "
+                f"after the session/prompt response on stream line {response.line_index}, so the "
+                "turn's final answer is not identified and no verdict is decoded"
             )
         try:
             review = decode_review(answer.text)

@@ -21,6 +21,7 @@ import hflow.drivers.acpx_dsh as driver_module
 import hflow.review as review_module
 from hflow.contracts import (
     DeliveryState,
+    EventKind,
     EvidenceStatus,
     InvocationOutcome,
     InvocationRequest,
@@ -55,6 +56,9 @@ def structured_harness(
     message_ids: bool = True,
     terminal_responses: str | None = None,
     reviewer_terminal_responses: str | None = None,
+    trailing_updates: str | None = None,
+    reviewer_trailing_updates: str | None = None,
+    reported_usage: bool = False,
 ) -> DriverHarness:
     """A driver whose agent answers by role, through the production launch path.
 
@@ -64,7 +68,10 @@ def structured_harness(
 
     ``terminal_responses`` replaces the stub's terminal prompt response with ``id:stopReason``
     pairs (the client sends ``session/prompt`` as id 2); ``reviewer_terminal_responses`` does the
-    same for the reviewer only.
+    same for the reviewer only. ``trailing_updates`` / ``reviewer_trailing_updates`` set
+    ``STUB_TRAILING_UPDATES`` / ``STUB_REVIEWER_TRAILING_UPDATES`` (updates sent after the
+    terminal response), and ``reported_usage`` sets ``STUB_REPORTED_USAGE=1`` (agent-reported
+    usage and cost).
     """
     harness = DriverHarness(tmp_path, "structured")
     scratch = (tmp_path / "stub-scratch").resolve()
@@ -77,6 +84,12 @@ def structured_harness(
         harness.driver.extra_env["STUB_TERMINAL_RESPONSES"] = terminal_responses
     if reviewer_terminal_responses is not None:
         harness.driver.extra_env["STUB_REVIEWER_TERMINAL_RESPONSES"] = reviewer_terminal_responses
+    if trailing_updates is not None:
+        harness.driver.extra_env["STUB_TRAILING_UPDATES"] = trailing_updates
+    if reviewer_trailing_updates is not None:
+        harness.driver.extra_env["STUB_REVIEWER_TRAILING_UPDATES"] = reviewer_trailing_updates
+    if reported_usage:
+        harness.driver.extra_env["STUB_REPORTED_USAGE"] = "1"
     return harness
 
 
@@ -255,6 +268,134 @@ def test_a_cancelled_turn_nobody_asked_to_stop_is_a_failure_not_a_cancellation(
 
     assert result.outcome is InvocationOutcome.FAILED
     assert result.error_code == "cancelled_unrequested"
+    assert result.review is None
+    harness.driver.release(handle.invocation_id)
+
+
+@pytest.mark.parametrize("role", ["implementer", "reviewer"])
+def test_an_error_answering_the_prompt_is_recorded_and_stays_unknown(
+    tmp_path: Path, role: str
+) -> None:
+    """ACP v1 reports a failed prompt as a JSON-RPC error answering it, not as a stop reason.
+
+    DSH sends ``-32603 Internal error: turn failed: ...``. The code and the message are recorded,
+    but whether a model call was made is not observable, so the outcome stays unknown - the same
+    as a turn with no stop reason, only now with its cause named.
+    """
+    harness = structured_harness(tmp_path, terminal_responses="2:!-32603")
+
+    result, handle, _ = run_invocation(harness, role, GOALS[role])
+
+    assert handle.dispatched is True
+    assert result.outcome is InvocationOutcome.OUTCOME_UNKNOWN
+    assert result.error_code == "prompt_error_response", result.error_message
+    assert "-32603" in (result.error_message or "")
+    assert "turn failed: stub provider error" in (result.error_message or "")
+    assert any(note.startswith("prompt_error_response:") for note in result.limitations)
+    assert result.review is None
+    assert not any(note.startswith("review_decoded") for note in result.limitations)
+    harness.driver.release(handle.invocation_id)
+
+
+@pytest.mark.parametrize("role", ["implementer", "reviewer"])
+def test_an_error_answering_another_request_is_not_attributed_to_the_prompt(
+    tmp_path: Path, role: str
+) -> None:
+    """An error for id 7 answers some other request: the turn simply never settled."""
+    harness = structured_harness(tmp_path, terminal_responses="7:!-32603")
+
+    result, handle, _ = run_invocation(harness, role, GOALS[role])
+
+    assert result.outcome is InvocationOutcome.OUTCOME_UNKNOWN
+    assert result.error_code == "no_stop_reason"
+    assert "-32603" not in (result.error_message or "")
+    assert not any(note.startswith("prompt_error") for note in result.limitations)
+    harness.driver.release(handle.invocation_id)
+
+
+@pytest.mark.parametrize("responses", ["2:!-32603,2:end_turn", "2:end_turn,2:!-32603"])
+@pytest.mark.parametrize("role", ["implementer", "reviewer"])
+def test_a_prompt_answered_with_an_error_and_a_stop_reason_is_unknown(
+    tmp_path: Path, role: str, responses: str
+) -> None:
+    """A request is answered once. Two answers, in either order, mean neither is taken.
+
+    Both streams used to be COMPLETED, and the reviewer's verdict was decoded from them.
+    """
+    harness = structured_harness(tmp_path, terminal_responses=responses)
+
+    result, handle, _ = run_invocation(harness, role, GOALS[role])
+
+    assert result.outcome is InvocationOutcome.OUTCOME_UNKNOWN
+    assert result.error_code == "prompt_error_response"
+    assert "stopReason='end_turn'" in (result.error_message or "")
+    assert result.review is None
+    harness.driver.release(handle.invocation_id)
+
+
+@pytest.mark.parametrize(
+    ("responses", "outcome", "error_code"),
+    [
+        (
+            "2:?session/request_permission,2:!-32603,2:end_turn",
+            InvocationOutcome.COMPLETED,
+            None,
+        ),
+        (
+            "2:?session/request_permission,2:!-32603",
+            InvocationOutcome.OUTCOME_UNKNOWN,
+            "no_stop_reason",
+        ),
+    ],
+)
+def test_an_error_carrying_an_id_the_agent_reused_is_not_attributed(
+    tmp_path: Path, responses: str, outcome: InvocationOutcome, error_code: str | None
+) -> None:
+    """JSON-RPC ids are per direction, and the stream carries both.
+
+    The ACP SDK DSH uses numbers each side's requests from 0 (``jsonrpc.js`` ``nextRequestId = 0``
+    and ``this.nextRequestId++``, lines 372 and 545 of the vendored 1.4.0), so the agent's third
+    ``session/request_permission`` carries the prompt's id 2. An error with that id may answer the
+    agent's request, so it is recorded as unattributed and never as the prompt's answer. The
+    client's exit code is not asserted: the stub exits 1 after any error item.
+    """
+    harness = structured_harness(tmp_path, terminal_responses=responses)
+
+    result, handle, _ = run_invocation(harness, "implementer", GOALS["implementer"])
+
+    assert result.outcome is outcome, result.error_message
+    assert result.error_code == error_code
+    assert any(
+        note.startswith("prompt_error_unattributed:") and "session/request_permission" in note
+        for note in result.limitations
+    )
+    assert not any(note.startswith("prompt_error_response:") for note in result.limitations)
+    harness.driver.release(handle.invocation_id)
+
+
+@pytest.mark.parametrize("reason", ["paused", "error"])
+@pytest.mark.parametrize("role", ["implementer", "reviewer"])
+def test_a_stop_reason_outside_acp_v1_is_unknown_in_the_result_and_the_event(
+    tmp_path: Path, role: str, reason: str
+) -> None:
+    """A stop reason this build cannot read says nothing it can act on: unknown, not FAILED.
+
+    It used to be ``FAILED stop_reason_<reason>`` while the event projection already said
+    ``outcome_unknown``; the two now share ACP v1's closed set.
+    """
+    harness = structured_harness(tmp_path, terminal_responses=f"2:{reason}")
+
+    result, handle, _ = run_invocation(harness, role, GOALS[role])
+
+    assert result.outcome is InvocationOutcome.OUTCOME_UNKNOWN
+    assert result.error_code == "unknown_stop_reason"
+    assert repr(reason) in (result.error_message or "")
+    settled = [
+        event
+        for event in harness.driver.events(handle.invocation_id)
+        if event.method == "session/prompt" and "stopReason=" in event.message
+    ]
+    assert settled and settled[-1].kind is EventKind.OUTCOME_UNKNOWN
     assert result.review is None
     harness.driver.release(handle.invocation_id)
 
@@ -606,6 +747,58 @@ def test_an_unbound_reviewer_completion_blocks_as_unknown_not_as_a_protocol_erro
     assert outcome.block_code is RefusalCode.OUTCOME_UNKNOWN, outcome.block_reason
     assert outcome.receipt is None
     assert review_evidence == [], "an unknown turn is not a failed review either"
+
+
+def test_an_implementer_prompt_error_blocks_as_unknown_and_status_names_the_code(
+    tmp_path: Path, project, task_spec, project_root: Path
+) -> None:
+    """The implementer's prompt is answered with an error: blocked, unchecked, and named."""
+    from hflow.controller import inspect_run
+    from hflow.report import status_text
+
+    harness = structured_harness(tmp_path, terminal_responses="2:!-32603")
+    controller, store, runner = controller_for(harness, tmp_path)
+    try:
+        outcome = _run(controller, project, task_spec, project_root)
+        text = status_text(inspect_run(store, outcome.run_id))
+        stored = json.loads(store.attempts_for(outcome.run_id)[0]["result_json"])
+    finally:
+        for invocation_id in list(harness.driver._handles):
+            harness.driver.release(invocation_id)
+        store.close()
+
+    assert outcome.task_state is TaskState.BLOCKED
+    assert outcome.block_code is RefusalCode.OUTCOME_UNKNOWN, outcome.block_reason
+    assert outcome.receipt is None
+    assert runner.calls == [], "no check may run on a turn whose outcome is unknown"
+    assert outcome.implementer_invocations == 1 and outcome.reviewer_invocations == 0
+    assert "prompt_error_response" in (outcome.block_reason or "")
+    assert "-32603" in (outcome.block_reason or "")
+    assert "prompt_error_response" in text
+    assert stored["error_code"] == "prompt_error_response"
+
+
+def test_a_reviewer_prompt_error_blocks_as_unknown_with_its_code(
+    tmp_path: Path, project, task_spec, project_root: Path
+) -> None:
+    """The reviewer's prompt is answered with an error: unknown, not a protocol error."""
+    harness = structured_harness(tmp_path, reviewer_terminal_responses="2:!-32603")
+    controller, store, runner = controller_for(harness, tmp_path)
+    try:
+        outcome = _run(controller, project, task_spec, project_root)
+        review_evidence = store.evidence_for(outcome.run_id, "review")
+    finally:
+        for invocation_id in list(harness.driver._handles):
+            harness.driver.release(invocation_id)
+        store.close()
+
+    assert runner.calls == ["unit", "docs-check"]
+    assert outcome.reviewer_invocations == 1
+    assert outcome.task_state is TaskState.BLOCKED
+    assert outcome.block_code is RefusalCode.OUTCOME_UNKNOWN, outcome.block_reason
+    assert "prompt_error_response" in (outcome.block_reason or "")
+    assert "-32603" in (outcome.block_reason or "")
+    assert review_evidence == []
 
 
 #: The two shapes an unbound reviewer can arrive in: the production driver's (an unknown outcome

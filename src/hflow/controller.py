@@ -2733,8 +2733,11 @@ class Controller:
                 dispatch=dispatch,
                 settle_detail="driver reported an unknown outcome",
                 block_code=RefusalCode.OUTCOME_UNKNOWN,
-                reason="the worker's result is unknown; no re-dispatch until an operator reconciles "
-                "(plan 9.3)",
+                reason=(
+                    f"the worker's result is unknown ({result.error_code or 'no code'}: "
+                    f"{result.error_message or 'no detail'}); no re-dispatch until an operator "
+                    "reconciles (plan 9.3)"
+                ),
             )
             self._release_invocation(self.driver, run_id, invocation_id)
             return _CycleResult(outcome=self._outcome_for(run_id))
@@ -4164,6 +4167,28 @@ def _stored_model_facts(row: Any, column: str, prefix: str) -> dict[str, Any]:
         return {}
 
 
+def _stored_stream_order(row: Any, column: str, prefix: str) -> dict[str, Any]:
+    """The stream order an attempt's stored invocation result carries, read as recorded.
+
+    Built like ``_stored_model_facts``: a result without it (an unbound turn, a stream not read to
+    its end, the offline driver, an older run) yields ``None``, which ``status`` reports as
+    unknown, never as "0 updates".
+    """
+    from .contracts import StreamOrder
+
+    raw = row[column] if column in row.keys() else None
+    try:
+        payload = json.loads(raw) if raw else {}
+        order = payload.get("stream_order")
+        return {
+            f"{prefix}stream_order": StreamOrder.model_validate(order)
+            if isinstance(order, dict)
+            else None
+        }
+    except (ValueError, TypeError, AttributeError):
+        return {}
+
+
 def inspect_run(store: Store, run_id: str, *, project_root: Path | None = None) -> RunInspection:
     """Read-only projection for ``status``/``report``. Zero model calls, by design."""
     from .contracts import AttemptRecord, EvidenceRecord
@@ -4196,6 +4221,8 @@ def inspect_run(store: Store, run_id: str, *, project_root: Path | None = None) 
             finished_at=a["finished_at"],
             **_stored_model_facts(a, "result_json", ""),
             **_stored_model_facts(a, "review_json", "review_"),
+            **_stored_stream_order(a, "result_json", ""),
+            **_stored_stream_order(a, "review_json", "review_"),
         )
         for a in store.attempts_for(run_id)
     ]

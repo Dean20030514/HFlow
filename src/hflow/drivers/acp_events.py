@@ -1,12 +1,16 @@
 """Projection of an ACP/JSON-RPC line stream into HFlow's neutral event vocabulary.
 
 The driver observes whatever the chosen CLI prints (acpx `--format json` emits NDJSON ACP
-messages) and maps it here. Two rules:
+messages) and maps it here. Three rules:
 
 * an unparseable line is *evidence of a protocol problem*, never silently dropped - it is
   counted, kept in the raw log, and can fail the invocation;
 * only semantics the controller can act on are invented. Unknown methods become
-  ``progress`` with the method name, not a fabricated specific event.
+  ``progress`` with the method name, not a fabricated specific event;
+* an event describes one line, never the invocation: a JSON-RPC error projects as ``failed``
+  whatever request it answers, and the driver's ``collect`` - which binds responses to the
+  observed ``session/prompt`` id - decides the outcome (there, a prompt answered with an error
+  is ``outcome_unknown``).
 """
 
 from __future__ import annotations
@@ -36,6 +40,10 @@ _STOP_REASON_EVENT = {
     "max_turn_requests": EventKind.FAILED,
     "refusal": EventKind.FAILED,
 }
+#: ACP v1's closed StopReason set (schema-v1.24.1). Shared with the driver so the event a stop reason
+#: projects to and the outcome ``collect`` gives it agree on which values are known: anything else
+#: is ``outcome_unknown`` in both.
+V1_STOP_REASONS = frozenset(_STOP_REASON_EVENT)
 
 
 class ObservedLine:
@@ -81,7 +89,9 @@ def project_line(line: str, sequence: int, at: str) -> ObservedLine:
         )
 
     if "error" in message:
-        error = message.get("error") or {}
+        # A malformed error (not an object) is still an error line, and must not raise out of the
+        # driver's reader thread.
+        error = message.get("error") if isinstance(message.get("error"), dict) else {}
         return ObservedLine(
             True,
             message,

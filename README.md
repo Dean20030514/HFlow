@@ -286,7 +286,11 @@ the project contract, the machine profile, the authorization artifact, the root 
   being reported as the reviewer requesting changes, a reviewer turn whose outcome is unknown
   blocks as `outcome_unknown` with its ledger entry settled as unknown (so `resume` can
   reconcile it and the root stays blocked), and a validated `changes_requested` stays a review
-  rejection.
+  rejection. A verdict is decoded only from a turn whose client output was read to its end and
+  carried no `agent_message_chunk` after the turn's own prompt response. Otherwise the final
+  answer is not identified and the turn blocks as `review_protocol_error` (`review_ambiguous`),
+  whatever either message says, and no repair is decided from it. The offline replay tool
+  refuses such a stream too (a blocker, so `--finalize` writes nothing).
 - What each role is told is rendered once, from stored facts, by the controller
   (`packet.py`) and transported verbatim; a driver may not rebuild or extend it. The prompt
   digest the transport reports is compared with the packet the controller rendered, so a
@@ -368,7 +372,18 @@ the project contract, the machine profile, the authorization artifact, the root 
   neither a repository file nor the operator's shell can change what was approved. See "Client
   launch hardening" in `docs/operations.md`.
 - A turn's outcome is taken only from the response to its own observed prompt: a completion that
-  answers another request is `outcome_unknown` (`unbound_completion`) for either role. A result
+  answers another request is `outcome_unknown` (`unbound_completion`) for either role; a JSON-RPC
+  error answering that prompt (ACP v1's failed-prompt shape; DSH sends `Internal error: turn
+  failed: ...`) is recorded with its code and message as `outcome_unknown`
+  (`prompt_error_response`), not `failed`; an error answering another request, or one carrying the
+  prompt's id after a request from the agent reused it, is not attributed; a prompt answered with
+  both an error and a stop reason is unknown; a stop reason outside ACP v1's set is
+  `outcome_unknown` (`unknown_stop_reason`). A prompt response with no `stopReason` (for example
+  the `{messageId}` insertion acknowledgement sketched in an unreleased ACP v2 RFD) settles
+  nothing (`outcome_unknown`, `no_stop_reason`), and a later idle `state_update` is an update, not
+  a settlement. Every bound result whose stream was read to its end records where its prompt
+  response fell and how many updates for the prompt's session followed it (`stream_order`;
+  `status` prints them). An implementer's trailing updates are recorded and never judged. A result
   of **either role** that arrives after a recorded stop - confirmed or not - is only a
   `late_result` note: an implementer's freezes nothing and creates no candidate ref, a reviewer's
   records no verdict and no review evidence, neither settles its ledger entry (after an
@@ -442,7 +457,10 @@ that is not `outcome_unknown` - a confirmed stop whose ledger write failed
 (`internal_error`, or `review_protocol_error` for the reviewer) - which `resume` does not touch
 because it reconciles only an `outcome_unknown` run, so that root stays blocked too (the run's
 notes say so instead of promising a reconcile); the upgrade of the pinned acpx
-from 0.17.1 to 0.19.x (surveyed, deliberately deferred). A reviewer's answer is read as text and
+from 0.17.1 to 0.19.x (surveyed, deliberately deferred); reading a prompt answered with a
+JSON-RPC error as `failed` - it stays `outcome_unknown` with its code recorded, even for DSH's
+pre-model forms, because telling them apart means reading DSH's message text, and that
+reclassification needs a decision. A reviewer's answer is read as text and
 decoded against the contract - the harness is not asked for structured output, and no model is
 ever asked to repair a malformed verdict.
 
@@ -566,8 +584,10 @@ Not verified, even where something works on one binding:
 - **What the harness itself does** (documented upstream, not observed here): under the
   implementer's `approve-all`, DSH's permission escalations - up to unconfined commands - are
   auto-approved; DSH uploads session logs to DeepSeek by default; DSH reports blocked and aborted
-  turns as `end_turn`; and acpx's `--timeout` bounds each phase, not the call. See "What the
-  harness does that HFlow does not control" in `docs/operations.md`.
+  turns as `end_turn`; a failed DSH turn arrives as a JSON-RPC error rather than a stop reason,
+  which HFlow records as `prompt_error_response` and leaves `outcome_unknown`; and acpx's
+  `--timeout` bounds each phase, not the call. See "What the harness does that HFlow does not
+  control" in `docs/operations.md`.
 - **Nothing is sandboxed.** `command` checks and a real worker run with the current user's
   rights: no filesystem confinement, no credential confinement, and no protection against
   another process of the same user changing the workspace, the authorization artifact or the
@@ -575,6 +595,11 @@ Not verified, even where something works on one binding:
 - **A stop is local.** It stops a process on this machine; it does not prove that a remote
   model request stopped, that remote billing stopped, or that any usage figure is known.
 - **Remote termination and billed usage remain unknown**, recorded as `null` and never as `0`.
+  An agent-reported `usage` on the prompt response (an UNSTABLE ACP field, whose meaning is
+  disputed in ACP #1860) and the optional `cost` of a `usage_update` are never read into
+  `provider_billed_tokens`, `provider_cost` or `subscription_quota_remaining` (offline-tested).
+  DSH 0.2.0-rc.2's source sends neither, and the five recorded live streams on this machine
+  (agentInfo `deepseek-harness-acp` 0.0.1, not rc.2) carry neither.
 - **Unattended execution is disabled**, and no new live task is authorized by anything in this
   repository - each live task needs its own explicit approval (`docs/operations.md`).
 
@@ -587,6 +612,7 @@ python -m pytest -q tests/test_driver_acpx_dsh.py        # 75 tests, no model, n
 python -m pytest -q tests/test_winjob.py                 # which Windows answers prove a process gone (injected kernel32, plus two real-kernel pids)
 python -m pytest -q tests/test_review.py                 # 37 tests: the review output grammar
 python -m pytest -q tests/test_review_wire.py            # 30 tests: reviewer verdict -> receipt; completion bound to its own prompt
+python -m pytest -q tests/test_driver_turn_settlement.py # 25 tests: what settles a turn, what follows its response, agent-reported usage never billed
 python -m pytest -q tests/test_real_client_review.py     # 9 tests: installed acpx + mock agent, no model (hardened launch, --model)
 python -m pytest -q tests/test_packet_wire.py            # 20 tests: role packets -> pinned acpx + input-sensitive agent, no model
 python -m pytest -q tests/test_saved_review_replay.py    # 8 tests: the recorded live review, replayed offline
@@ -619,7 +645,12 @@ acpx CLI plus stub agents that are **separate processes** - including one that i
 cancellation and holds a helper child, so a decorative process boundary would fail the test
 rather than pass it. The stand-in client mirrors acpx's `--model` behaviour (`STUB_MODEL_CATALOG`,
 `STUB_CLIENT_FAIL_BEFORE_PROMPT`), and the project's mock agent has a `dsh-catalog` scenario that
-copies the shape of DSH's grouped model catalog with placeholder ids. `real_client_checks.py` and
+copies the shape of DSH's grouped model catalog with placeholder ids. The stub agent can also
+answer the prompt with a JSON-RPC error or reuse its id (`STUB_TERMINAL_RESPONSES=2:!<code>` /
+`2:?<method>`), answer without a stop reason (`STUB_TERMINAL_RESPONSES=2:v2:<stopReason>`), send
+updates after its response (`STUB_TRAILING_UPDATES` / `STUB_REVIEWER_TRAILING_UPDATES`) and report
+usage and cost (`STUB_REPORTED_USAGE`); the mock agent has matching `prompt-error` and
+`trailing-update` scenarios. `real_client_checks.py` and
 `test_real_client_review.py` are the ones that exercise the *installed* acpx: a metadata probe and
 full one-shot `exec` runs against the project's mock agent, all with zero model calls. None of
 them is evidence about real DSH.
@@ -631,7 +662,7 @@ before the later M2 trial A and has not been regenerated since (editing that fil
 be overwritten; the current status is the table at the top of this README) - and
 `python tools/m2_live/replay_review.py <run> --finalize` writes a delivery decision through the
 controller/Store path, which needs its own explicit approval and is not part of any offline
-test run.
+test run (the replay refuses a reviewer stream with message text after its prompt response).
 
 ## M0 transport probe
 

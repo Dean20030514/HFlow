@@ -6,7 +6,13 @@ observed, it prints as ``unknown`` rather than being estimated.
 
 from __future__ import annotations
 
-from .contracts import ModelApplied, ModelObservation, ResultReceipt, RunInspection
+from .contracts import (
+    ModelApplied,
+    ModelObservation,
+    ResultReceipt,
+    RunInspection,
+    StreamOrder,
+)
 
 
 def _unknown(value: object) -> str:
@@ -226,6 +232,24 @@ def _model_line(
     return " ".join(parts)
 
 
+def _stream_line(role: str, order: StreamOrder | None) -> str:
+    """Where one invocation's bound prompt response fell and what followed it, or "unknown".
+
+    ``None`` is printed as unknown, never as 0: the offline driver, an unbound turn, a stream not
+    read to its end and a result recorded before this field existed all record nothing.
+    """
+    if order is None:
+        return (
+            f"    stream        {role} updates_after_prompt_response=unknown (not recorded: no "
+            "bound prompt response, no stream read to its end, or a result without this record)"
+        )
+    return (
+        f"    stream        {role} prompt_response_line={order.prompt_response_line} "
+        f"updates_after_prompt_response={order.updates_after_prompt_response} "
+        f"(agent_message_chunk {order.message_chunks_after_prompt_response})"
+    )
+
+
 def status_text(inspection: RunInspection) -> str:
     run = inspection.run
     lines = [
@@ -262,12 +286,14 @@ def status_text(inspection: RunInspection) -> str:
             + (f" block={attempt.block_code}" if attempt.block_code else "")
         )
         lines.append(_model_line("implementer", attempt.model_observation, attempt.model_applied))
+        lines.append(_stream_line("implementer", attempt.stream_order))
         if attempt.review_invocation_id:
             lines.append(
                 _model_line(
                     "reviewer", attempt.review_model_observation, attempt.review_model_applied
                 )
             )
+            lines.append(_stream_line("reviewer", attempt.review_stream_order))
     lines.extend(_repair_lines(inspection))
     lines.append("evidence")
     if not inspection.evidence:
