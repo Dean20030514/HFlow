@@ -311,6 +311,33 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             if p.is_dir() and not p.name.startswith(".") and p.name != "node_modules"
         )
         report["dsh_home"] = str(dsh_home)
+    # ``dsh_home`` above is the home *your* shell's dsh uses. An HFlow child gets the launch's
+    # bound DSH_HOME or none at all, so its home is named separately (read-only resolution).
+    from .drivers.acpx_dsh import (
+        INVOCATION_ID_PLACEHOLDER,
+        child_home_for,
+        effective_dsh_home,
+        resolve_launch_config,
+    )
+
+    child_kind, child_home = effective_dsh_home(
+        resolve_launch_config(data_dir=data_dir),
+        child_home=child_home_for(data_dir.resolve(), INVOCATION_ID_PLACEHOLDER),
+    )
+    report["child_dsh_home"] = {
+        "kind": child_kind,
+        "path": str(child_home),
+        "detail": (
+            "DSH_HOME is set here, so every HFlow child gets it (bound when the launch is "
+            "resolved)"
+            if child_kind == "bound"
+            else "DSH_HOME is not set here, so an HFlow child gets none: the driver removes it "
+            "and points USERPROFILE/HOME at the invocation's own home, and DSH's default home is "
+            "that home's .dsh, created empty for each invocation (no stored credentials, no "
+            "cordis.patch.yml, no AGENTS.md, no skills, a fresh anonymous id) - inferred from "
+            "upstream source, not observed"
+        ),
+    }
 
     probe = local_probe()
     report["capability_record"] = probe.model_dump(mode="json")
@@ -340,7 +367,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         report["notes"].append(default_refusal_reason())  # type: ignore[union-attr]
     report["notes"].append(  # type: ignore[union-attr]
         "capability states are the recorded table, not a live compatibility proof; doctor "
-        "observed only executables and file presence"
+        "observed executables, file presence and, with --profile, the dsh shim's text (to "
+        "classify its carrier), the version fields of package and manifest files and the SHA-256 "
+        "of a bound DSH home's patch files and AGENTS.md - nothing else was read and no .env or "
+        "credential file was opened"
+    )
+    report["notes"].append(  # type: ignore[union-attr]
+        "dsh_home/dsh_profiles describe the DSH home your own shell's dsh uses; an HFlow child "
+        "uses child_dsh_home"
     )
 
     if args.json:
@@ -350,7 +384,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         for name, entry in executables.items():  # type: ignore[union-attr]
             version = entry.get("version", "")
             print(f"{name:<13} {entry['path'] or 'NOT FOUND'}{('  ' + version) if version else ''}")
-        print(f"dsh home      {report.get('dsh_home', 'not found')}")
+        print(f"your dsh home {report.get('dsh_home', 'not found')}")
+        child = report["child_dsh_home"]
+        print(f"child dsh home {child['kind']} {child['path']}")  # type: ignore[index]
         print(f"dsh profiles  {', '.join(report['dsh_profiles']) or 'none'}")  # type: ignore[arg-type]
         print(f"data dir      {report['data_dir']} (writable={report['data_dir_writable']})")
         print(

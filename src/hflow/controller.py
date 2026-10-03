@@ -4454,6 +4454,28 @@ def _stored_stream_order(row: Any, column: str, prefix: str) -> dict[str, Any]:
         return {}
 
 
+def _stored_launch_surfaces(row: Any, column: str, prefix: str) -> dict[str, Any]:
+    """The launch-surface record an attempt's stored invocation result carries, as recorded.
+
+    A result without one - written before it existed, by the offline driver, after a failed
+    observation - or with one this build cannot read yields ``None``: "not recorded", never
+    "nothing was there".
+    """
+    from .contracts import LaunchSurfaces
+
+    raw = row[column] if column in row.keys() else None
+    try:
+        payload = json.loads(raw) if raw else {}
+        surfaces = payload.get("launch_surfaces")
+        return {
+            f"{prefix}launch_surfaces": LaunchSurfaces.model_validate(surfaces)
+            if isinstance(surfaces, dict)
+            else None
+        }
+    except (ValueError, TypeError, AttributeError):
+        return {f"{prefix}launch_surfaces": None}
+
+
 def inspect_run(store: Store, run_id: str, *, project_root: Path | None = None) -> RunInspection:
     """Read-only projection for ``status``/``report``. Zero model calls, by design."""
     from .contracts import AttemptRecord, EvidenceRecord
@@ -4488,6 +4510,8 @@ def inspect_run(store: Store, run_id: str, *, project_root: Path | None = None) 
             **_stored_model_facts(a, "review_json", "review_"),
             **_stored_stream_order(a, "result_json", ""),
             **_stored_stream_order(a, "review_json", "review_"),
+            **_stored_launch_surfaces(a, "result_json", ""),
+            **_stored_launch_surfaces(a, "review_json", "review_"),
         )
         for a in store.attempts_for(run_id)
     ]

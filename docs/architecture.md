@@ -42,6 +42,8 @@ HarnessDriver (contracts.HarnessDriver / LifecycleDriver)
   |-- drivers/selected.py   the single place a binding becomes a driver object
   |-- drivers/acpx_dsh.py   the production transport: acpx -> official DSH ACP
   |-- drivers/acp_events.py neutral projection of the client's event stream
+  |-- drivers/dsh_surfaces.py what DSH reads at launch beyond the packet, observed per role
+  |                         (files read, a .env never opened; never executed, enforced or bound)
   |-- drivers/winjob.py     Windows Job Object process boundary
   |-- drivers/fake.py       offline driver for tests and examples
 ```
@@ -206,6 +208,14 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
 
 ## Known boundaries (do not overstate)
 
+- **DSH's own launch inputs are recorded, not controlled.** DSH reads a workspace `.env`, its
+  home's `.env`, `cordis.patch.yml` layers, AGENTS.md/CLAUDE.md files and skills on its own
+  (documented upstream at dsh-v0.2.0-rc.2, not observed). `drivers/dsh_surfaces.py` records,
+  just before each spawn, what is at those fixed paths - presence, size and a SHA-256, a `.env`
+  by presence and size only - plus the DSH_* variable names reaching the child and the client and
+  carrier versions read from files. Nothing in that record is enforced or bound into an approval,
+  and DSH reads the files after the look. With `DSH_HOME` unbound the child's DSH home is the
+  per-invocation, empty `<data-dir>/invocations/<id>/home/.dsh` (inferred from upstream source).
 - **No sandbox.** `command` checks and workers run as ordinary child processes with the
   current user's rights. Scope is enforced by *detection after the fact* plus refusal to
   accept, not by confinement, so a worker could write anywhere this user can write. The
@@ -415,7 +425,8 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
   preflight) always carries `NoDefaultCurrentDirectoryInExePath=1`, with every other spelling
   removed, drops relative and empty `PATH` entries (absolute entries are passed on as they are),
   and has `DSH_PERMISSION_MODE` / `DSH_TOOLS_MODE` removed, so neither cmd.exe (which runs the
-  shim's bare `node`) nor Node's spawn looks in the workspace first.
+  npm shim's bare `node`; the Desktop shim runs an absolute `DeepSeek Harness.exe`) nor Node's
+  spawn looks in the workspace first.
 - **Billing is unknown.** `provider_billed_tokens`, `provider_cost` and
   `subscription_quota_remaining` are `null` because nothing observes them. Do not read `null`
   as `0`. An agent-reported `usage` on the prompt response (UNSTABLE in ACP) or the `cost` of a

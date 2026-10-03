@@ -785,7 +785,10 @@ class LaunchConfig(BaseModel):
     node: str = ""
     python: str = ""
     dsh_executable: str = ""
-    #: The DSH profile the launcher starts with, and the DSH home it will use ("" = ambient).
+    #: The DSH profile the launcher starts with, and the DSH home it will use ("" = none bound:
+    #: the driver removes DSH_HOME from the child, whose redirected USERPROFILE/HOME then make
+    #: DSH's default home a per-invocation, empty <data-dir>/invocations/<id>/home/.dsh -
+    #: inferred from upstream source, see acpx_dsh.effective_dsh_home).
     profile: str = ""
     dsh_home: str = ""
     #: The client's ``--model`` value, from the role's validated ``model_selection``; empty for
@@ -1058,6 +1061,91 @@ class StreamOrder(BaseModel):
     message_chunks_after_prompt_response: int = 0
 
 
+class SurfaceFile(BaseModel):
+    """One path DSH reads on its own at launch, as HFlow saw it just before the spawn.
+
+    Presence, kind, size and a SHA-256 - never content. A ``.env`` is never opened.
+    """
+
+    model_config = Strict
+
+    #: The path relative to the directory it was checked in, as checked.
+    name: str
+    #: The absolute path.
+    path: str
+    #: ``None`` = could not be determined (the entry could not be examined).
+    present: bool | None = False
+    kind: Literal["absent", "file", "directory", "other", "unknown"] = "absent"
+    #: True when the path itself is a symbolic link (what it points at is what was examined).
+    link: bool = False
+    size: int | None = None
+    #: ``sha256:<hex>`` of a regular file within the hash cap; never set for a ``.env``.
+    sha256: str = ""
+    #: Why a present entry has no digest.
+    detail: str = ""
+
+
+class ClientIdentity(BaseModel):
+    """The client and DSH carrier versions, read from files only; nothing is executed.
+
+    A version is what a package.json or manifest says. It is recorded, never bound, and never a
+    compatibility proof.
+    """
+
+    model_config = Strict
+
+    #: The ``version`` field of the acpx package.json the client entry belongs to.
+    acpx_version: str = ""
+    acpx_package_json: str = ""
+    #: The ``version`` field of the @agentclientprotocol/sdk package.json Node would resolve
+    #: from the client entry (its node_modules walk, without NODE_PATH).
+    sdk_version: str = ""
+    sdk_package_json: str = ""
+    #: Which layout the dsh shim has: the Desktop app's, the npm package's, neither
+    #: (``unknown``), or no resolved dsh is started (``not_applicable``: an override argv).
+    dsh_carrier: Literal["desktop", "npm", "unknown", "not_applicable"] = "unknown"
+    dsh_version: str = ""
+    #: Which file the dsh version was read from, and how far it is known to mean that.
+    dsh_version_source: str = ""
+    notes: list[str] = Field(default_factory=list)
+
+
+class LaunchSurfaces(BaseModel):
+    """What DSH reads at one role's launch besides HFlow's packet.
+
+    Recorded, never enforced, never part of an approval. Never file contents, never a directory
+    listing, never a ``.env`` or the home's stored credentials opened, never a variable value.
+    """
+
+    model_config = Strict
+
+    observed_at: str
+    #: ``bound``: DSH_HOME is set on the child. ``per_invocation``: none is bound, so DSH's
+    #: default home is the invocation's own (inferred from upstream source, not observed).
+    dsh_home_kind: Literal["bound", "per_invocation"]
+    dsh_home: str
+    #: False when the home was named but not looked into (a per-invocation home before dispatch).
+    dsh_home_observed: bool = False
+    #: The home's fixed surface paths, in a fixed order; empty when it was not looked into.
+    dsh_home_files: list[SurfaceFile] = Field(default_factory=list)
+    #: The directory DSH starts in ("" = not known before dispatch).
+    workspace: str = ""
+    #: The workspace's ``.env``, by presence and size only.
+    workspace_env: SurfaceFile | None = None
+    #: Whether ``DEEPSEEK_API_KEY`` is among the child's variable names; its value is never read.
+    deepseek_api_key_inherited: bool = False
+    #: The nearest directory at or above the workspace holding a ``.git`` marker ("" = none).
+    project_root: str = ""
+    #: The AGENTS.md/CLAUDE.md(.local) files present from the project root down to the
+    #: workspace (present entries only).
+    instruction_files: list[SurfaceFile] = Field(default_factory=list)
+    skill_dirs: list[SurfaceFile] = Field(default_factory=list)
+    #: Names of the DSH_* variables that reach the child (DSH_HOME is the home above).
+    dsh_env_names: list[str] = Field(default_factory=list)
+    client: ClientIdentity = Field(default_factory=ClientIdentity)
+    notes: list[str] = Field(default_factory=list)
+
+
 class InvocationResult(BaseModel):
     """What a driver may report. Note the absence of any task/acceptance state."""
 
@@ -1089,6 +1177,11 @@ class InvocationResult(BaseModel):
     #: reader had not finished the stream when the result was folded, when the driver observed no
     #: stream (offline driver), or for a result recorded before this field existed.
     stream_order: StreamOrder | None = None
+    #: What DSH reads on its own at this invocation's launch, observed just before the spawn
+    #: gate. Recorded, never enforced, never part of an approval. ``None`` when no launch was
+    #: observed: the offline driver, a stop that won the spawn gate, an observation that failed
+    #: (the reason is in ``limitations``), or a result recorded before this field existed.
+    launch_surfaces: LaunchSurfaces | None = None
 
 
 class CancellationReceipt(BaseModel):
@@ -1833,6 +1926,10 @@ class PrepareReport(BaseModel):
     #: controller uses. The reviewer's packet embeds the frozen candidate identity, which does
     #: not exist yet, so it is reported as rendered-at-dispatch instead of being invented here.
     packet_preview: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    #: role -> what DSH would read at that role's launch, as far as it is knowable before
+    #: dispatch (a worktree does not exist yet; a per-invocation home is created at spawn).
+    #: Recorded, never enforced, not part of ``authorization.binding``.
+    launch_surfaces: dict[str, LaunchSurfaces] = Field(default_factory=dict)
     authorization: PendingAuthorization = Field(default_factory=PendingAuthorization)
     model_calls_made: Literal[0] = 0
     notes: list[str] = Field(default_factory=list)
@@ -1902,6 +1999,10 @@ class AttemptRecord(BaseModel):
     #: not recorded, never "0 updates".
     stream_order: StreamOrder | None = None
     review_stream_order: StreamOrder | None = None
+    #: The launch-surface record each invocation's stored result carries. ``None`` = not
+    #: recorded, never "nothing was there".
+    launch_surfaces: LaunchSurfaces | None = None
+    review_launch_surfaces: LaunchSurfaces | None = None
 
 
 class RunInspection(BaseModel):

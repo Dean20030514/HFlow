@@ -27,6 +27,7 @@ not restate the design; read the plan and `docs/architecture.md` when the task n
 | The one production driver (acpx → DSH ACP) | `src/hflow/drivers/acpx_dsh.py` |
 | Windows Job Object process boundary | `src/hflow/drivers/winjob.py` |
 | Neutral event projection from the client stream | `src/hflow/drivers/acp_events.py` |
+| What DSH reads at launch beyond the packet (recorded, never enforced) | `src/hflow/drivers/dsh_surfaces.py` |
 | Offline driver (tests and development) | `src/hflow/drivers/fake.py` |
 | Which driver is production | `src/hflow/drivers/selected.py` |
 | Transport decision and its evidence | `docs/adr/0001-transport.md`, `docs/m0-results.md` |

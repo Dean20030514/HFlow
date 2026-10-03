@@ -11,6 +11,7 @@ No test here sends a model request, and none needs a credential.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -1350,6 +1351,203 @@ def test_status_shows_each_invocations_model_and_old_runs_say_not_recorded(
     assert legacy.attempts[0].model_observation is None
     assert legacy.attempts[0].model_applied is None
     assert "model         implementer not recorded" in status_text(legacy)
+
+
+# --------------------------------------------------------------------------
+# launch surfaces: what DSH reads on its own, recorded and never enforced
+# --------------------------------------------------------------------------
+
+
+def test_an_invocation_records_the_empty_per_invocation_dsh_home_it_launched_with(
+    harness_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DSH_HOME", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    harness = harness_factory("cooperative")
+    handle, _ = harness.start()
+    result = harness.driver.collect(handle)
+
+    assert result.outcome is InvocationOutcome.COMPLETED
+    surfaces = result.launch_surfaces
+    assert surfaces is not None
+    assert surfaces.dsh_home_kind == "per_invocation"
+    home = Path(surfaces.dsh_home)
+    assert home == (harness.data_dir / "invocations" / "I-1" / "home").resolve() / ".dsh"
+    # The same home the client got: its acpx config sits beside the DSH home it names.
+    assert (home.parent / ".acpx" / "config.json").is_file()
+    assert surfaces.dsh_home_observed is True
+    assert surfaces.dsh_home_files
+    assert all(entry.present is False for entry in surfaces.dsh_home_files)
+    assert surfaces.workspace == str(harness.workspace)
+    assert surfaces.deepseek_api_key_inherited is False
+    # The stand-in launch is an override argv, so no resolved dsh is started.
+    assert surfaces.client.dsh_carrier == "not_applicable"
+    harness.driver.release(handle.invocation_id)
+
+
+def test_a_bound_home_and_a_workspace_env_are_recorded_and_do_not_change_the_launch(
+    tmp_path: Path, harness_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bound = tmp_path / "bound-home"
+    bound.mkdir()
+    cordis = b"sandbox:\n  mode: read-only\n"
+    (bound / "cordis.patch.yml").write_bytes(cordis)
+    monkeypatch.setenv("DSH_HOME", str(bound))
+    harness = harness_factory("cooperative")
+    (harness.workspace / ".env").write_text(
+        "DSH_SANDBOX_HINT=x\nDEEPSEEK_API_KEY=sk-sentinel-456", encoding="utf-8"
+    )
+    handle, _ = harness.start()
+    result = harness.driver.collect(handle)
+
+    assert result.outcome is InvocationOutcome.COMPLETED, "nothing about the surfaces refuses"
+    surfaces = result.launch_surfaces
+    assert surfaces is not None and surfaces.dsh_home_kind == "bound"
+    files = {entry.name: entry for entry in surfaces.dsh_home_files}
+    assert files["cordis.patch.yml"].sha256 == "sha256:" + hashlib.sha256(cordis).hexdigest()
+    assert surfaces.workspace_env is not None
+    assert surfaces.workspace_env.present is True and surfaces.workspace_env.sha256 == ""
+    assert "sk-sentinel-456" not in result.model_dump_json()
+    harness.driver.release(handle.invocation_id)
+
+
+def test_an_observation_failure_never_changes_the_launch(
+    harness_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("hflow.drivers.dsh_surfaces.observe_launch_surfaces", broken)
+    harness = harness_factory("cooperative")
+    handle, _ = harness.start()
+    result = harness.driver.collect(handle)
+
+    assert result.outcome is InvocationOutcome.COMPLETED
+    assert result.launch_surfaces is None
+    notes = [
+        note
+        for note in result.limitations
+        if note.startswith("launch surfaces not recorded: RuntimeError: boom")
+    ]
+    assert len(notes) == 1
+    assert harness.spawn_log().exists(), "the client launched as it would have anyway"
+    harness.driver.release(handle.invocation_id)
+
+
+def test_status_shows_each_invocations_launch_surfaces_and_old_runs_say_not_recorded(
+    tmp_path: Path,
+    project,
+    task_spec,
+    project_root: Path,
+    harness_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """status/report read the launch-surface record from the stored result; nothing is re-observed."""
+    from hflow.contracts import EffectiveConfig, LaunchConfig, RoleConfig
+    from hflow.controller import inspect_run
+    from hflow.report import report_json, status_text
+
+    monkeypatch.delenv("DSH_HOME", raising=False)
+    harness = harness_factory("cooperative")
+    store = Store(tmp_path / "hflow.sqlite")
+    controller = Controller(
+        store,
+        harness.driver,
+        controller_build="test-build",
+        runners=CheckRunners({"fake": FakeCheckRunner()}),
+        data_dir=harness.data_dir,
+        production=False,
+    )
+    try:
+        outcome = controller.run_task(
+            RunRequest(
+                task=task_spec,
+                project=project,
+                project_root=project_root,
+                workspace_root=project_root,
+            )
+        )
+        inspection = inspect_run(store, outcome.run_id)
+        with store.transaction() as conn:
+            conn.execute(
+                "UPDATE attempts SET result_json = ? WHERE run_id = ?",
+                (json.dumps({"invocation_id": "old", "outcome": "completed"}), outcome.run_id),
+            )
+        legacy = inspect_run(store, outcome.run_id)
+        with store.transaction() as conn:
+            conn.execute(
+                "UPDATE attempts SET result_json = ? WHERE run_id = ?",
+                (
+                    json.dumps(
+                        {"invocation_id": "x", "outcome": "completed", "launch_surfaces": {"bogus": 1}}
+                    ),
+                    outcome.run_id,
+                ),
+            )
+        malformed = inspect_run(store, outcome.run_id)
+    finally:
+        for invocation_id in list(harness.driver._handles):
+            harness.driver.release(invocation_id)
+        store.close()
+
+    surfaces = inspection.attempts[0].launch_surfaces
+    assert surfaces is not None and surfaces.dsh_home_kind == "per_invocation"
+    assert "dsh home      implementer per-invocation" in status_text(inspection)
+    assert report_json(inspection)["attempts"][0]["launch_surfaces"]["dsh_home_kind"] == (
+        "per_invocation"
+    )
+
+    assert legacy.attempts[0].launch_surfaces is None
+    assert "launch        implementer surfaces not recorded" in status_text(legacy)
+    assert malformed.attempts[0].launch_surfaces is None
+
+    unbound = EffectiveConfig(
+        source="command_line",
+        roles=[
+            RoleConfig(
+                role="implementer",
+                agent="a",
+                harness="dsh",
+                driver="acpx-dsh",
+                driver_id=DRIVER_ID,
+                launch=LaunchConfig(driver_id=DRIVER_ID, harness="dsh"),
+            )
+        ],
+    )
+    rendered = status_text(inspection.model_copy(update={"effective_config": unbound}))
+    assert "dsh_home=unbound(per-invocation)" in rendered
+
+
+def test_probe_names_the_dsh_home_a_child_uses(
+    tmp_path: Path, harness_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("DSH_HOME", raising=False)
+    harness = harness_factory("cooperative")
+    report = harness.driver.probe(AgentBinding(harness="dsh", driver=DRIVER_ID))
+
+    home_notes = [note for note in report.notes if note.startswith("DSH home: per-invocation")]
+    assert len(home_notes) == 1
+    assert "<invocation-id>" in home_notes[0] and "not observed" in home_notes[0]
+    assert any(
+        note.startswith("client identity (read from files, nothing executed)")
+        for note in report.notes
+    )
+    assert not [note for note in report.notes if ".credentials" in note]
+    assert report.capabilities["cancel"] is CapabilityState.UNSUPPORTED
+    assert report.capabilities["model_selection"] is CapabilityState.DOCUMENTED
+    assert harness.stub_files("spawn") == [], "probe must not launch the agent"
+
+    bound = tmp_path / "bound"
+    bound.mkdir()
+    cordis = b"approval: never\n"
+    (bound / "cordis.patch.yml").write_bytes(cordis)
+    monkeypatch.setenv("DSH_HOME", str(bound))
+    bound_report = harness_factory("cooperative").driver.probe(
+        AgentBinding(harness="dsh", driver=DRIVER_ID)
+    )
+    bound_notes = [note for note in bound_report.notes if note.startswith("DSH home: bound")]
+    assert len(bound_notes) == 1
+    assert "sha256:" + hashlib.sha256(cordis).hexdigest() in bound_notes[0]
 
 
 def test_output_overflow_is_untrustworthy_not_success(harness_factory) -> None:

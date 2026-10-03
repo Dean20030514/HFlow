@@ -29,6 +29,7 @@ from .contracts import (
     CheckDef,
     EffectiveConfig,
     LaunchConfig,
+    LaunchSurfaces,
     MachineProfile,
     PendingAuthorization,
     PlannedCheck,
@@ -551,6 +552,44 @@ def resolved_launches(effective: EffectiveConfig) -> list[LaunchConfig]:
     return [entry.launch for entry in effective.roles if entry.launch is not None]
 
 
+def launch_surface_preview(
+    resolved: ResolvedRun, env: Mapping[str, str] | None = None
+) -> dict[str, LaunchSurfaces]:
+    """What each role's DSH would read on its own, as far as it is knowable before dispatch.
+
+    A worktree does not exist yet, so its files are left to the spawn-time record; a
+    per-invocation home is named, not looked into. Nothing is created and nothing is bound.
+    """
+    from .drivers.acpx_dsh import (
+        INVOCATION_ID_PLACEHOLDER,
+        child_environment,
+        child_home_for,
+        effective_dsh_home,
+    )
+    from .drivers.dsh_surfaces import observe_launch_surfaces
+
+    workspace = resolved.project_root if resolved.spec.workspace.mode != "worktree" else None
+    child_home = child_home_for(Path(resolved.data_dir).resolve(), INVOCATION_ID_PLACEHOLDER)
+    surfaces: dict[str, LaunchSurfaces] = {}
+    for entry in resolved.effective.roles:
+        if entry.launch is None:
+            continue
+        kind, home = effective_dsh_home(entry.launch, child_home=child_home)
+        surfaces[entry.role] = observe_launch_surfaces(
+            entry.launch,
+            dsh_home=home,
+            dsh_home_kind=kind,
+            child_env=child_environment(
+                env if env is not None else os.environ,
+                extra_env={},
+                dsh_home=entry.launch.dsh_home,
+            ),
+            workspace=workspace,
+            look_in_home=kind == "bound",
+        )
+    return surfaces
+
+
 def resolve_machine_bindings(
     *,
     data_dir: Path,
@@ -1066,6 +1105,7 @@ def build_prepare_report(
             "the worktree path contains the run id, which is chosen at dispatch: the packet "
             "size and digest above are for the template path and shift with the id's length"
         )
+    surfaces = launch_surface_preview(resolved, env) if resolved.is_real_driver else {}
     if resolved.is_real_driver:
         notes.append(
             "a live run needs an authorization artifact the user writes from their own "
@@ -1081,6 +1121,42 @@ def build_prepare_report(
             "observed, so each run records what its stream showed - `hflow doctor --profile "
             "<id>` shows the exact argv"
         )
+        notes.append(
+            "launch surfaces (what DSH reads on its own: its home's patch files, AGENTS.md and "
+            "skills, a workspace .env by presence and size only, AGENTS.md/CLAUDE.md files, "
+            "skills, DSH_* variable names, and the client and carrier versions) are recorded, "
+            "not enforced, and are not part of the approval binding; a worktree's are observed "
+            "at each invocation's spawn"
+        )
+        if any(
+            surface.dsh_home_kind == "per_invocation" and not surface.deepseek_api_key_inherited
+            for surface in surfaces.values()
+        ):
+            if resolved.spec.workspace.mode == "worktree":
+                env_source = "worktree: only what the base commit tracks"
+            else:
+                workspace_envs = [
+                    surface.workspace_env
+                    for surface in surfaces.values()
+                    if surface.workspace_env is not None
+                ]
+                env_file = workspace_envs[0] if workspace_envs else None
+                env_state = (
+                    "present"
+                    if env_file is not None and env_file.present
+                    else "unknown"
+                    if env_file is not None and env_file.present is None
+                    else "absent"
+                )
+                env_path = env_file.path if env_file is not None else str(resolved.project_root)
+                env_source = f"in-place: {env_state} at {env_path}"
+            notes.append(
+                "DEEPSEEK_API_KEY is not in the launch environment and DSH_HOME is unbound, so "
+                "the per-invocation DSH home holds no stored credential (inferred from upstream "
+                "source); the documented source left is a .env in the workspace DSH starts in "
+                f"({env_source}). M0 observed DSH fail with a no-API-key error when it had no "
+                "credential"
+            )
     if not budget.within_budget:
         notes.append(
             "this task does not fit its budget: it needs more reserved turns than are "
@@ -1154,6 +1230,7 @@ def build_prepare_report(
         roles=roles,
         root_budget=root_preview,
         packet_preview=preview,
+        launch_surfaces=surfaces,
         authorization=pending,
         notes=notes,
     )
@@ -1231,8 +1308,18 @@ def render_prepare_text(report: PrepareReport) -> str:
             lines.append(f"               launcher {' '.join(launch.agent_argv)}")
             if launch.model:
                 lines.append(f"               client flag --model {launch.model}")
-            if launch.dsh_home:
-                lines.append(f"               DSH_HOME {launch.dsh_home}")
+            surface = report.launch_surfaces.get(entry.role)
+            if surface is None:
+                if launch.dsh_home:
+                    lines.append(f"               DSH home bound {launch.dsh_home}")
+            elif surface.dsh_home_kind == "bound":
+                lines.append(f"               DSH home bound {surface.dsh_home}")
+            else:
+                lines.append(
+                    f"               DSH home per-invocation {surface.dsh_home} (DSH_HOME "
+                    "unbound: created empty for each invocation, inferred; not looked into "
+                    "before dispatch)"
+                )
             if not launch.resolvable:
                 lines.append(f"               reason {launch.detail}")
     lines.append(
@@ -1240,6 +1327,12 @@ def render_prepare_text(report: PrepareReport) -> str:
         f"reviewer={effective.reviewer_writes}"
     )
     lines.append(f"  config_hash {effective.digest()}")
+    if report.launch_surfaces:
+        from .report import launch_surfaces_lines
+
+        lines.append("launch surfaces (recorded, not enforced, not part of the approval)")
+        for role, surface in report.launch_surfaces.items():
+            lines.extend(launch_surfaces_lines(role, surface, indent="  "))
     lines.append(f"roles         {', '.join(report.roles)}")
     lines.append("write scope")
     lines.append(f"  allow       {', '.join(report.write_allow) or '(none)'}")

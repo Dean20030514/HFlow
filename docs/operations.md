@@ -54,7 +54,9 @@ the model. Any other value is passed to the acpx client as `--model <value>` - s
 selection" below for the accepted values, what acpx does with the flag, and why concrete values
 for real DSH are not chosen yet. `hflow doctor --profile dsh-local` prints the resolved launch
 per role - the agent argv and either the exact `--model` flag or "no --model flag" - so nothing
-about the launch has to be assumed.
+about the launch has to be assumed. `hflow doctor` (with or without `--profile`) also names the
+DSH home a child uses (`child_dsh_home`), which is not the `dsh_home` your own shell's `dsh` uses
+unless `DSH_HOME` is set.
 
 **Both roles must be bound.** An unbound role is refused instead of inheriting the other one,
 because a task revision can start requiring a review. Every one of these is a refusal, never a
@@ -175,7 +177,12 @@ Consequences worth knowing:
   *absence is bound too* - when the resolution found no DSH home, the variable is removed from
   the child environment rather than inherited, including any value passed in through the
   driver's `extra_env`. A `DSH_HOME` that appears after the resolution therefore cannot reach
-  the process.
+  the process. With none bound, DSH's home is the per-invocation
+  `<data-dir>/invocations/<id>/home/.dsh`, created empty (inferred from upstream source, not
+  observed): the child's USERPROFILE/HOME point at the invocation's own home.
+- The launch-surface record (what DSH reads on its own: see "What DSH reads on its own" below)
+  and the client and carrier versions are **not** part of the binding. A changed AGENTS.md,
+  `.env` or acpx package does not change the digest; binding by content is a deferred ruling.
 - An artifact written before config binding existed still loads, still lists, and still keys its
   own single-use ledger row - but it cannot authorize a run that resolved a configuration,
   because nothing in it says which one. Re-issue it.
@@ -1197,6 +1204,28 @@ a run on this machine; they are stated so nobody claims the opposite:
   `report`, with a receipt limitation) and refuses nothing; an ignored file of this kind already
   refuses the freeze, and files already in the base commit are not flagged.
 
+Pinned to dsh-v0.2.0-rc.2 (639ed015), documented, not observed:
+
+- **DSH layers two `.env` files into its environment.** `loadLayeredEnv` reads `<cwd>/.env`
+  (the workspace acpx starts DSH in), then `$DSH_HOME/.env`; a name the child already has wins.
+  A bootstrap name (49 of them: `PATH`, `NODE_OPTIONS`, the proxy and CA variables, Git's SSH,
+  pager and editor commands, and so on) or a `DSH_`, `XDG_`, `DYLD_` or `BASH_FUNC_` prefix in a
+  workspace `.env` makes DSH throw before it serves ACP; only the home `.env` may set the
+  proxies. HFlow does not parse either file, so it cannot predict this.
+- **Credential precedence:** the launch environment, then `$DSH_HOME/.credentials.yaml`, then
+  `<cwd>/.env`, then `$DSH_HOME/.env`. With `DSH_HOME` unbound the home is the per-invocation
+  empty one, so the launch environment and a workspace `.env` are what is left.
+- **`cordis.patch.yml` layers** in `$DSH_HOME` and `$DSH_HOME/profiles/<profile>` can replace
+  the shipped sandbox-policy and approval rows.
+- **Agent instructions and skills:** `$DSH_HOME/AGENTS.md`, the AGENTS.md/CLAUDE.md(.local)
+  chain from the nearest `.git` marker down to the cwd, and skills under `<root>/.dsh/skills`,
+  `<root>/.agents/skills` and `<home>/skills`. Nested instruction files DSH reads after a tool
+  call cannot be captured by any record taken before the launch.
+- **`DSH_TELEMETRY_*` and `DSH_AGENTS_HOME` pass through** to the child; HFlow removes only
+  `DSH_PERMISSION_MODE` and `DSH_TOOLS_MODE`.
+- **`~/.agents/skills` resolves inside the per-invocation home**, because `~` is the redirected
+  USERPROFILE.
+
 ## Client launch hardening
 
 What the launch path does, for both roles, since the 2026-10-02 refinement:
@@ -1266,6 +1295,43 @@ What the launch path does, for both roles, since the 2026-10-02 refinement:
   (including anything passed through the driver's `extra_env`) and never set, so an operator's
   shell cannot silently switch DSH's sandbox off for a role. `hflow doctor` lists which of the two
   were present and removed. Binding a per-role value instead is an open decision.
+
+### What DSH reads on its own: the launch-surfaces record
+
+For each invocation and role, just before the spawn gate, the driver records what DSH would read
+besides HFlow's packet (`src/hflow/drivers/dsh_surfaces.py`). It is a record: nothing in it is
+enforced, refused or part of an approval.
+
+- **Fields:** the DSH home and how it is chosen (`bound`, or `per_invocation` when `DSH_HOME` is
+  unbound - inferred from upstream source), the home's `cordis.patch.yml`,
+  `profiles/<profile>/cordis.patch.yml`, `.env`, `AGENTS.md` and `skills`; the workspace, its
+  `.env`, the project root (the nearest `.git` marker), the AGENTS.md/CLAUDE.md(.local) files
+  present from that root down to the workspace and the two project skill directories; the names
+  of the DSH_* variables that reach the child; whether `DEEPSEEK_API_KEY` is among the child's
+  variable names; and the client identity - acpx and @agentclientprotocol/sdk versions from
+  their package.json (the SDK found by Node's node_modules walk from the client entry), and the
+  dsh carrier.
+- **How it is read:** a fixed list of paths, never a directory listing. A regular file gets its
+  size and SHA-256 (none above 4 MiB); a `.env` is examined by stat only - presence and size,
+  never opened - and the home's stored-credentials file is never read. An entry that cannot be
+  examined is `unknown`, not absent. Variable values are never recorded. Nothing is executed.
+- **Carrier:** only a Windows batch shim's text is classified. The Desktop shim (it sets
+  `ELECTRON_RUN_AS_NODE` and runs an absolute `DeepSeek Harness.exe`) gives `desktop`, with the
+  version from `primary-runtime/runtime.json`'s `desktopVersion`, which the Desktop README
+  documents as equal to the dsh version (not verified); `payloadDigest` is never read or shown.
+  The npm shim gives `npm`, with the version from its `@deepseek-ai/dsh` package.json. Anything
+  else is `unknown`; an override argv that does not start the resolved dsh is `not_applicable`.
+- **Where it shows:** `prepare`'s `launch_surfaces` and its "launch surfaces" text section (a
+  worktree's files are not known before dispatch, and a per-invocation home is named, not looked
+  into); `doctor`'s `child_dsh_home` and, with `--profile`, the per-role probe notes; the
+  per-attempt `dsh home`, `workspace` and `client` lines of `status`; and `report --json`'s
+  `launch_surfaces` / `review_launch_surfaces`. The offline driver, an older row, a stop that won
+  the spawn gate and a failed observation show "not recorded"; a failed observation's reason is in
+  the result's limitations, and it never changes or stops the launch.
+- **Time of check:** DSH reads the files after the look. A worktree holds only what the base
+  commit tracks, so an untracked `.env` in your checkout is not in it.
+- A DSH home that lies inside the workspace is noted (the agent could write what DSH loads at the
+  next launch), not refused.
 
 ## Model selection
 

@@ -912,6 +912,72 @@ def test_a_native_profile_launch_binds_what_it_bound_before_model_passing() -> N
     assert digest_of(chosen.model_dump(mode="json")) != digest_of(launch.model_dump(mode="json"))
 
 
+def test_prepare_names_the_dsh_home_each_role_will_use(
+    tmp_path: Path, live_project, worktree_task, project_root: Path, live_profile,
+    acpx_client, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With DSH_HOME unbound, each role's DSH home is the per-invocation one - named, not made."""
+    from hflow.prepare import render_prepare_text
+
+    monkeypatch.setenv("HFLOW_ALLOW_WRITES", "true")
+    monkeypatch.delenv("DSH_HOME", raising=False)
+    resolved = _resolve_live(tmp_path, live_project, worktree_task, project_root, live_profile)
+    report = build_prepare_report(resolved)
+
+    assert set(report.launch_surfaces) == {"implementer", "reviewer"}
+    for surfaces in report.launch_surfaces.values():
+        assert surfaces.dsh_home_kind == "per_invocation"
+        assert surfaces.dsh_home.endswith(
+            os.path.join("invocations", "<invocation-id>", "home", ".dsh")
+        )
+        assert surfaces.dsh_home_observed is False
+        assert surfaces.workspace == "", "a worktree does not exist before dispatch"
+    text = render_prepare_text(report)
+    assert "DSH home per-invocation" in text
+    assert "launch surfaces (recorded, not enforced" in text
+    assert not (tmp_path / "data" / "invocations").exists()
+
+
+def test_launch_surfaces_are_recorded_but_never_bound(
+    tmp_path: Path, live_project, task_spec, project_root: Path, live_profile,
+    acpx_client, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """What DSH reads in the workspace changes the record, never the approval digest."""
+    monkeypatch.delenv("DSH_HOME", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    first = build_prepare_report(
+        _resolve_live(tmp_path, live_project, task_spec, project_root, live_profile)
+    )
+    (project_root / "AGENTS.md").write_text("# rules DSH would load\n", encoding="utf-8")
+    (project_root / ".env").write_text(
+        "DSH_X=1\nDEEPSEEK_API_KEY=sk-sentinel-789\n", encoding="utf-8"
+    )
+    second = build_prepare_report(
+        _resolve_live(tmp_path, live_project, task_spec, project_root, live_profile)
+    )
+
+    assert first.authorization.binding_digest
+    assert first.authorization.binding_digest == second.authorization.binding_digest
+    assert first.effective_config_digest == second.effective_config_digest
+    implementer = second.launch_surfaces["implementer"]
+    agents = [entry for entry in implementer.instruction_files if entry.name == "AGENTS.md"]
+    assert agents and agents[0].sha256.startswith("sha256:")
+    assert implementer.workspace_env is not None
+    assert implementer.workspace_env.present is True and implementer.workspace_env.sha256 == ""
+    assert "sk-sentinel-789" not in second.model_dump_json()
+
+    def credential_note(report) -> str:
+        notes = [n for n in report.notes if "DEEPSEEK_API_KEY is not in the launch environment" in n]
+        assert len(notes) == 1
+        return notes[0]
+
+    assert "absent" in credential_note(first)
+    assert "present" in credential_note(second)
+    assert not [note for note in second.notes if "would exit" in note]
+    # The conftest stand-in shim matches neither the Desktop nor the npm layout.
+    assert implementer.client.dsh_carrier == "unknown"
+
+
 # --------------------------------------------------------------------------
 # the exit code answers "will this run?", not "is the task well formed?"
 # --------------------------------------------------------------------------

@@ -7,6 +7,7 @@ never touch the real user data directory.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 from pathlib import Path
@@ -289,6 +290,47 @@ def test_doctor_shows_the_model_flag_and_keeps_model_selection_documented(
     assert "no --model flag" in reviewer
     assert "documented only" in implementer
     assert "model_selection" in payload["capabilities"]["states"]["documented"]
+
+
+def test_doctor_names_the_dsh_home_a_child_actually_uses(
+    tmp_path: Path,
+    live_profile: MachineProfile,
+    acpx_client,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``dsh_home`` is your shell's DSH home; ``child_dsh_home`` is the one an HFlow child gets."""
+    data_dir = tmp_path / "data"
+    monkeypatch.delenv("DSH_HOME", raising=False)
+    assert main(["doctor", "--json", "--data-dir", str(data_dir)]) == EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+    child = payload["child_dsh_home"]
+    assert child["kind"] == "per_invocation"
+    assert child["path"].endswith(os.path.join("invocations", "<invocation-id>", "home", ".dsh"))
+    assert child["detail"].endswith("inferred from upstream source, not observed")
+    assert ".credentials" not in json.dumps(payload)
+    notes = " ".join(payload["notes"])
+    assert "not a live compatibility proof" in notes
+    assert "no .env or credential file was opened" in notes
+    assert main(["doctor", "--data-dir", str(data_dir)]) == EXIT_OK
+    text = capsys.readouterr().out
+    assert "your dsh home" in text
+    assert f"child dsh home per_invocation {child['path']}" in text
+
+    bound = tmp_path / "bound"
+    bound.mkdir()
+    (bound / "cordis.patch.yml").write_text("approval: on-request\n", encoding="utf-8")
+    monkeypatch.setenv("DSH_HOME", str(bound))
+    write_profile(data_dir, live_profile)
+    assert main(
+        ["doctor", "--json", "--profile", "dsh-local", "--data-dir", str(data_dir)]
+    ) == EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["child_dsh_home"]["kind"] == "bound"
+    assert payload["child_dsh_home"]["path"] == str(bound)
+    dependencies = " ".join(payload["profile"]["roles"]["implementer"]["dependencies"])
+    assert "DSH home: bound" in dependencies
+    assert ".credentials" not in json.dumps(payload)
 
 
 def test_doctor_refuses_a_profile_it_cannot_resolve(

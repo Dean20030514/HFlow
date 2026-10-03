@@ -61,7 +61,7 @@ import time
 from collections import deque
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 from ..contracts import (
     AgentBinding,
@@ -74,6 +74,7 @@ from ..contracts import (
     InvocationRequest,
     InvocationResult,
     LaunchConfig,
+    LaunchSurfaces,
     ModelApplied,
     ModelChange,
     ModelObservation,
@@ -159,6 +160,14 @@ PROMPT_ENVELOPE = "HFLOW-PROMPT-DIGEST"
 #: How much of a JSON-RPC error message answering the prompt is kept: it is agent text, quoted
 #: (repr) in error_message, a limitation and block_reason.
 MAX_PROMPT_ERROR_MESSAGE_CHARS = 500
+#: Where each invocation's files live, under the data directory: ``<data-dir>/invocations/<id>``.
+INVOCATIONS_DIR_NAME = "invocations"
+#: The invocation's own home inside that directory. USERPROFILE, HOME and APPDATA of the child
+#: point here, so acpx's global config - and DSH's default home - are per invocation.
+CHILD_HOME_DIR_NAME = "home"
+#: Stands in for an invocation id that does not exist yet (prepare, doctor, probe). A path that
+#: contains it is a name, never a directory: nothing resolves or creates it.
+INVOCATION_ID_PLACEHOLDER = "<invocation-id>"
 
 
 def effective_prompt(request: InvocationRequest) -> str:
@@ -540,6 +549,76 @@ def _client_prefix_for(entry: Path | None, *, node: str, python: str) -> list[st
     if suffix == ".py":
         return [python, "-u"]
     return []
+
+
+def child_home_for(data_dir: Path, invocation_id: str) -> Path:
+    """The home directory one invocation's child gets (USERPROFILE, HOME, APPDATA's parent)."""
+    return Path(data_dir) / INVOCATIONS_DIR_NAME / invocation_id / CHILD_HOME_DIR_NAME
+
+
+def effective_dsh_home(
+    launch: LaunchConfig, *, child_home: Path
+) -> tuple[Literal["bound", "per_invocation"], Path]:
+    """The DSH home a child of this launch uses, and how it comes to use it.
+
+    A bound ``DSH_HOME`` is set on every child, so it is that path. With none bound the driver
+    removes ``DSH_HOME`` from the child and points USERPROFILE/HOME at ``child_home``; DSH's
+    upstream resolution is explicit > non-empty ``DSH_HOME`` > ``~/.dsh``, so its home is then
+    ``child_home/.dsh``, created empty for each invocation. That second case is inferred from
+    upstream source (defaultDshHome joins os.homedir(), which reads USERPROFILE first on
+    Windows); not observed. Nothing is created or resolved here: ``child_home`` may contain
+    :data:`INVOCATION_ID_PLACEHOLDER`.
+    """
+    if launch.dsh_home:
+        return "bound", Path(launch.dsh_home)
+    return "per_invocation", Path(child_home) / ".dsh"
+
+
+def child_environment(
+    source: Mapping[str, str], *, extra_env: Mapping[str, str], dsh_home: str
+) -> dict[str, str]:
+    """The environment a child process is started with, built from ``source``.
+
+    ``DSH_HOME`` is part of the *resolved launch*, so it is set from the bound value or
+    removed - never inherited by accident. Copying the ambient environment and only
+    overriding a non-empty bound home would leave an unset variable unset, and a
+    ``DSH_HOME`` added *after* the launch was resolved would then still reach the child:
+    the approval would say one thing and the process would do another. ``extra_env`` is
+    subject to the same rule, because it is not a way to smuggle a different launch past
+    the binding.
+
+    ``DSH_PERMISSION_MODE`` and ``DSH_TOOLS_MODE`` are removed and never set: DSH reads its
+    sandbox mode, approval policy and tool set from them at launch, so an ambient
+    ``danger-full-access`` would silently unconfine every role. Choosing a value per role is
+    not this driver's decision; inheriting one by accident is ruled out here.
+
+    ``NoDefaultCurrentDirectoryInExePath=1`` is always set, in exactly that spelling, after
+    removing every other spelling: acpx starts the agent with the workspace as its cwd, and
+    without it both cmd.exe (the npm DSH batch shim runs a bare ``node`` unless a node.exe sits
+    beside it; the Desktop shim runs an absolute ``DeepSeek Harness.exe``) and Node's spawn look
+    in that cwd before PATH - a ``node.cmd`` the implementer wrote would then run as the
+    reviewer's agent. For the same reason a relative PATH entry, which would be resolved
+    against the workspace, is not passed on.
+    """
+    env = dict(source)
+    env.update(extra_env)
+    if dsh_home:
+        env["DSH_HOME"] = dsh_home
+    else:
+        env.pop("DSH_HOME", None)
+    for name in STRIPPED_DSH_ENV:
+        env.pop(name, None)
+    for key in [key for key in env if key.upper() == NO_CWD_EXE_SEARCH_ENV.upper()]:
+        del env[key]
+    env[NO_CWD_EXE_SEARCH_ENV] = "1"
+    for key in [key for key in env if key.upper() == "PATH"]:
+        env[key] = os.pathsep.join(
+            entry
+            for entry in env[key].split(os.pathsep)
+            if entry.strip() and Path(entry.strip().strip('"')).is_absolute()
+        )
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    return env
 
 
 def _rpc_id(value: Any) -> tuple[str, Any] | None:
@@ -924,6 +1003,11 @@ class AcpxDshDriver:
         #: reader can see that the ledger entry for that invocation is conservative by accident
         #: instead of by fact.
         self._spawn_report_errors: list[str] = []
+        #: What each invocation's launch showed of DSH's own inputs, taken just before the spawn
+        #: gate; kept by ``release`` like the other recorded facts.
+        self._launch_surfaces: dict[str, LaunchSurfaces | None] = {}
+        #: Why an invocation's launch-surface record is missing.
+        self._surface_notes: dict[str, str] = {}
 
     # -- configuration -------------------------------------------------------
 
@@ -970,47 +1054,12 @@ class AcpxDshDriver:
         return list(self.launch.agent_argv)
 
     def _child_env(self, handle_workspace: Path) -> dict[str, str]:
-        """The environment a child process is started with.
-
-        ``DSH_HOME`` is part of the *resolved launch*, so it is set from the bound value or
-        removed - never inherited by accident. Copying the ambient environment and only
-        overriding a non-empty bound home would leave an unset variable unset, and a
-        ``DSH_HOME`` added *after* the launch was resolved would then still reach the child:
-        the approval would say one thing and the process would do another. ``extra_env`` is
-        subject to the same rule, because it is not a way to smuggle a different launch past
-        the binding.
-
-        ``DSH_PERMISSION_MODE`` and ``DSH_TOOLS_MODE`` are removed and never set: DSH reads its
-        sandbox mode, approval policy and tool set from them at launch, so an ambient
-        ``danger-full-access`` would silently unconfine every role. Choosing a value per role is
-        not this driver's decision; inheriting one by accident is ruled out here.
-
-        ``NoDefaultCurrentDirectoryInExePath=1`` is always set, in exactly that spelling, after
-        removing every other spelling: acpx starts the agent with the workspace as its cwd, and
-        without it both cmd.exe (the DSH batch shim runs a bare ``node``) and Node's spawn look
-        in that cwd before PATH - a ``node.cmd`` the implementer wrote would then run as the
-        reviewer's agent. For the same reason a relative PATH entry, which would be resolved
-        against the workspace, is not passed on.
+        """The environment a child process is started with: :func:`child_environment` applied
+        to this process's environment, this driver's ``extra_env`` and the bound DSH home.
         """
-        env = dict(os.environ)
-        env.update(self.extra_env)
-        if self.launch.dsh_home:
-            env["DSH_HOME"] = self.launch.dsh_home
-        else:
-            env.pop("DSH_HOME", None)
-        for name in STRIPPED_DSH_ENV:
-            env.pop(name, None)
-        for key in [key for key in env if key.upper() == NO_CWD_EXE_SEARCH_ENV.upper()]:
-            del env[key]
-        env[NO_CWD_EXE_SEARCH_ENV] = "1"
-        for key in [key for key in env if key.upper() == "PATH"]:
-            env[key] = os.pathsep.join(
-                entry
-                for entry in env[key].split(os.pathsep)
-                if entry.strip() and Path(entry.strip().strip('"')).is_absolute()
-            )
-        env.setdefault("PYTHONIOENCODING", "utf-8")
-        return env
+        return child_environment(
+            os.environ, extra_env=self.extra_env, dsh_home=self.launch.dsh_home
+        )
 
     # -- probe ---------------------------------------------------------------
 
@@ -1036,13 +1085,27 @@ class AcpxDshDriver:
             "model_selection capability: documented only - no set_config_option round trip "
             "with a real DSH has been observed; each run records what its stream showed",
         ]
-        if self.dsh_home is not None:
-            notes.append(f"probe DSH_HOME: {self.dsh_home}")
-        else:
-            notes.append(
-                "probe DSH_HOME: none bound, so DSH_HOME is removed from the child environment "
-                "rather than inherited"
+        try:
+            from .dsh_surfaces import observe_launch_surfaces, probe_notes
+
+            kind, home = effective_dsh_home(
+                self.launch,
+                child_home=child_home_for(self.data_dir.resolve(), INVOCATION_ID_PLACEHOLDER),
             )
+            notes.extend(
+                probe_notes(
+                    observe_launch_surfaces(
+                        self.launch,
+                        dsh_home=home,
+                        dsh_home_kind=kind,
+                        child_env=self._child_env(self.data_dir),
+                        workspace=None,
+                        look_in_home=kind == "bound",
+                    )
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - a record, never a reason the probe fails
+            notes.append(f"launch surfaces could not be examined: {type(exc).__name__}: {exc}")
         ambient = sorted(
             name for name in STRIPPED_DSH_ENV if name in os.environ or name in self.extra_env
         )
@@ -1177,13 +1240,34 @@ class AcpxDshDriver:
         """Interpreter prefix for the client entry point, as resolved before any approval."""
         return list(self.launch.client_argv_prefix)
 
+    def _observe_launch(
+        self, invocation_id: str, *, workspace: Path, env: Mapping[str, str], child_home: Path
+    ) -> None:
+        """Record what DSH reads on its own at this launch (see ``dsh_surfaces``).
+
+        Never raises, never changes ``env``, never decides anything: an observation that fails
+        leaves the record missing, with the reason kept for the result's limitations.
+        """
+        try:
+            from .dsh_surfaces import observe_launch_surfaces
+
+            kind, home = effective_dsh_home(self.launch, child_home=child_home)
+            self._launch_surfaces[invocation_id] = observe_launch_surfaces(
+                self.launch, dsh_home=home, dsh_home_kind=kind, child_env=env, workspace=workspace
+            )
+        except Exception as exc:  # noqa: BLE001 - an observation must never stop a launch
+            self._launch_surfaces[invocation_id] = None
+            self._surface_notes[invocation_id] = (
+                f"launch surfaces not recorded: {type(exc).__name__}: {exc}"
+            )
+
     def start_handle(self, request: InvocationRequest) -> DriverHandle:
         """Launch one invocation and return immediately with an observable handle."""
         if request.invocation_id in self._handles:
             raise DriverSetupError(
                 f"invocation {request.invocation_id} was already started; refusing to start it twice"
             )
-        invocation_dir = self.data_dir / "invocations" / request.invocation_id
+        invocation_dir = self.data_dir / INVOCATIONS_DIR_NAME / request.invocation_id
         invocation_dir.mkdir(parents=True, exist_ok=True)
         event_log = invocation_dir / "events.ndjson"
         stdout_path = invocation_dir / "stdout.ndjson"
@@ -1225,7 +1309,7 @@ class AcpxDshDriver:
         env = self._child_env(workspace)
         # Absolute, resolved paths only: a relative home would resolve against the child's
         # cwd and silently point the client at the wrong config directory.
-        child_home = (invocation_dir / "home").resolve()
+        child_home = (invocation_dir / CHILD_HOME_DIR_NAME).resolve()
         child_home.mkdir(parents=True, exist_ok=True)
         env["USERPROFILE"] = str(child_home)
         env["HOME"] = str(child_home)
@@ -1235,6 +1319,10 @@ class AcpxDshDriver:
         acpx_home = child_home / ".acpx"
         acpx_home.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(config_path, acpx_home / "config.json")
+        # Outside the gate, so a concurrent stop is not delayed by it; it records only.
+        self._observe_launch(
+            request.invocation_id, workspace=workspace, env=env, child_home=child_home
+        )
 
         # The child is created *inside* this gate, and both cancel entry points take the same
         # gate to record their request. That is what makes the handoff decidable: either the stop
@@ -1781,16 +1869,19 @@ class AcpxDshDriver:
                 )
             close_output_handles(process)
             observation, applied = self._model_facts(invocation_id, rejected=False)
+            timeout_limitations = [
+                "the invocation deadline was reached while waiting for the client; the "
+                "managed process boundary was used to stop it",
+                stop_detail,
+            ]
+            if self._surface_notes.get(invocation_id):
+                timeout_limitations.append(self._surface_notes[invocation_id])
             result = InvocationResult(
                 invocation_id=invocation_id,
                 outcome=InvocationOutcome.OUTCOME_UNKNOWN,
                 prompt_digest=self._prompt_digests.get(invocation_id, ""),
                 agent_turns=None,
-                limitations=[
-                    "the invocation deadline was reached while waiting for the client; the "
-                    "managed process boundary was used to stop it",
-                    stop_detail,
-                ],
+                limitations=timeout_limitations,
                 error_code="completion_timeout",
                 error_message=(
                     "the client did not exit before the invocation deadline "
@@ -1799,6 +1890,7 @@ class AcpxDshDriver:
                 raw_ref=str(handle.event_log),
                 model_observation=observation,
                 model_applied=applied,
+                launch_surfaces=self._launch_surfaces.get(invocation_id),
             )
             self._results[invocation_id] = result
             return result
@@ -1997,6 +2089,8 @@ class AcpxDshDriver:
         review, note = self._review_output(handle, outcome)
         if note:
             limitations.append(note)
+        if self._surface_notes.get(invocation_id):
+            limitations.append(self._surface_notes[invocation_id])
         observation, applied = self._model_facts(
             invocation_id, rejected=error_code == "model_rejected_before_prompt"
         )
@@ -2016,6 +2110,7 @@ class AcpxDshDriver:
             model_observation=observation,
             model_applied=applied,
             stream_order=stream_order,
+            launch_surfaces=self._launch_surfaces.get(invocation_id),
         )
         handle.finished = True
         self._results[invocation_id] = result

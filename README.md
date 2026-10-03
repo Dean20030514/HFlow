@@ -362,8 +362,11 @@ the project contract, the machine profile, the authorization artifact, the root 
   applying when the branch moves, and the run, every round and the receipt use that one commit. The launch is resolved once and then consumed
   by the driver, never re-selected after the check: a bound `DSH_HOME` is set on every child
   process, and a launch that bound none has it *removed* from the child environment rather than
-  inherited. An artifact written before config binding still loads and still keys its own ledger
-  row, but it cannot authorize a run that resolved a configuration.
+  inherited. With none bound, DSH uses a per-invocation, empty home
+  `<data-dir>/invocations/<id>/home/.dsh` - no stored credentials, patch files, AGENTS.md or
+  skills (inferred from upstream source, not observed); `prepare`, `doctor` and each invocation's
+  record name it. An artifact written before config binding still loads and still keys its own
+  ledger row, but it cannot authorize a run that resolved a configuration.
 - The agent launch argv carries only the launcher path and fixed flags. A model id is the one
   value that goes on a command line from configuration: the acpx **client** gets `--model <value>`
   when the role's profile names one, which counts as a fixed flag under AGENTS.md rule 9 by the
@@ -561,9 +564,11 @@ Not built around configuration either:
 - **The launch is bound by paths and argv, not by program content.** A run records *which*
   client entry point, interpreter and launcher it will start; it does not hash those programs, so
   replacing a file at the same path - upgrading `.probe/acpx` in place, or a `dsh` that later
-  resolves to a different carrier - does not change the approval. Version or content identity of
-  the client remains part of the capability record, not of the binding; binding by content is
-  deferred to a later batch.
+  resolves to a different carrier - does not change the approval. doctor's probe notes and each
+  invocation's launch-surface record carry the acpx and @agentclientprotocol/sdk versions from
+  their package.json, and the dsh carrier (Desktop or npm) with the version its shim's manifest
+  states; files are read, nothing is executed, and nothing is bound. Binding by content stays
+  deferred and needs a ruling.
 - **A repository that keeps an `.acpxrc.json` cannot be run on a real driver.** acpx offers no
   way to skip or pin that file (upstream issue #835, open), so a run whose starting workspace
   holds one is refused (`workspace_client_config`) before anything is recorded or charged - the
@@ -652,6 +657,20 @@ Not verified, even where something works on one binding:
   forms), project skills and the workspace `.env` into each role's context next to HFlow's packet
   (documented at dsh-v0.2.0-rc.2; see the `dsh_context` bullet under "Not implemented"). See "What
   the harness does that HFlow does not control" in `docs/operations.md`.
+- **What DSH reads on its own at launch is recorded, not controlled.** Documented at
+  dsh-v0.2.0-rc.2, not observed: `<workspace>/.env` and `$DSH_HOME/.env` (a name the child did not
+  inherit enters DSH's environment; a DSH_*/XDG_*/NODE_OPTIONS/PATH/proxy or other bootstrap name
+  in a workspace `.env` makes DSH exit before serving ACP; `DEEPSEEK_API_KEY` there is a
+  credential fallback); the `$DSH_HOME` and `profiles/<profile>` `cordis.patch.yml` layers, which
+  can replace the sandbox and approval rows; `$DSH_HOME/AGENTS.md` and the
+  AGENTS.md/CLAUDE.md(.local) chain from the nearest `.git` marker; skills; and every DSH_*
+  variable except the two HFlow removes. With DSH_HOME unbound, the home is the per-invocation
+  empty one. Per invocation and role HFlow records the presence, size and SHA-256 of those fixed
+  paths (a `.env` by presence and size only, never opened; the home's stored credentials are never
+  read), the DSH_* variable names, whether `DEEPSEEK_API_KEY` is among the child's variable names,
+  the client and carrier versions, and a note when the DSH home lies inside the workspace. It
+  refuses none of it, binds none of it, and looks just before the spawn. Whether to parse or
+  refuse a workspace `.env` is an open decision.
 - **Nothing is sandboxed.** `command` checks and a real worker run with the current user's
   rights: no filesystem confinement, no credential confinement, and no protection against
   another process of the same user changing the workspace, the authorization artifact or the
@@ -674,6 +693,7 @@ python -m pytest -q tests/test_cancel_routing.py         # 25 tests: a stop reac
 python -m pytest -q tests/test_authorization.py          # 16 tests: the authorized real-run gate
 python -m pytest -q tests/test_driver_acpx_dsh.py        # 75 tests, no model, no credential: launch hardening, model flag and observation, Job teardown
 python -m pytest -q tests/test_winjob.py                 # which Windows answers prove a process gone (injected kernel32, plus two real-kernel pids)
+python -m pytest -q tests/test_dsh_surfaces.py           # 9 tests: what DSH reads at launch, fixed paths, names never values, a .env never opened, nothing executed
 python -m pytest -q tests/test_review.py                 # 37 tests: the review output grammar
 python -m pytest -q tests/test_review_wire.py            # 30 tests: reviewer verdict -> receipt; completion bound to its own prompt
 python -m pytest -q tests/test_driver_turn_settlement.py # 25 tests: what settles a turn, what follows its response, agent-reported usage never billed

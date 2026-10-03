@@ -7,11 +7,13 @@ observed, it prints as ``unknown`` rather than being estimated.
 from __future__ import annotations
 
 from .contracts import (
+    LaunchSurfaces,
     ModelApplied,
     ModelObservation,
     ResultReceipt,
     RunInspection,
     StreamOrder,
+    SurfaceFile,
 )
 
 
@@ -157,9 +159,15 @@ def _config_lines(inspection: RunInspection) -> list[str]:
         + f" digest={effective.digest()}"
     ]
     for entry in effective.roles:
-        lines.append(
-            f"  {entry.role:<12} agent={entry.agent} driver={entry.driver} -> {entry.driver_id}"
-        )
+        line = f"  {entry.role:<12} agent={entry.agent} driver={entry.driver} -> {entry.driver_id}"
+        if entry.launch is not None:
+            # The recorded config fact: which DSH home the launch bound, if any.
+            line += (
+                f" dsh_home=bound:{entry.launch.dsh_home}"
+                if entry.launch.dsh_home
+                else " dsh_home=unbound(per-invocation)"
+            )
+        lines.append(line)
     lines.append(
         f"  writes      implementer={effective.implementer_writes} "
         f"reviewer={effective.reviewer_writes}"
@@ -290,6 +298,81 @@ def _dsh_context_lines(inspection: RunInspection) -> list[str]:
     return lines
 
 
+def surface_summary(entry: SurfaceFile) -> str:
+    """One launch-surface path as a short phrase. A ``.env`` never has a digest to show."""
+    if entry.kind == "absent":
+        return f"{entry.name} absent"
+    if entry.kind == "directory":
+        return f"{entry.name} directory"
+    if entry.kind == "unknown":
+        return f"{entry.name} unknown ({entry.detail})"
+    if entry.kind == "other":
+        return f"{entry.name} other"
+    if entry.name.rsplit("/", 1)[-1] == ".env":
+        return f"{entry.name} {entry.size} bytes (not opened: may hold credentials)"
+    if entry.sha256:
+        return f"{entry.name} {entry.size} bytes {entry.sha256}"
+    return f"{entry.name} {entry.size} bytes ({entry.detail})"
+
+
+def launch_surfaces_lines(
+    role: str, surfaces: LaunchSurfaces | None, *, indent: str = "    "
+) -> list[str]:
+    """One invocation's launch-surface record as stored, or "not recorded". Never re-observed.
+
+    The record's notes are not repeated here; ``report --json`` carries them.
+    """
+    if surfaces is None:
+        return [
+            f"{indent}launch        {role} surfaces not recorded (this result carries no "
+            "launch-surface record)"
+        ]
+    if surfaces.dsh_home_kind == "bound":
+        home = f"{indent}dsh home      {role} bound {surfaces.dsh_home}"
+    else:
+        home = (
+            f"{indent}dsh home      {role} per-invocation {surfaces.dsh_home} (created empty for "
+            "each invocation; inferred)"
+        )
+    if surfaces.dsh_home_observed:
+        present = [surface_summary(e) for e in surfaces.dsh_home_files if e.present is not False]
+        home += ": " + ("; ".join(present) if present else "nothing present")
+    else:
+        home += " (not looked into before dispatch)"
+    if not surfaces.workspace:
+        workspace = (
+            f"{indent}workspace     {role} not known before dispatch: observed at each "
+            "invocation's spawn"
+        )
+    else:
+        env_file = surfaces.workspace_env
+        if env_file is None or env_file.kind == "absent":
+            env_text = "absent"
+        elif env_file.kind == "unknown":
+            env_text = f"unknown ({env_file.detail})"
+        elif env_file.kind == "file":
+            env_text = f"present {env_file.size} bytes, not opened"
+        else:
+            env_text = f"present ({env_file.kind}), not opened"
+        instructions = ", ".join(e.name for e in surfaces.instruction_files) or "none"
+        skills = ", ".join(e.name for e in surfaces.skill_dirs if e.present) or "none"
+        inherited = "yes" if surfaces.deepseek_api_key_inherited else "no"
+        workspace = (
+            f"{indent}workspace     {role} {surfaces.workspace}: .env {env_text}; "
+            f"DEEPSEEK_API_KEY inherited={inherited}; "
+            f"project root {surfaces.project_root or 'none (no .git marker)'}; "
+            f"instructions {instructions}; skills {skills}"
+        )
+    client = surfaces.client
+    dsh = client.dsh_carrier + (f" {client.dsh_version}" if client.dsh_version else "")
+    client_line = (
+        f"{indent}client        {role} acpx={client.acpx_version or 'unknown'} "
+        f"sdk={client.sdk_version or 'unknown'} dsh={dsh}; DSH_* reaching the child: "
+        f"{', '.join(surfaces.dsh_env_names) or 'none'} (names only)"
+    )
+    return [home, workspace, client_line]
+
+
 def status_text(inspection: RunInspection) -> str:
     run = inspection.run
     lines = [
@@ -327,6 +410,7 @@ def status_text(inspection: RunInspection) -> str:
         )
         lines.append(_model_line("implementer", attempt.model_observation, attempt.model_applied))
         lines.append(_stream_line("implementer", attempt.stream_order))
+        lines.extend(launch_surfaces_lines("implementer", attempt.launch_surfaces))
         if attempt.review_invocation_id:
             lines.append(
                 _model_line(
@@ -334,6 +418,7 @@ def status_text(inspection: RunInspection) -> str:
                 )
             )
             lines.append(_stream_line("reviewer", attempt.review_stream_order))
+            lines.extend(launch_surfaces_lines("reviewer", attempt.review_launch_surfaces))
     lines.extend(_dsh_context_lines(inspection))
     lines.extend(_repair_lines(inspection))
     lines.append("evidence")
