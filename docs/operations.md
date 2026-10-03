@@ -759,7 +759,16 @@ What the freeze commits, and what it refuses:
   that ends without a receipt for another reason (a failed check or a rejection that buys no
   repair, a driver failure, an unknown outcome, a stop while the worker ran) is compared once
   more and gets only a note, `git_metadata: changed when the run ended ...`; it never relabels the
-  block, so an `outcome_unknown` stays. What to do: run `git config --list --show-origin
+  block, so an `outcome_unknown` stays. A comparison that cannot read the metadata at that point
+  notes `git_metadata: unreadable when the run ended ...` and the run's block still stands. You
+  see these warnings without opening the store: `hflow run` prints the at-exit note with its
+  other notes, and `hflow status` / `report` print every `git_metadata: changed ...` /
+  `unreadable ...` note as a `git metadata` line under the block (`git_metadata_notes` in
+  `report --json`). Output git prints that is not text in the locale's encoding (a config value
+  is raw bytes, so a worker can write any; a legacy GBK value under a UTF-8 locale) counts as
+  unreadable: "... or became unreadable" after dispatch, and `internal_error` ("git workspace
+  failed: ...") before it, when no snapshot can be taken - such a value already in your config
+  blocks every worktree run until you fix it. What to do: run `git config --list --show-origin
   --show-scope`, inspect `.git/info/attributes`, the file `git var GIT_ATTR_GLOBAL` names and any
   included files, and restore them before `hflow clean` or another worktree run - both read the
   metadata again, and HFlow restores nothing. If the edit was your own (any change counts, even
@@ -835,6 +844,11 @@ record is reported `MISSING`, never as a success.
   (documented upstream, not observed here); `clean` does not change permissions.
 - Worktrees are not garbage-collected automatically, and `clean` deliberately never runs
   `git gc`, `git clean`, `worktree prune`, or `rmtree`.
+- It does not check the run's shared-Git-metadata warnings. Even the preview runs `git status`
+  in the worktree (and `--apply` then `git worktree remove`), and a status read runs any clean
+  filter that metadata names. When `hflow status` shows a `git metadata` line, inspect and
+  restore the metadata first (the "Shared Git metadata is compared ..." item under "M2 runs
+  through the CLI").
 
 ## Running a real Harness task (authorized only)
 
@@ -1327,7 +1341,9 @@ enforced, refused or part of an approval.
   per-attempt `dsh home`, `workspace` and `client` lines of `status`; and `report --json`'s
   `launch_surfaces` / `review_launch_surfaces`. The offline driver, an older row, a stop that won
   the spawn gate and a failed observation show "not recorded"; a failed observation's reason is in
-  the result's limitations, and it never changes or stops the launch.
+  the result's limitations, and it never changes or stops the launch. In `prepare`, a role whose
+  surfaces could not be examined is left out of that section and named in prepare's notes; the
+  preview itself still completes.
 - **Time of check:** DSH reads the files after the look. A worktree holds only what the base
   commit tracks, so an untracked `.env` in your checkout is not in it.
 - A DSH home that lies inside the workspace is noted (the agent could write what DSH loads at the
@@ -1437,8 +1453,10 @@ attempts
   A-2432mgtqqj  revision=1 role=implementer state=SUCCEEDED outcome=completed repair=False
     model         implementer not recorded (this result carries no model observation)
     stream        implementer updates_after_prompt_response=unknown (not recorded: no bound prompt response, no stream read to its end, or a result without this record)
+    launch        implementer surfaces not recorded (this result carries no launch-surface record)
     model         reviewer not recorded (this result carries no model observation)
     stream        reviewer updates_after_prompt_response=unknown (not recorded: no bound prompt response, no stream read to its end, or a result without this record)
+    launch        reviewer surfaces not recorded (this result carries no launch-surface record)
 dsh context   not recorded: no frozen Git candidate was classified for this run (an in-place run, a run that ended or was refused before its candidate was kept, or one recorded before this build)
 repair        no repair decision recorded
 evidence
@@ -1488,6 +1506,10 @@ model_calls   0 (this command; provider-side requests are reported by the receip
   and how many updates for the prompt's session followed it (see "Driver `error_code`" above).
   They read `unknown`, never `0`, for the offline driver, older runs, unbound turns and streams
   not read to their end.
+- `launch` lines: one per invocation, the stored launch-surface record (see "What DSH reads on
+  its own"). They read `not recorded` for the offline driver, older rows, a stop that won the
+  spawn gate and an observation that failed; a recorded one prints its `dsh home`, `workspace`
+  and `client` lines instead.
 - `repair` lists every repair decision the run recorded, refusals included, or says `no repair
   decision recorded`.
 - `dsh context` projects the stored `dsh_context` records. `not recorded` means no frozen Git
@@ -1571,8 +1593,9 @@ The stop goes to the **role that is running**, not always to the implementer: wh
 phase is live it names the reviewer's own invocation and asks the reviewer's driver (a profile
 may bind the two roles to different drivers). Which role, driver and invocation were asked, and
 what the stop reported, is recorded as a `cancel_target` line in the run's own note table
-(`run_notes`, alongside the effective configuration and the role input packets); the run's notes
-are not part of the `status`/`report` projection, so read them from the store.
+(`run_notes`, alongside the effective configuration and the role input packets); apart from the
+`git_metadata` warnings (the `git metadata` lines), the run's notes are not part of the
+`status`/`report` projection, so read them from the store.
 
 A recorded stop is coordinated through the **write** and through the **spawn gate**, not
 through a sequence of checks. Registering a role's invocation and every block of a run carry

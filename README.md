@@ -6,6 +6,8 @@ Harness (DSH first) owns reasoning and tools.
 
 **Status: one thin production Driver plus an offline fake; offline vertical slice and the M2
 offline delivery slice; the batch E1 root ledger and the batch E2 bounded repair, offline-tested;
+the batch F hardening from the 2026-10-03 upstream survey (turn settlement, reviewer transcript,
+stop confirmation, shared Git metadata, launch and context records), offline-tested;
 three recorded live top-level M2 tasks (one stop trial, two attempts at one small change) under
 explicit one-time authorizations.**
 
@@ -122,12 +124,13 @@ tested, so they are recorded rather than asserted:
 
 | Snapshot | Command | Result |
 |---|---|---|
-| the 2026-10-02 refinement on top of `0ec289c` (ledger compare-and-set, stops and late results, freeze scope, base SHA, launch hardening, `--model`) | `python -m pytest -q` | `738 passed, 1 skipped in 454.43s` (exit 0; 739 collected) |
+| batch F on top of `f2796aa` (prompt errors and unknown stop reasons, stream order and after-response text, reviewer transcript by `messageId` and session, fail-safe exit checks, shared Git metadata, launch-surface and DSH-context records) | `python -m pytest -q` | `938 passed, 1 skipped in 610.03s` (exit 0; 939 collected) |
 
 History, for orientation only: the suite grew from 225 tests (T02 admission) through 298 (batches
 A/B/C), 353 (batch D configuration wiring), 377 (reviewer-cancel routing and the coordinated spawn
-gate) and 513 passed at `0ec289c` (E1 root ledger, E2 bounded repair; the figure its commit
-message records), each with the one directory-link skip on this machine.
+gate), 513 passed at `0ec289c` (E1 root ledger, E2 bounded repair; the figure its commit
+message records) and 738 at `f2796aa` (the 2026-10-02 refinement), each with the one
+directory-link skip on this machine.
 
 Some tests skip themselves when their precondition is absent rather than pretending to pass. On
 this machine one does - the directory-link test - and a run that reports more is telling you which
@@ -136,13 +139,17 @@ preconditions were missing, not that the suite failed:
 | Precondition | Tests | Where |
 |---|---:|---|
 | the OS lets this user create a directory link | 1 | `test_contracts.py` |
-| `node` on `PATH` and the pinned acpx at `.probe/acpx` (gitignored) | 11 | all 9 in `test_real_client_review.py`, 2 `real_acpx` cases in `test_packet_wire.py` |
-| the recorded M2 ledger at `.probe/m2-live/attempt-2-data` (gitignored) | 14 | all 8 in `test_saved_review_replay.py`, 6 in `test_local_finalization.py` |
-| Windows (a Job Object, or the batch-shim launch) | 13 | 4 in `test_check_process_lifecycle.py`, 6 in `test_driver_acpx_dsh.py`, 2 in `test_batch_e_repair.py`, 1 in `test_batch_e_verify.py` |
+| `node` on `PATH` and the pinned acpx at `.probe/acpx` (gitignored) | 13 | all 11 in `test_real_client_review.py`, 2 `real_acpx` cases in `test_packet_wire.py` |
+| the recorded M2 ledger at `.probe/m2-live/attempt-2-data` (gitignored) | 20 | all 9 in `test_saved_review_replay.py`, 11 in `test_local_finalization.py` |
+| Windows (a Job Object, or the batch-shim launch) | 26 | all 9 in `test_winjob.py`, 5 in `test_check_process_lifecycle.py`, 9 in `test_driver_acpx_dsh.py`, 2 in `test_batch_e_repair.py`, 1 in `test_batch_e_verify.py` |
 | Git 2.48+ (`worktree.useRelativePaths` records `extensions.relativeWorktrees`) | 1 | `test_m2_slice.py` |
+| a locale whose encoding cannot decode every byte (UTF-8 or GBK; not a single-byte code page) | 4 | 1 in `test_m2_slice.py`, 3 in `test_batch_e_repair.py` |
+| the temp directory does not lie inside a Git checkout | 1 | `test_dsh_surfaces.py` |
 
-A fresh clone on another platform, without `.probe/`, therefore skips up to 39 tests, and one more
-with a Git older than 2.48.
+The acpx and ledger counts were taken on 2026-10-03 by running the affected files with each
+`.probe/` directory moved aside. A fresh clone on another platform, without `.probe/`, therefore
+skips up to 60 tests, one more with a Git older than 2.48, up to four more in a single-byte
+locale, and one more when the temp directory lies inside a Git checkout.
 
 ## Commands
 
@@ -292,16 +299,21 @@ the project contract, the machine profile, the authorization artifact, the root 
   inserted. A reasoning block (`agent_thought_chunk`) is never part of it, whatever its id: DSH
   sends a message's reasoning under the message's own id, so a reasoning block between two text
   blocks is skipped, not treated as the end of the message. A `messageId` that resumes after
-  another message started blocks as `review_protocol_error`. A turn that
-  produced no usable verdict blocks as `review_protocol_error` (a wire failure) instead of
-  being reported as the reviewer requesting changes, a reviewer turn whose outcome is unknown
+  another message started blocks as `review_protocol_error`. Only message chunks for the session
+  the turn's first `session/prompt` request named are read: a chunk for another session, or with
+  no `sessionId` (counted as `agent_message_chunk_other_session=N`), a chunk seen before that
+  request, or a request that names no session, blocks as `review_protocol_error`. A
+  turn that produced no usable verdict blocks as `review_protocol_error` (a wire failure) instead
+  of being reported as the reviewer requesting changes, a reviewer turn whose outcome is unknown
   blocks as `outcome_unknown` with its ledger entry settled as unknown (so `resume` can
   reconcile it and the root stays blocked), and a validated `changes_requested` stays a review
   rejection. A verdict is decoded only from a turn whose client output was read to its end and
-  carried no `agent_message_chunk` after the turn's own prompt response. Otherwise the final
-  answer is not identified and the turn blocks as `review_protocol_error` (`review_ambiguous`),
-  whatever either message says, and no repair is decided from it. The offline replay tool
-  refuses such a stream too (a blocker, so `--finalize` writes nothing).
+  carried no `agent_message_chunk` for the prompt's session after the turn's own prompt response.
+  Otherwise the final answer is not identified and the turn blocks as `review_protocol_error`
+  (`review_ambiguous`), whatever either message says, and no repair is decided from it. The
+  offline replay tool refuses such a stream too (a blocker, so `--finalize` writes nothing), and
+  likewise a stream with excluded or pre-prompt message chunks, and a reviewer prompt answered
+  with a JSON-RPC error or settled with a stop reason other than `end_turn`.
 - What each role is told is rendered once, from stored facts, by the controller
   (`packet.py`) and transported verbatim; a driver may not rebuild or extend it. The prompt
   digest the transport reports is compared with the packet the controller rendered, so a
@@ -335,7 +347,10 @@ the project contract, the machine profile, the authorization artifact, the root 
   change blocks `scope_violation` ("shared Git metadata changed ...") before HFlow's status, add
   or commit reads it again. A run that ends without a receipt for another reason is compared once
   more and the result is a note (`git_metadata: changed when the run ended`); it never relabels
-  the block (see "Not verified" for what that does not cover).
+  the block (see "Not verified" for what that does not cover). `hflow run` prints that note, and
+  `hflow status` / `report` print every metadata warning as a `git metadata` line
+  (`git_metadata_notes` in `report --json`). Git output that is not text - a config value is raw
+  bytes - counts as unreadable: `scope_violation` after dispatch, `internal_error` before it.
 - The implementer and the reviewer are resolved from the profile **independently** and
   dispatched through their own driver object; a role the profile does not bind is refused rather
   than inheriting the other's agent. A binding's declared **harness** must be one its driver
@@ -636,7 +651,12 @@ Not verified, even where something works on one binding:
   - Nothing is restored and there is no cross-run baseline. A later or concurrent run that starts
     after the change takes it as its baseline: its own status read of your checkout and its
     `worktree add` run before its snapshot. After a block, `hflow clean` (status, then `worktree
-    remove`) and your own git read the changed metadata until you restore it.
+    remove`) and your own git read the changed metadata until you restore it. `hflow clean` does
+    not check the `git metadata` warnings: even its preview runs `git status` in that worktree,
+    which runs a clean filter the changed metadata names, so restore it before cleaning.
+  - A config value that is not valid text in the locale's encoding (a legacy GBK value under a
+    UTF-8 locale) already in your config blocks every worktree run `internal_error` before
+    dispatch; HFlow does not decode it any other way.
   - False positives fail closed: your own `git config`, `push -u`, an IDE writing `branch.*`, a
     global-config edit or a check that runs `git config` during a run all block it. Each costs a
     new revision; under a root budget, that revision's first implementer is charged as a repair.
@@ -691,23 +711,23 @@ Not verified, even where something works on one binding:
 ```sh
 python -m pytest -q tests/test_cancel_routing.py         # 25 tests: a stop reaches the live role, wins the handoff, and is never undone
 python -m pytest -q tests/test_authorization.py          # 16 tests: the authorized real-run gate
-python -m pytest -q tests/test_driver_acpx_dsh.py        # 75 tests, no model, no credential: launch hardening, model flag and observation, Job teardown
-python -m pytest -q tests/test_winjob.py                 # which Windows answers prove a process gone (injected kernel32, plus two real-kernel pids)
-python -m pytest -q tests/test_dsh_surfaces.py           # 9 tests: what DSH reads at launch, fixed paths, names never values, a .env never opened, nothing executed
-python -m pytest -q tests/test_review.py                 # 37 tests: the review output grammar
-python -m pytest -q tests/test_review_wire.py            # 30 tests: reviewer verdict -> receipt; completion bound to its own prompt
-python -m pytest -q tests/test_driver_turn_settlement.py # 25 tests: what settles a turn, what follows its response, agent-reported usage never billed
-python -m pytest -q tests/test_real_client_review.py     # 9 tests: installed acpx + mock agent, no model (hardened launch, --model)
+python -m pytest -q tests/test_driver_acpx_dsh.py        # 91 tests, no model, no credential: launch hardening, model flag and observation, Job teardown
+python -m pytest -q tests/test_winjob.py                 # 9 tests: which Windows answers prove a process gone (injected kernel32, plus two real-kernel pids)
+python -m pytest -q tests/test_dsh_surfaces.py           # 10 tests: what DSH reads at launch, fixed paths, names never values, a .env never opened, nothing executed
+python -m pytest -q tests/test_review.py                 # 52 tests: the review output grammar
+python -m pytest -q tests/test_review_wire.py            # 56 tests: reviewer verdict -> receipt; completion bound to its own prompt
+python -m pytest -q tests/test_driver_turn_settlement.py # 27 tests: what settles a turn, what follows its response, agent-reported usage never billed
+python -m pytest -q tests/test_real_client_review.py     # 11 tests: installed acpx + mock agent, no model (hardened launch, --model)
 python -m pytest -q tests/test_packet_wire.py            # 20 tests: role packets -> pinned acpx + input-sensitive agent, no model
-python -m pytest -q tests/test_saved_review_replay.py    # 8 tests: the recorded live review, replayed offline
-python -m pytest -q tests/test_local_finalization.py     # 13 tests: one later decision, recorded through the Store
+python -m pytest -q tests/test_saved_review_replay.py    # 9 tests: the recorded live review, replayed offline
+python -m pytest -q tests/test_local_finalization.py     # 25 tests: one later decision, recorded through the Store
 python -m pytest -q tests/test_concurrency.py            # 8 deterministic thread/cancel-orderings tests
-python -m pytest -q tests/test_m2_slice.py               # 19 tests: Git worktree -> frozen candidate, complete and deny-aware freeze
+python -m pytest -q tests/test_m2_slice.py               # 70 tests: Git worktree -> frozen candidate, complete and deny-aware freeze
 python -m pytest -q tests/test_cli_m2_cleanup.py         # 18 tests: the same flow through the CLI + guarded clean
 python -m pytest -q tests/test_dispatch_gates.py         # 19 tests: pre-dispatch gates, loop allowance, packet bound
 python -m pytest -q tests/test_check_resources.py        # 22 tests: bounded output, artifacts, minimal environment, reference round-trip
 python -m pytest -q tests/test_batch_e_dispatch.py       # 52 tests: the one dispatch transaction, open-state settlement, stop/ledger races
-python -m pytest -q tests/test_batch_e_repair.py         # 76 tests: the bounded repair, late results after a stop, base SHA, freeze scope
+python -m pytest -q tests/test_batch_e_repair.py         # 94 tests: the bounded repair, late results after a stop, base SHA, freeze scope
 python tools/verify_b_recheck.py <temp-dir>              # the three re-checked B failure paths: failed capture, retention budget, last-line overflow
 python tools/m0_probe/check_process_boundary.py          # Job Object teardown, standalone (Windows)
 python tools/m0_probe/real_client_checks.py all          # real acpx: version + mock-agent round trip
@@ -721,7 +741,7 @@ authorization writer, an environment probe for one specific task) are kept on th
 deliberately not listed here: they are not part of the committed tree, and their inputs live under
 `handoffs/`, which is local too.
 
-The per-file numbers were checked on 2026-10-02 with `python -m pytest --collect-only -q <file>`
+The per-file numbers were checked on 2026-10-03 with `python -m pytest --collect-only -q <file>`
 (collection only, nothing executed); they change as tests are added.
 
 The driver tests run the real launch/observe/stop code against a test-only stand-in for the

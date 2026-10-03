@@ -313,3 +313,27 @@ acpx 0.17.1 against the project's mock agent); none of it is live evidence.
   check first), read-only enforcement `unsupported`, billed usage `unknown`.
 - **Deferred:** binding the launch by program content rather than by path, and the acpx 0.19.x
   upgrade.
+
+## Addendum 2026-10-03 — re-survey and batch F
+
+Appended; the decision and every capability state above stand. A second read of the same upstreams
+(release metadata, compare views and source, nothing executed) found nothing that changes HFlow's
+transport:
+
+| Fact | Label |
+|---|---|
+| acpx has no release after `v0.19.4`; `main` moved past it only by dependency bumps (a `pnpm-lock.yaml` change and `@types/ws`, head `27efb1b57b9de22105a91e9154b1d29b51ede8cb` on 2026-10-03). `src/async-control.ts` is byte-identical at `v0.17.1` and `v0.19.4`: `exec` still sends `session/cancel` only on SIGINT/SIGTERM/SIGHUP, `--timeout` still sends none, and `exec` offers a host no other cancel channel (no stdin control message, no IPC) | documented |
+| openclaw/acpx#835 (pin or skip the project `.acpxrc.json`) is still open with no maintainer decision and no linked PR; none of the proposed flag names is settled, so HFlow keeps refusing such a workspace | documented |
+| DSH has no release after `dsh-v0.2.0-rc.2`; its ACP package sources are blob-identical on `master`. DSH sends no `PromptResponse.usage` and no `usage_update.cost` (only `used`/`size`) | documented |
+| ACP schema `v1.24.1` is unchanged: `PromptResponse` is still `{stopReason, _meta}`, the stop-reason set is still closed, and there is still no turn or prompt identifier on `session/update` | documented |
+
+What batch F changed, all offline-tested (production driver over the Python stand-in client, the
+pinned acpx 0.17.1 against the project's mock agent, and recorded-stream replays); none of it is
+live evidence and no capability is upgraded: a JSON-RPC error answering the prompt is recorded
+(`prompt_error_response`, still `OUTCOME_UNKNOWN`); a stop reason outside v1's set is
+`OUTCOME_UNKNOWN`; the reviewer's answer is taken only from the session the first prompt named,
+grouped by `messageId` so a same-id reasoning block neither splits nor joins it, and never from
+a chunk sent after the prompt response or from a stream not read to its end; a stop is confirmed
+only by an observed exit (`ERROR_INVALID_PARAMETER`, a signalled process, or the driver's own
+`Popen` handle) together with an empty Job. See README "Non-negotiables" and "Not verified" for
+the rest (shared Git metadata comparison, the launch-surface and DSH-context records).

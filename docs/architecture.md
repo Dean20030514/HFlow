@@ -265,8 +265,11 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
   `GitMetadataSnapshot` held in controller memory for the run (never stored), taken right after
   `worktree add`. `Controller._git_metadata_refusal` compares it before the freeze, before the
   repair reconcile and at acceptance and refuses `scope_violation` on any difference;
-  `Controller._note_git_metadata_at_exit` compares once more, note-only, when a worktree run ends
-  without a receipt for another reason. An in-scope `.gitattributes` in the delivery is recorded
+  `Controller._note_git_metadata_at_exit` compares once more, note-only and never raising, when a
+  worktree run ends without a receipt for another reason; the note is added to the run's outcome
+  notes, and `inspect_run` projects every `git_metadata: changed` / `unreadable` note as
+  `git_metadata_notes`, which `status` and `report` show. Git output that is not valid text makes
+  the snapshot unreadable (a `GitError`), never a crash. An in-scope `.gitattributes` in the delivery is recorded
   as a receipt limitation, not refused. (`hflow clean`'s read-only `git worktree list` does not go through `GitRepo`.) The user's HEAD,
   index, working files, stash and branches are not written to — but the worktree shares the
   source repository's Git objects and admin files, and a process running as this user can still
@@ -293,30 +296,37 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
   id: a terminal response that answers no observed prompt is `OUTCOME_UNKNOWN` /
   `unbound_completion` for implementer and reviewer alike (no freeze, no checks, no verdict); a
   prompt settled as `max_tokens`, `max_turn_requests` or `refusal` stays `FAILED
-  stop_reason_<reason>` whatever a later response says; a stop reason outside ACP v1's closed set
-  is `OUTCOME_UNKNOWN` / `unknown_stop_reason`, and the event projection and the result share the
-  set (`acp_events.V1_STOP_REASONS`); a JSON-RPC error answering the prompt is `OUTCOME_UNKNOWN` /
-  `prompt_error_response`, with its code and bounded message recorded, while an error with another
-  id, or with the prompt's id after a request from the agent reused it, is not attributed; a
-  response with no `stopReason` settles nothing (`no_stop_reason`); and `stopReason=cancelled`
+  stop_reason_<reason>` whatever a later stop-reason response says; a stop reason outside ACP v1's
+  closed set is `OUTCOME_UNKNOWN` / `unknown_stop_reason`, and the event projection and the result
+  share the set (`acp_events.V1_STOP_REASONS`); a JSON-RPC error answering the prompt is
+  `OUTCOME_UNKNOWN` / `prompt_error_response`, with its code and bounded message recorded - and so
+  is a prompt answered with both an error and a stop reason, in either order, since a request is
+  answered once - while an error with another id, or with the prompt's id after a request from the
+  agent reused it, is not attributed; a response with no `stopReason` settles nothing
+  (`no_stop_reason`); and `stopReason=cancelled`
   with no stop requested for that invocation is `FAILED cancelled_unrequested`, because DSH also
   settles a prompt as cancelled when it disposes of a session. `end_turn` is turn settlement, not
   success - acceptance is decided by checks and review. Every bound result whose stream was read
   to its end records where the prompt response fell and how many updates for the prompt's session
-  followed it (`stream_order`). The reviewer's verdict is reassembled from the `agent_message_chunk`
-  updates the driver observed - the production driver does not filter them by session, since
-  `acpx exec` runs one session, and the offline replay tool requires a single session - and
-  decoded into one canonical `ReviewOutput` (`src/hflow/review.py`). Chunks group into messages by
-  ACP `messageId`, and only a different id starts a new message, so a same-id thought (DSH sends
-  reasoning under the message's own id), a usage update or a tool call does not split one. The
-  answer is the last message's message-chunk text in stream order, and thought text is never part
-  of it. A `messageId` that returns after another message started rejects the transcript. Without
-  `messageId`, a non-message update or a sequence gap ends a message. A message chunk after the
-  bound prompt response, or a stream not read to its end, means no verdict (`review_protocol_error`
-  / `review_ambiguous`). Missing, malformed or ambiguous output, or a reviewer turn that `FAILED`,
-  blocks as `review_protocol_error` and is recorded as failed review evidence - it is never
-  described as the reviewer requesting changes, and a verdict can never be filled in on the
-  model's behalf. A reviewer turn whose outcome is unknown blocks as
+  followed it (`stream_order`), from one reading of the reader's drained flag that the verdict
+  decision uses too. The reviewer's verdict is reassembled from the `agent_message_chunk` updates
+  the driver observed for the session the first `session/prompt` request named - a chunk for any
+  other session, or with no `sessionId` (counted in a limitation,
+  `agent_message_chunk_other_session=N`), a chunk observed before that request, or a request that
+  names no session, leaves no verdict; the offline replay tool binds the same way and refuses
+  any of these streams - and decoded into one canonical `ReviewOutput` (`src/hflow/review.py`).
+  Chunks group into messages by ACP `messageId`, and only a different id starts a new message, so a
+  same-id thought (DSH sends reasoning under the message's own id), a usage update or a tool call
+  does not split one. The answer is the last message's message-chunk text in stream order, and
+  thought text is never part of it. A `messageId` that returns after another message started
+  rejects the transcript. Without `messageId`, a non-message update or a sequence gap ends a
+  message. A message chunk for the prompt's session after the bound prompt response, or a stream
+  not read to its end, means no verdict (`review_protocol_error` / `review_ambiguous`); the drain
+  is checked before the transcript is read, so a line the reader adds while `collect` folds the
+  result cannot leave a verdict behind. Missing, malformed or ambiguous output, or a reviewer turn
+  that `FAILED`, blocks as `review_protocol_error` and is recorded as failed review evidence - it
+  is never described as the reviewer requesting changes, and a verdict can never be filled in on
+  the model's behalf. A reviewer turn whose outcome is unknown blocks as
   `outcome_unknown`, and its ledger entry is settled as unknown (the ledger records the
   controller's classification, not the driver's raw outcome), so `resume` can reconcile it.
   Only the review invocation may produce a verdict: an implementer whose output happens to
