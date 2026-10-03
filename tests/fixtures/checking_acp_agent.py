@@ -226,8 +226,7 @@ def reviewer_turn(session_id: str, prompt: str, absent: dict[str, list[str]]) ->
     findings = [
         {
             "id": section,
-            "status": "missing_input",
-            "detail": "the review packet did not contain: " + "; ".join(needles),
+            "body": "the review packet did not contain: " + "; ".join(needles),
         }
         for section, needles in sorted(absent.items())
     ]

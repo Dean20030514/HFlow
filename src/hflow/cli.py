@@ -1,10 +1,19 @@
 """HFlow command line.
 
-Subcommands: doctor / prepare / run / status / report / cancel / resume / schema / clean.
+Subcommands: doctor / prepare / run / status / report / cancel / resume / schema / clean /
+ledger settle.
+
+``ledger settle`` closes an ``unknown`` / ``launch_unknown`` ledger entry by operator attestation;
+it never calls a model, never re-dispatches and never changes a run's state.
 
 ``doctor``, ``prepare``, ``status``, ``report``, ``schema`` and ``clean`` never call a model;
 ``doctor`` never boots a DSH profile either - it reports what is *known* locally and marks the
-rest ``unknown``. ``resume`` reconciles and never re-dispatches.
+rest ``unknown``. ``resume`` reconciles and never re-dispatches; on a live run it takes over only
+from an owner process proven gone, and that takeover blocks the run ``owner_lost``.
+
+``--controller-id`` is a human label. A run's exclusive owner is the controller *process*
+(``hflow.ownership``): a random token, its pid, creation time and host, and an OS file lock held
+for the process's lifetime.
 
 ``run`` is offline only with the ``fake`` driver (the default without a profile). With
 ``--driver acpx-dsh`` or a profile that binds it, ``run`` launches the real Harness and needs a
@@ -65,9 +74,10 @@ EXIT_OK = 0
 EXIT_REFUSED = 2
 EXIT_BLOCKED = 3
 EXIT_USAGE = 4
-#: The run exists and is not finished (DRAFT / READY / RUNNING / CHECKING): a history query for
-#: a run another controller still drives, or a ``resume`` no-op on a run a hard kill left
-#: ``RUNNING``. Never ``EXIT_REFUSED``, which promises that no run state was created.
+#: The run exists and is not finished (DRAFT / READY / RUNNING / CHECKING): a submission that
+#: found the run claimed by another owner process (the payload's note names it), or a ``resume``
+#: that refused a takeover because that owner may be alive. Never ``EXIT_REFUSED``, which promises
+#: that no run state was created.
 EXIT_IN_PROGRESS = 5
 #: ``status`` / ``report`` found the run but one of its stored records no longer validates (it was
 #: written under another build's contracts, or edited). The run exists, so this is never
@@ -289,6 +299,51 @@ def _capability_section(probe: object) -> dict[str, object]:
     }
 
 
+def _doctor_ledger_settlements(data_dir: Path) -> dict[str, object]:
+    """How many ledger entries an operator settled by attestation. Read-only, never migrates.
+
+    Opened with SQLite's read-only URI mode so doctor neither creates nor migrates a ledger; a
+    file it cannot read that way is reported as such rather than opened read-write.
+    """
+    import sqlite3
+
+    path = database_path(data_dir)
+    result: dict[str, object] = {"consumed": None, "void": None}
+    if not path.exists():
+        result["detail"] = "no ledger file in this data dir"
+        return result
+    try:
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            present = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = "
+                "'invocation_settlements'"
+            ).fetchone()
+            if present is None:
+                result["detail"] = (
+                    "not recorded: this ledger predates operator settlement (opening it with "
+                    "status/report migrates it)"
+                )
+                return result
+            rows = dict(
+                conn.execute(
+                    "SELECT settled_as, COUNT(*) FROM invocation_settlements GROUP BY settled_as"
+                ).fetchall()
+            )
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        result["detail"] = f"unreadable read-only ({exc}); not opened read-write by doctor"
+        return result
+    result["consumed"] = int(rows.get("consumed", 0))
+    result["void"] = int(rows.get("void", 0))
+    result["detail"] = (
+        f"{result['consumed']} consumed, {result['void']} void - settled by operator attestation "
+        "(not observed); billed usage for those entries stays unknown"
+    )
+    return result
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Read-only environment probe. Never installs, never modifies global config."""
     data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
@@ -364,6 +419,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         ),
     }
 
+    report["ledger_settlements"] = _doctor_ledger_settlements(data_dir)
+
     probe = local_probe()
     report["capability_record"] = probe.model_dump(mode="json")
     report["capabilities"] = _capability_section(probe)
@@ -414,6 +471,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"child dsh home {child['kind']} {child['path']}")  # type: ignore[index]
         print(f"dsh profiles  {', '.join(report['dsh_profiles']) or 'none'}")  # type: ignore[arg-type]
         print(f"data dir      {report['data_dir']} (writable={report['data_dir_writable']})")
+        print(f"ledger settle {report['ledger_settlements']['detail']}")  # type: ignore[index]
         print(
             f"profile       {profile_section['requested'] or '(none selected)'} "
             f"[via {profile_section['requested_via']}] "
@@ -1032,6 +1090,94 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return _outcome_exit_code(outcome)
 
 
+def cmd_ledger_settle(args: argparse.Namespace) -> int:
+    """Close one ``unknown`` / ``launch_unknown`` ledger entry by operator attestation.
+
+    Never calls a model, never dispatches, never changes a run's state. The identity recorded is
+    the OS user this process runs as - recorded, not authenticated. Before the store's own guards,
+    :func:`hflow.controller.operator_settle_refusal` refuses while the run's owner or the entry's
+    recorded child process may still be alive.
+    """
+    import getpass
+
+    from .controller import operator_settle_refusal
+    from .store import InvocationNotFound, SettlementRefused, StoreError
+
+    try:
+        attested_by = getpass.getuser()
+    except Exception:  # noqa: BLE001 - getuser raises OSError/KeyError/ImportError by platform
+        attested_by = "unknown"
+    try:
+        store = _open_store(args)
+    except StoreError as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return EXIT_REFUSED
+    try:
+        alive = operator_settle_refusal(
+            store, args.invocation_id, legacy_owner_gone_attested=args.legacy_owner_gone
+        )
+        if alive is not None:
+            raise SettlementRefused(alive)
+        attestation = args.attest
+        if args.legacy_owner_gone:
+            attestation = (
+                f"{attestation} [operator attests the pre-v6 owner of this run is gone]"
+            )
+        settlement = store.settle_by_operator(
+            args.invocation_id,
+            settled_as=args.settled_as,
+            attested_by=attested_by,
+            attestation=attestation,
+        )
+        usage = store.root_budget_view(settlement.root_id) if settlement.root_id else None
+    except InvocationNotFound as exc:
+        print(f"unknown invocation: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    except SettlementRefused as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return EXIT_REFUSED
+    finally:
+        store.close()
+    statement = (
+        "this is an operator attestation, not an observation: what the launch did stays unknown, "
+        "billed usage stays unknown, the run's state and outcome are unchanged and nothing was "
+        "re-dispatched. A new revision may now reserve against the root, and still needs its own "
+        "explicit approval"
+    )
+    if args.json:
+        payload: dict[str, object] = {
+            "settlement": settlement.model_dump(mode="json"),
+            "root_used_top_level_submissions": usage.used_top_level_submissions if usage else None,
+            "root_used_repairs": usage.used_repairs if usage else None,
+            "note": statement,
+        }
+        print(canonical_json(payload))
+        return EXIT_OK
+    print(
+        f"settled       {settlement.invocation_id} (run {settlement.run_id}) as "
+        f"{settlement.settled_as}, by operator attestation (not observed)"
+    )
+    print(f"prior state   {settlement.prior_state} -> operator_settled")
+    if settlement.settled_as == "void":
+        print(
+            f"returned      {settlement.returned_top_level_submissions} top-level submission(s) "
+            f"and {settlement.returned_repairs} repair(s) to root {settlement.root_id}; the "
+            "authorization's counter and the run's reserved turns are not returned"
+        )
+    else:
+        print("returned      nothing: every counter stays spent")
+    if usage is not None:
+        print(
+            f"root now      submissions used {usage.used_top_level_submissions}/"
+            f"{usage.limits.max_top_level_submissions}, repairs used {usage.used_repairs}/"
+            f"{usage.limits.max_repairs}"
+        )
+    print(f"attested_by   {settlement.attested_by} (OS user; recorded, not authenticated)")
+    print(f"attested_at   {settlement.attested_at}")
+    print(f"note          {statement}")
+    return EXIT_OK
+
+
 def cmd_clean(args: argparse.Namespace) -> int:
     """Release a run's workspace: preview by default, remove only with --apply."""
     if args.apply and args.dry_run:
@@ -1339,7 +1485,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add_store_args(cancel)
     cancel.set_defaults(func=cmd_cancel)
 
-    resume = sub.add_parser("resume", help="continue a run's state machine (never re-dispatches)")
+    resume = sub.add_parser(
+        "resume",
+        help="reconcile a run, or take a live one over from a dead owner (never re-dispatches)",
+    )
     resume.add_argument("run_id")
     resume.add_argument("--project-root", default=".")
     resume.add_argument("--controller-id", default="local-controller")
@@ -1367,6 +1516,43 @@ def build_parser() -> argparse.ArgumentParser:
     clean.add_argument("--json", action="store_true")
     _add_store_args(clean)
     clean.set_defaults(func=cmd_clean)
+
+    ledger = sub.add_parser("ledger", help="operator actions on the dispatch ledger (no model calls)")
+    ledger_sub = ledger.add_subparsers(dest="ledger_command", required=True)
+    settle = ledger_sub.add_parser(
+        "settle",
+        help=(
+            "close an unknown / launch_unknown ledger entry by operator attestation; never "
+            "re-dispatches and never changes the run's state"
+        ),
+    )
+    settle.add_argument("invocation_id")
+    settle.add_argument(
+        "--as",
+        dest="settled_as",
+        choices=["consumed", "void"],
+        default="consumed",
+        help=(
+            "consumed (default): every counter stays spent. void: launch_unknown only - returns "
+            "this dispatch's root charge"
+        ),
+    )
+    settle.add_argument(
+        "--attest",
+        required=True,
+        help="what the operator attests and why (required, at most 2000 characters)",
+    )
+    settle.add_argument(
+        "--legacy-owner-gone",
+        action="store_true",
+        help=(
+            "for a run written before owner identity existed: attest that the controller "
+            "process it recorded has exited (HFlow cannot check it; recorded with the settlement)"
+        ),
+    )
+    settle.add_argument("--json", action="store_true")
+    _add_store_args(settle)
+    settle.set_defaults(func=cmd_ledger_settle)
 
     return parser
 

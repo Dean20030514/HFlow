@@ -211,13 +211,17 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
 
 ## Known boundaries (do not overstate)
 
-- **DSH's own launch inputs are recorded, not controlled.** DSH reads a workspace `.env`, its
+- **DSH's own launch inputs are mostly recorded, not controlled.** DSH reads a workspace `.env`, its
   home's `.env`, `cordis.patch.yml` layers, AGENTS.md/CLAUDE.md files and skills on its own
   (documented upstream at dsh-v0.2.0-rc.2, not observed). `drivers/dsh_surfaces.py` records,
   just before each spawn, what is at those fixed paths - presence, size and a SHA-256, a `.env`
   by presence and size only - plus the DSH_* variable names reaching the child and the client and
-  carrier versions read from files. Nothing in that record is enforced or bound into an approval,
-  and DSH reads the files after the look. With `DSH_HOME` unbound the child's DSH home is the
+  carrier versions read from files. Two of these inputs are refused on a real driver, at
+  admission and again at the driver's spawn gate: a root `.env` in the workspace DSH starts in
+  (`workspace_env_file`; never parsed or opened) and a bound `DSH_HOME` inside or around the
+  workspace (`dsh_home_in_workspace`). The rest of the record is not enforced or bound into an
+  approval, and DSH reads the files after the look; a `$DSH_HOME/.env` outside the workspace is
+  not refused. With `DSH_HOME` unbound the child's DSH home is the
   per-invocation, empty `<data-dir>/invocations/<id>/home/.dsh` (inferred from upstream source).
 - **No sandbox.** `command` checks and workers run as ordinary child processes with the
   current user's rights. Scope is enforced by *detection after the fact* plus refusal to
@@ -415,14 +419,22 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
   dispatch already reserved. Both checks match the name without regard to case among the
   workspace root's own entries (acpx's open finds `.ACPXRC.JSON` on a case-insensitive
   filesystem) and name the spelling they found.
-- **A candidate's harness context files are recorded, not refused.** `workspace.dsh_context_paths`
+- **A candidate's harness context files are refused unless declared, and recorded when declared.**
+  `workspace.dsh_context_paths`
   classifies the `--no-renames` list `_attempt_cycle` already takes for the cumulative scope check
   against DSH's documented context list (instruction files at any depth, the root skill
-  directories, a root `.env`; upstream dsh-v0.2.0-rc.2 source). `store.record_dsh_context` keeps
+  directories, a root `.env`; upstream dsh-v0.2.0-rc.2 source). Right after that scope check,
+  `workspace.dsh_root_env_paths` and `workspace.undeclared_dsh_context_paths` (the rule is
+  `dsh_context_declared`: a `write_allow` entry equal to the path, or a skill entry at or under a
+  skill directory that contains it) block the run `RefusalCode.CONTEXT_FILE_CHANGE` before the
+  candidate ref (user ruling, 2026-10-03). `store.record_dsh_context` keeps
   one `DshContextRecord` per frozen attempt in `run_notes` (prefix `dsh_context: `, carrying its
   `list_source`; no storage version change), and only `status`/`report` read it back. `_accept`
-  re-derives the receipt limitation from its own Git delivery diff. `_review` and the reviewer
-  packet are unchanged. The reviewer's DSH still loads the files; nothing here is enforcement.
+  re-derives the receipt limitation from its own Git delivery diff. The cycle passes the declared
+  list to `_review`, which reads bounded diffs (`_context_file_changes` through
+  `GitRepo.diff_text_bounded`, 8 KiB in all) into the reviewer packet's untrusted-data section,
+  and to `_repairable_failure`, which carries it in `RepairContext.context_files` for the repair
+  packet. The reviewer's DSH still loads the files; nothing here is enforcement.
 - **Every launch program is an absolute file outside the workspace.** `resolve_launch_config`
   never falls back to a bare name: `dsh`, and `node`/`python` for a `.js`/`.py` client, are looked
   up only on the absolute entries of the resolving environment's `PATH` (`find_on_path`, never the

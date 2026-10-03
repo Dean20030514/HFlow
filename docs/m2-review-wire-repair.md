@@ -51,7 +51,8 @@ recorded stream the answer is the **last** of 17 assistant messages
   when it is absent - never "the last NDJSON line", never the whole transcript. User text,
   thoughts, tool results and other sessions cannot supply the answer.
 * `decode_review` accepts exactly one Review object and validates it against the canonical
-  `contracts.ReviewOutput`. Supported forms: one fenced block (plain or `json`-labelled - the
+  `contracts.ReviewOutput`, whose findings are typed (`contracts.Finding`, 2026-10-03; an untyped
+  finding is refused). Supported forms: one fenced block (plain or `json`-labelled - the
   form the recorded reviewer used) with no *verdict object* (a JSON object with a `verdict`
   key) outside the fences; with no such block, exactly one verdict object (a bare answer, or
   one inside prose); with neither, exactly one JSON object, so a misspelt key is invalid, not
@@ -129,6 +130,7 @@ is unchanged.
 | prompt binding | request id `2` = terminal response id `2`; single session `c8fa7994…b178` |
 | answer | final message `eb6ade90…d89b`, 6723 chars, `sha256:6c7cb3c9…7fa2c` |
 | **extracted verdict** | **`accepted`**, 5 findings (`AC-1`,`AC-2`,`AC-3`,`EVIDENCE-zgamyka8s3`,`F-1`), digest `sha256:bbe60014…025e9` |
+| contract (2026-10-03) | the findings are untyped (`id`/`target`/`status`/`detail`), so today's typed contract refuses them (`REVIEW_INVALID`); the replay reads them under the untyped contract this reviewer was shown (its prompt carried no output contract) and records `review_contract`; verdict and digest unchanged |
 | reviewer's own claim vs record | the answer names candidate commit `499ece7…` - the recorded ref and worktree HEAD |
 | task / project | `task.json` digest == recorded `spec_digest`; revision 2; both files hashed |
 | candidate | `refs/hflow/candidates/R-gkb3ld97x8/A-7f2pbp4teu` = `499ece7043fe3267b4ff89f9a5b5bc1d70c42481` = worktree HEAD; recomputed fingerprint `sha256:5c47b12d…d405` == recorded evidence fingerprint |
@@ -181,7 +183,8 @@ an already-terminal run; state, provenance and the decision itself were unchange
 
 ## 6. What this does and does not establish
 
-* Established: the saved reviewer verdict is a valid canonical `ReviewOutput`; the production
+* Established: the saved reviewer verdict was a valid canonical `ReviewOutput` under the
+  contract of its time (untyped findings; it does not satisfy today's typed findings); the production
   path carries such a verdict through `collect()` and `_review()` to the unchanged acceptance
   checks; the recorded candidate and its verification evidence still bind; and this candidate's
   delivery is now recorded as **`ACCEPTED` / `LOCAL_CANDIDATE`** through the Store's guarded

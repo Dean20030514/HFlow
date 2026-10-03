@@ -38,7 +38,12 @@ authorization record came from), v4 adds the process facts a driver actually rep
 ``reserved`` keeps its state and outcome and becomes a launch *request*; a v3 row keeps
 ``spawn_kind = unknown`` because v3 recorded no driver report to inherit; a row written before v5
 keeps an empty ``exit_reason`` and ``is_repair = 0``, because the build that wrote it observed
-neither - and batch E2's repair rule is exactly "no observation, no automatic repair".
+neither - and batch E2's repair rule is exactly "no observation, no automatic repair". v6 adds the
+run's *owner identity* (``owner_token``, ``owner_pid``, ``owner_created``, ``owner_host``,
+``claim_generation``); a row written before v6 keeps a NULL owner, which reads as "owner unknown",
+never as an owner this build observed. v7 adds ``invocation_settlements``: the append-only record
+of an operator closing an ``unknown`` or ``launch_unknown`` ledger entry by attestation
+(``hflow ledger settle``). It only adds a table; no existing row is rewritten.
 """
 
 from __future__ import annotations
@@ -52,9 +57,9 @@ from pathlib import Path
 
 #: Storage format version. Separate from the public contract version: the file layout can
 #: gain a table while every published contract keeps its own meaning.
-STORAGE_VERSION = 5
+STORAGE_VERSION = 7
 #: The highest storage version this build knows how to open.
-SUPPORTED_STORAGE_VERSION = 5
+SUPPORTED_STORAGE_VERSION = 7
 #: Suffix of the pre-migration snapshot, next to the database.
 MIGRATION_BACKUP_SUFFIX = ".pre-v{version}.bak"
 
@@ -296,6 +301,18 @@ CREATE INDEX IF NOT EXISTS ix_run_repair_records_run
     ON run_repair_records (run_id, created_at);
 """
 
+# --------------------------------------------------------------------------
+# v6 (user ruling 2026-10-03): the run's owner is a process, not a label
+# --------------------------------------------------------------------------
+
+_V6_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("runs", "owner_token", "TEXT"),
+    ("runs", "owner_pid", "INTEGER"),
+    ("runs", "owner_created", "INTEGER"),
+    ("runs", "owner_host", "TEXT"),
+    ("runs", "claim_generation", "INTEGER NOT NULL DEFAULT 0"),
+)
+
 #: The columns ``attempts`` has immediately *before* v5: the v1 definition plus the ``root_id``
 #: v2 added. Listed (rather than read and reused blindly) so the rebuild can refuse a file whose
 #: shape it does not recognise instead of copying a column set it did not expect.
@@ -358,6 +375,45 @@ CREATE TABLE attempts_v5 (
     is_repair             INTEGER NOT NULL DEFAULT 0,
     UNIQUE (run_id, task_revision, role, is_repair)
 );
+"""
+
+# --------------------------------------------------------------------------
+# v7 (ruling 2026-10-03): an operator's attested settlement of an unresolved ledger entry
+# --------------------------------------------------------------------------
+
+#: One row per operator settlement. Append-only and resolve-once (``invocation_id`` is UNIQUE):
+#: the invocation row's own state moves to ``operator_settled`` in the same transaction, and this
+#: row is the *why* - who said so, when, and in what words. ``attested_by`` is the OS user name as
+#: the process saw it: recorded, never authenticated. Nothing here is an observation, which is why
+#: ``basis`` is a column and its only value is ``operator_attested``.
+_V7_SCHEMA = """
+CREATE TABLE IF NOT EXISTS invocation_settlements (
+    settlement_id      TEXT PRIMARY KEY,
+    invocation_id      TEXT NOT NULL UNIQUE REFERENCES invocations(invocation_id),
+    run_id             TEXT NOT NULL REFERENCES runs(run_id),
+    root_id            TEXT NOT NULL DEFAULT '',
+    prior_state        TEXT NOT NULL,
+    settled_as         TEXT NOT NULL,
+    basis              TEXT NOT NULL DEFAULT 'operator_attested',
+    attested_by        TEXT NOT NULL,
+    attested_at        TEXT NOT NULL,
+    attestation        TEXT NOT NULL,
+    returned_top_level_submissions INTEGER NOT NULL DEFAULT 0,
+    returned_repairs   INTEGER NOT NULL DEFAULT 0,
+    CHECK (prior_state IN ('unknown', 'launch_unknown')),
+    CHECK (settled_as IN ('consumed', 'void')),
+    CHECK (settled_as = 'consumed' OR prior_state = 'launch_unknown'),
+    CHECK (basis = 'operator_attested'),
+    CHECK (length(trim(attestation)) > 0 AND length(attestation) <= 2000),
+    CHECK (returned_top_level_submissions IN (0, 1)),
+    CHECK (returned_repairs IN (0, 1)),
+    CHECK (settled_as = 'void' OR (returned_top_level_submissions = 0 AND returned_repairs = 0))
+);
+
+CREATE INDEX IF NOT EXISTS ix_invocation_settlements_run
+    ON invocation_settlements (run_id, attested_at);
+CREATE INDEX IF NOT EXISTS ix_invocation_settlements_root
+    ON invocation_settlements (root_id, settled_as);
 """
 
 #: Migration targets that rebuild a table. SQLite's recommended procedure for that runs with
@@ -423,6 +479,13 @@ def _effective_version(conn: sqlite3.Connection) -> int:
         return version
     if not _has_table(conn, "runs"):
         return 0
+    if _has_table(conn, "invocation_settlements") and _columns(conn, "runs") >= {
+        "owner_token",
+        "claim_generation",
+    }:
+        return 7
+    if _columns(conn, "runs") >= {"owner_token", "claim_generation"}:
+        return 6
     if (
         _has_table(conn, "run_repair_records")
         and _columns(conn, "evidence") >= {"exit_reason"}
@@ -762,12 +825,46 @@ def _rebuild_attempts_for_v5(conn: sqlite3.Connection, step: StepHook) -> None:
     step("v5:attempts-rebuild:rename")
 
 
+def _migrate_to_v6(conn: sqlite3.Connection, step: StepHook) -> None:
+    """Record who owns a run as a process identity (owner lease, user ruling 2026-10-03).
+
+    Before v6 a claim was the ``claimed_by`` label, which every CLI process shares. v6 adds the
+    owner's random token, pid, creation FILETIME and host, and a ``claim_generation`` that every
+    takeover increments so a superseded owner's guarded writes fail.
+
+    Existing rows keep a NULL owner and generation 0. The build that wrote them observed no owner
+    identity, so back-filling one (from ``claimed_by``, or from an attempt's recorded pid) would
+    present a guess as an observation; :func:`hflow.ownership.assess_owner` states the rule a
+    NULL owner is judged by instead.
+    """
+    for table, column, definition in _V6_COLUMNS:
+        if column in _columns(conn, table):
+            continue
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        step(f"v6:alter:{table}.{column}")
+
+
+def _migrate_to_v7(conn: sqlite3.Connection, step: StepHook) -> None:
+    """Add the operator-settlement record (``hflow ledger settle``). Adds only.
+
+    No existing invocation is touched: an ``unknown`` or ``launch_unknown`` entry written by an
+    earlier build stays exactly that - still blocking its root - until an operator settles it
+    with this build. Inferring a settlement from anything already stored would be the very
+    "attested figure presented as observed" the ruling forbids.
+    """
+    for statement in _statements(_V7_SCHEMA):
+        conn.execute(statement)
+    step("v7:invocation-settlements-table")
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection, StepHook], None]] = {
     1: _migrate_to_v1,
     2: _migrate_to_v2,
     3: _migrate_to_v3,
     4: _migrate_to_v4,
     5: _migrate_to_v5,
+    6: _migrate_to_v6,
+    7: _migrate_to_v7,
 }
 
 

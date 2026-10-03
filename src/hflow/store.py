@@ -45,6 +45,7 @@ from .contracts import (
     EvidenceStatus,
     InvocationIntent,
     InvocationOutcome,
+    InvocationSettlement,
     InvocationStartState,
     InvocationStateCounts,
     RefusalCode,
@@ -62,7 +63,7 @@ from .contracts import (
     digest_of,
     json_schema,
 )
-from .ids import new_attempt_id, new_evidence_id, parse_ts, utc_now
+from .ids import new_attempt_id, new_evidence_id, new_id, parse_ts, utc_now
 from .migrate import (
     MIGRATION_BACKUP_SUFFIX,
     STORAGE_VERSION,
@@ -73,6 +74,7 @@ from .migrate import (
     migrate,
     recorded_version,
 )
+from .ownership import OwnerFence, ProcessIdentity
 
 #: Marks a receipt that records an offline reprocessing decision rather than the outcome of
 #: the execution it belongs to. The string lives here because both the store guard and the
@@ -138,6 +140,16 @@ INVOCATION_OPEN_STATES: tuple[str, ...] = (
     InvocationStartState.STARTED.value,
 )
 
+#: The states ``hflow ledger settle`` may close (ruling 2026-10-03): unresolved and no longer
+#: open. An open entry is refused - a controller may still be driving it, and ``hflow resume``
+#: is what reconciles it into one of these.
+INVOCATION_OPERATOR_SETTLEABLE_STATES: tuple[str, ...] = (
+    InvocationStartState.UNKNOWN.value,
+    InvocationStartState.LAUNCH_UNKNOWN.value,
+)
+#: The bound on an operator's attestation text, in characters.
+ATTESTATION_MAX_CHARS = 2000
+
 _TERMINAL_STATES: tuple[str, ...] = (
     TaskState.ACCEPTED.value,
     TaskState.BLOCKED.value,
@@ -192,6 +204,18 @@ class StoreError(RuntimeError):
 
 class RunNotFound(StoreError):
     pass
+
+
+class OwnerLostError(StoreError):
+    """A guarded write by a controller that no longer owns the run (a takeover superseded it)."""
+
+
+class SettlementRefused(StoreError):
+    """``settle_by_operator`` refused; nothing was written."""
+
+
+class InvocationNotFound(StoreError):
+    """No ledger entry has this invocation id."""
 
 
 class Store:
@@ -337,8 +361,28 @@ class Store:
         checks_digest: str,
         turn_limit: int,
         repair_limit: int,
+        controller_id: str | None = None,
+        owner_token: str | None = None,
+        owner_identity: ProcessIdentity | None = None,
     ) -> sqlite3.Row:
+        """Insert a run, or return the existing row for the same ``(project_id, spec_digest)``.
+
+        With ``owner_token`` (the controller passes it, already holding its owner lock) the owner
+        is written in the **same insert** - token, pid, creation time, host, label and claim
+        generation 1 - so a run this build creates is never NULL-owned, not even for an instant a
+        successor could read as "no owner recorded". An existing row (a lost insert race) is
+        returned unchanged; the caller decides what to do with a run it did not create. Without
+        ``owner_token`` (store-level tests and tools) the run is created unclaimed, as before.
+        """
+        if owner_token is not None and (controller_id is None or owner_identity is None):
+            raise StoreError("an owned create_run needs the controller label and owner identity")
         now = utc_now()
+        owner_values: tuple[Any, ...] = (None, None, None, None, None, None, 0)
+        if owner_token is not None and owner_identity is not None:
+            owner_values = (
+                controller_id, now, owner_token, owner_identity.pid, owner_identity.created,
+                owner_identity.host, 1,
+            )
         with self.transaction() as conn:
             existing = conn.execute(
                 "SELECT * FROM runs WHERE project_id = ? AND spec_digest = ?",
@@ -352,8 +396,10 @@ class Store:
                     run_id, project_id, task_id, schema_version, spec_digest, task_spec_json,
                     task_revision, task_state, phase, delivery_state,
                     controller_build, checks_digest, turn_limit, repair_limit,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, updated_at,
+                    claimed_by, claimed_at, owner_token, owner_pid, owner_created, owner_host,
+                    claim_generation
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -371,6 +417,7 @@ class Store:
                     repair_limit,
                     now,
                     now,
+                    *owner_values,
                 ),
             )
             return conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
@@ -382,7 +429,12 @@ class Store:
         return row
 
     def claim_run(self, run_id: str, controller_id: str) -> bool:
-        """Transactionally claim exclusive scheduling ownership (acceptance A02)."""
+        """Transactionally claim exclusive scheduling ownership (acceptance A02).
+
+        The label-only form, with no owner identity. It never claims a run that a process owner
+        holds (``owner_token`` set): a label is shared by every CLI process and cannot outrank
+        one. The controller claims with :meth:`claim_run_owned`.
+        """
         now = utc_now()
         with self.transaction() as conn:
             cur = conn.execute(
@@ -390,6 +442,7 @@ class Store:
                 UPDATE runs
                    SET claimed_by = ?, claimed_at = ?, updated_at = ?
                  WHERE run_id = ? AND (claimed_by IS NULL OR claimed_by = ?)
+                   AND owner_token IS NULL
                 """,
                 (controller_id, now, now, run_id, controller_id),
             )
@@ -399,6 +452,216 @@ class Store:
             if row is None:
                 raise RunNotFound(run_id)
             return False
+
+    def claim_run_owned(
+        self, run_id: str, controller_id: str, *, token: str, identity: ProcessIdentity
+    ) -> int | None:
+        """Claim a run for one owner process; return the claim generation, ``None`` when refused.
+
+        A compare-and-set (owner lease, user ruling 2026-10-03): it succeeds only for a run nobody
+        has claimed (no owner token and no label) - the generation becomes the next one - or for a
+        run this same token already owns, which is idempotent and keeps the generation. A run
+        another owner holds, or one a label-only claim holds, is never taken here; taking over a
+        run whose owner is provably gone is :meth:`take_over_run`, which blocks it.
+        """
+        now = utc_now()
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE runs
+                   SET claimed_by = ?, claimed_at = ?, updated_at = ?,
+                       owner_token = ?, owner_pid = ?, owner_created = ?, owner_host = ?,
+                       claim_generation = claim_generation + 1
+                 WHERE run_id = ? AND owner_token IS NULL AND claimed_by IS NULL
+                """,
+                (
+                    controller_id, now, now, token, identity.pid, identity.created,
+                    identity.host, run_id,
+                ),
+            )
+            row = conn.execute(
+                "SELECT owner_token, claim_generation FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise RunNotFound(run_id)
+            if row["owner_token"] == token:
+                return int(row["claim_generation"])
+            return None
+
+    def adopt_run(
+        self,
+        run_id: str,
+        *,
+        expected_token: str,
+        expected_generation: int,
+        controller_id: str,
+        token: str,
+        identity: ProcessIdentity,
+        note: str,
+    ) -> int | None:
+        """Adopt a never-dispatched run from a provably gone owner and keep it live: ONE transaction.
+
+        The caller has already proven the owner gone (lock free and identity gone). This is the
+        compare-and-set that makes the adoption exclusive, and it re-checks in the same ``WHERE``
+        that nothing could be in flight: the run still has ``expected_token`` at
+        ``expected_generation``, is ``DRAFT`` or ``READY`` with no stop intent and no receipt, and
+        has **no attempt and no invocation** row. Then the owner becomes ``token``, the generation
+        increments (every guarded write by the old owner fails from here on), the state is kept
+        and ``note`` is recorded. Returns the new generation, ``None`` when any guard failed
+        (nothing written). A run with anything dispatched is never adopted; that is
+        :meth:`take_over_run`, which blocks it.
+        """
+        now = utc_now()
+        with self.transaction() as conn:
+            cur = conn.execute(
+                """
+                UPDATE runs
+                   SET owner_token = ?, owner_pid = ?, owner_created = ?, owner_host = ?,
+                       claimed_by = ?, claimed_at = ?, updated_at = ?,
+                       claim_generation = claim_generation + 1
+                 WHERE run_id = ? AND owner_token = ? AND claim_generation = ?
+                   AND task_state IN (?, ?) AND receipt_json IS NULL
+                   AND cancel_intent_at IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM attempts WHERE attempts.run_id = runs.run_id)
+                   AND NOT EXISTS (SELECT 1 FROM invocations WHERE invocations.run_id = runs.run_id)
+                """,
+                (
+                    token, identity.pid, identity.created, identity.host, controller_id, now, now,
+                    run_id, expected_token, expected_generation,
+                    TaskState.DRAFT.value, TaskState.READY.value,
+                ),
+            )
+            if cur.rowcount != 1:
+                if conn.execute("SELECT 1 FROM runs WHERE run_id = ?", (run_id,)).fetchone() is None:
+                    raise RunNotFound(run_id)
+                return None
+            self._record_note_locked(conn, run_id, note)
+            generation = conn.execute(
+                "SELECT claim_generation FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()["claim_generation"]
+            return int(generation)
+
+    def _check_fence_locked(
+        self, conn: sqlite3.Connection, run_id: str, fence: OwnerFence | None
+    ) -> None:
+        """Refuse a guarded write from a controller a takeover superseded. ``None`` skips it."""
+        if fence is None:
+            return
+        row = conn.execute(
+            "SELECT owner_token, claim_generation, owner_pid, owner_host FROM runs "
+            "WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            raise RunNotFound(run_id)
+        if row["owner_token"] != fence.token or int(row["claim_generation"]) != fence.generation:
+            raise OwnerLostError(
+                f"owner_lost: run {run_id} is owned by pid={row['owner_pid']} "
+                f"host={row['owner_host']} at claim generation {row['claim_generation']}, not by "
+                f"this controller (generation {fence.generation}); nothing was written"
+            )
+
+    def take_over_run(
+        self,
+        run_id: str,
+        *,
+        expected_token: str | None,
+        expected_generation: int,
+        controller_id: str,
+        token: str,
+        identity: ProcessIdentity,
+        reason: str,
+        detail: str,
+        note: str,
+        require_nothing_dispatched: bool = False,
+    ) -> tuple[int, int, int] | None:
+        """Take a live run from a provably gone owner and block it ``owner_lost``: ONE transaction.
+
+        The caller has already proven the owner gone (lock free and identity gone); this is the
+        compare-and-set that makes the decision exclusive. In order, all-or-nothing:
+
+        1. the run still has ``expected_token`` (``None`` for a pre-v6 owner) at
+           ``expected_generation`` and is live (not terminal, no receipt) - otherwise nothing is
+           written and ``None`` is returned;
+        2. the owner becomes the successor and the generation increments, so every guarded write
+           by the old owner fails from here on;
+        3. every unsettled invocation becomes ``unknown`` / ``launch_unknown`` (the same rule as
+           :meth:`mark_unsettled_invocations_unknown`) - the allowance stays spent;
+        4. every live attempt is finished as an unknown outcome;
+        5. the run is ``BLOCKED`` with ``owner_lost`` and the takeover note is recorded.
+
+        Nothing is dispatched, nothing is stopped and nothing is refunded. Returns
+        ``(new_generation, invocations_closed, attempts_closed)``.
+
+        ``require_nothing_dispatched`` adds to the compare-and-set that the run has no attempt and
+        no invocation row - the only case in which a run whose owner was never recorded (not
+        proven gone) may be taken over.
+        """
+        now = utc_now()
+        nothing_dispatched = (
+            "AND NOT EXISTS (SELECT 1 FROM attempts WHERE attempts.run_id = runs.run_id) "
+            "AND NOT EXISTS (SELECT 1 FROM invocations WHERE invocations.run_id = runs.run_id)"
+            if require_nothing_dispatched
+            else ""
+        )
+        with self.transaction() as conn:
+            cur = conn.execute(
+                f"""
+                UPDATE runs
+                   SET owner_token = ?, owner_pid = ?, owner_created = ?, owner_host = ?,
+                       claimed_by = ?, claimed_at = ?, updated_at = ?,
+                       claim_generation = claim_generation + 1
+                 WHERE run_id = ? AND owner_token IS ? AND claim_generation = ?
+                   AND {_LIVE_RUN_GUARD} {nothing_dispatched}
+                """,
+                (
+                    token, identity.pid, identity.created, identity.host, controller_id, now, now,
+                    run_id, expected_token, expected_generation, *_TERMINAL_STATES,
+                ),
+            )
+            if cur.rowcount != 1:
+                if conn.execute("SELECT 1 FROM runs WHERE run_id = ?", (run_id,)).fetchone() is None:
+                    raise RunNotFound(run_id)
+                return None
+            closed = self._mark_unsettled_invocations_unknown_locked(conn, run_id, detail)
+            result = {"error": reason}
+            attempts = conn.execute(
+                """
+                UPDATE attempts
+                   SET state = ?, outcome = ?, result_json = ?, result_digest = ?,
+                       block_code = ?, finished_at = ?
+                 WHERE run_id = ? AND state IN (?, ?)
+                """,
+                (
+                    AttemptState.OUTCOME_UNKNOWN.value,
+                    InvocationOutcome.OUTCOME_UNKNOWN.value,
+                    canonical_json(result),
+                    digest_of(result),
+                    RefusalCode.OWNER_LOST.value,
+                    now,
+                    run_id,
+                    AttemptState.CREATED.value,
+                    AttemptState.ACTIVE.value,
+                ),
+            ).rowcount
+            blocked = conn.execute(
+                f"""
+                UPDATE runs
+                   SET task_state = ?, block_code = ?, block_reason = ?, updated_at = ?
+                 WHERE run_id = ? AND {_LIVE_RUN_GUARD}
+                """,
+                (
+                    TaskState.BLOCKED.value, RefusalCode.OWNER_LOST.value, reason, now, run_id,
+                    *_TERMINAL_STATES,
+                ),
+            )
+            if blocked.rowcount != 1:  # pragma: no cover - the CAS above holds the same guard
+                raise StoreError(f"run {run_id} left its live state during the takeover")
+            self._record_note_locked(conn, run_id, note)
+            generation = conn.execute(
+                "SELECT claim_generation FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()["claim_generation"]
+            return int(generation), int(closed), int(attempts)
 
     def set_task_state(
         self,
@@ -590,7 +853,12 @@ class Store:
             )
 
     def finalize_acceptance(
-        self, run_id: str, receipt: ResultReceipt, *, checks_digest: str
+        self,
+        run_id: str,
+        receipt: ResultReceipt,
+        *,
+        checks_digest: str,
+        fence: OwnerFence | None = None,
     ) -> None:
         """Accept a run atomically: state change and receipt in the same transaction.
 
@@ -598,9 +866,11 @@ class Store:
         would mean the evidence was produced under a different command set
         (acceptance A11), and refuses if a cancellation intent was recorded after the
         result arrived: an accepted cancellation must not be overwritten by a late
-        success (the mirror of the stale-attempt rule).
+        success (the mirror of the stale-attempt rule). ``fence`` refuses it with ``owner_lost``
+        when a takeover superseded the caller.
         """
         with self.transaction() as conn:
+            self._check_fence_locked(conn, run_id, fence)
             row = conn.execute(
                 "SELECT task_state, checks_digest, cancel_intent_at FROM runs WHERE run_id = ?",
                 (run_id,),
@@ -1029,8 +1299,14 @@ class Store:
         required_loop_remaining: int = 1,
         is_repair: bool = False,
         repo_path: str = "",
+        fence: OwnerFence | None = None,
     ) -> DispatchReservation:
         """Reserve one top-level dispatch: every counter, in one transaction.
+
+        ``fence`` (owner lease): the caller's owner token and claim generation. When given, the
+        reservation is refused with ``owner_lost`` unless the run still has exactly that owner at
+        exactly that generation - checked first, inside the same transaction - so a controller a
+        takeover superseded can never buy another dispatch.
 
         This is the single entry point for both roles. Before it, an implementer dispatch and a
         review dispatch were charged in separate commits (authorization claim, turn reservation,
@@ -1096,6 +1372,7 @@ class Store:
                     ),
                 )
 
+            self._check_fence_locked(conn, run_id, fence)
             row = self._guard_dispatch_locked(conn, run_id, controller_id, attempt_id, role)
 
             if root_binding is None and root_limits is None:
@@ -1549,8 +1826,11 @@ class Store:
           repair cannot be disguised as a first attempt, and a run that knows it is repairing is
           charged as one even where the root-wide count alone would not say so;
         * a reviewer dispatch never consumes a repair;
-        * an unknown outcome never refunds anything: only this method increments, and nothing in
-          this build ever decrements a root's consumption;
+        * an unknown outcome never refunds anything: only this method increments. The one
+          decrement in this build is an operator's ``void`` of a ``launch_unknown`` entry
+          (``settle_by_operator``), which returns exactly what that dispatch charged and is
+          recorded as an attestation; a voided implementer entry therefore does not count as the
+          root's first implementer attempt either;
         * the root must be able to pay for the run's *whole remaining loop*
           (``required_loop_remaining``), not merely for this one dispatch: buying an
           implementation whose review cannot be afforded is the half-loop the ceiling check
@@ -1692,9 +1972,14 @@ class Store:
         if authorization_id not in authorization_ids:
             authorization_ids.append(authorization_id)
 
+        # A ``void`` operator settlement returned this entry's charge to the root, so it is not
+        # the root's first implementer attempt either: counting it would charge the next
+        # implementer as a repair the void just gave back. ``consumed`` entries still count.
         implementers_before = int(
             conn.execute(
-                "SELECT COUNT(*) AS n FROM invocations WHERE root_id = ? AND role = 'implementer'",
+                "SELECT COUNT(*) AS n FROM invocations i WHERE i.root_id = ?"
+                " AND i.role = 'implementer' AND NOT EXISTS (SELECT 1 FROM invocation_settlements"
+                " s WHERE s.invocation_id = i.invocation_id AND s.settled_as = 'void')",
                 (root_binding.root_id,),
             ).fetchone()["n"]
         )
@@ -1897,7 +2182,14 @@ class Store:
                 raise StoreError(f"unknown invocation {fact.invocation_id}")
             now = utc_now()
             current = InvocationStartState(str(row["state"]))
-            if current in {InvocationStartState.SETTLED, InvocationStartState.UNKNOWN}:
+            # ``OPERATOR_SETTLED`` is final too: a late report must neither reopen an entry an
+            # operator closed (re-blocking a root a new revision may already be using) nor
+            # rewrite it as ``not_started``. The attestation row stays the record.
+            if current in {
+                InvocationStartState.SETTLED,
+                InvocationStartState.UNKNOWN,
+                InvocationStartState.OPERATOR_SETTLED,
+            }:
                 return False
             if fact.created and current is InvocationStartState.LAUNCH_UNKNOWN:
                 conn.execute(
@@ -2201,40 +2493,46 @@ class Store:
         is unknown about it, and inventing an unknown would block the root for no reason.
         """
         with self.transaction() as conn:
-            launched = conn.execute(
-                """
-                UPDATE invocations
-                   SET state = ?, detail = ?
-                 WHERE run_id = ? AND state = ? AND started_at IS NOT NULL
-                """,
-                (
-                    InvocationStartState.UNKNOWN.value,
-                    detail[:1000],
-                    run_id,
-                    InvocationStartState.STARTED.value,
-                ),
-            )
-            # Every open row with no recorded launch (``started_at`` empty) is a
-            # requested-but-unconfirmed one: ``requested`` and ``reserved``, and the ``started``
-            # row a v2 ledger leaves after the v3 migration cleared its ``started_at`` (v2 wrote
-            # that state before any process existed). A launch may have happened, so the root
-            # stays blocked, and no process is known, so no process count may include it.
-            launch_only = conn.execute(
-                """
-                UPDATE invocations
-                   SET state = ?, detail = ?
-                 WHERE run_id = ? AND state IN (?, ?, ?) AND started_at IS NULL
-                """,
-                (
-                    InvocationStartState.LAUNCH_UNKNOWN.value,
-                    detail[:1000],
-                    run_id,
-                    InvocationStartState.REQUESTED.value,
-                    InvocationStartState.RESERVED.value,
-                    InvocationStartState.STARTED.value,
-                ),
-            )
-            return int(launched.rowcount + launch_only.rowcount)
+            return self._mark_unsettled_invocations_unknown_locked(conn, run_id, detail)
+
+    def _mark_unsettled_invocations_unknown_locked(
+        self, conn: sqlite3.Connection, run_id: str, detail: str
+    ) -> int:
+        """The body of :meth:`mark_unsettled_invocations_unknown`, inside a caller's transaction."""
+        launched = conn.execute(
+            """
+            UPDATE invocations
+               SET state = ?, detail = ?
+             WHERE run_id = ? AND state = ? AND started_at IS NOT NULL
+            """,
+            (
+                InvocationStartState.UNKNOWN.value,
+                detail[:1000],
+                run_id,
+                InvocationStartState.STARTED.value,
+            ),
+        )
+        # Every open row with no recorded launch (``started_at`` empty) is a
+        # requested-but-unconfirmed one: ``requested`` and ``reserved``, and the ``started``
+        # row a v2 ledger leaves after the v3 migration cleared its ``started_at`` (v2 wrote
+        # that state before any process existed). A launch may have happened, so the root
+        # stays blocked, and no process is known, so no process count may include it.
+        launch_only = conn.execute(
+            """
+            UPDATE invocations
+               SET state = ?, detail = ?
+             WHERE run_id = ? AND state IN (?, ?, ?) AND started_at IS NULL
+            """,
+            (
+                InvocationStartState.LAUNCH_UNKNOWN.value,
+                detail[:1000],
+                run_id,
+                InvocationStartState.REQUESTED.value,
+                InvocationStartState.RESERVED.value,
+                InvocationStartState.STARTED.value,
+            ),
+        )
+        return int(launched.rowcount + launch_only.rowcount)
 
     def unstarted_invocations(self, run_id: str) -> list[InvocationIntent]:
         """Invocations whose allowance was charged but for which no process was reported.
@@ -2284,6 +2582,8 @@ class Store:
                 counts.settled = number
             elif state is InvocationStartState.LAUNCH_UNKNOWN:
                 counts.launch_unknown = number
+            elif state is InvocationStartState.OPERATOR_SETTLED:
+                counts.operator_settled = number
             else:
                 counts.unknown = number
         counts.open = counts.reserved + counts.requested + counts.started
@@ -2956,6 +3256,7 @@ class Store:
         result: dict[str, Any] | None,
         block_code: RefusalCode | None = None,
         unless_stopped: bool = False,
+        fence: OwnerFence | None = None,
     ) -> sqlite3.Row:
         """Apply an attempt result only if it still belongs to the live revision.
 
@@ -2965,9 +3266,12 @@ class Store:
         - so without this a late result would be applied to an attempt the stop already decided.
         The stop's own bookkeeping (``cancel`` finishing the attempt as ``CANCELLED``) uses the
         plain form.
+
+        ``fence`` refuses the write with ``owner_lost`` when a takeover superseded the caller.
         """
         now = utc_now()
         with self.transaction() as conn:
+            self._check_fence_locked(conn, run_id, fence)
             self._guard_current(conn, run_id, attempt_id)
             if unless_stopped:
                 stop = conn.execute(
@@ -3004,10 +3308,16 @@ class Store:
             ).fetchone()
 
     def advance_to_checking(
-        self, *, run_id: str, attempt_id: str, phase: CheckPhase
+        self,
+        *,
+        run_id: str,
+        attempt_id: str,
+        phase: CheckPhase,
+        fence: OwnerFence | None = None,
     ) -> sqlite3.Row:
         now = utc_now()
         with self.transaction() as conn:
+            self._check_fence_locked(conn, run_id, fence)
             self._guard_current(conn, run_id, attempt_id)
             cur = conn.execute(
                 """
@@ -3047,7 +3357,9 @@ class Store:
             )
             return int(row["repairs_used"]) + 1
 
-    def reopen_for_repair(self, run_id: str, controller_id: str) -> sqlite3.Row:
+    def reopen_for_repair(
+        self, run_id: str, controller_id: str, *, fence: OwnerFence | None = None
+    ) -> sqlite3.Row:
         """Move a run back to its implementation phase for its single repair attempt.
 
         The E1 guard is right for its own rule: an implementer is only reserved before the
@@ -3074,6 +3386,7 @@ class Store:
         the run is not touched here either; it stays the historical per-run repair counter.
         """
         with self.transaction() as conn:
+            self._check_fence_locked(conn, run_id, fence)
             row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
             if row is None:
                 raise RunNotFound(run_id)
@@ -3342,3 +3655,228 @@ class Store:
         if row is None:
             raise RunNotFound(run_id)
         return int(row["reserved"]), int(row["attempts"])
+
+    # -- operator settlement of an unresolved ledger entry (ruling 2026-10-03) --------------
+
+    def settle_by_operator(
+        self,
+        invocation_id: str,
+        *,
+        settled_as: str,
+        attested_by: str,
+        attestation: str,
+    ) -> InvocationSettlement:
+        """Close an ``unknown`` / ``launch_unknown`` entry by an operator's attestation.
+
+        One ``BEGIN IMMEDIATE`` transaction: a compare-and-set of ``invocations.state`` from the
+        settleable states to ``operator_settled``, the appended ``invocation_settlements`` row,
+        a run note and, for ``void`` only, the return of what this dispatch charged to the root.
+        Any refusal raises ``SettlementRefused`` (``InvocationNotFound`` for an unknown id) and
+        writes nothing.
+
+        * ``consumed`` (the CLI default) keeps every counter spent: the conservative error is to
+          over-count a launch that may never have happened.
+        * ``void`` is refused for ``unknown`` - a launch was reported, so provider spend may have
+          occurred - and allowed only for ``launch_unknown``. It returns one top-level submission
+          to the root, plus one repair when the dispatch was charged as the repair. The
+          authorization's counter and the run's reserved turns are **not** returned: an approval
+          is spent per live task (rule 10), and the run is not revived.
+        * resolve-once: an entry already ``operator_settled`` is refused (the settlement table's
+          UNIQUE ``invocation_id`` is the backstop).
+        * an open entry (``reserved`` / ``requested`` / ``started``) or any other state is
+          refused: ``hflow resume`` reconciles an interrupted run first.
+        * the run must have ended (``ACCEPTED`` / ``BLOCKED`` / ``CANCELLED``): a run that has not
+          may still have a controller driving it.
+        * an ended run is not proof that nothing is running (a cross-process ``hflow cancel``
+          whose stop was not confirmed ends the run while its owner and agent may live on). The
+          owner-death proof lives above the store: ``hflow ledger settle`` first calls
+          :func:`hflow.controller.operator_settle_refusal`, which refuses unless the run's owner
+          is provably gone (the takeover rule of :func:`hflow.ownership.assess_owner`) and the
+          entry's recorded child process reads ``gone``. This method does not probe processes
+          itself, so a direct caller must apply that check first.
+
+        The run's task state, block code and outcome are never touched and nothing is
+        dispatched. The only effect is that the root no longer counts this entry as unresolved,
+        so a *new* revision may reserve - within the ceilings that remain, with its own approval.
+        """
+        if settled_as not in {"consumed", "void"}:
+            raise SettlementRefused(f"--as must be 'consumed' or 'void', not {settled_as!r}")
+        if not isinstance(attestation, str) or not attestation.strip():
+            raise SettlementRefused(
+                "the attestation is blank; an operator settlement records what the operator "
+                "claims and why, and an empty claim records nothing"
+            )
+        if len(attestation) > ATTESTATION_MAX_CHARS:
+            raise SettlementRefused(
+                f"the attestation is {len(attestation)} characters; the bound is "
+                f"{ATTESTATION_MAX_CHARS}. Shorten it (it is a statement, not a log)"
+            )
+        if "\x00" in attestation:
+            raise SettlementRefused("the attestation contains a NUL character")
+        who = (attested_by or "").strip() or "unknown"
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM invocations WHERE invocation_id = ?", (invocation_id,)
+            ).fetchone()
+            if row is None:
+                raise InvocationNotFound(f"no ledger entry has invocation id {invocation_id}")
+            prior = str(row["state"])
+            if prior == InvocationStartState.OPERATOR_SETTLED.value:
+                done = conn.execute(
+                    "SELECT settled_as, attested_by, attested_at FROM invocation_settlements"
+                    " WHERE invocation_id = ?",
+                    (invocation_id,),
+                ).fetchone()
+                already = (
+                    f" as {done['settled_as']} by {done['attested_by']} at {done['attested_at']}"
+                    if done is not None
+                    else ""
+                )
+                raise SettlementRefused(
+                    f"invocation {invocation_id} is already operator_settled{already}; an entry "
+                    "is settled once and the recorded settlement stands"
+                )
+            if prior in INVOCATION_OPEN_STATES:
+                raise SettlementRefused(
+                    f"invocation {invocation_id} is {prior}: still open, so a controller may be "
+                    "driving it. Run `hflow resume <run_id>` to reconcile the run first; only an "
+                    "unknown or launch_unknown entry can be settled by an operator"
+                )
+            if prior not in INVOCATION_OPERATOR_SETTLEABLE_STATES:
+                raise SettlementRefused(
+                    f"invocation {invocation_id} is {prior}, which already records its final "
+                    "fact; only an unknown or launch_unknown entry can be settled by an operator "
+                    "(`hflow resume` reconciles a run that is still unresolved)"
+                )
+            if settled_as == "void" and prior != InvocationStartState.LAUNCH_UNKNOWN.value:
+                raise SettlementRefused(
+                    f"invocation {invocation_id} is {prior}: a launch was reported, so provider "
+                    "spend may have occurred and its charge is not returned. Only a "
+                    "launch_unknown entry can be voided; settle this one as consumed"
+                )
+            run = conn.execute(
+                "SELECT task_state FROM runs WHERE run_id = ?", (row["run_id"],)
+            ).fetchone()
+            if run is None or str(run["task_state"]) not in _TERMINAL_STATES:
+                state = str(run["task_state"]) if run is not None else "missing"
+                raise SettlementRefused(
+                    f"run {row['run_id']} is {state}, not ended; a controller may still own it. "
+                    "Use `hflow resume` or `hflow cancel` first - an operator settles only an "
+                    "entry of a run that has ended"
+                )
+            root_id = str(row["root_id"] or "")
+            returned_top_level = 0
+            returned_repairs = 0
+            now = utc_now()
+            if settled_as == "void":
+                if not root_id:
+                    raise SettlementRefused(
+                        f"invocation {invocation_id} records no root, so there is no root "
+                        "counter to return its charge to; settle it as consumed"
+                    )
+                returned_top_level = 1
+                returned_repairs = 1 if int(row["is_repair"]) else 0
+                cur = conn.execute(
+                    """
+                    UPDATE root_budgets
+                       SET used_top_level_submissions = used_top_level_submissions - 1,
+                           used_repairs = used_repairs - ?,
+                           updated_at = ?
+                     WHERE root_id = ?
+                       AND used_top_level_submissions >= 1
+                       AND used_repairs >= ?
+                    """,
+                    (returned_repairs, now, root_id, returned_repairs),
+                )
+                if cur.rowcount != 1:
+                    raise SettlementRefused(
+                        f"root {root_id} cannot take back this entry's charge (its row is missing "
+                        "or its counters are already below what this dispatch charged); nothing "
+                        "was written"
+                    )
+            cas = conn.execute(
+                "UPDATE invocations SET state = ? WHERE invocation_id = ? AND state = ?",
+                (InvocationStartState.OPERATOR_SETTLED.value, invocation_id, prior),
+            )
+            if cas.rowcount != 1:  # pragma: no cover - the transaction holds the write lock
+                raise SettlementRefused(
+                    f"invocation {invocation_id} changed state during the settlement; retry"
+                )
+            settlement = InvocationSettlement(
+                settlement_id=new_id("S"),
+                invocation_id=invocation_id,
+                run_id=str(row["run_id"]),
+                root_id=root_id,
+                prior_state=prior,  # type: ignore[arg-type]
+                settled_as=settled_as,  # type: ignore[arg-type]
+                attested_by=who,
+                attested_at=now,
+                attestation=attestation,
+                returned_top_level_submissions=returned_top_level,
+                returned_repairs=returned_repairs,
+            )
+            conn.execute(
+                """
+                INSERT INTO invocation_settlements (
+                    settlement_id, invocation_id, run_id, root_id, prior_state, settled_as,
+                    basis, attested_by, attested_at, attestation,
+                    returned_top_level_submissions, returned_repairs
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    settlement.settlement_id,
+                    settlement.invocation_id,
+                    settlement.run_id,
+                    settlement.root_id,
+                    settlement.prior_state,
+                    settlement.settled_as,
+                    settlement.basis,
+                    settlement.attested_by,
+                    settlement.attested_at,
+                    settlement.attestation,
+                    settlement.returned_top_level_submissions,
+                    settlement.returned_repairs,
+                ),
+            )
+            self._record_note_locked(
+                conn,
+                settlement.run_id,
+                f"ledger: invocation {invocation_id} ({prior}) settled as {settled_as} by "
+                f"operator attestation (not observed); attested_by {who} at {now}. The run's "
+                "state and outcome are unchanged and nothing is re-dispatched",
+            )
+            return settlement
+
+    @staticmethod
+    def _settlement_from_row(row: sqlite3.Row) -> InvocationSettlement:
+        return InvocationSettlement(
+            settlement_id=str(row["settlement_id"]),
+            invocation_id=str(row["invocation_id"]),
+            run_id=str(row["run_id"]),
+            root_id=str(row["root_id"] or ""),
+            prior_state=str(row["prior_state"]),  # type: ignore[arg-type]
+            settled_as=str(row["settled_as"]),  # type: ignore[arg-type]
+            basis=str(row["basis"]),  # type: ignore[arg-type]
+            attested_by=str(row["attested_by"]),
+            attested_at=str(row["attested_at"]),
+            attestation=str(row["attestation"]),
+            returned_top_level_submissions=int(row["returned_top_level_submissions"]),
+            returned_repairs=int(row["returned_repairs"]),
+        )
+
+    def settlement_for(self, invocation_id: str) -> InvocationSettlement | None:
+        row = self._fetchone(
+            "SELECT * FROM invocation_settlements WHERE invocation_id = ?", (invocation_id,)
+        )
+        return self._settlement_from_row(row) if row is not None else None
+
+    def settlements_for(self, run_id: str) -> list[InvocationSettlement]:
+        """This run's operator settlements, oldest first. Attestations, not observations."""
+        return [
+            self._settlement_from_row(row)
+            for row in self._fetchall(
+                "SELECT * FROM invocation_settlements WHERE run_id = ?"
+                " ORDER BY attested_at, rowid",
+                (run_id,),
+            )
+        ]

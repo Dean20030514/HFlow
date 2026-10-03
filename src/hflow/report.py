@@ -7,6 +7,7 @@ observed, it prints as ``unknown`` rather than being estimated.
 from __future__ import annotations
 
 from .contracts import (
+    InvocationSettlement,
     LaunchSurfaces,
     ModelApplied,
     ModelObservation,
@@ -81,7 +82,12 @@ def _dispatch_ledger_lines(inspection: RunInspection) -> list[str]:
         "dispatch ledger",
         f"  reserved={counts.reserved} requested={counts.requested} started={counts.started} "
         f"not_started={counts.not_started} settled={counts.settled} unknown={counts.unknown} "
-        f"launch_unknown={counts.launch_unknown}",
+        f"launch_unknown={counts.launch_unknown}"
+        + (
+            f" operator_settled={counts.operator_settled} (by attestation, not observed)"
+            if counts.operator_settled
+            else ""
+        ),
         f"  processes   {counts.processes} operating-system child(ren) reported by a driver "
         f"(ever started {counts.ever_started}); {counts.childless_launches} launch(es) ran without "
         "one, which is what the offline driver does",
@@ -98,6 +104,14 @@ def _dispatch_ledger_lines(inspection: RunInspection) -> list[str]:
         "  provider model requests: unknown - no invocation row records one, and neither a "
         "reservation nor a process is counted as one",
     ]
+    if counts.operator_settled:
+        lines.append(
+            "  meaning     operator_settled = an operator closed an unknown/launch_unknown entry "
+            "with `hflow ledger settle`: a recorded human claim, not an observed result. It no "
+            "longer blocks the root; the run's state and outcome are unchanged, and billed usage "
+            "for it stays unknown"
+        )
+    settlements = {item.invocation_id: item for item in inspection.invocation_settlements}
     if inspection.invocations:
         lines.append("  invocations")
         for invocation in inspection.invocations:
@@ -129,7 +143,29 @@ def _dispatch_ledger_lines(inspection: RunInspection) -> list[str]:
                 facts.append(f"detail={invocation.detail}")
             if facts:
                 lines.append("      " + " ".join(facts))
+            settlement = settlements.get(invocation.invocation_id)
+            if settlement is not None:
+                lines.extend(_settlement_lines(settlement))
     return lines
+
+
+def _settlement_lines(settlement: InvocationSettlement) -> list[str]:
+    """One operator settlement, labelled as the attestation it is - never as an observation."""
+    if settlement.settled_as == "void":
+        effect = (
+            f"void: returned {settlement.returned_top_level_submissions} top-level submission(s) "
+            f"and {settlement.returned_repairs} repair(s) to the root"
+        )
+    else:
+        effect = "consumed: every counter stays spent"
+    return [
+        f"      settled by operator attestation (not observed): {settlement.prior_state} -> "
+        f"operator_settled, {effect}",
+        f"      attested_by={settlement.attested_by} (OS user, recorded not authenticated) "
+        f"attested_at={settlement.attested_at}",
+        f"      attestation: {settlement.attestation}",
+        "      billed usage: unknown (an attestation is not a usage or cost figure)",
+    ]
 
 
 def _drift_line(inspection: RunInspection) -> str:
@@ -263,7 +299,9 @@ def _dsh_context_lines(inspection: RunInspection) -> list[str]:
 
     Each record carries the list it was classified against, and that is what is printed: the
     current build's list may differ, and applying it to an old record would state a check that
-    never ran.
+    never ran. The same holds for the declaration rule of 2026-10-03: each record says whether it
+    was written after that check (``declaration_checked``), and only such a record is described
+    as listing files ``write_allow`` names.
     """
     records = inspection.dsh_context
     if not records:
@@ -285,15 +323,32 @@ def _dsh_context_lines(inspection: RunInspection) -> list[str]:
             if record.paths
             else "none on the list"
         )
+        checked = (
+            "declaration checked"
+            if record.declaration_checked
+            else "recorded without a declaration check (before the 2026-10-03 ruling)"
+        )
         lines.append(
             f"  {record.attempt_id}  round={record.round} "
-            f"candidate={record.candidate_commit} {found}"
+            f"candidate={record.candidate_commit} {found}; {checked}"
         )
     for source in dict.fromkeys(record.list_source for record in records):
         lines.append(f"  list        {source or '(not recorded)'}")
+    if any(record.declaration_checked for record in records):
+        lines.append(
+            "  meaning     in a record marked declaration checked a listed file is one write_allow "
+            "names (an undeclared one, or any root .env change, refused the run "
+            "context_file_change before a record existed)"
+        )
+    if not all(record.declaration_checked for record in records):
+        lines.append(
+            "  meaning     a record recorded without a declaration check was written before the "
+            "2026-10-03 ruling: its files were not checked against write_allow and may not have "
+            "been declared"
+        )
     lines.append(
-        "  meaning     recorded only: nothing was refused and the reviewer packet is unchanged. "
-        "Files already in the base commit load too and are not listed"
+        "  meaning     the reviewer packet lists these files as untrusted data, but DSH still "
+        "loads them. Files already in the base commit load too and are not listed"
     )
     return lines
 
@@ -373,6 +428,38 @@ def launch_surfaces_lines(
     return [home, workspace, client_line]
 
 
+def _owner_lines(inspection: RunInspection) -> list[str]:
+    """The run's recorded owner, and this command's read-only probe of it (owner lease)."""
+    owner = inspection.owner
+    if owner is None:
+        return ["owner         not recorded"]
+    if owner.token is None:
+        head = (
+            "owner         not recorded (claimed without an owner identity: written before "
+            "storage v6, or a label-only claim)"
+            if owner.label
+            else "owner         none (never claimed)"
+        )
+    else:
+        head = (
+            f"owner         pid={owner.pid} host={owner.host} created={owner.created_utc} "
+            f"generation={owner.generation} token={owner.token[:8]}..."
+        )
+    if owner.liveness == "not_recorded":
+        basis = "nothing to observe: the run records no owner"
+    elif owner.liveness == "not_probed":
+        basis = "not probed: the run is terminal"
+    elif owner.probed:
+        basis = "observed by this command, not stored"
+    else:
+        basis = "decided by rule, nothing was probed"
+    return [
+        head,
+        f"  liveness    {owner.liveness} (lock {owner.lock}; {basis})"
+        + (f": {owner.detail}" if owner.detail else ""),
+    ]
+
+
 def status_text(inspection: RunInspection) -> str:
     run = inspection.run
     lines = [
@@ -381,6 +468,7 @@ def status_text(inspection: RunInspection) -> str:
         f"state         {run.task_state.value}" + (f" ({run.phase.value})" if run.phase else ""),
         f"delivery      {run.delivery_state.value}",
         f"claimed_by    {_unknown(run.claimed_by)}",
+        *_owner_lines(inspection),
         f"turns         reserved {run.agent_turns_reserved}/{run.agent_turns_limit}, "
         f"implementer self-reported {_unknown(run.agent_turns_observed)} "
         "(a self-report, not a dispatched count and not a bill)",
@@ -555,6 +643,13 @@ def report_json(inspection: RunInspection) -> dict[str, object]:
         else None,
         "invocations": [i.model_dump(mode="json") for i in inspection.invocations],
         "invocation_counts": inspection.invocation_counts.model_dump(mode="json"),
+        # Operator attestations (``hflow ledger settle``), each with ``basis``
+        # ``operator_attested``. Not observations, and not part of any usage figure.
+        "invocation_settlements": [
+            item.model_dump(mode="json") for item in inspection.invocation_settlements
+        ],
         "model_calls_made": inspection.model_calls_made,
+        # Owner lease: the recorded owner and this command's read-only liveness probe of it.
+        "owner": inspection.owner.model_dump(mode="json") if inspection.owner else None,
     }
     return payload

@@ -18,9 +18,12 @@ from __future__ import annotations
 import glob
 import json
 import os
+import weakref
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable, Protocol
+
+from pydantic import ValidationError
 
 from .admission import predictable_dispatch_problems, validate_task_spec
 from .authorization import AuthorizationRecord
@@ -35,6 +38,7 @@ from .contracts import (
     DshContextRecord,
     EffectiveConfig,
     EvidenceStatus,
+    Finding,
     HarnessDriver,
     InvocationOutcome,
     InvocationRequest,
@@ -56,6 +60,7 @@ from .contracts import (
     RootBudgetBinding,
     RootBudgetLimits,
     RunInspection,
+    RunOwner,
     RunRequest,
     RunSummary,
     Scope,
@@ -77,6 +82,7 @@ from .ids import (
     utc_now,
 )
 from .packet import (
+    MAX_CONTEXT_DIFF_BYTES,
     PacketTooLargeError,
     RenderedPacket,
     render_implementer_packet,
@@ -104,15 +110,30 @@ from .store import (
     Store,
     StoreError,
 )
+from .ownership import (
+    OwnerAssessment,
+    OwnerFence,
+    OwnerLock,
+    OwnerLockError,
+    ProcessIdentity,
+    assess_owner,
+    current_identity,
+    filetime_iso,
+    lock_path_for,
+    new_owner_token,
+    probe_recorded,
+)
 from .verify import CLEAN_EXIT_REASONS, CheckRunners, failed_check_facts, verify_candidate
 from .workspace import (
     DSH_CONTEXT_LIST_SOURCE,
     candidate_fingerprint,
     changed_paths,
     dsh_context_paths,
+    dsh_root_env_paths,
     expand_scope,
     manifest,
     paths_outside_scope,
+    undeclared_dsh_context_paths,
 )
 
 #: How long a reservation may stay open before it is considered abandoned.
@@ -311,6 +332,129 @@ class PreflightCheck(Protocol):
     def __call__(self) -> tuple[bool, str]: ...
 
 
+def owner_ledger_dir(store: Store) -> Path | None:
+    """Where owner lock files live: ``<ledger dir>/owners``. ``None`` for an in-memory ledger.
+
+    Derived from the ledger, not from a controller's ``data_dir``, so every controller of one
+    ledger - and every successor judging an owner - looks at the same files.
+    """
+    path = getattr(store, "path", None)
+    if path is None or str(path) == ":memory:":
+        return None
+    return Path(path).parent
+
+
+def assess_run_owner(store: Store, row: Any) -> OwnerAssessment:
+    """Apply the takeover rule to a run row. Read-only; never calls a model."""
+    recorded: list[tuple[int, str | None]] = []
+    if row["owner_token"] is None:
+        recorded = [
+            (int(attempt["process_id"]), attempt["process_started_at"])
+            for attempt in store.attempts_for(str(row["run_id"]))
+            if attempt["process_id"] is not None
+        ]
+    return assess_owner(
+        ledger_dir=owner_ledger_dir(store),
+        owner_token=row["owner_token"],
+        owner_pid=row["owner_pid"],
+        owner_created=row["owner_created"],
+        owner_host=row["owner_host"],
+        recorded_controllers=recorded,
+    )
+
+
+def operator_settle_refusal(
+    store: Store, invocation_id: str, *, legacy_owner_gone_attested: bool = False
+) -> str | None:
+    """Why ``hflow ledger settle`` must not close this entry yet, or ``None``. Read-only.
+
+    A run can end (``BLOCKED`` by a cross-process ``hflow cancel`` whose stop was not confirmed)
+    while the controller that drove it, and the agent it launched, are still alive. Settling then
+    would let a new revision dispatch against the same root next to that agent. So an operator
+    settles only when nothing recorded can still act, by the rule ``resume``'s takeover uses:
+
+    * the run's owner must be provably gone (:func:`assess_run_owner`): with an owner token, its
+      lock can be taken **and** its identity reads ``gone``. With no token (a pre-v6 run, or a
+      claim made without an owner) nothing can be proven: a run that recorded no controller
+      process at all (``not_recorded``) passes this half - an inference from an ended run with
+      nothing recorded that could still act, said so in the refusal-free path's attestation - and
+      a run whose attempts recorded a controller pid (host never recorded, so never probed) passes
+      only when the operator attests that owner is gone (``legacy_owner_gone_attested``,
+      ``--legacy-owner-gone``); otherwise it refuses;
+    * the entry's own recorded child process (``process_pid`` + ``process_started_at``, probed on
+      the owner's recorded host when there is one) must read ``gone``. ``matching`` and
+      ``unknown`` both refuse. An entry that recorded no pid has nothing to probe and rests on the
+      owner rule alone, as the takeover does.
+
+    ``None`` also when the entry is missing, its run is missing or it is not in a settleable state:
+    the store's own guards refuse those with their own words. Never calls a model; nothing is
+    written. The probes run before the store's transaction, so they describe the moment of the
+    check (documented).
+    """
+    from .store import INVOCATION_OPERATOR_SETTLEABLE_STATES
+
+    invocation = store.invocation(invocation_id)
+    if invocation is None or invocation.state.value not in INVOCATION_OPERATOR_SETTLEABLE_STATES:
+        return None
+    try:
+        row = store.get_run(invocation.run_id)
+    except RunNotFound:
+        return None
+    run_id = invocation.run_id
+    assessment = assess_run_owner(store, row)
+    legacy = row["owner_token"] is None
+    if legacy and assessment.probe.verdict == "not_recorded":
+        pass  # an ended run that recorded no controller: nothing recorded can still act
+    elif legacy and legacy_owner_gone_attested:
+        pass  # the operator attests the pre-v6 owner is gone; recorded with the settlement
+    elif legacy:
+        return (
+            f"run {run_id} was written before owner identity existed ({_owner_words(row)}; "
+            f"{assessment.summary}). Its recorded controller process carries no host, so HFlow "
+            "cannot tell whether it still runs - on this machine or another. If you know it has "
+            "exited, settle again with --legacy-owner-gone, which records that you attest it; "
+            "nothing was written"
+        )
+    elif not assessment.gone:
+        return (
+            f"the owner of run {run_id} may still be alive ({_owner_words(row)}; "
+            f"{assessment.summary}), so the agent it launched may still be running. Wait for that "
+            "controller to exit, or stop its process tree yourself, then run "
+            f"`hflow resume {run_id}` and settle again; nothing was written"
+        )
+    if invocation.process_pid is not None:
+        observed = probe_recorded(
+            int(invocation.process_pid), invocation.process_started_at, row["owner_host"]
+        )
+        if observed.verdict != "gone":
+            words = (
+                "may still be running" if observed.verdict == "matching"
+                else "cannot be judged from here"
+            )
+            return (
+                f"the child process pid={invocation.process_pid} recorded for invocation "
+                f"{invocation_id} {words} ({observed.detail}). Wait for it to exit, or stop that "
+                "process tree yourself, then settle again (`hflow resume "
+                f"{run_id}` reconciles the run first if it is still unresolved); nothing was "
+                "written"
+            )
+    return None
+
+
+def _owner_words(row: Any) -> str:
+    if row["owner_token"] is None:
+        if row["claimed_by"] is None:
+            return "no owner recorded (never claimed)"
+        return (
+            f"label {row['claimed_by']!r}, claimed without an owner identity (before storage v6, "
+            "or by a label-only claim)"
+        )
+    return (
+        f"owner pid={row['owner_pid']} host={row['owner_host']} label={row['claimed_by']!r} "
+        f"created={filetime_iso(row['owner_created'])} generation={row['claim_generation']}"
+    )
+
+
 class Controller:
     def __init__(
         self,
@@ -389,12 +533,24 @@ class Controller:
         #: Workspace the current run targets; set by ``run_task``. Only used for the
         #: read-only drift check in ``workspace_matches_receipt``.
         self.project_root: Path | None = None
-        #: The attempts this controller object reserved, per run. Every CLI process shares the
-        #: default controller id, so the claim alone does not tell two identical submissions
-        #: apart; what does is whose reservation the run's attempt is. A refusal from a
+        #: The attempts this controller object reserved, per run. The owner lease keeps a second
+        #: controller from driving a claimed run at all; this is the backstop for a run claimed
+        #: without an owner (a label-only claim), where what tells two controllers apart is whose
+        #: reservation the run's attempt is. A refusal from a
         #: controller that holds none of the run's attempts is not that run's outcome, and
         #: ``_blocked`` does not write it (see ``Store.block_unless_stopped``).
         self._held_attempts: dict[str, set[str]] = {}
+        #: Owner lease (user ruling 2026-10-03). ``controller_id`` stays a human label; what
+        #: makes a claim exclusive is this random per-controller token, recorded with the
+        #: process identity (pid, creation time, host) and backed by an OS file lock held for
+        #: this controller's lifetime. The lock is taken lazily, at the first claim or takeover,
+        #: so an observer that never claims (``status``-like reads, ``cancel``) creates no file.
+        self.owner_token = new_owner_token()
+        self._owner_identity: ProcessIdentity | None = None
+        self._owner_lock: OwnerLock | None = None
+        self._owner_lock_finalizer: weakref.finalize | None = None
+        #: The claim generation this controller holds, per run: the fence its guarded writes carry.
+        self._claims: dict[str, int] = {}
         assert_driver_shape(driver)
         assert_driver_shape(self.reviewer_driver)
 
@@ -405,6 +561,257 @@ class Controller:
         if path is None or str(path) == ":memory:":
             return default_data_dir()
         return Path(path).parent
+
+    # -- owner lease (user ruling 2026-10-03) ----------------------------------
+
+    @property
+    def owner_identity(self) -> ProcessIdentity:
+        """This controller's process: pid, creation FILETIME and host, read once."""
+        if self._owner_identity is None:
+            self._owner_identity = current_identity()
+        return self._owner_identity
+
+    def _hold_owner_lock(self) -> None:
+        """Take this controller's owner lock (once); refuse before anything is claimed if not.
+
+        An in-memory ledger has no directory and no other process can open it, so it has no lock
+        file: only the identity stands for its owner.
+        """
+        if self._owner_lock is not None and self._owner_lock.held:
+            return
+        ledger_dir = owner_ledger_dir(self.store)
+        if ledger_dir is None:
+            return
+        lock = OwnerLock(lock_path_for(ledger_dir, self.owner_token))
+        try:
+            lock.acquire()
+        except OwnerLockError as exc:
+            raise RefusedError(
+                RefusalCode.INTERNAL_ERROR,
+                f"this controller could not hold its owner lock ({exc}); without it a successor "
+                "could not tell this process from a dead one, so nothing was claimed",
+            ) from exc
+        self._owner_lock = lock
+        self._owner_lock_finalizer = weakref.finalize(self, lock.release)
+
+    def close(self) -> None:
+        """Release the owner lock now instead of at garbage collection or process exit."""
+        if self._owner_lock_finalizer is not None:
+            self._owner_lock_finalizer()
+
+    def _claim(self, run_id: str) -> bool:
+        """Claim ``run_id`` for this owner (compare-and-set); remember the generation."""
+        self._hold_owner_lock()
+        generation = self.store.claim_run_owned(
+            run_id, self.controller_id, token=self.owner_token, identity=self.owner_identity
+        )
+        if generation is None:
+            return False
+        self._claims[run_id] = generation
+        return True
+
+    def _fence(self, run_id: str) -> OwnerFence | None:
+        """The fence this controller's guarded writes carry; ``None`` if it never claimed it."""
+        generation = self._claims.get(run_id)
+        return None if generation is None else OwnerFence(self.owner_token, generation)
+
+    def _claimable(self, row: Any) -> bool:
+        """Is the run unclaimed, or already this controller's own?"""
+        token = row["owner_token"]
+        return token == self.owner_token or (token is None and row["claimed_by"] is None)
+
+    def _nothing_dispatched(self, run_id: str) -> bool:
+        """No attempt and no invocation: nothing of this run was ever in flight."""
+        return not self.store.attempts_for(run_id) and not self.store.invocations_for(run_id)
+
+    def _adopt(self, run_id: str, row: Any, assessment: OwnerAssessment) -> bool:
+        """Adopt a never-dispatched run whose owner is provably gone; keep its state.
+
+        One compare-and-set (:meth:`Store.adopt_run`), which re-checks in the same statement that
+        the run still has that owner at that generation, is DRAFT/READY and has no attempt and no
+        invocation. ``False`` means nothing was written.
+        """
+        self._hold_owner_lock()
+        note = (
+            f"adopted from a controller that is provably gone ({_owner_words(row)}; "
+            f"{assessment.summary}); nothing had been dispatched. Continued by "
+            f"pid={self.owner_identity.pid} host={self.owner_identity.host} "
+            f"label={self.controller_id!r} at claim generation {row['claim_generation']} -> "
+            f"{int(row['claim_generation']) + 1}"
+        )
+        generation = self.store.adopt_run(
+            run_id,
+            expected_token=row["owner_token"],
+            expected_generation=int(row["claim_generation"]),
+            controller_id=self.controller_id,
+            token=self.owner_token,
+            identity=self.owner_identity,
+            note=note,
+        )
+        if generation is None:
+            return False
+        self._claims[run_id] = generation
+        return True
+
+    def _foreign_owner_note(self, row: Any) -> str:
+        """Why this controller does not drive a run another owner holds, naming that owner."""
+        assessment = assess_run_owner(self.store, row)
+        dispatched = not self._nothing_dispatched(str(row["run_id"]))
+        if assessment.gone and dispatched:
+            tail = (
+                "that owner is provably gone, but the run has dispatched work, so it is not "
+                "continued here; `hflow resume` takes the run over and blocks it "
+                f"{RefusalCode.OWNER_LOST.value} (it never re-dispatches)"
+            )
+        elif assessment.gone:
+            tail = (
+                "that owner is provably gone and nothing was dispatched; resubmitting this "
+                "TaskSpec adopts and continues the run"
+            )
+        elif assessment.probe.verdict == "not_recorded":
+            tail = (
+                "no owner was recorded, which is not proof that one is gone, so nothing here "
+                "drives the run"
+                + (
+                    "; `hflow resume` takes it over and blocks it "
+                    f"{RefusalCode.OWNER_LOST.value} only because nothing was dispatched"
+                    if not dispatched
+                    else "; `hflow cancel` (which blocks it outcome_unknown) and then "
+                    "`hflow resume` reconcile it"
+                )
+            )
+        else:
+            tail = "the owner may be alive, so nothing here drives, blocks or changes the run"
+        return (
+            f"run {row['run_id']} is claimed by another controller ({_owner_words(row)}; "
+            f"{assessment.summary}); it is not driven from here: {tail}"
+        )
+
+    def _take_over(self, run_id: str, row: Any) -> RunOutcome:
+        """``resume`` on a live run: take it over only from a provably gone owner, then block it.
+
+        The proof is :func:`hflow.ownership.assess_owner`: the owner's lock can be taken and its
+        identity reads ``gone``. Anything else - a held lock, ``matching``, ``unknown`` (which is
+        what a pre-v6 owner's recorded controller pid reads: it carries no host) - refuses with
+        "owner may be alive" and changes nothing. One more case: a run with no owner token that
+        recorded no controller process reads ``not_recorded``. That is not a proof of death, so
+        such a run is taken over only when it has no attempt and no invocation (nothing was in
+        flight), and its block reason says "no owner was recorded", never "provably gone". A
+        takeover is one store transaction (:meth:`Store.take_over_run`) that blocks the run
+        ``owner_lost``. It never re-dispatches and never reports a stop: each child process the
+        run recorded is probed afterwards and the answer is recorded as an observation, never as
+        ``confirmed_stopped`` (rule 8).
+        """
+        if row["owner_token"] == self.owner_token:
+            return self._outcome_for(
+                run_id,
+                notes=["this controller owns the run; resume takes nothing over and re-dispatches "
+                       "nothing"],
+            )
+        assessment = assess_run_owner(self.store, row)
+        not_recorded = assessment.probe.verdict == "not_recorded"
+        if not_recorded and not self._nothing_dispatched(run_id):
+            return self._outcome_for(
+                run_id,
+                notes=[
+                    f"no owner was recorded ({_owner_words(row)}; {assessment.summary}), and the "
+                    "run has dispatched work, so it is not taken over: nothing was changed. "
+                    "`hflow cancel` (which blocks it outcome_unknown) followed by `hflow resume` "
+                    "reconciles it"
+                ],
+            )
+        if not assessment.gone and not not_recorded:
+            return self._outcome_for(
+                run_id,
+                notes=[
+                    f"owner may be alive ({_owner_words(row)}; {assessment.summary}). Nothing was "
+                    "changed: the run is not taken over, not blocked and not re-dispatched. Run "
+                    "`hflow resume` again once that owner has exited"
+                    + (
+                        "; a run recorded before storage v6 is never proven gone (its controller "
+                        "pid carries no host): `hflow cancel` (which blocks it outcome_unknown) "
+                        "followed by `hflow resume` is the way out"
+                        if row["owner_token"] is None
+                        else ""
+                    )
+                ],
+            )
+        try:
+            self._hold_owner_lock()
+        except RefusedError as exc:
+            return self._outcome_for(
+                run_id, notes=[f"the run's owner is gone, but {exc.message}; nothing was changed"]
+            )
+        me = self.owner_identity
+        old_generation = int(row["claim_generation"])
+        if not_recorded:
+            reason = (
+                f"owner_lost: no owner was recorded for this run ({_owner_words(row)}; "
+                f"{assessment.summary}) and nothing had been dispatched; taken over by "
+                f"pid={me.pid} host={me.host} label={self.controller_id!r}. Nothing was stopped "
+                "and nothing re-dispatches - submit a new revision to proceed"
+            )
+        else:
+            reason = (
+                f"owner_lost: the controller that owned this run ({_owner_words(row)}) is "
+                f"provably gone ({assessment.summary}); taken over by pid={me.pid} "
+                f"host={me.host} label={self.controller_id!r}. Whatever was in flight is "
+                "unknown; nothing was stopped and nothing re-dispatches - submit a new revision "
+                "to proceed"
+            )
+        detail = (
+            "the controller that owned this invocation was proven gone and its result was never "
+            "observed; recorded unknown at takeover. The consumption stands and nothing "
+            "re-dispatches."
+        )
+        result = self.store.take_over_run(
+            run_id,
+            expected_token=row["owner_token"],
+            expected_generation=old_generation,
+            controller_id=self.controller_id,
+            token=self.owner_token,
+            identity=me,
+            reason=reason,
+            detail=detail,
+            note=reason,
+            require_nothing_dispatched=not_recorded,
+        )
+        if result is None:
+            return self._outcome_for(
+                run_id,
+                notes=["the run's owner or state changed while it was being assessed (another "
+                       "successor took it, or it ended); this resume changed nothing"],
+            )
+        generation, closed, attempts = result
+        self._claims[run_id] = generation
+        notes = [
+            f"{RefusalCode.OWNER_LOST.value}: took over at claim generation {old_generation} -> "
+            f"{generation}; {closed} unsettled invocation(s) recorded unknown/launch_unknown, "
+            f"{attempts} live attempt(s) finished as unknown; nothing was re-dispatched and "
+            "nothing was stopped"
+        ]
+        for invocation in self.store.invocations_for(run_id):
+            if invocation.process_pid is None:
+                continue
+            if invocation.state is not InvocationStartState.UNKNOWN:
+                continue
+            observed = probe_recorded(
+                int(invocation.process_pid), invocation.process_started_at, row["owner_host"]
+            )
+            if observed.verdict == "matching":
+                words = "may still be running; nothing was stopped"
+            elif observed.verdict == "gone":
+                words = "reads gone; this is an observation, not a confirmed stop"
+            else:
+                words = "cannot be judged from here; nothing was stopped"
+            note = (
+                f"{RefusalCode.OWNER_LOST.value}: child process pid={invocation.process_pid} of "
+                f"invocation {invocation.invocation_id} {words} ({observed.detail}). The process "
+                "boundary that could stop or confirm it died with the owner"
+            )
+            self.store.record_note(run_id, note)
+            notes.append(note)
+        return self._outcome_for(run_id, notes=notes)
 
     def _infer_production(self) -> bool:
         """Can this controller execute a real approved check at all?
@@ -486,17 +893,43 @@ class Controller:
             # the existing run instead of opening a second one. Only the turns this run still
             # needs are asked for, because its first dispatch may already have been paid for.
             #
-            # The run is claimed first, so a refusal below can end *this* controller's run and
-            # never a run another controller is driving.
-            if not self.store.claim_run(run_id, self.controller_id):
-                raise RefusedError(
-                    RefusalCode.RUN_CLAIMED_BY_OTHER,
-                    f"run {run_id} is owned by another controller; one owner per project at a time",
-                )
-            # An authorization that cannot cover the remaining loop stays a plain refusal: the
-            # run row already exists, and a new authorization for this same TaskSpec continues
-            # it, so ending the run here would make the refusal's own advice unusable.
+            # Owner lease, in this order:
+            # (a) a run another owner holds is continued only when that owner is *provably gone*
+            #     (lock free and identity gone) and the run has no attempt and no invocation -
+            #     nothing was in flight, so nothing needs fencing or reconciling. It is adopted by
+            #     one compare-and-set (old token and generation -> this token, generation + 1) and
+            #     keeps its DRAFT/READY state. Any other foreign owner - one that may be alive, one
+            #     never recorded, or a run with anything dispatched - is returned as it stands with
+            #     a note naming that owner (the CLI exits 5): a live owner may be in setup right
+            #     now, and a run with work in flight is resume's to take over (owner_lost);
+            # (b) the authorization check is read-only and runs before this controller claims or
+            #     adopts anything, so its refusal leaves the run exactly as it was and a new
+            #     authorization for this same TaskSpec, submitted by any later process, continues
+            #     it (ending the run here would make the refusal's own advice unusable);
+            # (c) the run is claimed (or adopted), so the repair gate below can end only *this*
+            #     controller's run, never one another controller is driving;
+            # (d) the repair gate; (e) the drive.
+            adopt = False
+            if not self._claimable(existing):
+                assessment = assess_run_owner(self.store, existing)
+                if not (assessment.gone and self._nothing_dispatched(run_id)):
+                    return self._outcome_for(run_id, notes=[self._foreign_owner_note(existing)])
+                adopt = True
             self._assert_allowance_for(run_id, spec, project)
+            if adopt:
+                if not self._adopt(run_id, existing, assessment):
+                    return self._outcome_for(
+                        run_id,
+                        notes=[
+                            "the run's owner or state changed while it was being assessed "
+                            "(another controller took it, or it moved on); nothing here drives "
+                            "it: " + self._foreign_owner_note(self.store.get_run(run_id))
+                        ],
+                    )
+            elif not self._claim(run_id):
+                return self._outcome_for(
+                    run_id, notes=[self._foreign_owner_note(self.store.get_run(run_id))]
+                )
             try:
                 self._assert_root_repair_allowance(run_id, spec)
             except RefusedError as exc:
@@ -546,6 +979,9 @@ class Controller:
         else:
             self._assert_no_root_for_task(spec, project)
         self._assert_root_repair_allowance(run_id, spec)
+        # The owner lock is taken before anything is written, so a controller that cannot hold
+        # one is refused with nothing recorded.
+        self._hold_owner_lock()
         # The root is registered before the run row exists: its ceilings are an admission
         # precondition, and refusing them after the run row was written would leave a run
         # pointing at a root nothing agreed to. Registration repeats the read-only check inside
@@ -585,6 +1021,12 @@ class Controller:
             checks_digest=project.checks_digest(),
             turn_limit=spec.budget.max_agent_turns,
             repair_limit=spec.budget.max_repair_cycles,
+            # The owner is written in the same insert (this controller already holds its owner
+            # lock), so the new run is never NULL-owned: there is no instant in which a successor
+            # could read it as "no owner recorded" while its creator is alive.
+            controller_id=self.controller_id,
+            owner_token=self.owner_token,
+            owner_identity=self.owner_identity,
         )
         run_id = row["run_id"]  # a concurrent identical submit may have won the insert
         if run_id != implementer_packet.run_id:
@@ -598,13 +1040,13 @@ class Controller:
                 ],
             )
 
-        self._record_effective_config(run_id)
+        # Claimed by the insert itself. A row this controller did not create was returned above
+        # (lost insert race), so a row with another token here would be a store fault: refuse.
+        if row["owner_token"] != self.owner_token:  # pragma: no cover - the insert wrote it
+            return self._outcome_for(run_id, notes=[self._foreign_owner_note(row)])
+        self._claims[run_id] = int(row["claim_generation"])
 
-        if not self.store.claim_run(run_id, self.controller_id):
-            raise RefusedError(
-                RefusalCode.RUN_CLAIMED_BY_OTHER,
-                f"run {run_id} is owned by another controller; one owner per project at a time",
-            )
+        self._record_effective_config(run_id)
 
         return self._drive(run_id, request, implementer_packet=implementer_packet)
 
@@ -638,7 +1080,14 @@ class Controller:
         """Continue the state machine. Never replays a prompt and never re-dispatches."""
         row = self.store.get_run(run_id)
         state = TaskState(row["task_state"])
-        if state is TaskState.BLOCKED and row["block_code"] == RefusalCode.OUTCOME_UNKNOWN.value:
+        if state in {TaskState.DRAFT, TaskState.READY, TaskState.RUNNING, TaskState.CHECKING}:
+            # A live run: take it over only from a provably gone owner (owner lease), which
+            # blocks it owner_lost; otherwise change nothing.
+            return self._take_over(run_id, row)
+        if state is TaskState.BLOCKED and row["block_code"] in {
+            RefusalCode.OUTCOME_UNKNOWN.value,
+            RefusalCode.OWNER_LOST.value,
+        }:
             self.reconcile(run_id)
             return self._outcome_for(
                 run_id,
@@ -745,6 +1194,37 @@ class Controller:
 
         attempt = self.store.open_attempt(run_id)
         role, driver, active_invocation = self._active_invocation(row, attempt)
+        if not active_invocation and attempt is not None:
+            recorded_pid = dict(attempt).get("process_id")
+            if recorded_pid is not None:
+                # An attempt with a recorded controller process but no invocation id is a row
+                # written before invocations existed: something may have been launched, and no
+                # driver here can be asked about it. A stop is never confirmed without the
+                # managed boundary (rule 8), so this one is unknown and the run blocks.
+                receipt = CancellationReceipt(
+                    invocation_id="",
+                    status="unknown",
+                    mechanism="none",
+                    local_process_stopped=False,
+                    detail=(
+                        f"attempt {attempt['attempt_id']} recorded controller process "
+                        f"{recorded_pid} but no invocation, so no driver can be asked to stop "
+                        "what it may have launched; nothing was stopped"
+                    ),
+                    run_already_ended=ended,
+                )
+                if ended:
+                    # The run keeps the outcome it ended with; only the stop is recorded.
+                    self.store.record_cancel_receipt(run_id, receipt)
+                    self._note_stop_of_ended_run(run_id, row)
+                    return receipt
+                ended_meanwhile = self._end_live_run_for_stop(
+                    run_id,
+                    receipt,
+                    RefusalCode.OUTCOME_UNKNOWN,
+                    f"stop requested at {intent_at} for an attempt with no recorded invocation",
+                )
+                return ended_meanwhile if ended_meanwhile is not None else receipt
         if not active_invocation:
             if ended:
                 detail = (
@@ -1127,6 +1607,8 @@ class Controller:
         transport) whether the starting workspace at ``base_commit`` already holds the client's
         project config - and turns the first problem into a refusal.
         """
+        from .prepare import launch_dsh_home_problem, launch_workspaces, start_workspace_env_file
+
         real_transport = self._real_transport()
         problems = predictable_dispatch_problems(
             spec,
@@ -1138,6 +1620,28 @@ class Controller:
             root_bound=self.root_binding is not None,
             workspace_client_config=(
                 start_workspace_client_config(spec, self.project_root, base_commit)
+                if real_transport and self.project_root is not None
+                else ""
+            ),
+            workspace_env_file=(
+                start_workspace_env_file(spec, self.project_root, base_commit)
+                if real_transport and self.project_root is not None
+                else ""
+            ),
+            # The drivers' own launches too: a driver built without a resolved configuration (a
+            # direct library caller) still binds a DSH home, and its spawn gate would refuse it.
+            dsh_home_in_workspace=(
+                launch_dsh_home_problem(
+                    [
+                        *self._resolved_launches(),
+                        *(
+                            driver.launch
+                            for driver in (self.driver, self.reviewer_driver)
+                            if isinstance(getattr(driver, "launch", None), LaunchConfig)
+                        ),
+                    ],
+                    launch_workspaces(spec, self.project_root),
+                )
                 if real_transport and self.project_root is not None
                 else ""
             ),
@@ -1528,6 +2032,8 @@ class Controller:
                 is_repair=is_repair,
                 # Lets the rootless path see a root this task already has in the ledger.
                 repo_path=str(self.project_root) if self.project_root is not None else "",
+                # Owner lease: a controller a takeover superseded buys nothing.
+                fence=self._fence(run_id),
             )
         except StoreError as exc:
             raise RefusedError(self._dispatch_refusal_code(str(exc)), str(exc)) from exc
@@ -1562,6 +2068,8 @@ class Controller:
         return (
             "refusing a second live attempt" in message
             or "a terminal run never dispatches again" in message
+            # A takeover superseded this controller: the run is the successor's to record.
+            or "owner_lost:" in message
         )
 
     def _dispatch_refusal_code(self, message: str) -> RefusalCode:
@@ -1572,6 +2080,8 @@ class Controller:
         """
         if "cancellation intent" in message:
             return RefusalCode.CANCELLED_BY_OPERATOR
+        if message.startswith("owner_lost:"):
+            return RefusalCode.OWNER_LOST
         if (
             "unresolved invocation" in message
             or "deadline" in message
@@ -1606,13 +2116,32 @@ class Controller:
 
         def report(fact: SpawnFact) -> None:
             try:
-                self.store.record_invocation_spawn(fact)
+                recorded = self.store.record_invocation_spawn(fact)
             except StoreError as exc:
                 self.store.record_note(
                     run_id,
                     f"{NOTE_DISPATCH}: the driver's spawn fact for {invocation.invocation_id} "
                     f"could not be recorded ({exc}); the invocation keeps the state it had",
                 )
+                return
+            if recorded:
+                return
+            # Rule 4: a late report changes nothing, but one that contradicts an operator
+            # attestation (a ``void`` of a launch the driver now says happened) is kept visible.
+            try:
+                current = self.store.invocation(invocation.invocation_id)
+                if current is not None and (
+                    current.state is InvocationStartState.OPERATOR_SETTLED
+                ):
+                    self.store.record_note(
+                        run_id,
+                        f"{NOTE_DISPATCH}: invocation {invocation.invocation_id}: a spawn report "
+                        f"(created={fact.created}, pid={fact.pid}) arrived after an operator "
+                        "settlement; the settlement stands",
+                    )
+            except StoreError:
+                # Same reason as above: never raise inside the driver's spawn gate.
+                pass
 
         return report
 
@@ -1740,6 +2269,7 @@ class Controller:
                 result={"error": reason},
                 block_code=RefusalCode.OUTCOME_UNKNOWN,
                 unless_stopped=True,
+                fence=self._fence(run_id),
             )
         except Exception:  # noqa: BLE001 - not live any more, or a stop decided it
             pass
@@ -2076,9 +2606,10 @@ class Controller:
         identity: CandidateIdentity,
         trigger_candidate: RepairTrigger,
         failure_facts: list[dict[str, Any]],
-        findings: list[dict[str, Any]],
+        findings: list[Finding],
         detail: str,
         configured_deadline_seconds: int,
+        context_files: list[str] | None = None,
     ) -> _CycleResult:
         """Decide whether this failure may buy the run's single repair, and record the answer.
 
@@ -2157,7 +2688,7 @@ class Controller:
             allowed, reason = self._business_failure_allows(policy, failure_facts)
             if not allowed:
                 return refuse(RepairDecision.NOT_A_BUSINESS_FAILURE, reason)
-            context_findings: list[dict[str, Any]] = []
+            context_findings: list[Finding] = []
         else:
             if not policy.allow_reviewer_changes:
                 return refuse(
@@ -2211,6 +2742,9 @@ class Controller:
             # fallback 0 for a clock that does not exist.
             deadline_seconds=self._capped_deadline(configured_deadline_seconds),
             detail=detail,
+            # The declared DSH context files this candidate changes, so the repair packet can
+            # name them as untrusted data and the repair cannot carry them forward unnoticed.
+            context_files=list(context_files or []),
         )
         return _CycleResult(repair=context, identity=identity)
 
@@ -2363,9 +2897,7 @@ class Controller:
             f"reason={record.reason[:400]}",
         )
 
-    def _review_findings(
-        self, run_id: str, attempt_id: str, candidate_fp: str
-    ) -> list[dict[str, Any]]:
+    def _review_findings(self, run_id: str, attempt_id: str, candidate_fp: str) -> list[Finding]:
         """The reviewer's findings for *this* candidate, if it left any usable ones.
 
         Read from the recorded review evidence rather than from the verdict object, so the facts a
@@ -2378,10 +2910,14 @@ class Controller:
           recorded as failed for a rejection and for a wire failure alike, and only the former is
           a finding a repair may act on.
 
-        Only *usable* findings are returned (see :meth:`_usable_finding`): a ``[{}]`` or a
-        whitespace statement is a non-empty list that still names nothing to change. An empty or
-        unusable payload returns nothing, so the caller refuses with ``NO_FINDINGS`` rather than
-        guessing what the reviewer meant.
+        A usable finding is a typed :class:`Finding` (user ruling, 2026-10-03): its ``body`` is
+        required and never blank, so every valid typed finding names something to change. The
+        row was written from a verdict already validated against that type, so each item is
+        re-read with the same model; a list with any item that does not satisfy it (untyped
+        findings recorded before typed findings existed, or a row edited on disk) is not a typed
+        verdict, so none of its items is usable and it buys nothing.
+        An empty or unusable list returns nothing, so the caller refuses with ``NO_FINDINGS``
+        rather than guessing what the reviewer meant.
         """
         for row in self.store.evidence_for(run_id, kind="review"):
             if row["attempt_id"] != attempt_id or row["candidate_fingerprint"] != candidate_fp:
@@ -2398,41 +2934,12 @@ class Controller:
                 continue
             findings = payload.get("findings")
             if isinstance(findings, list) and findings:
-                return [
-                    item
-                    for item in findings
-                    if isinstance(item, dict) and self._usable_finding(item)
-                ]
+                try:
+                    return [Finding.model_validate(item) for item in findings]
+                except ValidationError:
+                    # Not a typed verdict as a whole, so no item of it is trusted on its own.
+                    return []
         return []
-
-    #: Keys that label or place a finding but do not say what is wrong: a finding made only of
-    #: these (or of blank text) gives a repair nothing to act on.
-    _FINDING_BOOKKEEPING_KEYS = frozenset({"id", "severity", "status", "location", "target"})
-
-    @classmethod
-    def _usable_finding(cls, finding: dict[str, Any]) -> bool:
-        """Does this finding carry at least one non-blank text value outside the bookkeeping keys?
-
-        The reviewer contract names no finding keys, so usability is decided by content rather
-        than by a key name: any string under any other key counts, including one nested in a
-        list or an object (``"evidence": ["..."]``). Numbers and booleans alone say nothing a
-        repair could act on.
-        """
-
-        def has_text(value: Any) -> bool:
-            if isinstance(value, str):
-                return bool(value.strip())
-            if isinstance(value, dict):
-                return any(has_text(item) for item in value.values())
-            if isinstance(value, list):
-                return any(has_text(item) for item in value)
-            return False
-
-        return any(
-            has_text(value)
-            for key, value in finding.items()
-            if key not in cls._FINDING_BOOKKEEPING_KEYS
-        )
 
     def _reconcile_repair_workspace(
         self,
@@ -2742,7 +3249,9 @@ class Controller:
             # a stop or a terminal decision already ended - a repair is a decision taken *inside* a
             # live run, never a way back into a finished one.
             try:
-                self.store.reopen_for_repair(run_id, self.controller_id)
+                self.store.reopen_for_repair(
+                    run_id, self.controller_id, fence=self._fence(run_id)
+                )
             except StoreError as exc:
                 self._record_repair_decision(
                     run_id,
@@ -3129,6 +3638,9 @@ class Controller:
         # Freeze an explicit Git identity for the candidate before any check runs, so the
         # receipt names a commit rather than only a content fingerprint.
         freeze: CandidateFreeze | None = None
+        # The DSH context files this candidate changes from the task's base, each one declared in
+        # write_allow (an undeclared one refuses the run below). Empty for an in-place run.
+        context_files: list[str] = []
         if repo is not None and worktree is not None:
             try:
                 freeze = repo.freeze_candidate(
@@ -3186,16 +3698,52 @@ class Controller:
                             ),
                         )
                     )
+                # The next role (the reviewer, or a repair round) starts a DSH agent in this
+                # worktree, and upstream DSH source says it loads these files as instructions,
+                # skills or environment next to HFlow's packet (user ruling, 2026-10-03): a root
+                # .env the candidate adds, changes or deletes is refused whatever the scope says,
+                # and any other listed file is refused unless a write_allow entry names it
+                # explicitly - an entry that merely contains it ("src", ".") does not. Same point
+                # and same outcome as the scope refusal above: no candidate ref, no check.
+                root_env = dsh_root_env_paths(cumulative_paths)
+                undeclared = undeclared_dsh_context_paths(
+                    cumulative_paths, spec.scope.write_allow
+                )
+                if root_env or undeclared:
+                    problems: list[str] = []
+                    if root_env:
+                        problems.append(
+                            "it adds, changes or deletes the workspace-root "
+                            f"{', '.join(root_env)}, which DSH reads as environment at start-up "
+                            "and which is refused even when write_allow names it"
+                        )
+                    if undeclared:
+                        problems.append(
+                            "it changes files DSH loads as instructions or skills that no "
+                            "write_allow entry names explicitly: "
+                            + ", ".join(undeclared[:5])
+                            + (f" (+{len(undeclared) - 5} more)" if len(undeclared) > 5 else "")
+                            + " (declare each file by its path, or a skill directory by an entry "
+                            "under .dsh/skills or .agents/skills)"
+                        )
+                    return _CycleResult(
+                        outcome=self._blocked(
+                            run_id,
+                            RefusalCode.CONTEXT_FILE_CHANGE,
+                            "the candidate commit changes DSH context files the next agent "
+                            "started in this worktree would load, so nothing was checked or "
+                            "reviewed: " + "; ".join(problems),
+                        )
+                    )
+                context_files = dsh_context_paths(cumulative_paths)
                 # Keep the candidate reachable independently of its worktree: a bare commit
                 # SHA is an identifier, not a retention policy.
                 ref = repo.candidate_ref(run_id, attempt_id)
                 ref_status = repo.ensure_candidate_ref(ref, freeze.candidate_commit)
                 self.store.record_note(run_id, f"candidate ref {ref} ({ref_status})")
-                # The next role (the reviewer, or a repair round) starts a DSH agent in this
-                # worktree, and upstream DSH source says it loads these files as instructions,
-                # skills or environment next to HFlow's packet. They are recorded from Git's own
-                # list, never refused here (refusing needs a ruling), and an empty list is
-                # recorded too.
+                # What was allowed through above is recorded from Git's own list, an empty list
+                # too; the reviewer packet and a repair packet show the same files as untrusted
+                # data. ``declaration_checked`` marks that the refusal above ran for this record.
                 self.store.record_dsh_context(
                     run_id,
                     DshContextRecord(
@@ -3203,9 +3751,10 @@ class Controller:
                         round=round_number,
                         base_commit=original_base_commit,
                         candidate_commit=freeze.candidate_commit,
-                        paths=dsh_context_paths(cumulative_paths),
+                        paths=list(context_files),
                         list_source=DSH_CONTEXT_LIST_SOURCE,
                         recorded_at=utc_now(),
+                        declaration_checked=True,
                     ),
                 )
             except GitError as exc:
@@ -3284,7 +3833,10 @@ class Controller:
 
         try:
             self.store.advance_to_checking(
-                run_id=run_id, attempt_id=attempt_id, phase=CheckPhase.VERIFICATION
+                run_id=run_id,
+                attempt_id=attempt_id,
+                phase=CheckPhase.VERIFICATION,
+                fence=self._fence(run_id),
             )
         except StoreError as exc:
             # As in ``_advance_to_review``: a transition refused because a stop landed is the
@@ -3404,6 +3956,7 @@ class Controller:
                     repo=repo,
                     original_base_commit=original_base_commit,
                     round_number=round_number,
+                    context_files=context_files,
                 )
             except RefusedError as exc:
                 return _CycleResult(outcome=self._blocked(run_id, exc.code, exc.message))
@@ -3426,6 +3979,7 @@ class Controller:
                 findings=[],
                 detail=verification.detail,
                 configured_deadline_seconds=request.deadline_seconds,
+                context_files=context_files,
             )
 
         if review.status == "changes_requested":
@@ -3443,6 +3997,7 @@ class Controller:
                 findings=findings,
                 detail="independent review requested changes",
                 configured_deadline_seconds=request.deadline_seconds,
+                context_files=context_files,
             )
         if review.status not in {"accepted", "not_required"}:
             return _CycleResult(
@@ -3486,6 +4041,48 @@ class Controller:
 
 
 
+    @staticmethod
+    def _context_file_changes(
+        repo: GitRepo | None,
+        freeze: CandidateFreeze | None,
+        candidate_identity: dict[str, object],
+        context_files: list[str],
+        project_root: Path,
+    ) -> list[dict[str, object]]:
+        """Bounded diffs of the declared DSH context files a frozen candidate changes.
+
+        Read from Git between the task's base and the candidate commit, one file at a time, and
+        no more than :data:`MAX_CONTEXT_DIFF_BYTES` in all: once the cap is reached the remaining
+        files get ``diff=None`` and the packet marks the section truncated. A root ``.env`` never
+        reaches here (it refuses the run at the freeze), so no environment file is inlined. A Git
+        failure refuses the review before anything is bought.
+        """
+        if not context_files or repo is None or freeze is None:
+            return []
+        base = str(candidate_identity.get("base_commit", "") or "")
+        commit = freeze.candidate_commit
+        changes: list[dict[str, object]] = []
+        remaining = MAX_CONTEXT_DIFF_BYTES
+        for path in context_files:
+            if remaining <= 0:
+                changes.append({"path": path, "diff": None, "truncated": True})
+                continue
+            try:
+                text, truncated = repo.diff_text_bounded(
+                    base, commit, path, max_bytes=remaining, cwd=project_root
+                )
+            except GitError as exc:
+                raise RefusedError(
+                    RefusalCode.INTERNAL_ERROR,
+                    "the diff of a changed DSH context file could not be read for the reviewer "
+                    f"packet, so no review was bought: {exc}",
+                ) from exc
+            remaining -= len(text.encode("utf-8"))
+            if truncated:
+                remaining = 0
+            changes.append({"path": path, "diff": text, "truncated": truncated})
+        return changes
+
     def _review(
         self,
         run_id: str,
@@ -3500,6 +4097,7 @@ class Controller:
         repo: GitRepo | None = None,
         original_base_commit: str = "",
         round_number: int = 1,
+        context_files: list[str] | None = None,
     ) -> ReviewResult:
         """Buy the review turn, run the reviewer, then interpret its structured verdict.
 
@@ -3633,6 +4231,9 @@ class Controller:
                 verification_detail=verification.detail if verification else "",
                 check_summaries=check_summaries,
                 evidence_rows=evidence_rows,
+                context_changes=self._context_file_changes(
+                    repo, freeze, candidate_identity, list(context_files or []), project_root
+                ),
             )
         except PacketTooLargeError as exc:
             raise RefusedError(
@@ -4192,8 +4793,10 @@ class Controller:
                         "says a DSH agent started in this worktree loads as instructions, skills "
                         f"or environment ({_first_paths(dsh_changed)}); every role started there "
                         "after the freeze - the reviewer when one ran, a repair implementer when "
-                        "there was one - would have them in its context. Recorded from the Git "
-                        "diff, not observed in an agent and not refused"
+                        "there was one - would have them in its context. Each is named in the "
+                        "task's write_allow, and the reviewer packet, when a reviewer ran, listed "
+                        "them as untrusted data; recorded from the Git diff, not observed in an "
+                        "agent"
                     ]
                     if dsh_changed
                     else []
@@ -4202,7 +4805,9 @@ class Controller:
         )
 
         try:
-            self.store.finalize_acceptance(run_id, receipt, checks_digest=row["checks_digest"])
+            self.store.finalize_acceptance(
+                run_id, receipt, checks_digest=row["checks_digest"], fence=self._fence(run_id)
+            )
         except RunNotFound:
             raise
         except StoreError as exc:
@@ -4272,6 +4877,7 @@ class Controller:
                 outcome=InvocationOutcome.FAILED,
                 result={"error": reason},
                 block_code=code,
+                fence=self._fence(run_id),
             )
         except StoreError:
             pass
@@ -4317,6 +4923,7 @@ class Controller:
                 result=result.model_dump(mode="json"),
                 block_code=block_code,
                 unless_stopped=True,
+                fence=self._fence(run_id),
             )
         except StoreError as exc:
             self.store.record_note(
@@ -4725,4 +5332,60 @@ def inspect_run(store: Store, run_id: str, *, project_root: Path | None = None) 
         root_budget=root_usage,
         invocations=store.invocations_for(run_id),
         invocation_counts=store.invocation_state_counts(run_id),
+        owner=_run_owner(store, row),
+        # Operator settlements (``hflow ledger settle``): attestations, rendered as such.
+        invocation_settlements=store.settlements_for(run_id),
+    )
+
+
+def _owner_takeover_words(store: Store, row: Any, assessment: OwnerAssessment) -> str:
+    """What ``hflow resume`` would do with this live run's owner, from the same rule it applies."""
+    run_id = str(row["run_id"])
+    nothing = not store.attempts_for(run_id) and not store.invocations_for(run_id)
+    if assessment.probe.verdict == "not_recorded":
+        if nothing:
+            return (
+                "; not proven gone - `hflow resume` would take it over only because nothing was "
+                "dispatched"
+            )
+        return "; not proven gone and work was dispatched, so `hflow resume` would change nothing"
+    if assessment.gone:
+        return "; a takeover by `hflow resume` is permitted"
+    return "; the owner may be alive, so `hflow resume` would change nothing"
+
+
+def _run_owner(store: Store, row: Any) -> RunOwner:
+    """The recorded owner plus this command's read-only liveness probe of it (live runs only).
+
+    The probe opens the owner's lock file without creating it and asks the OS about the recorded
+    pid; it writes nothing to the ledger and never calls a model. A terminal run is not probed:
+    nothing about its owner can change what it recorded.
+    """
+    keys = row.keys()
+    if "owner_token" not in keys:  # pragma: no cover - every v6 ledger has the column
+        return RunOwner(label=row["claimed_by"], liveness="not_recorded", lock="not_applicable")
+    owner = RunOwner(
+        label=row["claimed_by"],
+        token=row["owner_token"],
+        pid=row["owner_pid"],
+        created=row["owner_created"],
+        created_utc=filetime_iso(row["owner_created"]),
+        host=row["owner_host"],
+        generation=int(row["claim_generation"] or 0),
+    )
+    if TaskState(row["task_state"]) not in {
+        TaskState.DRAFT, TaskState.READY, TaskState.RUNNING, TaskState.CHECKING
+    }:
+        return owner.model_copy(
+            update={"liveness": "not_probed", "lock": "not_probed",
+                    "detail": "the run is terminal; its owner is not probed"}
+        )
+    assessment = assess_run_owner(store, row)
+    return owner.model_copy(
+        update={
+            "liveness": assessment.probe.verdict,
+            "lock": assessment.lock,
+            "probed": assessment.probe.probed,
+            "detail": assessment.summary + _owner_takeover_words(store, row, assessment),
+        }
     )

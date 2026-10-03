@@ -408,10 +408,16 @@ class RepairContext(BaseModel):
     previous: CandidateIdentity | None = None
     trigger: RepairTrigger
     failed_checks: list[dict[str, Any]] = Field(default_factory=list)
-    findings: list[dict[str, Any]] = Field(default_factory=list)
+    #: The reviewer's typed findings (:class:`Finding`), as validated when the verdict was decoded.
+    findings: list[Finding] = Field(default_factory=list)
     remaining_turns: int = 0
     deadline_seconds: int = 0
     detail: str = ""
+    #: The DSH context files (instruction files, root skills) the candidate being repaired
+    #: changes from the task's original base. Each one is explicitly declared in ``write_allow``
+    #: (an undeclared one refuses the run before a repair can be decided). Rendered as untrusted
+    #: data in the repair packet; empty renders nothing, so older packets are unchanged.
+    context_files: list[str] = Field(default_factory=list)
 
 
 class DshContextRecord(BaseModel):
@@ -422,6 +428,11 @@ class DshContextRecord(BaseModel):
     ``list_source``. The list is documented upstream, not observed, and nothing here is enforced:
     a Record, not an Observation, because nothing watched DSH load a file. An empty ``paths``
     means "checked, none on the list", which differs from no record at all.
+
+    ``declaration_checked`` says the record was written after the controller refused an
+    undeclared context-file change and any root ``.env`` change (ruling of 2026-10-03), so every
+    listed path is one ``write_allow`` names. A record written before that ruling carries no such
+    key and reads as ``False``: its paths were recorded without that check.
     """
 
     model_config = Strict
@@ -433,6 +444,7 @@ class DshContextRecord(BaseModel):
     paths: list[str] = Field(default_factory=list)
     list_source: str = ""
     recorded_at: str = ""
+    declaration_checked: bool = False
 
 
 class BudgetRequest(BaseModel):
@@ -755,6 +767,43 @@ class MachineProfile(BaseModel):
         return self
 
 
+#: The launch entry files a resolved launch binds by content (user ruling 2026-10-03, H6).
+#: Short and explicit on purpose: these are the files the launch starts or that name what it
+#: starts. Transitive modules (``node_modules``), DSH's own code loading and anything Node reads
+#: later remain bound by path only.
+LaunchFileKind = Literal[
+    "client_interpreter",
+    "client_entry",
+    "client_package_json",
+    "dsh_launcher",
+    "carrier_entry",
+    "carrier_package_json",
+    # The Electron archive (``*.asar``) a Desktop carrier entry lies inside, bound in place of
+    # the entry and its package.json, which exist only inside it.
+    "carrier_archive",
+]
+#: The ``LaunchConfig`` fields that record content. They are left out of
+#: :meth:`EffectiveConfig.digest`, because an approval binds them through its own
+#: ``launch_content_digest`` - so a changed file is reported as a changed file, and a
+#: configuration digest stays what it was before content binding existed.
+LAUNCH_CONTENT_FIELDS = ("content_digests", "content_notes")
+
+
+class LaunchFileDigest(BaseModel):
+    """SHA-256 of one launch entry file, taken at its final path (links followed once).
+
+    ``path`` is the path that was hashed *and* the path the launch spawns or names, so a link
+    cannot point the hash at one file and the spawn at another.
+    """
+
+    model_config = Strict
+
+    kind: LaunchFileKind
+    path: str
+    sha256: str
+    size: int = Field(ge=0)
+
+
 class LaunchConfig(BaseModel):
     """The concrete program launch a role's driver will perform.
 
@@ -799,6 +848,13 @@ class LaunchConfig(BaseModel):
     #: before it has said anything; the launch itself still refuses.
     resolvable: bool = True
     detail: str = ""
+    #: H6: SHA-256 of the launch entry files (:data:`LaunchFileKind`), taken when the launch is
+    #: resolved and checked again by the driver just before spawn. Empty for a launch that was
+    #: not resolved by :func:`hflow.drivers.acpx_dsh.resolve_launch_config` (or not resolvable).
+    content_digests: list[LaunchFileDigest] = Field(default_factory=list)
+    #: What the content binding does not cover for this launch, in words (a loose client entry
+    #: with no package.json, a carrier that is not classified, programs bound by path only).
+    content_notes: list[str] = Field(default_factory=list)
 
     @model_serializer(mode="wrap")
     def _omit_unset_model(self, handler: Any):
@@ -806,11 +862,15 @@ class LaunchConfig(BaseModel):
 
         So a ``native_profile`` configuration keeps its approval digest, while any chosen model
         is part of what an approval binds. (No return annotation on purpose: pydantic would take
-        it as the serialization schema and drop the field list.)
+        it as the serialization schema and drop the field list.) The content fields follow the
+        same rule: absent while empty.
         """
         data = handler(self)
         if not self.model:
             data.pop("model", None)
+        for field in LAUNCH_CONTENT_FIELDS:
+            if not data.get(field):
+                data.pop(field, None)
         return data
 
 
@@ -870,8 +930,28 @@ class EffectiveConfig(BaseModel):
         return [entry.driver_id for entry in self.roles]
 
     def digest(self) -> str:
-        """Identity of this configuration. Stable across processes, JSON-order independent."""
-        return digest_of(self.model_dump(mode="json"))
+        """Identity of this configuration. Stable across processes, JSON-order independent.
+
+        The launches' content digests are left out: an approval binds them separately
+        (``AuthorizationBinding.launch_content_digest``), so a file whose bytes changed is
+        refused as ``launch_content_changed`` rather than as "a different configuration".
+        """
+        payload = self.model_dump(mode="json")
+        for role in payload.get("roles") or []:
+            launch = role.get("launch") if isinstance(role, dict) else None
+            if isinstance(launch, dict):
+                for field in LAUNCH_CONTENT_FIELDS:
+                    launch.pop(field, None)
+        return digest_of(payload)
+
+    def launch_content_digest(self) -> str:
+        """Digest of every role's launch content digests, or ``""`` when none carries any."""
+        entries = {
+            entry.role: [item.model_dump(mode="json") for item in entry.launch.content_digests]
+            for entry in self.roles
+            if entry.launch is not None and entry.launch.content_digests
+        }
+        return digest_of(entries) if entries else ""
 
 
 # --------------------------------------------------------------------------
@@ -912,12 +992,151 @@ class CandidateRef(BaseModel):
     produced_paths: list[str] = Field(default_factory=list)
 
 
+#: The reviewer's own label for a finding. Recorded and rendered; HFlow ranks, filters and gates
+#: nothing by it (user ruling, 2026-10-03).
+FindingSeverity = Literal["P0", "P1", "P2", "P3"]
+
+#: The typed finding models: unknown keys are refused, and ``strict`` refuses coercion, so a
+#: ``"12"`` or a ``true`` is not a line number and a number is not a string.
+StrictTyped = ConfigDict(extra="forbid", strict=True)
+
+
+def _refuse_null_optional_keys(data: Any) -> Any:
+    """An optional finding key is omitted, never ``null``: the schema says the value's type."""
+    if isinstance(data, dict):
+        nulls = sorted(str(key) for key, value in data.items() if value is None)
+        if nulls:
+            raise ValueError(
+                "optional keys are left out, never null; null given for: " + ", ".join(nulls)
+            )
+    return data
+
+
+def _optional_keys_are_omitted(schema: dict[str, Any]) -> None:
+    """Show an optional key's real type in the generated schema, without a ``null`` branch.
+
+    The models refuse an explicit ``null`` (:func:`_refuse_null_optional_keys`); the Python
+    default of ``None`` only marks the key absent, so the schema must not advertise ``null``.
+    """
+    for prop in schema.get("properties", {}).values():
+        branches = prop.get("anyOf")
+        if not isinstance(branches, list):
+            continue
+        kept = [branch for branch in branches if branch != {"type": "null"}]
+        if len(kept) == 1 and len(kept) < len(branches):
+            del prop["anyOf"]
+            prop.update(kept[0])
+            if "default" in prop and prop["default"] is None:
+                del prop["default"]
+
+
+def _require_non_blank(value: str) -> str:
+    # ``str.strip`` is the same test the controller's "usable finding" rule has always applied.
+    if not value.strip():
+        raise ValueError("must not be blank")
+    return value
+
+
+class FindingLocation(BaseModel):
+    """Where a finding applies. Give a line only when you have read it; never invent one."""
+
+    model_config = ConfigDict(
+        extra="forbid", strict=True, json_schema_extra=_optional_keys_are_omitted
+    )
+
+    path: str = Field(pattern=r"\S", description="repository-relative path, non-blank")
+    line_start: int | None = Field(default=None, ge=1, description="first line, 1-based")
+    line_end: int | None = Field(
+        default=None, ge=1, description="last line, >= line_start; requires line_start"
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_null(cls, data: Any) -> Any:
+        return _refuse_null_optional_keys(data)
+
+    @field_validator("path")
+    @classmethod
+    def _path_not_blank(cls, value: str) -> str:
+        return _require_non_blank(value)
+
+    @model_validator(mode="after")
+    def _line_range(self) -> FindingLocation:
+        if self.line_end is not None:
+            if self.line_start is None:
+                raise ValueError("line_end requires line_start")
+            if self.line_end < self.line_start:
+                raise ValueError("line_end must be >= line_start")
+        return self
+
+    @model_serializer(mode="wrap")
+    def _omit_absent(self, handler: Callable[[Any], Any]) -> Any:
+        return {key: value for key, value in handler(self).items() if value is not None}
+
+
+class Finding(BaseModel):
+    """One defect: body says what is wrong, why, and the input or scenario that triggers it."""
+
+    # The docstring above is embedded in the reviewer packet's schema, so notes live here.
+    # ``body`` is the only required key and it is never blank, so every valid finding is a
+    # usable one: a repair can always be told what was wrong. There is deliberately no
+    # confidence field - a model's self-reported confidence is not an observation - and no
+    # free-form fallback: an object with any other key is refused, never read as text.
+
+    model_config = ConfigDict(
+        extra="forbid", strict=True, json_schema_extra=_optional_keys_are_omitted
+    )
+
+    body: str = Field(
+        pattern=r"\S",
+        description="non-blank: what is wrong, why, and the input or scenario that triggers it",
+    )
+    title: str | None = Field(default=None, description="short summary")
+    location: FindingLocation | None = None
+    severity: FindingSeverity | None = Field(
+        default=None, description="the reviewer's own label; gates nothing"
+    )
+    id: str | None = Field(default=None, description="the reviewer's own label")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_null(cls, data: Any) -> Any:
+        return _refuse_null_optional_keys(data)
+
+    @field_validator("body")
+    @classmethod
+    def _body_not_blank(cls, value: str) -> str:
+        return _require_non_blank(value)
+
+    @model_serializer(mode="wrap")
+    def _omit_absent(self, handler: Callable[[Any], Any]) -> Any:
+        # Stored and rendered as the reviewer wrote it: an absent key stays absent.
+        return {key: value for key, value in handler(self).items() if value is not None}
+
+
 class ReviewOutput(BaseModel):
     """Shortest structured reviewer output (plan 16.5)."""
 
     # The docstring above is embedded in the reviewer packet's schema, so notes live here.
     # Both keys are required, as the packet's output contract says: a verdict without
     # ``findings`` is refused, never completed with an empty list on the model's behalf.
+    # Each finding is typed (:class:`Finding`); an untyped or malformed finding makes the whole
+    # answer invalid - there is no text fallback that would turn it into zero findings.
+
+    model_config = Strict
+
+    verdict: Literal["accepted", "changes_requested"]
+    findings: list[Finding]
+
+
+class RecordedUntypedReview(BaseModel):
+    """A reviewer verdict produced under the contract in force before typed findings.
+
+    Only for re-reading historical bytes offline (``tools/m2_live/replay_review.py``): that
+    reviewer was told "findings is a list of objects" and nothing more, so its answer is judged
+    against that contract, not one it was never shown. Never used for a new reviewer answer -
+    the drivers decode with :class:`ReviewOutput` only.
+    """
 
     model_config = Strict
 
@@ -1289,6 +1508,12 @@ class InvocationStartState(StrEnum):
     #: while the fact that the launch may have run is what keeps the root blocked until an
     #: operator looks.
     LAUNCH_UNKNOWN = "launch_unknown"
+    #: An operator closed an ``unknown`` or ``launch_unknown`` entry with ``hflow ledger settle``
+    #: (ruling 2026-10-03). Terminal and resolve-once. It records a human attestation, never an
+    #: observation: what happened to the launch is still not known, and the attestation row in
+    #: ``invocation_settlements`` says who claimed what. It no longer blocks the root; it never
+    #: changes the run's task state or outcome.
+    OPERATOR_SETTLED = "operator_settled"
 
 
 class InvocationIntent(BaseModel):
@@ -1361,10 +1586,12 @@ class InvocationIntent(BaseModel):
         Everything that is not explicitly finished blocks: a reservation, a requested launch, a
         created process, and both unknown shapes. ``NOT_STARTED`` and ``SETTLED`` are done - the
         former spent an allowance for nothing, which is recorded rather than refunded.
+        ``OPERATOR_SETTLED`` is done by an operator's attestation, not by an observation.
         """
         return self.state not in {
             InvocationStartState.NOT_STARTED,
             InvocationStartState.SETTLED,
+            InvocationStartState.OPERATOR_SETTLED,
         }
 
 
@@ -1446,6 +1673,10 @@ class InvocationStateCounts(BaseModel):
     processes: int = 0
     #: Invocations whose driver reported doing its work without a child (the offline driver).
     childless_launches: int = 0
+    #: ``unknown`` / ``launch_unknown`` entries an operator closed by attestation
+    #: (``hflow ledger settle``). Not an observed result and never part of a process, launch or
+    #: provider-request figure: what the launch did is still unknown.
+    operator_settled: int = 0
 
     @property
     def total(self) -> int:
@@ -1457,6 +1688,7 @@ class InvocationStateCounts(BaseModel):
             + self.settled
             + self.unknown
             + self.launch_unknown
+            + self.operator_settled
         )
 
     @property
@@ -1467,6 +1699,32 @@ class InvocationStateCounts(BaseModel):
         ``settled`` offline invocation here was a claim about the machine that was simply false.
         """
         return self.processes
+
+
+class InvocationSettlement(BaseModel):
+    """One operator settlement of an unresolved ledger entry (``hflow ledger settle``).
+
+    A recorded human claim, not an observation. ``attested_by`` is the operating-system user name
+    the settling process saw: recorded, never authenticated. ``consumed`` keeps every counter
+    spent; ``void`` (``launch_unknown`` only) returned exactly what the dispatch charged to the
+    root - ``returned_*`` say how much. Neither carries a usage, cost or provider-request figure:
+    billed usage for the invocation stays unknown.
+    """
+
+    model_config = Strict
+
+    settlement_id: str
+    invocation_id: str
+    run_id: str
+    root_id: str = ""
+    prior_state: Literal["unknown", "launch_unknown"]
+    settled_as: Literal["consumed", "void"]
+    basis: Literal["operator_attested"] = "operator_attested"
+    attested_by: str
+    attested_at: str
+    attestation: str
+    returned_top_level_submissions: int = 0
+    returned_repairs: int = 0
 
 
 class RepairPlanPreview(BaseModel):
@@ -1744,6 +2002,30 @@ class RefusalCode(StrEnum):
     WORKSPACE_CLIENT_CONFIG = "workspace_client_config"
     NOT_IMPLEMENTED = "not_implemented"
     INTERNAL_ERROR = "internal_error"
+    #: The run's owning controller process was proven gone (its owner lock could be taken and its
+    #: pid + creation time no longer name a running process) and a successor took the run over.
+    #: Same semantics as ``OUTCOME_UNKNOWN``: whatever was in flight is unknown, the run blocks,
+    #: and nothing re-dispatches. Never a confirmed stop - the boundary that could confirm one
+    #: died with the owner.
+    OWNER_LOST = "owner_lost"
+    #: The frozen candidate changes a file on the DSH context list (an instruction file, a root
+    #: skill directory) that the task's ``write_allow`` does not name explicitly, or creates,
+    #: changes or deletes a root ``.env`` (refused even when named). Decided after the freeze,
+    #: before a candidate ref is written or a check runs; a check on listed files, not a sandbox.
+    CONTEXT_FILE_CHANGE = "context_file_change"
+    #: The workspace a real client would be launched in holds a root entry named ``.env`` (any
+    #: letter case). DSH loads ``<cwd>/.env`` at launch into its own environment and its tool
+    #: processes (documented upstream, not observed); HFlow never opens it, so the launch is
+    #: refused - at admission when the starting workspace holds it, otherwise before any process.
+    WORKSPACE_ENV_FILE = "workspace_env_file"
+    #: A real launch binds a ``DSH_HOME`` that is relative, cannot be resolved, equals or lies
+    #: inside the workspace / the user's checkout / the worktree directory, or contains one of
+    #: them: the agent could write what DSH loads from its home at the next launch.
+    DSH_HOME_IN_WORKSPACE = "dsh_home_in_workspace"
+    #: A launch entry file bound by content (node.exe, the acpx entry and its package.json, the
+    #: dsh launcher and its carrier entry and package.json) no longer has the bytes - or the final
+    #: path - it had when the launch was resolved or approved. Refused before any process exists.
+    LAUNCH_CONTENT_CHANGED = "launch_content_changed"
 
 
 class RefusedError(RuntimeError):
@@ -2041,3 +2323,40 @@ class RunInspection(BaseModel):
     root_budget: RootBudgetUsage | None = None
     invocations: list[InvocationIntent] = Field(default_factory=list)
     invocation_counts: InvocationStateCounts = Field(default_factory=InvocationStateCounts)
+    #: The run's recorded owner and a read-only liveness probe of it, taken by this command.
+    #: ``None`` only for a ledger that cannot record one.
+    owner: RunOwner | None = None
+    #: Operator settlements of this run's unresolved entries (``hflow ledger settle``), oldest
+    #: first. Attestations, not observations; empty when none was recorded.
+    invocation_settlements: list[InvocationSettlement] = Field(default_factory=list)
+
+
+class RunOwner(BaseModel):
+    """Who owns a run (storage v6) and what a read-only probe observed about that owner now.
+
+    ``token``/``pid``/``created``/``host`` are ``None`` for a run written before owner identity
+    existed (or claimed without one): "not recorded", never inferred from ``claimed_by``.
+    ``liveness`` is ``matching`` / ``gone`` / ``unknown``, ``not_recorded`` when the run records no
+    owner at all (a recorded absence, not an observation), or ``not_probed`` for a terminal run;
+    ``lock`` is ``held`` / ``free`` / ``absent`` / ``not_applicable`` / ``unknown``. A probe result is
+    this command's observation, not a stored fact, and is never upgraded from a missing answer.
+    """
+
+    model_config = Strict
+
+    label: str | None = None
+    token: str | None = None
+    pid: int | None = None
+    created: int | None = None
+    created_utc: str = "not recorded"
+    host: str | None = None
+    generation: int = 0
+    liveness: str = "unknown"
+    lock: str = "unknown"
+    #: ``True`` only when this command actually asked the operating system about the owner;
+    #: ``not_recorded``, ``not_probed`` and rule-based ``unknown`` answers are not observations.
+    probed: bool = False
+    detail: str = ""
+
+
+RunInspection.model_rebuild()

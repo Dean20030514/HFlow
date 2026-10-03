@@ -379,6 +379,11 @@ def test_a_migration_interrupted_at_any_step_rolls_back_and_a_later_open_succeed
     """
     reference = tmp_path / "reference" / "hflow.sqlite"
     _build_v1_database(reference, task_spec)
+    # Storage v6 adds columns to ``runs`` itself, so the migrated reference no longer has the v1
+    # row shape; an interrupted file is compared with an untouched v1 build instead.
+    pristine = tmp_path / "pristine" / "hflow.sqlite"
+    _build_v1_database(pristine, task_spec)
+    pristine_runs = _content_digest(pristine)["runs"]
     steps: list[str] = []
     migrated = Store(reference, on_migration_step=steps.append)
     migrated.close()
@@ -407,7 +412,8 @@ def test_a_migration_interrupted_at_any_step_rolls_back_and_a_later_open_succeed
         assert "invocations" not in _tables(path)
         assert "root_id" not in _columns(path, "authorizations")
         assert "root_id" not in _columns(path, "attempts")
-        assert _content_digest(path)["runs"] == _content_digest(reference)["runs"]
+        assert "owner_token" not in _columns(path, "runs")
+        assert _content_digest(path)["runs"] == pristine_runs
 
         # The snapshot is taken before the transaction by design, so it is there to restore
         # from even though the migration itself rolled back.

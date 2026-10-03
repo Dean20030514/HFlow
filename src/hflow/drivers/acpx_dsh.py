@@ -18,6 +18,11 @@ Facts baked in from the M0 probe and the installed acpx 0.17.1 bundle (not assum
   prompt or credentials - only the fixed launcher path and profile flag.
 * acpx always loads ``<--cwd>/.acpxrc.json`` and lets it override this driver's config,
   agent argv included, with no opt-out; a workspace that has one is refused before spawn.
+* DSH loads ``<cwd>/.env`` at launch (documented upstream, not observed), so a workspace whose
+  root holds a ``.env`` is refused before spawn too - by listing only, the file is never opened
+  - and so is a bound ``DSH_HOME`` that is relative, unresolvable, inside the workspace (or the
+  user's checkout and its worktree directory) or around it: the agent could write what DSH
+  loads from its home.
 * The task body goes through acpx's documented stdin path (``-f -``), written from its own
   thread after both output readers started, then the child's stdin is closed so input is
   complete. The ACP stdin between acpx and DSH is acpx's own
@@ -160,6 +165,13 @@ NO_CWD_EXE_SEARCH_ENV = "NoDefaultCurrentDirectoryInExePath"
 #: opt-out in 0.17.1; upstream issue #835) and lets it override the global config this driver
 #: writes - including the agent argv, which no CLI flag can override on Windows.
 WORKSPACE_CLIENT_CONFIG_NAME = ".acpxrc.json"
+#: DSH's workspace env file. DSH's app boot reads ``<cwd>/.env`` and applies what it sets to its
+#: own environment and its tool processes (documented at dsh 5badb150, not observed). A real
+#: launch refuses a workspace whose root holds an entry by this name; it is never opened.
+WORKSPACE_ENV_FILE_NAME = ".env"
+#: Where ``GitRepo.worktree_parent`` puts a run's worktrees: ``<checkout>.hflow-worktrees`` beside
+#: the checkout. The spawn gate uses it to name the user's checkout from a worktree's path.
+WORKTREE_PARENT_SUFFIX = ".hflow-worktrees"
 #: Written around a packet so the prompt text a driver actually sent is recoverable, and so a
 #: bare ``goal`` (a direct driver call) is still traceable to the request it came from. The
 #: digest covers the prompt text alone, so this envelope cannot change what the digest means.
@@ -397,9 +409,14 @@ def resolve_launch_config(
         raise RefusedError(RefusalCode.INVALID_SPEC, str(exc)) from exc
     resolved_data_dir = Path(data_dir)
 
+    from .launch_content import bind_launch_content, final_path
+
     entry = _resolve_client_entry(
         data_dir=resolved_data_dir, explicit=acpx_cli, env=source
     )
+    if entry is not None:
+        # Followed once, here: the path hashed by the content binding is the path spawned.
+        entry = Path(final_path(str(entry)))
     problems: list[str] = []
     if entry is None:
         problems.append(
@@ -409,10 +426,14 @@ def resolve_launch_config(
         )
 
     def program(label: str, explicit: str | None, name: str, *, needed: bool) -> str:
-        """An absolute program path, or ``""`` (with a problem recorded when it is needed)."""
+        """An absolute program path, or ``""`` (with a problem recorded when it is needed).
+
+        Links and junctions are followed once (:func:`launch_content.final_path`), so the file
+        the content binding hashes is the file that is started.
+        """
         if explicit:
             if Path(explicit).is_absolute():
-                return explicit
+                return final_path(explicit)
             if needed:
                 problems.append(
                     f"{label} {explicit!r} is not an absolute path. A relative program is "
@@ -427,7 +448,7 @@ def resolve_launch_config(
                 "the current directory). A bare name would be looked up in the workspace first, "
                 "so it is never a fallback; put it on PATH or name its absolute path."
             )
-        return found
+        return final_path(found) if found else found
 
     suffix = entry.suffix.lower() if entry is not None else ""
     resolved_dsh = program(
@@ -499,7 +520,7 @@ def resolve_launch_config(
                 )
     resolvable = not problems
     detail = " ".join(problems)
-    return LaunchConfig(
+    launch = LaunchConfig(
         driver_id=DRIVER_ID,
         harness="dsh",
         agent_argv=agent_argv,
@@ -513,6 +534,19 @@ def resolve_launch_config(
         model=model,
         resolvable=resolvable,
         detail=detail,
+    )
+    if not resolvable:
+        return launch
+    # H6: the launch entry files bound by content. A file that cannot be hashed, or a binding
+    # that cannot name what it says it covers, makes the launch not resolvable - refused at
+    # prepare, like a missing program.
+    digests, content_problems, content_notes = bind_launch_content(launch)
+    if content_problems:
+        return launch.model_copy(
+            update={"resolvable": False, "detail": " ".join(content_problems)}
+        )
+    return launch.model_copy(
+        update={"content_digests": digests, "content_notes": content_notes}
     )
 
 
@@ -822,14 +856,32 @@ class _ModelWatch:
 def _workspace_client_config(workspace: Path) -> Path | None:
     """The workspace's acpx project config if any entry by that name exists, else ``None``.
 
+    See :func:`_workspace_root_entry` for how the entry is found.
+    """
+    return _workspace_root_entry(workspace, WORKSPACE_CLIENT_CONFIG_NAME)
+
+
+def _workspace_env_file(workspace: Path) -> Path | None:
+    """The workspace's ``.env`` if any root entry by that name exists, else ``None``.
+
+    Found by listing and ``lstat`` only (:func:`_workspace_root_entry`): the file may hold
+    credentials and is never opened, so what it sets is unknown and any entry refuses.
+    """
+    return _workspace_root_entry(workspace, WORKSPACE_ENV_FILE_NAME)
+
+
+def _workspace_root_entry(workspace: Path, file_name: str) -> Path | None:
+    """The workspace root's entry named ``file_name`` (any letter case) if one exists, else ``None``.
+
     ``lstat`` rather than ``exists``: a file, a directory, a broken link or a junction all count,
     because what acpx would make of any of them is not something to reason about here. The name
     is matched without regard to case, on every filesystem: where the filesystem ignores case
     (NTFS by default), acpx's open of ``.acpxrc.json`` finds ``.ACPXRC.JSON`` too, and refusing
     a lookalike elsewhere is the safe side. The returned path carries the spelling found on disk.
-    Only the workspace root's own entries count; acpx does not walk into subdirectories.
+    Only the workspace root's own entries count; acpx does not walk into subdirectories (nor
+    does DSH for its ``.env``). Nothing is opened: a listing and at most one ``lstat``.
     """
-    candidate = workspace / WORKSPACE_CLIENT_CONFIG_NAME
+    candidate = workspace / file_name
     try:
         names = os.listdir(workspace)
     except (FileNotFoundError, NotADirectoryError):
@@ -837,18 +889,108 @@ def _workspace_client_config(workspace: Path) -> Path | None:
     except OSError:
         # Any other failure (access denied, for one) does not show the entry is absent.
         return candidate
-    wanted = WORKSPACE_CLIENT_CONFIG_NAME.casefold()
+    wanted = file_name.casefold()
     for name in names:
         if name.casefold() == wanted:
             return workspace / name
     try:
-        # The listing missed it; a direct lookup is the open acpx itself would make.
+        # The listing missed it; a direct lookup is the open the client itself would make.
         os.lstat(candidate)
     except (FileNotFoundError, NotADirectoryError):
         return None
     except OSError:
         return candidate
     return candidate
+
+
+def _path_forms(path: str | Path) -> set[str]:
+    """``path`` as written (made absolute) and with links resolved, both case-folded.
+
+    Raises ``OSError``/``ValueError`` when the path cannot be resolved; a caller refuses then.
+    A NUL is refused here: ``realpath`` does not reject one, and no OS path can hold it.
+    """
+    if "\0" in str(path):
+        raise ValueError("the path contains a NUL character")
+    return {
+        os.path.normcase(os.path.abspath(path)).casefold(),
+        os.path.normcase(os.path.realpath(path)).casefold(),
+    }
+
+
+def _same_or_inside(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip("\\/") + os.sep)
+
+
+def dsh_home_workspace_problem(dsh_home: str, workspaces: Sequence[Path]) -> str:
+    """Why a bound ``DSH_HOME`` may not be used with these directories, or ``""``.
+
+    DSH loads its patch layers (which can replace the sandbox and approval rows), ``AGENTS.md``,
+    skills and ``.env`` from its home, and never checks where that home is (documented at dsh
+    5badb150, not observed). A home the agent can write is therefore refused: one that equals or
+    lies inside any of ``workspaces`` (the agent's cwd, the user's checkout, the worktree
+    directory) - and one that contains any of them, which puts ``$DSH_HOME/AGENTS.md`` and the
+    home ``.env`` on the project's ancestry. Both the path as written and its links resolved are
+    compared, case-folded, and either one inside refuses: DSH compares the string it was given,
+    while a link or junction can point somewhere else. A path that cannot be resolved refuses.
+
+    A relative value is refused before anything is resolved: DSH would resolve it against the
+    directory it starts in - the workspace - and whether DSH expands a leading ``~`` is not
+    verified, so a ``~`` value is refused as relative too (``Path.is_absolute`` is ``False`` for
+    it). ``dsh_home`` empty (unbound) is no problem: the driver then gives each invocation its own
+    home under the data directory. Read-only: path resolution only, nothing is opened or created.
+    """
+    if not dsh_home:
+        return ""
+    if not Path(dsh_home).is_absolute():
+        return (
+            f"DSH_HOME {dsh_home!r} is not an absolute path: DSH would resolve it against the "
+            "directory it starts in - the workspace - and whether it expands a leading '~' is "
+            "not verified"
+        )
+    try:
+        home_forms = _path_forms(dsh_home)
+    except (OSError, ValueError) as exc:
+        return (
+            f"DSH_HOME {dsh_home} could not be resolved ({type(exc).__name__}: {exc}), so "
+            "whether it lies inside the workspace is unknown"
+        )
+    for workspace in workspaces:
+        try:
+            root_forms = _path_forms(workspace)
+        except (OSError, ValueError) as exc:
+            return (
+                f"the workspace {workspace} could not be resolved ({type(exc).__name__}: "
+                f"{exc}), so whether DSH_HOME {dsh_home} lies inside it is unknown"
+            )
+        if any(_same_or_inside(home, root) for home in home_forms for root in root_forms):
+            return (
+                f"DSH_HOME {dsh_home} is, or lies inside, {workspace}: the agent can write "
+                "there, and DSH loads its patch layers, AGENTS.md, skills and .env from its "
+                "home at the next launch"
+            )
+        if any(_same_or_inside(root, home) for home in home_forms for root in root_forms):
+            return (
+                f"{workspace} lies inside DSH_HOME {dsh_home}: the home's AGENTS.md and .env "
+                "would sit on the project's ancestry, inside what the agent works in"
+            )
+    return ""
+
+
+def spawn_workspaces(workspace: Path) -> list[Path]:
+    """The directories a launch in ``workspace`` must keep a bound DSH home out of.
+
+    The workspace itself, and - when it is a run's worktree (``<checkout>.hflow-worktrees/<id>``,
+    :data:`WORKTREE_PARENT_SUFFIX`) - that worktree directory and the user's checkout it was named
+    after. The checkout is derived from the name alone; admission checks the real project root.
+    """
+    absolute = Path(os.path.abspath(workspace))
+    roots = [absolute]
+    parent = absolute.parent
+    suffix = WORKTREE_PARENT_SUFFIX.casefold()
+    if parent.name.casefold().endswith(suffix) and len(parent.name) > len(suffix):
+        roots.append(parent)
+        roots.append(parent.parent / parent.name[: -len(suffix)])
+    return roots
 
 
 class AcpxDshDriver:
@@ -1099,6 +1241,7 @@ class AcpxDshDriver:
             "model_selection capability: documented only - no set_config_option round trip "
             "with a real DSH has been observed; each run records what its stream showed",
         ]
+        notes.extend(self._content_notes())
         try:
             from .dsh_surfaces import observe_launch_surfaces, probe_notes
 
@@ -1133,7 +1276,9 @@ class AcpxDshDriver:
         )
         notes.append(
             "a workspace containing .acpxrc.json is refused before spawn: acpx would let it "
-            "override this driver's config, agent argv included"
+            "override this driver's config, agent argv included; so is a workspace whose root "
+            "holds a .env (DSH loads it at launch; listed only, never opened) and a bound "
+            "DSH_HOME that is relative, inside the workspace or around it"
         )
         return CapabilityReport(
             driver_id=DRIVER_ID,
@@ -1208,6 +1353,9 @@ class AcpxDshDriver:
         must be explicit that they are running a metadata probe, never a task.
         """
         argv = [*self._client_prefix(), str(self.acpx_cli), *(args or ["--version"])]
+        content_refusal = self._launch_content_refusal()
+        if content_refusal:
+            raise RefusedError(RefusalCode.LAUNCH_CONTENT_CHANGED, content_refusal)
         work_dir = self.data_dir / "readonly-check"
         work_dir.mkdir(parents=True, exist_ok=True)
         stdout_path = work_dir / "stdout.txt"
@@ -1253,6 +1401,43 @@ class AcpxDshDriver:
     def _client_prefix(self) -> list[str]:
         """Interpreter prefix for the client entry point, as resolved before any approval."""
         return list(self.launch.client_argv_prefix)
+
+    def _content_notes(self) -> list[str]:
+        """The probe's (and so doctor's) lines for the launch content binding."""
+        from .launch_content import CONTENT_BINDING_LABEL, content_lines
+
+        if not self.launch.content_digests:
+            return [
+                "launch content: not bound - this launch recorded no entry-file digests (it was "
+                "not resolved by resolve_launch_config); it is bound by path only"
+            ]
+        return [
+            f"launch content: {CONTENT_BINDING_LABEL} (SHA-256 taken at resolution, checked "
+            "again just before each spawn; the window between that check and process creation "
+            "stays open on Windows, which has no exec-by-handle)",
+            *(f"launch content: {line}" for line in content_lines(self.launch)),
+            *(f"launch content: {note}" for note in self.launch.content_notes),
+        ]
+
+    def _launch_content_refusal(self) -> str:
+        """Why the launch entry files no longer match the launch's recorded content, or ``""``.
+
+        Hashes again (node.exe is ~90 MB, ~60 ms warm). Anything unexpected while checking is a
+        refusal too: the check fails closed. A file swapped after this check and before
+        ``CreateProcess`` is not caught - Windows offers no exec-by-handle.
+        """
+        from .launch_content import launch_content_changes
+
+        try:
+            changes = launch_content_changes(self.launch)
+        except Exception as exc:  # noqa: BLE001 - an unchecked launch is not started
+            changes = [f"the content check itself failed: {type(exc).__name__}: {exc}"]
+        if not changes:
+            return ""
+        return (
+            "the launch entry files no longer match the content bound when the launch was "
+            "resolved: " + "; ".join(changes) + "."
+        )
 
     def _observe_launch(
         self, invocation_id: str, *, workspace: Path, env: Mapping[str, str], child_home: Path
@@ -1394,6 +1579,59 @@ class AcpxDshDriver:
                     )
                     self._report_spawn(request, created=False, pid=None, detail=message)
                     raise RefusedError(RefusalCode.WORKSPACE_CLIENT_CONFIG, message)
+                env_file = _workspace_env_file(workspace)
+                if env_file is not None:
+                    # The same gate and the same reasoning as the client config above: DSH loads
+                    # ``<cwd>/.env`` at launch. Listed and lstat'ed only - never opened, so what
+                    # it sets is unknown and any entry by that name refuses. One already in the
+                    # starting workspace is refused at admission
+                    # (``prepare.start_workspace_env_file``).
+                    boundary.close()
+                    message = (
+                        f"{env_file} exists in the workspace. DSH loads <cwd>/.env at launch "
+                        "into its own environment and its tool processes (documented upstream, "
+                        "not observed); HFlow never opens it, so no client process was started. "
+                        "(A run that starts with one is refused at admission, before anything is "
+                        "reserved; this one was found at launch, when the dispatch was already "
+                        "reserved, so the run stays blocked.) Remove or rename the file (or "
+                        "directory), then submit a new revision of the task: an identical "
+                        "TaskSpec returns this blocked run, and under a root budget the new "
+                        "revision's first implementer counts as a repair, so it needs a repair "
+                        "attempt left on the root."
+                    )
+                    self._report_spawn(request, created=False, pid=None, detail=message)
+                    raise RefusedError(RefusalCode.WORKSPACE_ENV_FILE, message)
+                home_problem = dsh_home_workspace_problem(
+                    self.launch.dsh_home, spawn_workspaces(workspace)
+                )
+                if home_problem:
+                    # Admission refuses this against the project root and the worktree directory
+                    # (``prepare.launch_dsh_home_problem``); checked again here against the
+                    # role's actual cwd, for every invocation, before any process exists.
+                    boundary.close()
+                    message = (
+                        f"{home_problem}. No client process was started. Point DSH_HOME at an "
+                        "absolute directory outside the project, its worktrees and this "
+                        "workspace (or unset it, so each invocation gets its own home), then "
+                        "prepare again: DSH_HOME is part of the approved launch, so a real run "
+                        "needs an authorization for the new binding, and since this dispatch "
+                        "was already reserved the run stays blocked - submit a new revision."
+                    )
+                    self._report_spawn(request, created=False, pid=None, detail=message)
+                    raise RefusedError(RefusalCode.DSH_HOME_IN_WORKSPACE, message)
+                content_refusal = self._launch_content_refusal()
+                if content_refusal:
+                    # The last check before the process exists: the entry files are hashed again
+                    # and compared with what the launch recorded. Nothing is created and no handle
+                    # is published, as for the workspace config above.
+                    boundary.close()
+                    message = (
+                        f"{content_refusal} No client process was started; the run stays "
+                        "blocked. Run `hflow prepare` again to see the files' current digests and "
+                        "re-issue the authorization for them."
+                    )
+                    self._report_spawn(request, created=False, pid=None, detail=message)
+                    raise RefusedError(RefusalCode.LAUNCH_CONTENT_CHANGED, message)
                 try:
                     stdout_handle = stdout_path.open("wb")
                     child = popen_in_boundary(

@@ -216,6 +216,8 @@ def test_client_argv_uses_the_right_interpreter_for_the_entry_point(tmp_path: Pa
     node_cli = tmp_path / "node_modules" / "acpx" / "dist" / "cli.js"
     node_cli.parent.mkdir(parents=True)
     node_cli.write_text("// the client entry point, not executed here\n", encoding="utf-8")
+    # A Node entry's package.json is a launch entry file bound by content (H6).
+    (node_cli.parent.parent / "package.json").write_text('{"name": "acpx"}', encoding="utf-8")
     node_entry = AcpxDshDriver(data_dir=tmp_path, acpx_cli=node_cli)
     argv = node_entry._client_argv(tmp_path, tmp_path, 60)
     assert argv[0] == node_entry.node_executable
@@ -351,6 +353,8 @@ def test_the_batch_shim_wrapper_is_the_absolute_system_cmd_exe(tmp_path: Path) -
     cmd = system_root / "System32" / "cmd.exe"
     cmd.write_bytes(b"")
     shim = tmp_path / "bin" / "dsh.CMD"
+    # The launcher file exists: a launch binds its content (H6), so a missing one is refused.
+    _launcher_stand_in(shim.parent, shim.name)
 
     launch = resolve_launch_config(
         data_dir=tmp_path,
@@ -534,6 +538,9 @@ def test_an_acpx_client_entry_the_agent_can_write_is_not_resolvable(
             workspaces = [workspace, dependency]
     entry.parent.mkdir(parents=True, exist_ok=True)
     entry.write_text("// stand-in; resolution only", encoding="utf-8")
+    if layout != "loose":
+        # The package.json of the entry's package is bound by content too (H6).
+        (entry.parent.parent / "package.json").write_text('{"name": "acpx"}', encoding="utf-8")
 
     launch = resolve_launch_config(
         data_dir=tmp_path / "data",
@@ -968,7 +975,14 @@ def test_exhausted_budget_never_reaches_the_cli(
             turn_limit=1,
             repair_limit=0,
         )
-        store.claim_run(run["run_id"], "local-controller")
+        # Claimed for this controller's owner identity (owner lease): a label-only claim is never
+        # adopted by a controller.
+        store.claim_run_owned(
+            run["run_id"],
+            "local-controller",
+            token=controller.owner_token,
+            identity=controller.owner_identity,
+        )
         store.reserve_turn(run["run_id"], "local-controller", turns=1)
         store.set_task_state(run["run_id"], [TaskState.DRAFT], TaskState.READY)
 
@@ -1385,18 +1399,20 @@ def test_an_invocation_records_the_empty_per_invocation_dsh_home_it_launched_wit
     harness.driver.release(handle.invocation_id)
 
 
-def test_a_bound_home_and_a_workspace_env_are_recorded_and_do_not_change_the_launch(
+def test_a_bound_home_and_its_env_are_recorded_and_do_not_change_the_launch(
     tmp_path: Path, harness_factory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # A workspace .env now refuses a real launch (tests/test_launch_refusals.py); the home's
+    # .env, outside the workspace, is still only recorded - by presence and size, never opened.
     bound = tmp_path / "bound-home"
     bound.mkdir()
     cordis = b"sandbox:\n  mode: read-only\n"
     (bound / "cordis.patch.yml").write_bytes(cordis)
-    monkeypatch.setenv("DSH_HOME", str(bound))
-    harness = harness_factory("cooperative")
-    (harness.workspace / ".env").write_text(
+    (bound / ".env").write_text(
         "DSH_SANDBOX_HINT=x\nDEEPSEEK_API_KEY=sk-sentinel-456", encoding="utf-8"
     )
+    monkeypatch.setenv("DSH_HOME", str(bound))
+    harness = harness_factory("cooperative")
     handle, _ = harness.start()
     result = harness.driver.collect(handle)
 
@@ -1405,8 +1421,8 @@ def test_a_bound_home_and_a_workspace_env_are_recorded_and_do_not_change_the_lau
     assert surfaces is not None and surfaces.dsh_home_kind == "bound"
     files = {entry.name: entry for entry in surfaces.dsh_home_files}
     assert files["cordis.patch.yml"].sha256 == "sha256:" + hashlib.sha256(cordis).hexdigest()
-    assert surfaces.workspace_env is not None
-    assert surfaces.workspace_env.present is True and surfaces.workspace_env.sha256 == ""
+    assert files[".env"].present is True and files[".env"].sha256 == ""
+    assert surfaces.workspace_env is not None and surfaces.workspace_env.present is False
     assert "sk-sentinel-456" not in result.model_dump_json()
     harness.driver.release(handle.invocation_id)
 

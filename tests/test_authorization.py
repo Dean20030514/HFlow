@@ -257,6 +257,7 @@ def test_a_recorded_authorization_from_an_earlier_build_still_loads_and_digests_
     assert record.binding.profile_id == ""
     assert record.binding.root_budget is None
     assert record.binding.project_contract_digest == ""
+    assert record.binding.launch_content_digest == ""
     assert record.root_limits is None
     assert record.binding_digest() == LEGACY_FIXTURE_DIGEST
 
@@ -266,6 +267,7 @@ def test_a_recorded_authorization_from_an_earlier_build_still_loads_and_digests_
         "profile_id",
         "root_budget",
         "project_contract_digest",
+        "launch_content_digest",
     }
     old_recipe = digest_of({field: binding_document[field] for field in LEGACY_BINDING_FIELDS})
     assert old_recipe == LEGACY_FIXTURE_DIGEST

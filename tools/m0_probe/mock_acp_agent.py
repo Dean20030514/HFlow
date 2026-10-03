@@ -408,7 +408,7 @@ def role_answer(prompt_text: str) -> str:
     mode = os.environ.get(REVIEW_MODE_ENV, "fenced")
     verdict = {
         "verdict": "accepted",
-        "findings": [{"id": "AC-1", "status": "pass", "detail": "empty input returns the agreed result"}],
+        "findings": [{"id": "AC-1", "body": "empty input returns the agreed result"}],
     }
     if mode == "bare":
         return json.dumps(verdict)

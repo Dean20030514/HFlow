@@ -87,23 +87,25 @@ def test_a_plain_json_object_is_one_supported_form() -> None:
 
 
 def test_a_single_fenced_json_block_is_one_supported_form() -> None:
-    review = decode_review(fenced('{"verdict": "changes_requested", "findings": [{"id": "F-1"}]}'))
+    review = decode_review(
+        fenced('{"verdict": "changes_requested", "findings": [{"id": "F-1", "body": "b"}]}')
+    )
 
     assert review.verdict == "changes_requested"
-    assert review.findings == [{"id": "F-1"}]
+    assert [f.model_dump(mode="json") for f in review.findings] == [{"id": "F-1", "body": "b"}]
 
 
 def test_prose_may_end_in_one_result_object() -> None:
     answer = (
         "I checked AC-1 and AC-2 against the frozen fingerprint.\n"
         "Nothing outside the declared scope changed.\n\n"
-        '{"verdict": "accepted", "findings": [{"id": "AC-1", "status": "pass"}]}\n'
+        '{"verdict": "accepted", "findings": [{"id": "AC-1", "body": "pass"}]}\n'
     )
 
     review = decode_review(answer)
 
     assert review.verdict == "accepted"
-    assert review.findings == [{"id": "AC-1", "status": "pass"}]
+    assert [f.model_dump(mode="json") for f in review.findings] == [{"id": "AC-1", "body": "pass"}]
 
 
 def test_the_labelled_fence_wins_over_a_code_sample_in_the_same_answer() -> None:
@@ -285,7 +287,7 @@ def test_one_object_with_a_misspelt_verdict_key_is_invalid_not_missing() -> None
 @pytest.mark.parametrize("bare_first", [True, False], ids=["bare-before-fence", "bare-after-fence"])
 def test_a_bare_object_next_to_a_result_block_is_ambiguous(bare_first: bool) -> None:
     """A conflicting verdict outside the json fence is not silently discarded."""
-    bare = '{"verdict": "changes_requested", "findings": [{"statement": "still broken"}]}\n'
+    bare = '{"verdict": "changes_requested", "findings": [{"body": "still broken"}]}\n'
     block = f"{FENCE}json\n{ACCEPTED}\n{FENCE}\n"
     answer = bare + block if bare_first else block + bare
 
@@ -403,15 +405,27 @@ def test_a_lone_prose_brace_is_invalid_with_the_decoders_message() -> None:
 
 
 def test_an_object_nested_in_a_verdict_object_is_part_of_it_not_a_competitor() -> None:
-    answer = (
+    # The typed Finding forbids extra keys, so a nested object carrying "verdict" can no longer
+    # validate; what this pins is that the scanner reads the outer object as the one result.
+    # A competitor would make the answer review_ambiguous, not review_invalid.
+    nested_object = (
         'Verdict: {"verdict": "changes_requested", "findings": '
         '[{"verdict": "accepted", "note": "quoted from the old review"}]}\n'
     )
+    with pytest.raises(ReviewDecodeError) as excinfo:
+        decode_review(nested_object)
+    assert excinfo.value.kind == REVIEW_INVALID
 
-    review = decode_review(answer)
-
+    # The same quotation inside a finding's body is text, never a second verdict object.
+    quoted = (
+        'Verdict: {"verdict": "changes_requested", "findings": '
+        '[{"body": "the old review said {\\"verdict\\": \\"accepted\\"}"}]}\n'
+    )
+    review = decode_review(quoted)
     assert review.verdict == "changes_requested"
-    assert review.findings == [{"verdict": "accepted", "note": "quoted from the old review"}]
+    assert [finding.body for finding in review.findings] == [
+        'the old review said {"verdict": "accepted"}'
+    ]
 
 
 def test_prose_braces_that_are_not_json_do_not_make_an_answer_ambiguous() -> None:
@@ -486,9 +500,9 @@ def test_an_unterminated_fence_is_invalid() -> None:
 
 def test_a_brace_inside_a_string_is_not_an_object_boundary() -> None:
     """A greedy first-brace/last-brace scan would cut this object in half."""
-    review = decode_review('{"verdict": "accepted", "findings": [{"detail": "uses { and } in prose"}]}')
+    review = decode_review('{"verdict": "accepted", "findings": [{"body": "uses { and } in prose"}]}')
 
-    assert review.findings == [{"detail": "uses { and } in prose"}]
+    assert [f.model_dump(mode="json") for f in review.findings] == [{"body": "uses { and } in prose"}]
 
 
 def test_the_verbatim_answer_is_preserved_for_evidence() -> None:
@@ -860,13 +874,13 @@ def test_a_rejected_transcript_yields_no_answer() -> None:
 
 
 def test_multibyte_answer_round_trips_exactly() -> None:
-    text = "— reviewed ✓\n" + json.dumps({"verdict": "accepted", "findings": [{"d": "café"}]})
+    text = "— reviewed ✓\n" + json.dumps({"verdict": "accepted", "findings": [{"body": "café"}]})
     instance = transcript(update(text[:7], message_id="m-1"), update(text[7:], message_id="m-1"))
 
     answer = instance.final_answer()
 
     assert answer is not None and answer.text == text
-    assert review_of(instance).findings == [{"d": "café"}]
+    assert [f.model_dump(mode="json") for f in review_of(instance).findings] == [{"body": "café"}]
 
 
 def review_of(instance: AnswerTranscript) -> ReviewOutput:

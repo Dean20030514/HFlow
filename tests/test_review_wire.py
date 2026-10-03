@@ -155,7 +155,7 @@ def test_a_reviewer_verdict_is_decoded_from_the_final_message(tmp_path: Path) ->
     assert result.review is not None, "the reviewer's structured verdict was discarded"
     assert result.review == ReviewOutput(
         verdict="accepted",
-        findings=[{"id": "AC-1", "status": "pass", "detail": "empty input returns the agreed result"}],
+        findings=[{"id": "AC-1", "severity": "P2", "body": "empty input returns the agreed result"}],
     )
     assert f"{REVIEW_INPUT_PREFIX}decoded: accepted" in " ".join(result.limitations)
     harness.driver.release(handle.invocation_id)
@@ -429,8 +429,8 @@ def test_user_and_tool_text_cannot_supply_the_verdict(tmp_path: Path) -> None:
 
     assert result.review is not None
     assert result.review.verdict == "accepted"
-    assert all(finding.get("id") != "user-text" for finding in result.review.findings)
-    assert all(finding.get("id") != "tool-output" for finding in result.review.findings)
+    assert all(finding.id != "user-text" for finding in result.review.findings)
+    assert all(finding.id != "tool-output" for finding in result.review.findings)
     harness.driver.release(handle.invocation_id)
 
 
@@ -449,7 +449,7 @@ def test_a_reasoning_block_inside_the_final_message_is_skipped_not_a_boundary(
     assert result.outcome is InvocationOutcome.COMPLETED
     assert result.review == ReviewOutput(
         verdict="accepted",
-        findings=[{"id": "AC-1", "status": "pass", "detail": "empty input returns the agreed result"}],
+        findings=[{"id": "AC-1", "severity": "P2", "body": "empty input returns the agreed result"}],
     )
     assert f"{REVIEW_INPUT_PREFIX}decoded: accepted" in " ".join(result.limitations)
     harness.driver.release(handle.invocation_id)
@@ -720,7 +720,7 @@ def test_changes_requested_keeps_its_findings_and_blocks(
     assert len(evidence) == 1
     detail = json.loads(evidence[0]["detail"])
     assert detail["verdict"] == "changes_requested"
-    assert detail["findings"][0]["detail"] == "empty input still reaches an invalid index"
+    assert detail["findings"][0]["body"] == "empty input still reaches an invalid index"
 
 
 @pytest.mark.parametrize(

@@ -57,6 +57,7 @@ POST_BINDING_FIELDS = (
     "effective_config_digest",
     "root_budget",
     "project_contract_digest",
+    "launch_content_digest",
 )
 
 
@@ -111,7 +112,8 @@ class AuthorizationBinding(BaseModel):
     authorize a run that resolved a configuration (see :func:`verify_authorization`).
 
     The same holds for the *project contract* (``project_contract_digest``) and for ``roles``,
-    which on a resolved run are the roles the task will actually dispatch.
+    which on a resolved run are the roles the task will actually dispatch, and for the content
+    of the launch entry files (``launch_content_digest``).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -138,6 +140,13 @@ class AuthorizationBinding(BaseModel):
     #: check could be swapped for a no-op, or the review dropped, after the user saw them.
     #: Dropped from the digest while empty, like the other post-binding fields.
     project_contract_digest: str = ""
+    #: ``EffectiveConfig.launch_content_digest()``: the SHA-256 of every role's launch entry
+    #: files (the client interpreter - node.exe -, the acpx entry and its package.json, the dsh
+    #: launcher and its carrier entry and package.json). Replacing one of those files at the same
+    #: path after approval stops the approval applying. Transitive modules and anything Node loads
+    #: later remain bound by path. Dropped from the digest while empty, like the other
+    #: post-binding fields.
+    launch_content_digest: str = ""
 
     def digest(self) -> str:
         """Identity of what this binding covers.
@@ -302,6 +311,7 @@ def current_binding(
         binding.effective_config_digest = effective.digest()
         binding.profile_id = effective.profile_id
         binding.project_contract_digest = project_contract_digest(project)
+        binding.launch_content_digest = effective.launch_content_digest()
     if root_binding is not None:
         binding.root_budget = root_binding
     return binding
@@ -371,7 +381,36 @@ def verify_authorization(
         )
     _verify_effective_config(actual, expected)
     _verify_project_contract(actual, expected)
+    _verify_launch_content(actual, expected)
     _verify_root_budget(actual, expected)
+
+
+def _verify_launch_content(actual: AuthorizationBinding, expected: AuthorizationBinding) -> None:
+    """The launch-content half of the check, on the same terms as the contract half.
+
+    A run whose launch resolved content digests refuses an artifact that names none: nothing in
+    it says which node.exe, acpx or dsh carrier bytes the user approved, so it is re-issued, not
+    reused. A different digest means a launch entry file changed since approval.
+    """
+    if not expected.launch_content_digest:
+        return
+    if not actual.launch_content_digest:
+        raise RefusedError(
+            RefusalCode.RISK_DOWNGRADE,
+            "this authorization carries no launch content binding, so it does not say which "
+            "node.exe, acpx entry or dsh carrier files (by content) it approves. It predates "
+            "launch content binding and cannot authorize this run; re-issue it against the "
+            "digests `hflow prepare` prints.",
+        )
+    if actual.launch_content_digest != expected.launch_content_digest:
+        raise RefusedError(
+            RefusalCode.LAUNCH_CONTENT_CHANGED,
+            "a launch entry file changed since approval: authorized launch content "
+            f"{actual.launch_content_digest} != actual {expected.launch_content_digest}. "
+            "Replacing node.exe, the acpx entry or its package.json, or the dsh launcher, carrier "
+            "entry or package.json at the same path does not extend the approval; run `hflow "
+            "prepare` again (it prints each file's digest) and re-issue it.",
+        )
 
 
 def _verify_project_contract(actual: AuthorizationBinding, expected: AuthorizationBinding) -> None:

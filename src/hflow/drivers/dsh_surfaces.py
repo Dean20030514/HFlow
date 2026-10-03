@@ -9,7 +9,9 @@ variables.
 
 This module checks a FIXED list of paths. It never lists a directory, never opens a ``.env`` or
 the home's stored-credentials file, never records a value, executes nothing, refuses nothing and
-binds nothing. :func:`_read_regular` is the only place a file is opened.
+binds nothing. :func:`_read_regular` is the only place a file is opened. :func:`carrier_files`
+and :func:`package_manifest_for` only *name* files; the binding by content is
+``launch_content``'s.
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ import re
 import stat
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NamedTuple
 
 from ..contracts import ClientIdentity, LaunchConfig, LaunchSurfaces, SurfaceFile
 from ..ids import utc_now
@@ -67,6 +69,18 @@ DESKTOP_SHIM_MARKERS = ("electron_run_as_node", "deepseek harness.exe")
 NPM_SHIM_MARKER = "node_modules/@deepseek-ai/dsh/"
 #: What a recorded version may look like; anything else is not recorded.
 _VERSION_TOKEN = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}")
+#: A script a batch shim runs, written relative to the shim's own directory - npm's
+#: ``"%dp0%\node_modules\...\x.js"`` or ``"%~dp0..\...\x.js"`` - read by the launch content
+#: binding (``launch_content``) to name the carrier entry file.
+_SHIM_SCRIPT = re.compile(
+    r"(?:%~dp0|%dp0%)[\\/]*([^\"'%*\r\n]+?\.(?:c|m)?js)(?=[\"'\s]|$)", re.IGNORECASE
+)
+#: An Electron archive (a regular file the Desktop shim's script path passes through) and the
+#: directory Electron keeps the archive's unpacked files in, next to it.
+ARCHIVE_SUFFIX = ".asar"
+ARCHIVE_UNPACKED_SUFFIX = ".unpacked"
+#: What a node_modules package's entry file is: the package root holds its package.json.
+NODE_SCRIPT_SUFFIXES = (".js", ".mjs", ".cjs")
 
 
 def _read_regular(path: Path, limit: int) -> tuple[bytes | None, int | None, str]:
@@ -310,6 +324,198 @@ def observe_client_identity(launch: LaunchConfig) -> ClientIdentity:
     return ClientIdentity(dsh_carrier=carrier, notes=notes, **identity)
 
 
+def package_manifest_for(entry: Path) -> Path | None:
+    """The package.json of the ``node_modules`` package that holds ``entry``, or ``None``.
+
+    The same package root :func:`observe_client_identity` reads the acpx version from
+    (``node_modules/<name>`` or ``node_modules/@scope/<name>``). ``None`` for a loose file and for
+    a file directly inside a ``node_modules`` directory, which belongs to no package.
+    """
+    tree = _client_module_tree(entry)
+    if tree is None:
+        return None
+    parts = Path(os.path.abspath(entry)).relative_to(tree).parts
+    if parts and parts[0].startswith("@"):
+        if len(parts) < 3:
+            return None
+        return tree / parts[0] / parts[1] / "package.json"
+    if len(parts) < 2:
+        return None
+    return tree / parts[0] / "package.json"
+
+
+class CarrierFiles(NamedTuple):
+    """The dsh carrier's launch entry files, as the launch content binding names them.
+
+    ``launcher`` is the dsh file the agent argv starts (``None`` when it starts something
+    else). ``entry`` and ``package_json`` are named only for a classified carrier (Desktop or
+    npm), from the script its shim runs relative to itself. ``archive`` is named instead of
+    them when that script's path passes through a regular file named ``*.asar`` (the installed
+    Desktop app runs ``resources/app.asar/dsh/.../cli.js``): the entry and its package.json
+    exist only inside that Electron archive, which is not parsed, so the archive file itself is
+    what the content binding hashes. ``problem`` is non-empty when a classified carrier's files
+    cannot be named - the content binding then refuses rather than binding less than it says.
+    """
+
+    carrier: Literal["desktop", "npm", "unknown", "not_applicable"]
+    launcher: Path | None
+    entry: Path | None
+    package_json: Path | None
+    problem: str
+    notes: list[str]
+    archive: Path | None = None
+
+
+def _enclosing_archive(entry: Path) -> Path | None:
+    """The regular file named ``*.asar`` that ``entry``'s path passes through, else ``None``.
+
+    Only the nearest existing ancestor of ``entry`` is considered: a path cannot continue
+    below a regular file, so that ancestor is the archive or there is none. Links are followed
+    by ``stat``; the content binding resolves the archive's final path itself. Nothing is
+    opened and the archive is not parsed.
+    """
+    for parent in entry.parents:
+        try:
+            info = os.stat(parent)
+        except (OSError, ValueError):
+            continue
+        if stat.S_ISREG(info.st_mode) and parent.name.casefold().endswith(ARCHIVE_SUFFIX):
+            return parent
+        return None
+    return None
+
+
+def carrier_files(launch: LaunchConfig) -> CarrierFiles:
+    """Name the carrier entry file and its package.json from the dsh shim's text. Runs nothing.
+
+    Classified the way :func:`observe_client_identity` classifies the carrier (same markers):
+    the Desktop shim runs ``DeepSeek Harness.exe`` on a script, the npm shim runs ``node`` on
+    ``node_modules/@deepseek-ai/dsh/...``. The script is the one path ending in ``.js``/``.mjs``/
+    ``.cjs`` that the shim writes relative to its own directory (``%~dp0`` / ``%dp0%``).
+    """
+    dsh = launch.dsh_executable
+    if not dsh or dsh not in launch.agent_argv:
+        return CarrierFiles(
+            "not_applicable",
+            None,
+            None,
+            None,
+            "",
+            ["the agent argv does not start the resolved dsh: no launcher or carrier file is "
+             "bound by content"],
+        )
+    shim = Path(dsh)
+    if shim.suffix.casefold() not in BATCH_SHIM_SUFFIXES:
+        return CarrierFiles(
+            "unknown",
+            shim,
+            None,
+            None,
+            "",
+            ["the dsh launcher is not a batch shim: the launcher file itself is bound by "
+             "content; whatever it loads is bound by path only"],
+        )
+    data, _size, detail = _read_regular(shim, MANIFEST_READ_LIMIT_BYTES)
+    if data is None:
+        return CarrierFiles(
+            "unknown", shim, None, None, f"the dsh shim {shim} could not be read ({detail})", []
+        )
+    raw = data.decode("utf-8", "replace")
+    text = raw.replace("\\", "/").casefold()
+    carrier: Literal["desktop", "npm"]
+    if all(marker in text for marker in DESKTOP_SHIM_MARKERS):
+        carrier = "desktop"
+        interpreter_note = (
+            "the Desktop shim's DeepSeek Harness.exe (the program that runs the carrier entry) is "
+            "bound by path only"
+        )
+    elif NPM_SHIM_MARKER in text:
+        carrier = "npm"
+        interpreter_note = (
+            "the npm shim starts node from its own directory or from PATH; that node is bound by "
+            "path only"
+        )
+    else:
+        return CarrierFiles(
+            "unknown",
+            shim,
+            None,
+            None,
+            "",
+            ["the dsh shim matches neither the Desktop nor the npm layout: only the shim itself "
+             "is bound by content; what it starts is bound by path only"],
+        )
+    scripts: dict[str, Path] = {}
+    for match in _SHIM_SCRIPT.finditer(raw):
+        relative = match.group(1).strip().replace("\\", "/")
+        candidate = Path(os.path.normpath(os.path.join(str(shim.parent), relative)))
+        scripts.setdefault(os.path.normcase(str(candidate)), candidate)
+    if len(scripts) != 1:
+        return CarrierFiles(
+            carrier,
+            shim,
+            None,
+            None,
+            f"the {carrier} dsh shim {shim} names {len(scripts)} script(s) relative to itself, "
+            "so its carrier entry file cannot be named and the launch cannot be bound by content",
+            [],
+        )
+    entry = next(iter(scripts.values()))
+    archive = _enclosing_archive(entry)
+    if archive is not None:
+        inside = entry.relative_to(archive)
+        unpacked = Path(str(archive) + ARCHIVE_UNPACKED_SUFFIX) / inside
+        if os.path.lexists(unpacked):
+            # Electron runs the unpacked copy only when the archive header marks the file as
+            # unpacked; the header is not parsed, so which of the two runs cannot be named.
+            return CarrierFiles(
+                carrier,
+                shim,
+                None,
+                None,
+                f"the carrier entry {entry} that the {carrier} dsh shim runs lies inside the "
+                f"archive {archive} and also exists unpacked at {unpacked}; which of the two "
+                "Electron runs is decided by the archive header, which is not parsed, so the "
+                "launch cannot be bound by content",
+                [],
+            )
+        return CarrierFiles(
+            carrier,
+            shim,
+            None,
+            None,
+            "",
+            [
+                f"the carrier entry inside {archive} is bound through the archive's digest",
+                f"files Electron reads from {archive}{ARCHIVE_UNPACKED_SUFFIX} are bound by "
+                "path only",
+                interpreter_note,
+            ],
+            archive,
+        )
+    if not entry.is_file():
+        return CarrierFiles(
+            carrier,
+            shim,
+            entry,
+            None,
+            f"the carrier entry {entry} that the {carrier} dsh shim runs is not a file",
+            [],
+        )
+    manifest = package_manifest_for(entry)
+    if manifest is None:
+        return CarrierFiles(
+            carrier,
+            shim,
+            entry,
+            None,
+            f"the carrier entry {entry} lies in no node_modules package, so it has no "
+            "package.json to bind",
+            [],
+        )
+    return CarrierFiles(carrier, shim, entry, manifest, "", [interpreter_note])
+
+
 def observe_launch_surfaces(
     launch: LaunchConfig,
     *,
@@ -344,7 +550,8 @@ def observe_launch_surfaces(
     if ws is not None and home.is_absolute() and _inside(home, ws):
         notes.append(
             f"the DSH home {home} lies inside the workspace {ws}: the agent can write the patch "
-            "files, AGENTS.md and skills DSH loads at the next launch (recorded, not refused)"
+            "files, AGENTS.md and skills DSH loads at the next launch (recorded here; a real "
+            "launch is refused at the driver's spawn gate, dsh_home_in_workspace)"
         )
     home_files: list[SurfaceFile] = []
     if look_in_home:
@@ -417,7 +624,7 @@ def probe_notes(surfaces: LaunchSurfaces) -> list[str]:
             "home is then this directory, created empty for each invocation (no stored "
             "credentials, no cordis.patch.yml, no AGENTS.md, no skills, a fresh anonymous id), so "
             "credentials come only from the launch environment or a workspace .env (inferred "
-            "from upstream source, not observed)"
+            "from upstream source, not observed); a real launch refuses a workspace .env"
         )
     client = surfaces.client
     carrier = client.dsh_carrier

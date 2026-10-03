@@ -499,7 +499,7 @@ def test_top_level_help_names_every_subcommand_and_the_live_driver(
     subcommands = next(
         action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
     ).choices
-    assert len(subcommands) == 9
+    assert len(subcommands) == 10
     for name in subcommands:
         assert name in description, name
     assert "offline in M1" not in description

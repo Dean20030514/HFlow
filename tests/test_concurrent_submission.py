@@ -1,9 +1,10 @@
 """Two identical submissions, and a stop during setup, must not relabel a run.
 
-Every CLI process uses the default controller id, so ``claim_run`` does not tell two ``hflow run``
-processes on the identical TaskSpec apart: the second one passes the "admitted but never
-dispatched" branch while the first is still setting the run up. What keeps the run honest is
-in the writes themselves:
+Every CLI process uses the default controller id, but since the owner lease (user ruling
+2026-10-03) a claim is a compare-and-set on a per-controller owner token, recorded with the owning
+process's pid, creation time and host. A second identical submission that finds the run claimed by
+another owner returns it as it stands, with a note naming that owner, and drives nothing - it does
+not run setup. What still keeps the run honest in the writes themselves:
 
 * no writer that sets ``BLOCKED`` relabels a run that already ended (a terminal state or a
   delivery receipt);
@@ -12,15 +13,15 @@ in the writes themselves:
 * the store's "second live attempt" and "terminal run" refusals return the existing run with a
   note instead of an ``internal_error`` block.
 
-Owner identity across processes (leases, per-process controller ids) is not implemented; both
-submissions may still run setup. These tests force each interleaving with real threads and
-``Event`` coordination, never sleeps.
+These tests force each interleaving with real threads and ``Event`` coordination, never sleeps.
 """
 
 from __future__ import annotations
 
 import threading
 from pathlib import Path
+
+import pytest
 
 from hflow.contracts import (
     CancellationReceipt,
@@ -45,26 +46,23 @@ def _controller(store: Store, project_root: Path, fake_script: FakeScript) -> Co
     )
 
 
+def _never_drives(controller: Controller) -> None:
+    def refuse(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        pytest.fail("the second submission drove a run another owner holds")
+
+    controller._drive = refuse  # type: ignore[method-assign]
+
+
 def _race_while_the_first_implementer_runs(
     store: Store,
     first: Controller,
     second: Controller,
     run_request: RunRequest,
 ) -> tuple[RunOutcome, object, str]:
-    """B's identical submission passes ``run_task`` while A is in setup, then acts while A's
-    implementer is in flight. Returns A's outcome, B's outcome (or exception) and the stored
-    task state observed while A's implementer was still running."""
-    b_ready, a_started = threading.Event(), threading.Event()
+    """B's identical submission arrives while A is in setup (claimed, nothing reserved yet).
+    Returns A's outcome, B's outcome (or exception) and the stored task state observed while A's
+    implementer was in flight."""
     result: dict[str, object] = {}
-
-    original_b_cycle = second._attempt_cycle
-
-    def b_cycle(*args, **kwargs):  # noqa: ANN002, ANN003
-        b_ready.set()
-        assert a_started.wait(10)
-        return original_b_cycle(*args, **kwargs)
-
-    second._attempt_cycle = b_cycle  # type: ignore[method-assign]
 
     def run_b() -> None:
         try:
@@ -72,23 +70,21 @@ def _race_while_the_first_implementer_runs(
         except BaseException as exc:  # noqa: BLE001 - reported to the test
             result["b"] = exc
 
-    thread = threading.Thread(target=run_b)
     original_a_cycle = first._attempt_cycle
 
     def a_cycle(*args, **kwargs):  # noqa: ANN002, ANN003
-        thread.start()  # B's identical submission arrives while A is still in setup
-        assert b_ready.wait(10)
+        if "b" not in result:
+            thread = threading.Thread(target=run_b)
+            thread.start()
+            thread.join(10)
+            assert not thread.is_alive()
         return original_a_cycle(*args, **kwargs)
 
     first._attempt_cycle = a_cycle  # type: ignore[method-assign]
-
     original_start = first.driver.start
 
     def a_start(request):  # noqa: ANN001 - Protocol shape
         if request.role == "implementer":
-            a_started.set()
-            thread.join(10)
-            assert not thread.is_alive()
             result["state_in_flight"] = store.get_run(request.run_id)["task_state"]
         return original_start(request)
 
@@ -101,9 +97,10 @@ def _race_while_the_first_implementer_runs(
 def test_a_second_identical_submission_does_not_block_the_live_run(
     store: Store, project_root: Path, fake_script: FakeScript, run_request: RunRequest
 ) -> None:
-    """B's reservation meets A's live attempt: B reports the run, A's paid work is accepted."""
+    """B finds the run claimed by A's live owner: B reports the run, A's paid work is accepted."""
     first = _controller(store, project_root, fake_script)
     second = _controller(store, project_root, fake_script)
+    _never_drives(second)
 
     outcome, b_outcome, state_in_flight = _race_while_the_first_implementer_runs(
         store, first, second, run_request
@@ -112,9 +109,9 @@ def test_a_second_identical_submission_does_not_block_the_live_run(
     assert isinstance(b_outcome, RunOutcome), b_outcome
     assert b_outcome.run_id == outcome.run_id
     assert b_outcome.block_code is None, b_outcome.block_reason
-    assert any("concurrent identical submission" in note for note in b_outcome.notes), (
-        b_outcome.notes
-    )
+    notes = " ".join(b_outcome.notes)
+    assert "claimed by another controller" in notes, notes
+    assert "the owner may be alive" in notes, notes
     assert state_in_flight == TaskState.RUNNING.value, (
         "the second submission relabelled the run while the first one's implementer was running"
     )
@@ -125,9 +122,10 @@ def test_a_second_identical_submission_does_not_block_the_live_run(
 def test_a_pre_dispatch_refusal_of_the_second_submission_is_not_the_runs_outcome(
     store: Store, project_root: Path, fake_script: FakeScript, run_request: RunRequest
 ) -> None:
-    """B holds none of the run's attempts, so its own refusal is a note, not a block."""
+    """A second submission that would refuse its own packet never gets that far: no setup runs."""
     first = _controller(store, project_root, fake_script)
     second = _controller(store, project_root, fake_script)
+    _never_drives(second)
 
     def refuse(**_kwargs):  # noqa: ANN003
         raise RefusedError(RefusalCode.INVALID_SPEC, "the packet does not fit (forced)")
@@ -141,8 +139,8 @@ def test_a_pre_dispatch_refusal_of_the_second_submission_is_not_the_runs_outcome
     assert isinstance(b_outcome, RunOutcome), b_outcome
     assert b_outcome.block_code is None, b_outcome.block_reason
     notes = " ".join(b_outcome.notes)
-    assert "invalid_spec block was not recorded" in notes, notes
-    assert "reserved by another controller" in notes, notes
+    assert "claimed by another controller" in notes, notes
+    assert "invalid_spec" not in notes, notes
     assert state_in_flight == TaskState.RUNNING.value
     assert outcome.task_state is TaskState.ACCEPTED, (outcome.block_code, outcome.block_reason)
 
@@ -150,9 +148,10 @@ def test_a_pre_dispatch_refusal_of_the_second_submission_is_not_the_runs_outcome
 def test_an_accepted_run_keeps_its_outcome_when_the_other_submission_reserves_late(
     store: Store, project_root: Path, fake_script: FakeScript, run_request: RunRequest
 ) -> None:
-    """B completes the whole run first; A's late reservation must not relabel the receipt."""
+    """B submits between A's claim and A's reservation: B drives nothing, A completes the run."""
     first = _controller(store, project_root, fake_script)
     second = _controller(store, project_root, fake_script)
+    _never_drives(second)
     original = store.reserve_dispatch
     state: dict[str, object] = {"fired": False}
 
@@ -168,14 +167,18 @@ def test_an_accepted_run_keeps_its_outcome_when_the_other_submission_reserves_la
 
     b_outcome = state["b"]
     assert isinstance(b_outcome, RunOutcome)
-    assert b_outcome.task_state is TaskState.ACCEPTED, b_outcome.block_reason
-    assert outcome.run_id == b_outcome.run_id
+    assert b_outcome.run_id == outcome.run_id
+    assert b_outcome.task_state in {TaskState.DRAFT, TaskState.READY, TaskState.RUNNING}
+    assert b_outcome.block_code is None, b_outcome.block_reason
+    assert any("claimed by another controller" in note for note in b_outcome.notes), (
+        b_outcome.notes
+    )
     assert outcome.task_state is TaskState.ACCEPTED, (outcome.block_code, outcome.block_reason)
-    assert any("concurrent identical submission" in note for note in outcome.notes), outcome.notes
     row = store.get_run(outcome.run_id)
     assert row["task_state"] == TaskState.ACCEPTED.value
     assert row["block_code"] is None
     assert row["receipt_json"]
+    assert row["owner_token"] == first.owner_token
 
 
 # --------------------------------------------------------------------------

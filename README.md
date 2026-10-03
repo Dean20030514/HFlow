@@ -202,7 +202,8 @@ It never lands inside a project checkout.
 
 Exit codes: `0` accepted, `2` refused at admission (no run state is created), `3` blocked after
 dispatch, `4` usage (including every argument-parsing error), `5` the run exists and is not
-finished (`DRAFT`/`READY`/`RUNNING`/`CHECKING`, e.g. `resume` on a run a hard kill left `RUNNING`).
+finished (`DRAFT`/`READY`/`RUNNING`/`CHECKING`, e.g. a submission that found the run claimed by
+another owner process, or `resume` refusing a takeover because that owner may be alive).
 `6`: `status`/`report` found the run but a stored record of it no longer validates; one line names
 the record, nothing is rewritten, and `cancel`/`resume` still work from the run row.
 A `CANCELLED` task state, which this build never writes, would exit `3`.
@@ -274,6 +275,34 @@ the project contract, the machine profile, the authorization artifact, the root 
   approval to give - gets a CLI-computed record whose id starts `AUTH-offline`, whose `origin` is
   `cli_offline_synthetic` (a structural field, not just a sentence), and whose binding names
   `driver: fake`, so it can never authorize a real transport.
+- **`hflow ledger settle <invocation_id> --as consumed|void --attest "<text>"`** (ruling
+  2026-10-03) closes one `unknown` or `launch_unknown` ledger entry into the terminal state
+  `operator_settled`, by compare-and-set, with an appended attestation row (who - the OS user,
+  recorded, not authenticated - when, and your text, at most 2000 characters). `consumed` (the
+  default) keeps every counter spent; `void` is allowed only for `launch_unknown` (an `unknown`
+  launch was reported, so provider spend may have occurred) and returns exactly that dispatch's
+  root charge - one top-level submission, plus the repair if it was charged as one - but not the
+  authorization's counter or the run's turns. An entry is settled once. The run's state and
+  outcome do not change and nothing is re-dispatched: the only effect is that the root stops
+  being blocked by that entry, so a *new* revision may dispatch (with its own approval).
+  `status`/`report`/`doctor` show it as "settled by operator attestation (not observed)", and
+  billed usage for it stays unknown. Refused (exit 2): open entries (`reserved`/`requested`/
+  `started`; use `hflow resume`), final entries, entries of a run that has not ended, a blank
+  or oversized attestation; an unknown id is a usage error (exit 4). There is no time-based
+  expiry. An ended run is not proof that nothing runs (a cross-process `hflow cancel` whose stop
+  was not confirmed ends the run while its controller and agent may live on), so settle is also
+  refused (exit 2, nothing written) unless the run's owner is provably gone by the takeover
+  rule (its owner lock can be taken **and** its identity reads `gone`) and the entry's recorded
+  child process (pid + recorded start, on the owner's host) reads `gone`; `matching` and
+  `unknown` both refuse, and the message says to wait for or stop that process tree, then
+  `hflow resume` and settle again. A run with no owner token (pre-v6, or a label-only claim)
+  cannot prove its owner gone: if it recorded no controller process at all, the owner half passes
+  (an ended run with nothing recorded that could still act - an inference, not an observation);
+  if it recorded a controller pid (which carries no host, so it is never probed), settle refuses
+  unless you add `--legacy-owner-gone`, which records your attestation that that controller has
+  exited. The child rule applies either way. Not covered: an entry that
+  recorded a process but no pid has nothing to probe and rests on the owner rule alone, and
+  the check runs just before the store transaction, not inside it.
 - **A repair is classified from a stored execution fact, never from prose.** `evidence.exit_reason`
   records *why* a check ended (`completed`, `nonzero_exit`, `timed_out`, `settlement_forced`,
   `output_capture_error`, ...), and an automatic repair needs that reason to say the check ran to
@@ -403,6 +432,27 @@ the project contract, the machine profile, the authorization artifact, the root 
   issued before the project-contract binding must be re-issued**, whenever it was written (one
   without the contract digest is refused, naming why); copy a fresh binding from
   `hflow prepare --json`.
+- **Launch entry files bound by content; transitive modules and anything Node loads later remain
+  bound by path** (user ruling 2026-10-03). Each resolved launch records the SHA-256 of a short,
+  fixed list: the client interpreter (`node.exe` for the real acpx), the acpx entry file and the
+  `package.json` of the package it lies in, the dsh launcher the agent argv starts, and - for a
+  Desktop or npm carrier - the carrier entry file its shim runs and that file's `package.json`.
+  The installed Desktop carrier's entry
+  (`resources\app.asar\dsh\node_modules\@deepseek-ai\dsh-desktop-host\lib\cli.js`) and its
+  `package.json` exist only inside the Electron archive `resources\app.asar`, a regular
+  file: when the entry's path passes through a regular file named `*.asar`, that archive file is
+  bound by content in their place (`carrier_archive`, ~121 MB, ~0.1 s to hash warm), with the
+  note "the carrier entry inside <archive> is bound through the archive's digest". The archive
+  is not parsed; `app.asar.unpacked` and `DeepSeek Harness.exe` are bound by path only, and an
+  entry that also exists under `app.asar.unpacked` makes the launch not resolvable.
+  `prepare` and `doctor --profile` print the digests, and the approval binds them as
+  `launch_content_digest`: replacing one of those files at the same path stops the approval
+  applying (`launch_content_changed`), and an artifact without the field cannot authorize a run
+  whose launch resolved digests. The driver hashes the files again just before each spawn and
+  refuses a difference before any process exists. Each file's final path is resolved once (links
+  and junctions followed once) and that path is both hashed and started. A file that is missing
+  or unreadable, a Node entry outside any `node_modules` package, or a classified carrier whose
+  entry cannot be named makes the launch not resolvable.
 - The agent launch argv carries only the launcher path and fixed flags. A model id is the one
   value that goes on a command line from configuration: the acpx **client** gets `--model <value>`
   when the role's profile names one, which counts as a fixed flag under AGENTS.md rule 9 by the
@@ -477,10 +527,14 @@ decision naming the check, its exit code and what the policy declared for it. An
 written before storage v5 carries no observed reason and is therefore ineligible - the reason is
 never back-filled from a stored exit code. The root's `max_repairs` stays a ceiling that the
 dispatch transaction enforces; a task file that says `max_repair_cycles: 1` still opts into
-nothing. A reviewer rejection buys the repair only with at least one **usable** finding - a
-non-blank text value under a key other than `id`/`severity`/`status`/`location`/`target` - so
-`[{}]` or metadata-only findings stop the run as `no_findings`; the repair packet carries every
-key of every usable finding, cutting a value over 2048 bytes with an explicit marker. The repair
+nothing. A reviewer rejection buys the repair only with at least one finding. Findings are
+typed (user ruling, 2026-10-03): `{body, title?, location?{path, line_start?, line_end?},
+severity?: P0-P3, id?}`, unknown keys refused and `body` never blank, so every valid finding is
+usable; `changes_requested` with `[]` stops the run as `no_findings`, and an untyped or malformed
+finding makes the whole answer `REVIEW_INVALID` (a protocol error, never a rejection - there is no
+text fallback). Severity is recorded and rendered but gates nothing; there is no confidence field.
+The repair packet renders each finding's title, location, severity and body, cutting a value over
+2048 bytes with an explicit marker. The repair
 round's reviewer sees the whole change from the original base, not only the second round's patch.
 
 What it still is **not**, and cannot be read as more than:
@@ -495,8 +549,16 @@ What it still is **not**, and cannot be read as more than:
   transport is refused unless `--root-budget-file` binds a root (`prepare` lists it under
   `dispatch_preconditions`); only a fully offline fake run may repair without one, charged to no
   root counter.
-- **No typed finding schema.** Findings are still "a list of objects"; the reviewer is not told
-  which keys count as content.
+- **Typed findings do not prove a finding true.** The schema checks shape only: a `location`
+  is not checked against the candidate (the path may not exist, the lines may be invented), and
+  `severity` is the reviewer's own label. Review evidence recorded before typed findings keeps its
+  untyped findings: `status`/`report` show it as stored, it is never re-validated, and it can no
+  longer buy a repair. The offline replay (`tools/m2_live/replay_review.py`) reads such a saved
+  answer under the untyped contract only when the recorded reviewer prompt did not show typed
+  findings, and says so: `review_contract` is in its output and, for a replay finalized by this
+  build or later, in the receipt's provenance and the review evidence detail. The one recorded
+  finalization (run `R-gkb3ld97x8`, evidence `E-wln314qoor`) predates that and carries none; a
+  repeated `--finalize` reports it as "not recorded" and rewrites nothing.
 - **Message boundaries without `messageId` are inferred.** For a runtime that omits ACP's
   optional `messageId`, any update that is not a message chunk (a thought included) or a
   sequence gap ends a message, and only the last such segment is read as the answer. Every
@@ -514,13 +576,13 @@ modelling choice inside the offline facility, not evidence about a live harness.
 Not built: cooperative (protocol) cancellation on the selected launch path; a `hflow repair` or
 `hflow integrate` command; integration/publish delivery; reuse-research automation; teams and
 native subagents; real billing observation; metrics against a direct-DSH baseline; an operator
-command that closes an `unknown` or `launch_unknown` ledger entry (`resume` records an
-observation but settles nothing, so such a root stays blocked), or an entry left open on a run
-that is not `outcome_unknown` - a confirmed stop whose ledger write failed
-(`cancelled_by_operator`), or a driver that raised without reporting a spawn fact
-(`internal_error`, or `review_protocol_error` for the reviewer) - which `resume` does not touch
-because it reconciles only an `outcome_unknown` run, so that root stays blocked too (the run's
-notes say so instead of promising a reconcile); the upgrade of the pinned acpx
+command that closes an entry left OPEN (`reserved`/`requested`/`started`) on a run that is not
+`outcome_unknown` - a confirmed stop whose ledger write failed (`cancelled_by_operator`), or a
+driver that raised without reporting a spawn fact (`internal_error`, or `review_protocol_error`
+for the reviewer) - which `resume` does not touch because it reconciles only an
+`outcome_unknown` run, and which `hflow ledger settle` refuses because it settles only `unknown`
+and `launch_unknown` entries, so that root stays blocked (the run's notes say so instead of
+promising a reconcile); the upgrade of the pinned acpx
 from 0.17.1 to 0.19.x (surveyed, deliberately deferred); reading a prompt answered with a
 JSON-RPC error as `failed` - it stays `outcome_unknown` with its code recorded, even for DSH's
 pre-model forms, because telling them apart means reading DSH's message text, and that
@@ -552,8 +614,9 @@ Not built around configuration either:
   check - keep profiles on `native_profile` until then. `hflow doctor --profile <id>` prints the
   resolved launch per role, including the exact `--model` flag or "no --model flag".
 - **No `hflow init`.** A project contract is still hand-written, and no `--format markdown`
-  handoff renderer or `hflow repair` / `hflow integrate` command exists. `resume` still only
-  reconciles.
+  handoff renderer or `hflow repair` / `hflow integrate` command exists. `resume` never
+  re-dispatches: it reconciles a blocked run, or takes a live run over from a provably gone owner
+  and blocks it `owner_lost`.
 - **A stop targets the role that is running, and the two sides of a handoff are coordinated, not
   merely ordered.** The controller resolves the live invocation from the run's recorded `phase`
   and routes the stop through that role's own driver, so a reviewer bound to its own driver is
@@ -588,30 +651,82 @@ Not built around configuration either:
   (the implementer's entry already settled, no reviewer registered yet) leaves no open entry, and
   the run is no longer live once it is blocked, so the root accepts a new revision immediately -
   even while the original controller is still finishing its checks, in the same workspace for an
-  in-place run. Keeping a root busy for as long as its run's controller still owns it (owner
-  identity across processes) is not built. For the same reason two `hflow run` processes on the
-  identical TaskSpec (both on the default `--controller-id`) can both pass the claim and both run
-  setup (worktree, Git snapshot, packet). What is guarded: only one of them reserves the attempt -
-  the other returns the existing run with a note instead of blocking it - no writer that sets
+  in-place run. Keeping a root busy for as long as its run's controller process is alive is not
+  built: the owner identity below is recorded, but the root rule does not read it. Two `hflow run`
+  processes on the identical TaskSpec no longer both run setup: the claim is a compare-and-set on
+  a per-controller owner token (see "Owner lease" below), so the second finds the run claimed by
+  another owner and returns it as it stands with a note naming that owner (pid, host, label,
+  generation) - exit `5`, no setup, no block. The one exception is a run whose owner is provably
+  gone and that has no attempt and no invocation (an `hflow run` interrupted in setup): the
+  resubmission adopts it with one compare-and-set (old token and generation -> its own, generation
+  + 1), keeps it `DRAFT`/`READY`, records "adopted from a controller that is provably gone; nothing
+  had been dispatched" and continues it. The authorization check runs read-only before any claim
+  or adoption, so its refusal leaves the run as it was and a new authorization for the same
+  TaskSpec continues it. Still guarded as before: no writer that sets
   `BLOCKED` relabels a run that already ended or carries a receipt, and a controller never records
-  its own refusal as the block of a run whose attempt another controller reserved. A refusal that
-  lands before either reserves (a setup failure in the second process) still blocks the run, and
-  the first then returns that blocked run. A controller interrupted (Ctrl+C, `SystemExit`) while an invocation is
-  starting or running leaves an `outcome_unknown` run that `resume` reconciles, but a hard kill,
-  a power loss or an interrupt outside a driver start records nothing and leaves the run
-  `RUNNING`, which `resume` does not touch. And this covers the one driver that creates processes
-  here (`AcpxDshDriver`); another driver must coordinate its own spawn the same way.
+  its own refusal as the block of a run whose attempt another controller reserved. A controller
+  interrupted (Ctrl+C, `SystemExit`) while an invocation is starting or running leaves an
+  `outcome_unknown` run that `resume` reconciles. A hard kill, a power loss or an interrupt outside
+  a driver start records nothing and leaves the run `RUNNING`; `resume` then takes it over only if
+  its owner is proven gone, and blocks it `owner_lost` (below). And this covers the one driver that
+  creates processes here (`AcpxDshDriver`); another driver must coordinate its own spawn the same
+  way.
+- **Owner lease (user ruling 2026-10-03).** A run is owned by a controller *process*: a random
+  per-controller token, the process's pid, creation time (`GetProcessTimes`) and host (storage
+  v6), plus an exclusive OS file lock on `<ledger dir>/owners/<token>.lock` held for the
+  controller's lifetime. `--controller-id` is only a label. `resume` on a live run
+  (`DRAFT`/`READY`/`RUNNING`/`CHECKING`) takes it over only when the owner is **proven** gone: its
+  lock can be taken **and** its pid plus creation time no longer name a running process (exited,
+  no such pid, or the pid was reused). The takeover is one transaction: the owner becomes the
+  successor and the claim generation increments, open ledger entries become `unknown` /
+  `launch_unknown`, live attempts finish as unknown, and the run is `BLOCKED` `owner_lost` (exit
+  `3`). It never re-dispatches and never reports `confirmed_stopped`: each child pid the run
+  recorded is probed and recorded as an observation ("may still be running; nothing was stopped",
+  or "reads gone", which is not a confirmed stop). A held lock, a running owner, or an owner that
+  reads `unknown` refuses with "owner may be alive" and changes nothing (exit `5`). After a
+  takeover the old owner's dispatch reservation, result application, check transition, repair
+  reopen and acceptance carry its token and generation and are refused (`owner_lost`). A new run
+  is created with its owner in the same insert, so a run this build wrote is never ownerless. A
+  run recorded before v6 has no owner token: a controller pid its attempts recorded carries no
+  host, so it reads `unknown` and the run is never taken over (see the limits below); one that
+  recorded no controller process reads `not_recorded` - not proof of death - and `resume` takes it
+  over (block reason "no owner was recorded") only when it has no attempt and no invocation.
+  `status` and `report` print the owner and a read-only liveness probe (`owner`, `liveness ... (lock ...)`);
+  the liveness is this command's observation, never stored.
+- **What the owner lease does not cover.** File locks on network shares or cloud-synced folders
+  (a ledger under a OneDrive-synced Desktop, for example) may not exclude anything; this build
+  does not detect such a location. An owner running elevated or as another user, an owner on
+  another host, and every owner off Windows (no creation time is read there - documented, not
+  observed) read `unknown`, so their runs stay blocked from takeover until the operator ends them
+  some other way. The OS releases a hard-killed owner's lock promptly but not instantly, so a
+  takeover right after a kill can be refused once (fail closed; run `resume` again). Sleep or
+  hibernation keeps the owner alive, so nothing is taken over. A pre-v6 run that recorded a
+  controller pid cannot be taken over at all: that pid carries no host, and a local lookup of
+  another host's pid would read "no such process", so it reads `unknown`. The way out for such a
+  run is `hflow cancel` (which blocks it `outcome_unknown`) followed by `hflow resume`, which
+  reconciles it. A pre-v6 run that recorded no controller process and dispatched nothing can be
+  taken over as `not_recorded`, which is wrong only for a pre-v6 controller that opened the ledger
+  before it was migrated and is still in setup. A takeover stops nothing: a child that "may
+  still be running" keeps running until it exits or is ended by hand, and no takeover is ever
+  automatic - only `resume` performs one, and a new `hflow run` on a run another owner holds only
+  reports it (or, for a provably gone owner's never-dispatched run, adopts and continues it).
+  `cancel` does not use the lease. Writes other than the fenced ones (notes, evidence rows, spawn reports) are still guarded only by the run's state and ledger rules, which a
+  takeover sets to `BLOCKED` / `unknown`.
 - **An offline profile is all-or-nothing.** A profile may bind every role to the offline fake
   (for development) or every role to a real transport; mixing the two is refused rather than
   half-scripted.
-- **The launch is bound by paths and argv, not by program content.** A run records *which*
-  client entry point, interpreter and launcher it will start; it does not hash those programs, so
-  replacing a file at the same path - upgrading `.probe/acpx` in place, or a `dsh` that later
-  resolves to a different carrier - does not change the approval. doctor's probe notes and each
-  invocation's launch-surface record carry the acpx and @agentclientprotocol/sdk versions from
-  their package.json, and the dsh carrier (Desktop or npm) with the version its shim's manifest
-  states; files are read, nothing is executed, and nothing is bound. Binding by content stays
-  deferred and needs a ruling.
+- **Only the launch entry files are bound by content.** `node_modules` trees, every module Node
+  resolves at runtime, DSH's own code loading, the Desktop carrier's `DeepSeek Harness.exe` and
+  `app.asar.unpacked` tree (its entry is covered only through the `app.asar` digest), the
+  `node` the npm shim starts and `cmd.exe` stay bound by path. A dsh launcher that is not a
+  Desktop or npm shim (an unclassified shim or an `.exe`) is bound as a file, and what it starts
+  is not. A launch built by hand rather than by `resolve_launch_config` carries no digests and the
+  spawn gate has nothing to compare it with. Windows has no exec-by-handle, so a file swapped
+  between the spawn gate's hash and process creation is not caught; holding the files open
+  without write/delete sharing during the spawn is not implemented. A Node or npm upgrade changes
+  the digests and needs a new `prepare` and a new approval. Versions (acpx,
+  @agentclientprotocol/sdk, the dsh carrier) are still only recorded in the launch-surface record,
+  not bound.
 - **A repository that keeps an `.acpxrc.json` cannot be run on a real driver.** acpx offers no
   way to skip or pin that file (upstream issue #835, open), so a run whose starting workspace
   holds one is refused (`workspace_client_config`) before anything is recorded or charged - the
@@ -624,20 +739,55 @@ Not built around configuration either:
   an identical TaskSpec returns that blocked run, and the next step is a new revision - whose
   first implementer, under a root budget, is charged as a repair, so the root needs one left
   (without one the revision is refused `budget_exhausted` before its run row exists).
-- **A candidate that changes the files DSH loads as context is recorded, not refused.** The list
-  is `AGENTS.md`, `CLAUDE.md`, `AGENTS.local.md` and `CLAUDE.local.md` at any depth, the root
-  `.dsh/skills/**` and `.agents/skills/**`, and a root `.env`, in any letter case; it is read from
-  upstream DSH source at dsh-v0.2.0-rc.2 (639ed015) and not observed in a DSH run. After each
-  freeze the whole change from the task's original base (`--no-renames`, so a deletion counts) is
-  classified against it and kept as that attempt's `dsh_context` record. `status` and `report`
-  show it, the review evidence of that attempt is marked `dsh_context=changed` (joined by attempt
-  id), and an accepted receipt carries a limitation naming the files. Nothing is refused and the
-  reviewer packet is unchanged; it already lists every changed path. An ignored instruction file
-  or `.env` the implementer writes already refuses the freeze. Not covered: such files already in
-  the base commit; in-place runs; a link to a directory that holds one; an ignored `AGENTS.md`
-  under an allowlisted cache directory (`__pycache__`, `.pytest_cache`); anything under the DSH
-  home. Refusing these files, labelling them in the reviewer packet, or telling the repair
-  implementer each needs a ruling.
+- **A workspace with a root `.env` cannot be run on a real driver** (user ruling 2026-10-03). DSH
+  loads `<cwd>/.env` at launch (documented upstream, not observed), and HFlow never opens the file,
+  so it cannot tell what it sets. The refusal (`workspace_env_file`) works exactly like the
+  `.acpxrc.json` one above - at admission for the starting workspace (project root's own entries,
+  or the base commit's root tree; any letter case), and at the driver's spawn gate for a `.env`
+  that appears later, e.g. in the reviewer's candidate worktree. The file is found by a directory
+  listing, `lstat` or `ls-tree` only. Remove or rename it (for a worktree run, commit its
+  removal). The offline fake driver is unaffected. Not covered: a `.env` written in the window
+  between the spawn-gate look and DSH's read, and parsing which names a `.env` sets (not done).
+- **A bound `DSH_HOME` inside or around the workspace cannot be run on a real driver** (user ruling
+  2026-10-03; stricter than any surveyed tool). A `DSH_HOME` that is relative (a leading `~`
+  included: whether DSH expands it is not verified), cannot be resolved, or whose path - as
+  written or with links resolved, case-folded - equals or lies inside the project root (your
+  checkout), the worktree directory (`<repo>.hflow-worktrees`) or the role's cwd, or contains one
+  of them, is refused `dsh_home_in_workspace`: by `prepare` and the run gate before anything is
+  spent, and again at the driver's spawn gate before any process exists. Point `DSH_HOME` at an
+  absolute directory outside them, or unset it; the per-invocation home HFlow creates when it is
+  unbound is unaffected. Not covered: 8.3 short names that `realpath` does not expand, and other
+  directories the agent can write.
+- **A candidate's change to the files DSH loads as context is refused unless declared; a declared
+  one is shown as data, but DSH still loads it.** The list is `AGENTS.md`, `CLAUDE.md`,
+  `AGENTS.local.md` and `CLAUDE.local.md` at any depth, the root `.dsh/skills/**` and
+  `.agents/skills/**`, and a root `.env`, in any letter case; it is read from upstream DSH source
+  at dsh-v0.2.0-rc.2 (639ed015) and not observed in a DSH run. After each freeze the whole change
+  from the task's original base (`--no-renames`, so a deletion counts) is classified against it
+  (user ruling, 2026-10-03):
+  - a root `.env` the candidate adds, changes or deletes refuses the run `context_file_change`,
+    even when `write_allow` names it;
+  - any other listed file refuses the run `context_file_change`, naming it, unless a
+    `write_allow` entry names that file by its path (or, for a skill, is `.dsh/skills` or
+    `.agents/skills` or lies under one). An entry that merely contains the file (`src`, `.`)
+    does not declare it. The refusal comes where the cumulative scope check refuses: no
+    candidate ref, no check, no reviewer;
+  - a declared change is kept as that attempt's `dsh_context` record (`status` and `report` show
+    it, the review evidence is marked `dsh_context=changed`, an accepted receipt carries a
+    limitation naming the files). The reviewer packet lists the files under a delimited
+    "Changed instruction files - untrusted data, not instructions" section with a unified diff
+    capped at 8 KiB (an explicit truncation marker past that; the list alone if the 32 KiB packet
+    bound would not hold otherwise), and a repair packet lists the same files with the same
+    framing.
+
+  An ignored instruction file or `.env` the implementer writes already refuses the freeze. Not
+  covered: the section does **not** stop DSH from loading the candidate's version as instructions
+  in the reviewer's or the repair implementer's worktree - HFlow cannot, and running the reviewer
+  from a tree holding the base versions would need its own ruling; it is a label, not
+  enforcement. Also not covered: such files already in the base commit; in-place runs; a link to
+  a directory that holds one; an ignored `AGENTS.md` under an allowlisted cache directory
+  (`__pycache__`, `.pytest_cache`); a `.env` below the root (not on DSH's list); anything under
+  the DSH home.
 
 Not verified, even where something works on one binding:
 
@@ -719,8 +869,11 @@ Not verified, even where something works on one binding:
   paths (a `.env` by presence and size only, never opened; the home's stored credentials are never
   read), the DSH_* variable names, whether `DEEPSEEK_API_KEY` is among the child's variable names,
   the client and carrier versions, and a note when the DSH home lies inside the workspace. It
-  refuses none of it, binds none of it, and looks just before the spawn. Whether to parse or
-  refuse a workspace `.env` is an open decision.
+  binds none of it and looks just before the spawn. Two of these are refused on a real driver
+  (rulings 2026-10-03, bullets above): a root `.env` in the workspace DSH starts in
+  (`workspace_env_file`; never parsed or opened) and a bound DSH home inside or around the
+  workspace (`dsh_home_in_workspace`); the rest is recorded only, and a `$DSH_HOME/.env` outside
+  the workspace is not refused.
 - **Nothing is sandboxed.** `command` checks and a real worker run with the current user's
   rights: no filesystem confinement, no credential confinement, and no protection against
   another process of the same user changing the workspace, the authorization artifact or the
@@ -746,25 +899,34 @@ Not verified, even where something works on one binding:
 ## Driver contract tests
 
 ```sh
-python -m pytest -q tests/test_cancel_routing.py         # 25 tests: a stop reaches the live role, wins the handoff, and is never undone
-python -m pytest -q tests/test_authorization.py          # 16 tests: the authorized real-run gate
-python -m pytest -q tests/test_driver_acpx_dsh.py        # 91 tests, no model, no credential: launch hardening, model flag and observation, Job teardown
+python -m pytest -q tests/test_cancel_routing.py         # 26 tests: a stop reaches the live role, wins the handoff, and is never undone
+python -m pytest -q tests/test_authorization.py          # 21 tests: the authorized real-run gate
+python -m pytest -q tests/test_driver_acpx_dsh.py        # 96 tests, no model, no credential: launch hardening, model flag and observation, Job teardown
 python -m pytest -q tests/test_winjob.py                 # 9 tests: which Windows answers prove a process gone (injected kernel32, plus two real-kernel pids)
 python -m pytest -q tests/test_dsh_surfaces.py           # 10 tests: what DSH reads at launch, fixed paths, names never values, a .env never opened, nothing executed
-python -m pytest -q tests/test_review.py                 # 52 tests: the review output grammar
+python -m pytest -q tests/test_review.py                 # 78 tests: the review output grammar
 python -m pytest -q tests/test_review_wire.py            # 56 tests: reviewer verdict -> receipt; completion bound to its own prompt
-python -m pytest -q tests/test_driver_turn_settlement.py # 27 tests: what settles a turn, what follows its response, agent-reported usage never billed
+python -m pytest -q tests/test_driver_turn_settlement.py # 41 tests: what settles a turn, what follows its response, agent-reported usage never billed
 python -m pytest -q tests/test_real_client_review.py     # 11 tests: installed acpx + mock agent, no model (hardened launch, --model)
-python -m pytest -q tests/test_packet_wire.py            # 20 tests: role packets -> pinned acpx + input-sensitive agent, no model
+python -m pytest -q tests/test_packet_wire.py            # 23 tests: role packets -> pinned acpx + input-sensitive agent, no model
 python -m pytest -q tests/test_saved_review_replay.py    # 9 tests: the recorded live review, replayed offline
-python -m pytest -q tests/test_local_finalization.py     # 25 tests: one later decision, recorded through the Store
+python -m pytest -q tests/test_local_finalization.py     # 29 tests: one later decision, recorded through the Store
 python -m pytest -q tests/test_concurrency.py            # 8 deterministic thread/cancel-orderings tests
-python -m pytest -q tests/test_m2_slice.py               # 70 tests: Git worktree -> frozen candidate, complete and deny-aware freeze
+python -m pytest -q tests/test_m2_slice.py               # 78 tests: Git worktree -> frozen candidate, complete and deny-aware freeze
 python -m pytest -q tests/test_cli_m2_cleanup.py         # 21 tests: the same flow through the CLI + guarded clean
 python -m pytest -q tests/test_dispatch_gates.py         # 19 tests: pre-dispatch gates, loop allowance, packet bound
 python -m pytest -q tests/test_check_resources.py        # 22 tests: bounded output, artifacts, minimal environment, reference round-trip
 python -m pytest -q tests/test_batch_e_dispatch.py       # 52 tests: the one dispatch transaction, open-state settlement, stop/ledger races
-python -m pytest -q tests/test_batch_e_repair.py         # 94 tests: the bounded repair, late results after a stop, base SHA, freeze scope
+python -m pytest -q tests/test_batch_e_repair.py         # 92 tests: the bounded repair, late results after a stop, base SHA, freeze scope
+python -m pytest -q tests/test_launch_refusals.py        # 30 tests: a workspace .env (never opened) and a DSH_HOME in the workspace refused on a real driver
+python -m pytest -q tests/test_owner_lease.py            # 27 tests: owner identity and lock, adoption and takeover only from a provably gone owner, fenced writes
+python -m pytest -q tests/test_ledger_settle.py          # 37 tests: operator settlement of unknown/launch_unknown entries, never shown as observed
+python -m pytest -q tests/test_typed_findings.py         # 40 tests: the typed reviewer finding, strict, no text fallback
+python -m pytest -q tests/test_context_files.py          # 41 tests: undeclared DSH context-file changes refused, declared ones shown as untrusted data
+python -m pytest -q tests/test_launch_content_binding.py # 10 tests: launch entry files bound by SHA-256, re-checked at the spawn gate
+python -m pytest -q tests/test_concurrent_submission.py  # 6 tests: two submissions of one TaskSpec never relabel each other's run
+python -m pytest -q tests/test_bytecode_isolation.py     # 19 tests: worker-left bytecode removed before each check, sourceless .pyc refused
+python -m pytest -q tests/test_scope_rules.py            # 31 tests: write_deny spellings normalized, unmatchable entries refused
 python tools/verify_b_recheck.py <temp-dir>              # the three re-checked B failure paths: failed capture, retention budget, last-line overflow
 python tools/m0_probe/check_process_boundary.py          # Job Object teardown, standalone (Windows)
 python tools/m0_probe/real_client_checks.py all          # real acpx: version + mock-agent round trip

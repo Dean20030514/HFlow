@@ -19,7 +19,9 @@ Two stages, both deterministic and both reusable for offline replay of saved byt
    given a ``session_id`` without ``require_session`` excludes other sessions' chunks, and one
    built with neither reads every session's chunks.
 2. :func:`decode_review` parses exactly one Review object out of that answer and
-   validates it against the canonical model in ``contracts.py``.
+   validates it against the canonical model in ``contracts.py``, typed findings included
+   (``Finding``: a required non-blank ``body``; optional ``title``, ``location``,
+   ``severity``, ``id``; no other key).
 
 Nothing here decides acceptance, and nothing here is allowed to fill in a missing
 verdict: a missing, malformed or ambiguous answer is an error the controller reports as
@@ -61,7 +63,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from .contracts import ReviewOutput
+from .contracts import RecordedUntypedReview, ReviewOutput
 
 #: Bound on retained assistant text for one invocation. A looping agent must not be able
 #: to grow driver memory without limit, and a verdict read from a truncated answer is not
@@ -415,6 +417,26 @@ def decode_review(answer: str) -> ReviewOutput:
     Raises :class:`ReviewDecodeError` for anything else. The raw answer is never modified
     and no field is ever filled in on the model's behalf.
     """
+    return validate_review(_answer_payload(answer))
+
+
+def decode_untyped_recorded_review(answer: str) -> RecordedUntypedReview:
+    """Decode a *historical* answer against the contract its reviewer was shown: untyped findings.
+
+    Same grammar as :func:`decode_review`; only the finding objects are not typed. This exists so
+    an offline replay of bytes recorded before typed findings can still read their verdict. It is
+    never a fallback for a new answer: the drivers call :func:`decode_review` only, and a caller
+    that uses this must say which contract the verdict was read under.
+    """
+    payload = _answer_payload(answer)
+    try:
+        return RecordedUntypedReview.model_validate(payload)
+    except ValidationError as exc:
+        raise ReviewDecodeError(REVIEW_INVALID, _describe(payload, exc)) from exc
+
+
+def _answer_payload(answer: str) -> dict[str, Any]:
+    """The one JSON object the answer grammar admits, parsed but not yet validated."""
     if not answer.strip():
         raise ReviewDecodeError(REVIEW_MISSING, "the reviewer's final answer is empty")
 
@@ -423,11 +445,20 @@ def decode_review(answer: str) -> ReviewOutput:
         payload = _loads_object(region, where="the fenced result block")
     else:
         payload = _loads_object(region, where="the answer")
-    return validate_review(payload)
+    if not isinstance(payload, dict):
+        raise ReviewDecodeError(
+            REVIEW_INVALID, f"the review result must be a JSON object, not {type(payload).__name__}"
+        )
+    return payload
 
 
 def validate_review(payload: Any) -> ReviewOutput:
-    """Validate an already-parsed object against the canonical review contract."""
+    """Validate an already-parsed object against the canonical review contract.
+
+    Every finding must satisfy the typed :class:`~hflow.contracts.Finding`: an extra key, a
+    blank ``body``, an unknown severity or a bad line range makes the whole answer
+    ``REVIEW_INVALID``. Nothing is coerced, dropped or turned into text on the model's behalf.
+    """
     if not isinstance(payload, dict):
         raise ReviewDecodeError(
             REVIEW_INVALID, f"the review result must be a JSON object, not {type(payload).__name__}"
@@ -715,6 +746,13 @@ def _loads_object(text: str, *, where: str) -> Any:
         raise
     except json.JSONDecodeError as exc:
         raise ReviewDecodeError(REVIEW_INVALID, f"{where} is not valid JSON: {exc}") from exc
+    except ValueError as exc:
+        # A plain ValueError (for example an integer longer than the interpreter's digit
+        # limit) is still an unreadable review, not a driver failure.
+        raise ReviewDecodeError(REVIEW_INVALID, f"{where} is not valid JSON: {exc}") from exc
+    except RecursionError as exc:
+        # Nesting past the decoder's stack is the same: unreadable, never a crash.
+        raise ReviewDecodeError(REVIEW_INVALID, f"{where} nests too deeply to decode") from exc
 
 
 def _describe(payload: dict[str, Any], exc: ValidationError) -> str:

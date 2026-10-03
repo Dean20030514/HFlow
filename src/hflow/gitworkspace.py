@@ -22,6 +22,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -661,6 +662,87 @@ class GitRepo:
             if path.casefold().endswith(".pyc")
             and any(part.casefold() == "__pycache__" for part in path.split("/")[:-1])
         ]
+
+    def diff_text_bounded(
+        self,
+        base: str,
+        candidate: str,
+        path: str,
+        *,
+        max_bytes: int,
+        cwd: Path | None = None,
+        timeout: float = 60.0,
+    ) -> tuple[str, bool]:
+        """The unified diff of one path between two commits, read up to ``max_bytes`` bytes.
+
+        Returns ``(text, truncated)``. At most ``max_bytes + 1`` bytes are read from git; when
+        there are more, git is stopped and ``truncated`` is true, so a worker that wrote a huge
+        file cannot make HFlow hold it in memory. Bytes that are not UTF-8 are replaced, never
+        guessed. No external diff program and no textconv filter runs (``--no-ext-diff
+        --no-textconv``), renames are not detected, and the path is a literal pathspec. Used only
+        to show a reviewer a bounded excerpt; the full change stays reachable by its commits.
+        """
+        if not base or not candidate:
+            raise GitError("a bounded diff needs both a base and a candidate commit")
+        args = (
+            "diff",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--unified=3",
+            f"{base}..{candidate}",
+            "--",
+            path,
+        )
+        env = _base_env()
+        env["GIT_LITERAL_PATHSPECS"] = "1"
+        limit = max(int(max_bytes), 0)
+        with tempfile.TemporaryFile() as stderr_file:
+            proc = subprocess.Popen(  # noqa: S603,S607 - fixed argv, no shell
+                ["git", *args],
+                cwd=str(cwd or self.root),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=stderr_file,
+                env=env,
+            )
+            timer_fired: list[bool] = []
+
+            def _expire() -> None:
+                timer_fired.append(True)
+                proc.kill()
+
+            timer = threading.Timer(timeout, _expire)
+            timer.start()
+            chunks: list[bytes] = []
+            read = 0
+            truncated = False
+            try:
+                assert proc.stdout is not None
+                while True:
+                    chunk = proc.stdout.read(min(65536, limit + 1 - read))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    read += len(chunk)
+                    if read > limit:
+                        truncated = True
+                        proc.kill()
+                        break
+            finally:
+                if proc.stdout is not None:
+                    proc.stdout.close()
+                proc.wait()
+                timer.cancel()
+            if timer_fired:
+                raise GitError(f"git {' '.join(args[:-2])} timed out after {timeout}s")
+            if not truncated and proc.returncode != 0:
+                stderr_file.seek(0)
+                detail = stderr_file.read(300).decode("utf-8", errors="replace").strip()
+                raise GitError(f"git {' '.join(args[:-2])} failed: {detail}")
+        data = b"".join(chunks)[:limit]
+        return data.decode("utf-8", errors="replace"), truncated
 
     def index_flagged_paths(self, worktree: Path) -> list[str]:
         """Index entries whose worktree changes git does not look at.

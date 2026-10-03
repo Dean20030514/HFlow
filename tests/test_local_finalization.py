@@ -189,6 +189,10 @@ def test_the_recorded_evidence_finalizes_in_a_ledger_copy(
     assert evidence[0]["status"] == "passed"
     assert evidence[0]["candidate_fingerprint"] == CANDIDATE_FINGERPRINT
     assert json.loads(evidence[0]["detail"])["verdict"] == "accepted"
+    # The recorded reviewer was shown the untyped contract; the ledger says so, twice.
+    assert receipt.provenance["review_contract"].startswith("untyped_findings")
+    assert receipt.provenance["typed_contract_error"]
+    assert json.loads(evidence[0]["detail"])["review_contract"] == receipt.provenance["review_contract"]
 
 
 def test_the_finalization_consumes_no_allowance_and_adds_no_submission(
@@ -252,6 +256,7 @@ def test_a_second_finalization_changes_nothing(blocked_ledger_copy: Path, no_chi
     assert second["finalization"]["written"] is False
     assert second["already_finalized"]["runtime_build"] == CHECK_BUILD
     assert second["already_finalized"]["original_block_code"] == "review_rejected"
+    assert not second["already_finalized"]["review_contract"].startswith("not recorded")
     assert (
         _rows(ledger_copy, "SELECT receipt_json, updated_at FROM runs WHERE run_id = ?", (RUN_ID,))[0]
         == first_receipt
@@ -559,6 +564,167 @@ def test_a_verdict_that_is_not_an_acceptance_still_records_a_failed_review(tmp_p
         assert rows[0]["status"] == "failed"
         stored = ResultReceipt.model_validate(json.loads(store.get_run("R-guard")["receipt_json"]))
         assert stored.review.status == "changes_requested"
+    finally:
+        store.close()
+
+
+UNTYPED_ANSWER = (
+    "```json\n"
+    + json.dumps(
+        {
+            "verdict": "accepted",
+            "findings": [
+                {"id": "AC-1", "status": "pass", "target": "src/x.py", "detail": "looks right"}
+            ],
+        }
+    )
+    + "\n```"
+)
+#: A recorded reviewer prompt from before typed findings: it does not carry the typed marker.
+UNTYPED_PROMPT = "Review the frozen candidate. findings is a list of objects."
+
+
+def _seed_finalizable_run(tmp_path: Path) -> tuple[Path, dict, dict]:
+    """A blocked run with current verification evidence, ready for ``finalize_in_store``."""
+    store_path = tmp_path / "guard.sqlite"
+    store = Store(store_path)
+    try:
+        _seed_blocked_run(store)
+        run = store.get_run("R-guard")
+        from hflow.contracts import EvidenceStatus
+
+        store.record_evidence(
+            evidence_id="E-verify",
+            run_id="R-guard",
+            attempt_id="A-guard",
+            kind="verification",
+            status=EvidenceStatus.PASSED,
+            candidate_fingerprint="sha256:fp",
+            checks_digest=run["checks_digest"],
+            check_id="unit",
+            detail="passed",
+        )
+        with store.transaction() as conn:
+            conn.execute(
+                "UPDATE runs SET worktree_path = ? WHERE run_id = ?", (str(tmp_path), "R-guard")
+            )
+        run_row = dict(store.get_run("R-guard"))
+        attempt_row = dict(store.attempts_for("R-guard")[0])
+    finally:
+        store.close()
+    return store_path, run_row, attempt_row
+
+
+def _untyped_replay(tool, run_row: dict, store_path: Path) -> tuple[object, dict, dict]:
+    checks: dict = {}
+    review = tool._decode_saved_answer(UNTYPED_ANSWER, checks, UNTYPED_PROMPT)
+    checks["verdict_digest"] = "sha256:verdict"
+    checks["answer_sha256"] = "sha256:answer"
+    diagnostic = {"review": checks, "recorded": {}, "candidate": {}}
+    verification = next(
+        row for row in tool._load_evidence(store_path, "R-guard") if row["kind"] == "verification"
+    )
+    provenance = tool.reprocessing_provenance(diagnostic, run_row, verification)
+    return review, diagnostic, provenance
+
+
+def test_finalizing_an_untyped_replay_records_the_contract_in_the_ledger(tmp_path: Path) -> None:
+    """A verdict read under the pre-typed contract says so in the receipt and the evidence row."""
+    tool = _load_tool()
+    store_path, run_row, attempt_row = _seed_finalizable_run(tmp_path)
+    review, diagnostic, provenance = _untyped_replay(tool, run_row, store_path)
+    assert type(review).__name__ == "RecordedUntypedReview"
+
+    result = tool.finalize_in_store(
+        store_path=store_path,
+        run_row=run_row,
+        attempt_row=attempt_row,
+        diagnostic=diagnostic,
+        provenance=provenance,
+        processing_build=CHECK_BUILD,
+        review=review,
+    )
+
+    assert result["written"] is True
+    store = Store(store_path)
+    try:
+        stored = ResultReceipt.model_validate(json.loads(store.get_run("R-guard")["receipt_json"]))
+        assert stored.provenance["review_contract"] == (
+            "untyped_findings (recorded before typed findings)"
+        )
+        assert stored.provenance["typed_contract_error"]
+        rows = [dict(row) for row in store.evidence_for("R-guard", "review")]
+        assert [row["evidence_id"] for row in rows] == stored.review.evidence_ids
+        detail = json.loads(rows[0]["detail"])
+        assert detail["review_contract"] == stored.provenance["review_contract"]
+        # The verdict stays where every review evidence row keeps it.
+        assert detail["verdict"] == "accepted"
+        assert detail["findings"][0]["status"] == "pass"
+    finally:
+        store.close()
+
+
+def test_a_typed_replay_names_the_typed_contract(tmp_path: Path) -> None:
+    tool = _load_tool()
+    checks: dict = {}
+    typed = '```json\n{"verdict": "accepted", "findings": []}\n```'
+    tool._decode_saved_answer(typed, checks, UNTYPED_PROMPT)
+    provenance = tool.reprocessing_provenance(
+        {"review": checks},
+        {"checks_digest": "sha256:c"},
+        {"evidence_id": "E-v", "candidate_fingerprint": "sha256:fp"},
+    )
+    assert provenance["review_contract"] == "typed_findings"
+    assert "typed_contract_error" not in provenance
+
+
+def test_a_finalization_without_a_recorded_contract_is_refused(tmp_path: Path) -> None:
+    tool = _load_tool()
+    store_path, run_row, attempt_row = _seed_finalizable_run(tmp_path)
+    review, diagnostic, provenance = _untyped_replay(tool, run_row, store_path)
+    provenance["review_contract"] = ""
+
+    with pytest.raises(tool.ReplayError, match="contract"):
+        tool.finalize_in_store(
+            store_path=store_path,
+            run_row=run_row,
+            attempt_row=attempt_row,
+            diagnostic=diagnostic,
+            provenance=provenance,
+            processing_build=CHECK_BUILD,
+            review=review,
+        )
+    store = Store(store_path)
+    try:
+        assert store.get_run("R-guard")["receipt_json"] is None
+        assert list(store.evidence_for("R-guard", "review")) == []
+    finally:
+        store.close()
+
+
+def test_a_review_detail_the_store_would_cut_is_refused(tmp_path: Path) -> None:
+    """The store keeps 2000 characters; a cut detail would lose the verdict and its contract."""
+    tool = _load_tool()
+    store_path, run_row, attempt_row = _seed_finalizable_run(tmp_path)
+    review, diagnostic, provenance = _untyped_replay(tool, run_row, store_path)
+    long_review = review.model_copy(
+        update={"findings": [{"id": "AC-1", "detail": "x" * tool.REVIEW_EVIDENCE_DETAIL_LIMIT}]}
+    )
+
+    with pytest.raises(StoreError, match="would cut it"):
+        tool.finalize_in_store(
+            store_path=store_path,
+            run_row=run_row,
+            attempt_row=attempt_row,
+            diagnostic=diagnostic,
+            provenance=provenance,
+            processing_build=CHECK_BUILD,
+            review=long_review,
+        )
+    store = Store(store_path)
+    try:
+        assert store.get_run("R-guard")["receipt_json"] is None
+        assert store.get_run("R-guard")["task_state"] == TaskState.BLOCKED.value
     finally:
         store.close()
 

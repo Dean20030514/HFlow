@@ -156,6 +156,76 @@ def dsh_context_paths(paths: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(found))
 
 
+def dsh_root_env_paths(paths: Iterable[str]) -> list[str]:
+    """The ``paths`` that are the workspace-root ``.env`` (any letter case), as Git spelled them.
+
+    DSH reads that file from its cwd at start-up as environment, so a candidate that adds,
+    changes or deletes it is refused outright, whatever the task's scope says (user ruling,
+    2026-10-03). A ``.env`` in a subdirectory is not on the DSH list and is not matched here.
+    """
+    env_file = DSH_WORKSPACE_ENV_FILE.casefold()
+    return list(dict.fromkeys(raw for raw in paths if _normalize(raw).casefold() == env_file))
+
+
+def dsh_context_declared(path: str, write_allow: Iterable[str]) -> bool:
+    """Does some ``write_allow`` entry *name* this DSH context file, rather than merely contain it?
+
+    Declared means one of, after :func:`_normalize` and ignoring letter case:
+
+    * the entry is the path itself (``docs/AGENTS.md``);
+    * the entry is a glob whose last segment is the file's own name, without a wildcard, and that
+      matches the path (``**/AGENTS.md``). Admission refuses globs in ``write_allow`` today, so
+      only the literal form reaches a run; the rule is kept so that relaxing admission cannot
+      turn a broad pattern into a declaration;
+    * for a file under a root skill directory, the entry is that skill directory or lies inside it
+      (``.agents/skills``, ``.dsh/skills/review``) and the path is the entry or lies under it.
+
+    A broad entry that only contains the file (``src``, ``.``, ``docs``) does not declare it.
+    The root ``.env`` is refused whether or not an entry names it: see
+    :func:`dsh_root_env_paths`.
+    """
+    folded = _normalize(path).casefold()
+    if not folded:
+        return False
+    name = folded.rsplit("/", 1)[-1]
+    skill_dirs = [d.casefold() for d in DSH_SKILL_DIRS]
+    for raw in write_allow:
+        entry = _normalize(str(raw)).casefold()
+        if not entry:
+            continue
+        if entry == folded:
+            return True
+        last = entry.rsplit("/", 1)[-1]
+        if (
+            any(char in entry for char in _GLOB_CHARS)
+            and not any(char in last for char in _GLOB_CHARS)
+            and last == name
+            and fnmatch.fnmatchcase(folded, entry)
+        ):
+            return True
+        if any(entry == d or entry.startswith(d + "/") for d in skill_dirs) and (
+            folded == entry or folded.startswith(entry + "/")
+        ):
+            return True
+    return False
+
+
+def undeclared_dsh_context_paths(paths: Iterable[str], write_allow: Iterable[str]) -> list[str]:
+    """The DSH context files among ``paths`` that no ``write_allow`` entry names explicitly.
+
+    The root ``.env`` is left out: it is refused unconditionally (see :func:`dsh_root_env_paths`).
+    Like :func:`dsh_context_paths`, a check against a documented list, not an enforcement.
+    """
+    allow = [str(entry) for entry in write_allow]
+    changed = list(paths)
+    env = set(dsh_root_env_paths(changed))
+    return [
+        path
+        for path in dsh_context_paths(changed)
+        if path not in env and not dsh_context_declared(path, allow)
+    ]
+
+
 def resolve_within(root: Path, relative: str) -> Path:
     """Resolve ``relative`` under ``root`` and refuse any escape (plan A18).
 

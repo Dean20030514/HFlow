@@ -438,6 +438,8 @@ def predictable_dispatch_problems(
     real_transport: bool | None = None,
     root_bound: bool = False,
     workspace_client_config: str = "",
+    workspace_env_file: str = "",
+    dsh_home_in_workspace: str = "",
 ) -> list[ValidationIssue]:
     """Problems knowable before a dispatch, from the task, the contract and this machine.
 
@@ -469,6 +471,11 @@ def predictable_dispatch_problems(
     already holds acpx's project config (``prepare.start_workspace_client_config``; empty when it
     does not, or when no role uses that client). It is reported for offline-checked runs too:
     it is a fact about the client the run would launch, not about how its checks run.
+    ``workspace_env_file`` is the same kind of finding for a ``.env`` DSH would load from the
+    starting workspace (``prepare.start_workspace_env_file``), and ``dsh_home_in_workspace`` why
+    a launch's bound ``DSH_HOME`` lies inside or around the run's directories
+    (``prepare.launch_dsh_home_problem``); both empty when there is none or no role uses a real
+    client, and both reported for offline-checked runs for the same reason.
     """
     issues: list[ValidationIssue] = list(
         repair_policy_problems(
@@ -494,6 +501,39 @@ def predictable_dispatch_problems(
                     "charged: submit again once the file is gone"
                 ),
                 location="workspace",
+            )
+        )
+    #    DSH loads ``<cwd>/.env`` at launch, and the driver refuses to launch on a workspace whose
+    #    root holds one (never opened, so what it sets is unknown). Refused here when it is already
+    #    in the starting workspace, for the same reason as the client config above.
+    if workspace_env_file:
+        issues.append(
+            ValidationIssue(
+                code=RefusalCode.WORKSPACE_ENV_FILE,
+                detail=(
+                    f"{workspace_env_file}. DSH loads <cwd>/.env at launch into its own "
+                    "environment and its tool processes (documented upstream, not observed); "
+                    "HFlow never opens it and cannot tell what it sets, so no real agent may be "
+                    "started there. Refused before anything was dispatched or charged: submit "
+                    "again once the file is gone"
+                ),
+                location="workspace",
+            )
+        )
+    #    A bound DSH home the agent can write (or whose AGENTS.md and .env sit above the project)
+    #    is refused at the spawn gate too; knowable now from the resolved launch.
+    if dsh_home_in_workspace:
+        issues.append(
+            ValidationIssue(
+                code=RefusalCode.DSH_HOME_IN_WORKSPACE,
+                detail=(
+                    f"{dsh_home_in_workspace}. Refused before anything was dispatched or "
+                    "charged: point DSH_HOME at an absolute directory outside the project and "
+                    "its worktree directory (or unset it, so each invocation gets its own home), "
+                    "then prepare again - DSH_HOME is part of the launch, so a real run needs an "
+                    "authorization for the new binding"
+                ),
+                location="launch.dsh_home",
             )
         )
 

@@ -52,6 +52,7 @@ from hflow.contracts import (  # noqa: E402
     EvidenceStatus,
     InvocationOutcome,
     IsolationLevel,
+    RecordedUntypedReview,
     ResultReceipt,
     ReviewOutput,
     ReviewResult,
@@ -62,8 +63,16 @@ from hflow.contracts import (  # noqa: E402
     canonical_json,
     digest_of,
 )
-from hflow.review import AnswerTranscript, decode_review, review_input_error  # noqa: E402
+from hflow.review import (  # noqa: E402
+    REVIEW_INVALID,
+    AnswerTranscript,
+    ReviewDecodeError,
+    decode_review,
+    decode_untyped_recorded_review,
+    review_input_error,
+)
 from hflow.ids import new_evidence_id  # noqa: E402
+from hflow.packet import TYPED_FINDINGS_MARKER  # noqa: E402
 from hflow.runtime import PACKAGE_VERSION as _PACKAGE_VERSION  # noqa: E402
 from hflow.store import (  # noqa: E402
     OFFLINE_REPROCESSING_KIND,
@@ -84,8 +93,32 @@ REVIEWER_PROMPT_MARKER = "Review the frozen candidate"
 RECORDED_REVIEW_ISOLATION = IsolationLevel.PROMPT_ONLY
 
 
+#: The longest review evidence detail ``Store.finalize_offline_reprocessing`` keeps; it cuts
+#: anything longer. A cut detail is no longer readable JSON and would lose the contract name,
+#: so the finalization refuses such a detail instead of letting the store truncate it.
+REVIEW_EVIDENCE_DETAIL_LIMIT = 2000
+
+
 class ReplayError(RuntimeError):
     """The recorded material cannot support the replay. Reported, never worked around."""
+
+
+def review_evidence_detail(review: RecordedReview, review_contract: str) -> str:
+    """The review evidence detail a replay writes: the verdict plus the contract it was read under.
+
+    ``verdict`` and ``findings`` stay at the top level, as every review evidence row has them,
+    so readers of the row see the same verdict. ``review_contract`` makes the row say which
+    contract decoded it: a verdict read under the pre-typed contract must not look like a typed
+    one in the ledger. An empty contract is refused - the caller always knows it.
+    """
+    if not review_contract:
+        raise ReplayError(
+            "the review contract the verdict was decoded under is not recorded; refusing to "
+            "write review evidence that does not say it"
+        )
+    payload = review.model_dump(mode="json")
+    payload["review_contract"] = review_contract
+    return canonical_json(payload)
 
 
 # --------------------------------------------------------------------------
@@ -208,7 +241,12 @@ def extract_reviewer_answer(messages: list[dict[str, Any]]):
 # --------------------------------------------------------------------------
 
 
-def review_result_status(review: ReviewOutput) -> str:
+#: A saved verdict as it decodes: typed when it satisfies today's contract, otherwise read under the
+#: untyped-findings contract its reviewer was shown (see ``_decode_saved_answer``).
+RecordedReview = ReviewOutput | RecordedUntypedReview
+
+
+def review_result_status(review: RecordedReview) -> str:
     """The controller's review status for a validated verdict. One definition, two callers."""
     return "accepted" if review.verdict == "accepted" else "changes_requested"
 
@@ -219,7 +257,7 @@ def build_receipt(
     run_row: dict[str, Any],
     attempt_row: dict[str, Any],
     verification_evidence: dict[str, Any],
-    review: ReviewOutput,
+    review: RecordedReview,
     review_evidence_id: str,
     fingerprint: str,
     target: Path,
@@ -291,7 +329,7 @@ def evaluate_acceptance(
     run_row: dict[str, Any],
     attempt_row: dict[str, Any],
     verification_evidence: dict[str, Any],
-    review: ReviewOutput,
+    review: RecordedReview,
     reviewed_fingerprint: str,
     target: Path,
     candidate_commit: str,
@@ -401,7 +439,7 @@ def evaluate_acceptance(
                 candidate_fingerprint=fresh_fingerprint,
                 checks_digest=run_row["checks_digest"],
                 check_id="review",
-                detail=canonical_json(review.model_dump(mode="json")),
+                detail=review_evidence_detail(review, str(provenance.get("review_contract") or "")),
             )
             store.advance_to_checking(
                 run_id=row["run_id"],
@@ -552,6 +590,10 @@ def replay(
                     "original_block_code": existing.provenance.get("original_block_code"),
                     "original_runtime_build": existing.provenance.get("original_runtime_build"),
                     "source_evidence_id": existing.provenance.get("source_evidence_id"),
+                    # A finalization written before the contract was recorded says so instead of
+                    # being read as one decoded under today's typed contract.
+                    "review_contract": existing.provenance.get("review_contract")
+                    or "not recorded (finalized before the review contract was recorded)",
                 }
                 if finalize:
                     diagnostic["finalization"] = {
@@ -761,7 +803,7 @@ def _check_reviewer_and_extract(
     run_row: dict[str, Any],
     attempt_row: dict[str, Any],
     notes: list[dict[str, Any]],
-) -> ReviewOutput | None:
+) -> RecordedReview | None:
     """Bind the recorded reviewer invocation to its stream, then extract the verdict."""
     reviewer = attempt_row.get("review_invocation_id") or ""
     checks: dict[str, Any] = {"reviewer_invocation": reviewer}
@@ -802,6 +844,7 @@ def _check_reviewer_and_extract(
                 "the recorded reviewer config does not show the read-only permission mode"
             )
     task_path = invocation_dir / "task.txt"
+    reviewer_task: str | None = None
     if task_path.is_file():
         reviewer_task = task_path.read_text(encoding="utf-8")
         checks["review_task_sha256"] = sha256_file(task_path)
@@ -898,14 +941,14 @@ def _check_reviewer_and_extract(
     checks["answer_sha256"] = "sha256:" + hashlib.sha256(answer.text.encode("utf-8")).hexdigest()
 
     try:
-        review = decode_review(answer.text)
+        review = _decode_saved_answer(answer.text, checks, reviewer_task)
     except Exception as exc:  # noqa: BLE001 - reported verbatim, never repaired
         diagnostic["blockers"].append(f"the saved reviewer answer did not decode: {exc}")
         diagnostic["review"] = checks
         return None
 
     checks["verdict"] = review.verdict
-    checks["findings"] = review.findings
+    checks["findings"] = review.model_dump(mode="json")["findings"]
     checks["verdict_digest"] = digest_of(review.model_dump(mode="json"))
     stored = json.loads(attempt_row.get("review_json") or "{}")
     checks["stored_result_review"] = stored.get("review")
@@ -931,12 +974,45 @@ def _check_reviewer_and_extract(
     return review
 
 
+def _decode_saved_answer(
+    text: str, checks: dict[str, Any], reviewer_task: str | None
+) -> RecordedReview:
+    """Decode saved reviewer bytes, saying which contract the verdict was read under.
+
+    Today's contract (typed findings) is tried first. A saved answer from before typed findings
+    fails it - its findings carry keys such as ``status`` and ``detail`` - and is then read under
+    the contract its reviewer was actually shown ("findings is a list of objects"). Both facts are
+    recorded: ``review_contract`` names the contract used and ``typed_contract_error`` keeps the
+    refusal verbatim, so the replay never presents an old answer as a typed one. Any other failure
+    is raised unchanged.
+
+    The untyped reading is allowed only when the reviewer's recorded prompt (``task.txt``) is
+    present and does not show the typed finding contract. A reviewer that *was* shown typed
+    findings and answered otherwise produced an invalid verdict, and a replay must not turn it
+    into a valid one; a missing prompt cannot show which contract applied, so it is refused too.
+    """
+    try:
+        review: RecordedReview = decode_review(text)
+    except ReviewDecodeError as exc:
+        if exc.kind != REVIEW_INVALID:
+            raise
+        if reviewer_task is None or TYPED_FINDINGS_MARKER in reviewer_task:
+            checks["review_contract"] = "typed_findings"
+            raise
+        review = decode_untyped_recorded_review(text)
+        checks["review_contract"] = "untyped_findings (recorded before typed findings)"
+        checks["typed_contract_error"] = str(exc)
+        return review
+    checks["review_contract"] = "typed_findings"
+    return review
+
+
 def _evaluate(
     diagnostic: dict[str, Any],
     run_row: dict[str, Any],
     attempt_row: dict[str, Any],
     evidence_rows: list[dict[str, Any]],
-    review: ReviewOutput,
+    review: RecordedReview,
 ) -> None:
     verification = next((row for row in evidence_rows if row["kind"] == "verification"), None)
     worktree = Path(run_row["worktree_path"]) if run_row["worktree_path"] else None
@@ -976,7 +1052,7 @@ def reprocessing_provenance(
     derived from - so the original failure stays readable next to the delivery.
     """
     review = diagnostic.get("review", {})
-    return {
+    provenance: dict[str, Any] = {
         "kind": OFFLINE_REPROCESSING_KIND,
         "original_decision": "BLOCKED",
         "original_block_code": run_row.get("block_code") or "",
@@ -989,9 +1065,16 @@ def reprocessing_provenance(
         "reviewer_invocation_id": diagnostic.get("recorded", {}).get("reviewer_invocation") or "",
         "review_answer_sha256": review.get("answer_sha256") or "",
         "review_verdict_digest": review.get("verdict_digest") or "",
+        # Which contract the verdict was decoded under (typed findings, or the untyped contract a
+        # reviewer from before typed findings was shown), so the ledger - not only the console
+        # diagnostic - says it.
+        "review_contract": review.get("review_contract") or "",
         "model_calls": 0,
         "authorization_consumed": 0,
     }
+    if review.get("typed_contract_error"):
+        provenance["typed_contract_error"] = str(review["typed_contract_error"])
+    return provenance
 
 
 def finalize_in_store(
@@ -1002,7 +1085,7 @@ def finalize_in_store(
     diagnostic: dict[str, Any],
     provenance: dict[str, Any],
     processing_build: str,
-    review: ReviewOutput,
+    review: RecordedReview,
 ) -> dict[str, Any]:
     """Record the decision in the ledger, through the Store's guarded transaction.
 
@@ -1044,6 +1127,14 @@ def finalize_in_store(
             for row in _load_evidence(store_path, run_row["run_id"])
             if row["kind"] == "verification"
         )
+        review_contract = str(provenance.get("review_contract") or "")
+        review_detail = review_evidence_detail(review, review_contract)
+        if len(review_detail) > REVIEW_EVIDENCE_DETAIL_LIMIT:
+            raise StoreError(
+                f"the review evidence detail is {len(review_detail)} characters; the store keeps "
+                f"{REVIEW_EVIDENCE_DETAIL_LIMIT} and would cut it, losing the verdict's readable "
+                "record and the contract it was decoded under - refusing to finalize"
+            )
         review_evidence_id = new_evidence_id()
         receipt = build_receipt(
             spec=spec,
@@ -1069,7 +1160,7 @@ def finalize_in_store(
                 "status": EvidenceStatus.PASSED
                 if review.verdict == "accepted"
                 else EvidenceStatus.FAILED,
-                "detail": canonical_json(review.model_dump(mode="json")),
+                "detail": review_detail,
                 "verdict": review.verdict,
             },
         )

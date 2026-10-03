@@ -44,12 +44,19 @@ from .conftest import unit_only
 
 
 def _seed_live_run(
-    store: Store, request: RunRequest, *, turn_limit: int, reserve: int
+    store: Store,
+    request: RunRequest,
+    *,
+    turn_limit: int,
+    reserve: int,
+    owner: Controller | None = None,
 ) -> str:
     """Create a claimed run with a chosen ceiling, optionally pre-consuming budget.
 
     Used to reach budget states deterministically instead of hoping a real run
-    happens to run out at the right moment.
+    happens to run out at the right moment. ``owner`` claims it for that controller's owner
+    identity (owner lease) so that controller continues it; without one the claim is label-only,
+    which no controller adopts.
     """
     spec = request.task
     run = store.create_run(
@@ -63,7 +70,12 @@ def _seed_live_run(
         repair_limit=spec.budget.max_repair_cycles,
     )
     run_id = run["run_id"]
-    assert store.claim_run(run_id, "local-controller")
+    if owner is None:
+        assert store.claim_run(run_id, "local-controller")
+    else:
+        assert store.claim_run_owned(
+            run_id, "local-controller", token=owner.owner_token, identity=owner.owner_identity
+        ) is not None
     if reserve:
         store.reserve_turn(run_id, "local-controller", turns=reserve)
     store.set_task_state(run_id, [TaskState.DRAFT], TaskState.READY)
@@ -226,7 +238,7 @@ def test_identical_spec_inside_a_loop_never_creates_a_second_accepted_run(
 def test_insufficient_budget_blocks_before_the_driver_starts(
     controller: Controller, driver, run_request: RunRequest, store: Store
 ) -> None:
-    run_id = _seed_live_run(store, run_request, turn_limit=1, reserve=1)
+    run_id = _seed_live_run(store, run_request, turn_limit=1, reserve=1, owner=controller)
 
     outcome = controller.run_task(run_request)
 
@@ -244,7 +256,7 @@ def test_review_is_refused_when_only_the_implementation_turn_fits(
     controller: Controller, driver, run_request: RunRequest, store: Store
 ) -> None:
     """Having one turn left is not enough if acceptance also requires a review turn."""
-    run_id = _seed_live_run(store, run_request, turn_limit=3, reserve=2)
+    run_id = _seed_live_run(store, run_request, turn_limit=3, reserve=2, owner=controller)
 
     outcome = controller.run_task(run_request)
 
@@ -594,10 +606,9 @@ def test_review_rejection_blocks_acceptance(
         findings=[
             {
                 "id": "F-1",
-                "location": "src/parser.py:2",
-                "impact": "empty input still reaches an invalid index",
-                "evidence": "reproduced against AC-1",
-                "required_fix": "return the agreed empty result first",
+                "location": {"path": "src/parser.py", "line_start": 2},
+                "body": "empty input still reaches an invalid index (reproduced against AC-1); "
+                "return the agreed empty result first",
             }
         ],
     )
@@ -787,8 +798,8 @@ def test_phase_field_tracks_the_checking_stage(
     seen: list[str] = []
     original = store.advance_to_checking
 
-    def spy(*, run_id: str, attempt_id: str, phase: CheckPhase):
-        row = original(run_id=run_id, attempt_id=attempt_id, phase=phase)
+    def spy(*, run_id: str, attempt_id: str, phase: CheckPhase, **kwargs: object):
+        row = original(run_id=run_id, attempt_id=attempt_id, phase=phase, **kwargs)
         seen.append(row["phase"])
         return row
 

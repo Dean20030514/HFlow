@@ -104,9 +104,20 @@ def ledger_copy(tmp_path: Path) -> Path:
 def test_saved_review_replays_to_a_validated_verdict(
     ledger_copy: Path, no_child_processes: None
 ) -> None:
-    """The recorded reviewer bytes still decode to the canonical verdict, from the raw stream."""
+    """The recorded reviewer bytes still decode to their verdict, from the raw stream.
+
+    The recording predates typed findings: its findings carry ``status``/``target``/``detail``,
+    so today's contract refuses it (``REVIEW_INVALID``), and it is read under the untyped
+    contract its reviewer was shown. The verdict and the five findings are unchanged.
+    """
     _require_saved_evidence()
-    from hflow.review import AnswerTranscript, decode_review
+    from hflow.review import (
+        REVIEW_INVALID,
+        AnswerTranscript,
+        ReviewDecodeError,
+        decode_review,
+        decode_untyped_recorded_review,
+    )
 
     stream = PROBE / "attempt-2-data" / "invocations" / "I-vc5pcccfog" / "events.ndjson"
     transcript = AnswerTranscript(session_id=None, role="reviewer")
@@ -141,7 +152,10 @@ def test_saved_review_replays_to_a_validated_verdict(
         "6c7cb3c9f9f080bfff0a653c2fde92330257eca532664e30d97fa42c4cb7fa2c"
     )
     assert any(item in prompt_ids for item in terminal_ids), "the terminal response answers the prompt"
-    review = decode_review(answer.text)
+    with pytest.raises(ReviewDecodeError) as excinfo:
+        decode_review(answer.text)
+    assert excinfo.value.kind == REVIEW_INVALID
+    review = decode_untyped_recorded_review(answer.text)
 
     assert review.verdict == "accepted"
     assert len(review.findings) == 5

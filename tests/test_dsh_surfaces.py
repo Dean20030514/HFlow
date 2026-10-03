@@ -366,15 +366,20 @@ def test_a_manifest_nested_too_deeply_to_parse_is_a_note_not_an_exception(
 
 
 def test_dsh_carriers_are_classified_from_shim_text_without_running_them(tmp_path: Path) -> None:
-    desktop = tmp_path / "Desktop App" / "resources" / "runtime"
+    # The installed Desktop layout: the shim's script lies inside resources/app.asar, a regular
+    # file (an Electron archive); the shim text is the installed one plus a trap line.
+    desktop = tmp_path / "DeepSeek Harness" / "resources" / "runtime"
     shim = desktop / "cli" / "bin" / "dsh.cmd"
     shim.parent.mkdir(parents=True)
+    (desktop.parent / "app.asar").write_bytes(b"asar-archive-stand-in")
     trap = shim.parent / "ran.txt"
     shim.write_text(
-        "@echo off\r\nset ELECTRON_RUN_AS_NODE=1\r\n"
+        "@echo off\r\nsetlocal DisableDelayedExpansion\r\n"
+        'set "ELECTRON_RUN_AS_NODE=1"\r\n'
         f'echo ran > "{trap}"\r\n'
-        '"%~dp0..\\..\\..\\..\\DeepSeek Harness.exe" '
-        '"%~dp0..\\..\\node_modules\\@deepseek-ai\\dsh-desktop-host\\bin.js" %*\r\n',
+        '"%~dp0..\\..\\..\\..\\DeepSeek Harness.exe" --expose-internals '
+        '"%~dp0..\\..\\..\\app.asar\\dsh\\node_modules\\@deepseek-ai\\dsh-desktop-host'
+        '\\lib\\cli.js" %*\r\nexit /b %errorlevel%\r\n',
         encoding="utf-8",
     )
     (desktop / "primary-runtime").mkdir()
@@ -391,6 +396,15 @@ def test_dsh_carriers_are_classified_from_shim_text_without_running_them(tmp_pat
     assert "documented, not verified" in found.dsh_version_source
     assert "payload-sentinel" not in found.model_dump_json()
     assert not trap.exists(), "the shim was read, never run"
+    # The content binding names the archive the entry lies in, not the entry inside it.
+    named = dsh_surfaces.carrier_files(
+        _launch(dsh_executable=str(shim), agent_argv=[cmd, "/c", str(shim), "--profile", "acp"])
+    )
+    assert named.carrier == "desktop" and named.problem == ""
+    assert named.archive == desktop.parent / "app.asar"
+    assert named.entry is None and named.package_json is None
+    assert any("bound through the archive's digest" in note for note in named.notes)
+    assert not trap.exists()
 
     npm_dir = tmp_path / "npm"
     npm_shim = npm_dir / "dsh.CMD"

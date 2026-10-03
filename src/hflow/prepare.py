@@ -458,19 +458,8 @@ def start_workspace_client_config(
             f"{found} exists in the project root this in-place run works in; remove it (or the "
             "directory) before submitting"
         )
-    from .gitworkspace import GitError, GitRepo
-
     base = base_commit or spec.workspace.base_commit or "HEAD"
-    try:
-        # No pathspec: a pathspec matches case-sensitively even with core.ignorecase. Without
-        # -r only the root's entries are listed; -z keeps names unquoted.
-        listed = GitRepo.discover(project_root).run("ls-tree", "-z", "--name-only", base)
-    except (GitError, RefusedError):
-        return ""  # no repository or no such base: the worktree gate refuses that on its own
-    wanted = WORKSPACE_CLIENT_CONFIG_NAME.casefold()
-    matched = next(
-        (name for name in listed.split("\0") if name and name.casefold() == wanted), ""
-    )
+    matched = _base_root_entry(project_root, base, WORKSPACE_CLIENT_CONFIG_NAME)
     if not matched:
         return ""
     return (
@@ -478,6 +467,84 @@ def start_workspace_client_config(
         "starts from; commit its removal before submitting (a real run then needs an "
         "authorization issued for the new base)"
     )
+
+
+def _base_root_entry(project_root: Path, base: str, file_name: str) -> str:
+    """The spelling of ``file_name`` (any letter case) among ``base``'s root tree entries, or ``""``.
+
+    ``""`` too when there is no repository or no such base: the worktree gate refuses that on its
+    own. Read-only: one ``ls-tree`` of the base's root; no blob is read.
+    """
+    from .gitworkspace import GitError, GitRepo
+
+    try:
+        # No pathspec: a pathspec matches case-sensitively even with core.ignorecase. Without
+        # -r only the root's entries are listed; -z keeps names unquoted.
+        listed = GitRepo.discover(project_root).run("ls-tree", "-z", "--name-only", base)
+    except (GitError, RefusedError):
+        return ""
+    wanted = file_name.casefold()
+    return next(
+        (name for name in listed.split("\0") if name and name.casefold() == wanted), ""
+    )
+
+
+def start_workspace_env_file(
+    spec: TaskSpec, project_root: Path, base_commit: str = ""
+) -> str:
+    """Why the workspace this run starts in already holds a ``.env``, or ``""``.
+
+    DSH loads ``<cwd>/.env`` at launch (documented upstream, not observed), and the real driver
+    refuses to launch on a workspace whose root holds one - at its spawn gate, after the dispatch
+    was reserved. Exactly like :func:`start_workspace_client_config`, a file already in what the
+    run starts from is refused at admission instead: the project root's own entries for an
+    in-place run, the base commit's root tree for a worktree run (an untracked or ignored copy in
+    the user's checkout is not in the worktree). Any letter case; root entries only. The file is
+    never opened: a directory listing (and at most one ``lstat``), or one ``ls-tree``.
+    """
+    from .drivers.acpx_dsh import WORKSPACE_ENV_FILE_NAME, _workspace_env_file
+
+    if spec.workspace.mode != "worktree":
+        found = _workspace_env_file(Path(project_root))
+        if found is None:
+            return ""
+        return (
+            f"{found} exists in the project root this in-place run works in; remove or rename "
+            "it before submitting (HFlow never opens it)"
+        )
+    base = base_commit or spec.workspace.base_commit or "HEAD"
+    matched = _base_root_entry(project_root, base, WORKSPACE_ENV_FILE_NAME)
+    if not matched:
+        return ""
+    return (
+        f"{matched} is in base commit {base}, which this worktree run starts from; commit its "
+        "removal before submitting (a real run then needs an authorization issued for the new "
+        "base)"
+    )
+
+
+def launch_dsh_home_problem(
+    launches: Sequence[LaunchConfig], workspaces: Sequence[Path]
+) -> str:
+    """Why a launch's bound ``DSH_HOME`` may not be used with this run's directories, or ``""``.
+
+    ``workspaces`` are :func:`launch_workspaces` (the project root - the user's checkout - and,
+    for a worktree run, the directory its worktrees are created in); the rule itself is
+    ``acpx_dsh.dsh_home_workspace_problem``, which the driver's spawn gate applies again to the
+    role's actual cwd. A launch with no bound home (the per-invocation home HFlow creates) is no
+    problem. Read-only: path resolution only.
+    """
+    from .drivers.acpx_dsh import dsh_home_workspace_problem
+
+    seen: set[str] = set()
+    for launch in launches:
+        if not launch.dsh_home or launch.dsh_home in seen:
+            continue
+        seen.add(launch.dsh_home)
+        problem = dsh_home_workspace_problem(launch.dsh_home, workspaces)
+        if problem:
+            return problem
+    return ""
 
 
 def resolve_permissions(
@@ -784,6 +851,10 @@ def resolve_run(
             start_workspace_client_config(spec, root, base)
             if is_real
             else ""
+        ),
+        workspace_env_file=start_workspace_env_file(spec, root, base) if is_real else "",
+        dsh_home_in_workspace=(
+            launch_dsh_home_problem(resolved_launches(effective), workspaces) if is_real else ""
         ),
     )
     if root_limits is not None:
@@ -1177,6 +1248,17 @@ def build_prepare_report(
             "not enforced, and are not part of the approval binding; a worktree's are observed "
             "at each invocation's spawn"
         )
+        if resolved.effective.launch_content_digest():
+            from .drivers.launch_content import CONTENT_BINDING_LABEL
+
+            notes.append(
+                f"{CONTENT_BINDING_LABEL}: the SHA-256 of each role's client interpreter (node.exe), "
+                "acpx entry and its package.json, dsh launcher and - for a Desktop or npm carrier - "
+                "its entry file and package.json are in the launch above and in the approval "
+                "binding (launch_content_digest). The driver hashes them again just before each "
+                "spawn and refuses a difference (launch_content_changed); a file swapped between "
+                "that check and process creation is not caught on Windows (no exec-by-handle)"
+            )
         if any(
             surface.dsh_home_kind == "per_invocation" and not surface.deepseek_api_key_inherited
             for surface in surfaces.values()
@@ -1203,8 +1285,9 @@ def build_prepare_report(
                 "DEEPSEEK_API_KEY is not in the launch environment and DSH_HOME is unbound, so "
                 "the per-invocation DSH home holds no stored credential (inferred from upstream "
                 "source); the documented source left is a .env in the workspace DSH starts in "
-                f"({env_source}). M0 observed DSH fail with a no-API-key error when it had no "
-                "credential"
+                f"({env_source}), and a real launch refuses a workspace that holds one "
+                "(workspace_env_file), so DSH would start with no credential. M0 observed DSH "
+                "fail with a no-API-key error when it had no credential"
             )
     if not budget.within_budget:
         notes.append(
@@ -1374,6 +1457,14 @@ def render_prepare_text(report: PrepareReport) -> str:
                     "unbound: created empty for each invocation, inferred; not looked into "
                     "before dispatch)"
                 )
+            if launch.content_digests:
+                from .drivers.launch_content import CONTENT_BINDING_LABEL, content_lines
+
+                lines.append(f"               content ({CONTENT_BINDING_LABEL})")
+                for content_line in content_lines(launch):
+                    lines.append(f"               content {content_line}")
+                for content_note in launch.content_notes:
+                    lines.append(f"               content note: {content_note}")
             if not launch.resolvable:
                 lines.append(f"               reason {launch.detail}")
     lines.append(
@@ -1381,6 +1472,9 @@ def render_prepare_text(report: PrepareReport) -> str:
         f"reviewer={effective.reviewer_writes}"
     )
     lines.append(f"  config_hash {effective.digest()}")
+    launch_content = effective.launch_content_digest()
+    if launch_content:
+        lines.append(f"  launch_content_digest {launch_content}")
     if report.launch_surfaces:
         from .report import launch_surfaces_lines
 

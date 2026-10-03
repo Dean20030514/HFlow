@@ -2275,7 +2275,7 @@ def test_a_stop_after_a_rejected_review_rewrites_neither_the_entries_nor_the_blo
             write_plan=FAKE_WRITE_PLAN,
             review=ReviewOutput(
                 verdict="changes_requested",
-                findings=[{"statement": "the empty input still crashes"}],
+                findings=[{"body": "the empty input still crashes"}],
             ),
         ),
     )
