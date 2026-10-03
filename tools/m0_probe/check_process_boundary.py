@@ -34,25 +34,26 @@ def main() -> int:
     err = Path(".probe/jobtest.err")
     print("platform:", platform_summary())
 
+    out.parent.mkdir(parents=True, exist_ok=True)
     boundary = ProcessBoundary().open()
-    child = popen_in_boundary(
-        [sys.executable, "-u", "-c", HELPER],
-        cwd=".",
-        env=dict(os.environ),
-        boundary=boundary,
-        stdout_path=str(out),
-        stderr_path=str(err),
-    )
-    time.sleep(2.5)
+    with out.open("wb") as stdout_handle, err.open("wb") as stderr_handle:
+        child = popen_in_boundary(
+            [sys.executable, "-u", "-c", HELPER],
+            cwd=".",
+            env=dict(os.environ),
+            boundary=boundary,
+            stdout_handle=stdout_handle,
+            stderr_handle=stderr_handle,
+        )
+        time.sleep(2.5)
     print("boundary kind:", boundary.kind)
     print("active processes inside boundary:", boundary.active_processes())
-    child._hflow_stdout.close()  # type: ignore[attr-defined]
-    child._hflow_stderr.close()  # type: ignore[attr-defined]
 
     text = out.read_text(encoding="utf-8", errors="replace").strip()
     print("helper stdout:", text[:80])
     grandchild = int(text.split()[1])
-    print("grandchild alive before teardown:", not process_gone(grandchild))
+    # ``process_gone`` answers True (observed exit), False (observed running) or None (unanswered).
+    print("grandchild gone before teardown (expect False):", process_gone(grandchild))
 
     boundary.terminate()
     emptied = boundary.wait_empty(5)
