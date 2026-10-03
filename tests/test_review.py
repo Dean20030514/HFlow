@@ -49,6 +49,31 @@ def transcript(*updates: tuple[dict, dict], session_id: str | None = "sess-1") -
     return instance
 
 
+ACCEPTED = '{"verdict": "accepted", "findings": []}'
+REJECTED = '{"verdict": "changes_requested", "findings": []}'
+
+
+def thought(text: str, *, message_id: str | None) -> tuple[dict, dict]:
+    return update(text, message_id=message_id, kind="agent_thought_chunk")
+
+
+def usage(*, session_id: str = "sess-1") -> tuple[dict, dict]:
+    """The context-occupancy update DSH sends after each committed assistant message."""
+    payload: dict = {"sessionUpdate": "usage_update", "used": 1024, "size": 131072}
+    return payload, {"sessionId": session_id, "update": payload}
+
+
+def tool_call(*, session_id: str = "sess-1") -> tuple[dict, dict]:
+    payload: dict = {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "call-1",
+        "title": "read",
+        "kind": "other",
+        "status": "in_progress",
+    }
+    return payload, {"sessionId": session_id, "update": payload}
+
+
 # --------------------------------------------------------------------------
 # the supported grammar
 # --------------------------------------------------------------------------
@@ -300,6 +325,154 @@ def test_thoughts_tool_output_and_user_text_never_supply_the_answer() -> None:
     assert instance.observed_message_count == 1
     with pytest.raises(ReviewDecodeError):
         decode_review(instance.final_answer().text)  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("message_id", ["m-1", None])
+def test_a_dsh_message_answers_with_its_text_not_its_reasoning(message_id: str | None) -> None:
+    """The live shape: [thought(id), message(id), usage] - the reasoning is never the answer."""
+    instance = transcript(
+        thought(REJECTED, message_id=message_id),
+        update(ACCEPTED, message_id=message_id),
+        usage(),
+    )
+
+    answer = instance.final_answer()
+
+    assert answer is not None and answer.text == ACCEPTED
+    assert (answer.chunk_count, answer.first_line, answer.last_line) == (1, 1, 1)
+    assert instance.observed_message_count == 1
+    assert review_of(instance).verdict == "accepted"
+
+
+def test_text_blocks_split_by_their_own_reasoning_are_one_answer() -> None:
+    """DSH emits [text, reasoning, text] under one messageId: the thought does not end it."""
+    prose = "I checked AC-1 against the frozen fingerprint.\n"
+    instance = transcript(
+        update(prose, message_id="m-1"),
+        thought(REJECTED, message_id="m-1"),
+        update(ACCEPTED, message_id="m-1"),
+        usage(),
+    )
+
+    answer = instance.final_answer()
+
+    assert answer is not None
+    # Plain concatenation in stream order: no separator, no thought text.
+    assert answer.text == prose + ACCEPTED
+    assert (answer.message_id, answer.chunk_count, answer.first_line, answer.last_line) == (
+        "m-1",
+        2,
+        0,
+        2,
+    )
+    assert instance.observed_message_count == 1
+    assert review_of(instance).verdict == "accepted"
+
+
+def test_a_verdict_before_the_messages_own_reasoning_is_not_dropped() -> None:
+    """Reading only the fragment after the thought used to report this as review_missing."""
+    instance = transcript(
+        update(ACCEPTED + "\n", message_id="m-1"),
+        thought("Done reviewing.", message_id="m-1"),
+        update("All criteria pass.", message_id="m-1"),
+        usage(),
+    )
+
+    answer = instance.final_answer()
+
+    assert answer is not None and answer.text == ACCEPTED + "\nAll criteria pass."
+    assert review_of(instance).verdict == "accepted"
+
+
+def test_conflicting_verdicts_inside_one_message_are_ambiguous_not_the_last_one() -> None:
+    """The core regression: the last fragment of one message used to decide the verdict."""
+    instance = transcript(
+        update(REJECTED + "\n", message_id="m-1"),
+        thought("On reflection the tests pass.", message_id="m-1"),
+        update(ACCEPTED, message_id="m-1"),
+        usage(),
+    )
+
+    with pytest.raises(ReviewDecodeError) as excinfo:
+        decode_review(instance.final_answer().text)  # type: ignore[union-attr]
+
+    assert excinfo.value.kind == REVIEW_AMBIGUOUS
+
+
+def test_a_message_id_names_one_message_across_other_updates() -> None:
+    """Only a change of messageId starts a new message; other updates do not split one."""
+    instance = transcript(
+        update("Verdict:\n", message_id="m-1"),
+        usage(),
+        tool_call(),
+        update(ACCEPTED, message_id="m-1"),
+    )
+
+    answer = instance.final_answer()
+
+    assert answer is not None and answer.text == "Verdict:\n" + ACCEPTED
+    assert instance.observed_message_count == 1
+
+
+def test_thoughts_and_usage_updates_do_not_change_the_answer() -> None:
+    turn = [
+        thought("Let me read the candidate.", message_id="x"),
+        update("Reading the candidate.", message_id="x"),
+        usage(),
+        tool_call(),
+        update('{"verdict": "accepted"}', message_id=None, kind="tool_call_update"),
+        thought("The checks pass.", message_id="y"),
+        update("Verdict:\n", message_id="y"),
+        thought(REJECTED, message_id="y"),
+        update(ACCEPTED, message_id="y"),
+        usage(),
+    ]
+    reference = [
+        item
+        for item in turn
+        if item[0]["sessionUpdate"] not in {"agent_thought_chunk", "usage_update"}
+    ]
+
+    answer = transcript(*turn).final_answer()
+    expected = transcript(*reference).final_answer()
+
+    assert answer is not None and expected is not None
+    assert (answer.message_id, answer.text, answer.chunk_count) == (
+        expected.message_id,
+        expected.text,
+        expected.chunk_count,
+    )
+    assert answer.text == "Verdict:\n" + ACCEPTED
+
+
+def test_without_message_ids_a_thought_still_ends_the_message() -> None:
+    """The messageId-free fallback is unchanged: a thought is the demonstrable boundary."""
+    instance = transcript(
+        update(REJECTED, message_id=None),
+        thought("Let me look again.", message_id=None),
+        update(ACCEPTED, message_id=None),
+    )
+
+    answer = instance.final_answer()
+
+    assert answer is not None and answer.text == ACCEPTED
+    assert answer.chunk_count == 1
+    assert instance.observed_message_count == 2
+
+
+def test_a_message_id_that_returns_after_another_message_is_refused() -> None:
+    """Which text is the final message is not identified, so nothing is guessed."""
+    instance = transcript(
+        update(REJECTED, message_id="m-1"),
+        update("Checking the tests.", message_id="m-2"),
+        update(ACCEPTED, message_id="m-1"),
+        update(" more", message_id="m-1"),
+    )
+
+    # The first reason stands: the fourth chunk does not overwrite it with line 3.
+    assert "line 2 continues message 'm-1'" in instance.rejected
+    assert instance.final_answer() is None
+    assert instance.observed_message_count == 0
 
 
 def test_updates_from_another_session_are_excluded() -> None:

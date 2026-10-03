@@ -59,6 +59,7 @@ def structured_harness(
     trailing_updates: str | None = None,
     reviewer_trailing_updates: str | None = None,
     reported_usage: bool = False,
+    answer_shape: str = "split",
 ) -> DriverHarness:
     """A driver whose agent answers by role, through the production launch path.
 
@@ -70,8 +71,9 @@ def structured_harness(
     pairs (the client sends ``session/prompt`` as id 2); ``reviewer_terminal_responses`` does the
     same for the reviewer only. ``trailing_updates`` / ``reviewer_trailing_updates`` set
     ``STUB_TRAILING_UPDATES`` / ``STUB_REVIEWER_TRAILING_UPDATES`` (updates sent after the
-    terminal response), and ``reported_usage`` sets ``STUB_REPORTED_USAGE=1`` (agent-reported
-    usage and cost).
+    terminal response), ``reported_usage`` sets ``STUB_REPORTED_USAGE=1`` (agent-reported
+    usage and cost), and ``answer_shape`` selects how the reviewer's final message is
+    framed (see the stub's ``STUB_ANSWER_SHAPE``).
     """
     harness = DriverHarness(tmp_path, "structured")
     scratch = (tmp_path / "stub-scratch").resolve()
@@ -80,6 +82,7 @@ def structured_harness(
     harness.driver.extra_env["STUB_REVIEW_MODE"] = review_mode
     harness.driver.extra_env["STUB_MESSAGE_IDS"] = "1" if message_ids else "0"
     harness.driver.extra_env["STUB_IMPLEMENTER_PATH"] = "src/parser.py"
+    harness.driver.extra_env["STUB_ANSWER_SHAPE"] = answer_shape
     if terminal_responses is not None:
         harness.driver.extra_env["STUB_TERMINAL_RESPONSES"] = terminal_responses
     if reviewer_terminal_responses is not None:
@@ -428,6 +431,47 @@ def test_user_and_tool_text_cannot_supply_the_verdict(tmp_path: Path) -> None:
     harness.driver.release(handle.invocation_id)
 
 
+def test_a_reasoning_block_inside_the_final_message_is_skipped_not_a_boundary(
+    tmp_path: Path,
+) -> None:
+    """DSH frames a [text, reasoning, text] message as a same-id thought between two chunks.
+
+    The thought is verdict-shaped: if it were read, the verdict would change or become
+    ambiguous. If it were treated as the end of the message, only the second half of the
+    answer would be read (an unterminated fence).
+    """
+    harness = structured_harness(tmp_path, answer_shape="thought-inside")
+    result, handle, _ = run_invocation(harness, "reviewer", REVIEW_GOAL)
+
+    assert result.outcome is InvocationOutcome.COMPLETED
+    assert result.review == ReviewOutput(
+        verdict="accepted",
+        findings=[{"id": "AC-1", "status": "pass", "detail": "empty input returns the agreed result"}],
+    )
+    assert f"{REVIEW_INPUT_PREFIX}decoded: accepted" in " ".join(result.limitations)
+    harness.driver.release(handle.invocation_id)
+
+
+def test_a_message_id_that_resumes_after_another_message_is_a_wire_failure(
+    tmp_path: Path,
+) -> None:
+    """The answer's second half arrives under the earlier commentary's ``messageId``.
+
+    Which text is the final message is then not identified, so no verdict is decoded. The line
+    number is not asserted: the driver's line index saturates at its buffered-line bound.
+    """
+    harness = structured_harness(tmp_path, answer_shape="resumed-id")
+    result, handle, _ = run_invocation(harness, "reviewer", REVIEW_GOAL)
+
+    assert result.outcome is InvocationOutcome.COMPLETED
+    assert result.review is None
+    assert any(
+        note.startswith("review_invalid:") and "continues message 'm-4'" in note
+        for note in result.limitations
+    ), result.limitations
+    harness.driver.release(handle.invocation_id)
+
+
 # --------------------------------------------------------------------------
 # 2. transport validity stays separate from content
 # --------------------------------------------------------------------------
@@ -589,6 +633,41 @@ def test_unusable_verdicts_block_as_a_protocol_error_not_a_rejection(
         "a wire failure must not be described as the reviewer's substantive rejection"
     )
     assert len(evidence) == 1, "the failure is recorded as review evidence"
+    assert evidence[0]["status"] == EvidenceStatus.ERROR.value
+
+
+def test_a_rejection_before_the_final_messages_own_reasoning_never_becomes_an_acceptance(
+    tmp_path: Path, project, task_spec, project_root: Path
+) -> None:
+    """One final message holds a rejection block, its own reasoning, then an acceptance.
+
+    The reasoning arrives as a same-id thought. When that thought ended the message, only the
+    fragment after it was read, and the run was ACCEPTED with a receipt although the reviewer's
+    final message also rejected the candidate. The whole message is now the answer, and two
+    verdicts in it are ambiguous: a protocol error, never an acceptance.
+    """
+    harness = structured_harness(tmp_path, answer_shape="conflict-inside")
+    controller, store, _ = controller_for(harness, tmp_path)
+    try:
+        outcome = controller.run_task(
+            RunRequest(
+                task=task_spec,
+                project=project,
+                project_root=project_root,
+                workspace_root=project_root,
+            )
+        )
+        evidence = [dict(row) for row in store.evidence_for(outcome.run_id, "review")]
+    finally:
+        for invocation_id in list(harness.driver._handles):
+            harness.driver.release(invocation_id)
+        store.close()
+
+    assert outcome.task_state is TaskState.BLOCKED
+    assert outcome.block_code is RefusalCode.REVIEW_PROTOCOL_ERROR
+    assert outcome.receipt is None
+    assert "ambiguous" in (outcome.block_reason or ""), outcome.block_reason
+    assert len(evidence) == 1
     assert evidence[0]["status"] == EvidenceStatus.ERROR.value
 
 

@@ -287,7 +287,12 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
   followed it (`stream_order`). The reviewer's verdict is reassembled from the `agent_message_chunk`
   updates the driver observed - the production driver does not filter them by session, since
   `acpx exec` runs one session, and the offline replay tool requires a single session - and
-  decoded into one canonical `ReviewOutput` (`src/hflow/review.py`). A message chunk after the
+  decoded into one canonical `ReviewOutput` (`src/hflow/review.py`). Chunks group into messages by
+  ACP `messageId`, and only a different id starts a new message, so a same-id thought (DSH sends
+  reasoning under the message's own id), a usage update or a tool call does not split one. The
+  answer is the last message's message-chunk text in stream order, and thought text is never part
+  of it. A `messageId` that returns after another message started rejects the transcript. Without
+  `messageId`, a non-message update or a sequence gap ends a message. A message chunk after the
   bound prompt response, or a stream not read to its end, means no verdict (`review_protocol_error`
   / `review_ambiguous`). Missing, malformed or ambiguous output, or a reviewer turn that `FAILED`,
   blocks as `review_protocol_error` and is recorded as failed review evidence - it is never

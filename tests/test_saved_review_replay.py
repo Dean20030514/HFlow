@@ -133,7 +133,13 @@ def test_saved_review_replays_to_a_validated_verdict(
 
     answer = transcript.final_answer()
     assert answer is not None
-    assert answer.chunk_count >= 1
+    # Pinned exactly, so a change to the grouping rule cannot silently change the recorded answer.
+    assert answer.message_id == "eb6ade90-750b-4bf3-8733-e9ccd164d89b"
+    assert answer.chunk_count == 1
+    assert transcript.observed_message_count == 17
+    assert hashlib.sha256(answer.text.encode("utf-8")).hexdigest() == (
+        "6c7cb3c9f9f080bfff0a653c2fde92330257eca532664e30d97fa42c4cb7fa2c"
+    )
     assert any(item in prompt_ids for item in terminal_ids), "the terminal response answers the prompt"
     review = decode_review(answer.text)
 

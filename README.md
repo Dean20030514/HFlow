@@ -281,7 +281,13 @@ the project contract, the machine profile, the authorization artifact, the root 
   state, consumes no allowance and dispatches nothing; it is not the same event as a run that
   dispatches and then blocks (`exit 3`).
 - A reviewer's verdict is decoded from that reviewer invocation's own final message and
-  validated against the canonical `ReviewOutput`; nothing else can supply it. A turn that
+  validated against the canonical `ReviewOutput`; nothing else can supply it. The final
+  message is the last message by ACP `messageId` (only a change of id starts a new one), and
+  its answer is that message's `agent_message_chunk` text in stream order, with nothing
+  inserted. A reasoning block (`agent_thought_chunk`) is never part of it, whatever its id: DSH
+  sends a message's reasoning under the message's own id, so a reasoning block between two text
+  blocks is skipped, not treated as the end of the message. A `messageId` that resumes after
+  another message started blocks as `review_protocol_error`. A turn that
   produced no usable verdict blocks as `review_protocol_error` (a wire failure) instead of
   being reported as the reviewer requesting changes, a reviewer turn whose outcome is unknown
   blocks as `outcome_unknown` with its ledger entry settled as unknown (so `resume` can
@@ -440,6 +446,13 @@ What it still is **not**, and cannot be read as more than:
   root counter.
 - **No typed finding schema.** Findings are still "a list of objects"; the reviewer is not told
   which keys count as content.
+- **Message boundaries without `messageId` are inferred.** For a runtime that omits ACP's
+  optional `messageId`, any update that is not a message chunk (a thought included) or a
+  sequence gap ends a message, and only the last such segment is read as the answer. Every
+  message chunk in the recorded live DSH streams carries a `messageId`, so no recorded
+  production run took this path. The order "text, reasoning, text" inside one DSH message comes
+  from DSH source (`dsh-v0.2.0-rc.2`, `packages/acp/acp/src/updates.ts`); HFlow handles it in
+  offline tests only, and it has not been observed live.
 
 Offline checks never look like a real execution: `kind=fake` launches no process, so its evidence
 says `not_launched` and it can never trigger a repair. An offline test that wants the repair rule

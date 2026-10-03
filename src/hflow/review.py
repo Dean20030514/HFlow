@@ -102,7 +102,11 @@ class AnswerChunk:
 
 @dataclass(frozen=True)
 class FinalAnswer:
-    """The invocation's final assistant message, verbatim."""
+    """The invocation's final assistant message, verbatim.
+
+    ``first_line``/``last_line`` span its message chunks; a thought between them is not part of
+    ``text``, and ``chunk_count`` counts message chunks only.
+    """
 
     message_id: str
     first_line: int
@@ -116,13 +120,25 @@ class AnswerTranscript:
     """Accumulates the assistant messages of one invocation, in stream order.
 
     Grouping rule (pinned to the observed runtime): chunks belong to the same message when
-    they carry the same ``messageId``. ``messageId`` is *optional* in ACP, so when the
-    runtime does not send one, a new ``sessionUpdate`` that is not a message chunk ends the
-    current message - that is the demonstrable turn boundary, not a guess about the last
-    line of the stream. A gap in sequence numbers also ends it.
+    they carry the same ``messageId``, and only a different id starts a new one (ACP: a
+    change in ``messageId`` indicates a new message has started). Thoughts, usage updates
+    and tool calls are never answer text, and when ids are present they are not boundaries
+    either. DSH gives a committed message's reasoning the message's own id (seen in every
+    recorded live stream) and emits the message's blocks in content order, then a
+    ``usage_update`` (``packages/acp/acp/src/updates.ts``), so a reasoning block between two
+    text blocks arrives as a same-id thought inside the message. A ``messageId`` that
+    returns after another message started leaves the final message unidentified (ACP's v2
+    draft lets chunks append to an earlier message), so the transcript is rejected rather
+    than guessing which text is the answer.
 
-    The answer is the **last** group, i.e. the message the turn ended with. Intermediate
-    commentary is never concatenated into it.
+    ``messageId`` is *optional* in ACP, so when the runtime does not send one, a new
+    ``sessionUpdate`` that is not a message chunk ends the current message - that is the
+    demonstrable turn boundary, not a guess about the last line of the stream. A gap in
+    sequence numbers also ends it.
+
+    The answer is the **last** message: the text of its ``agent_message_chunk`` updates,
+    concatenated in stream order with nothing inserted. Thought text is never part of it,
+    and intermediate commentary (an earlier message) is never concatenated into it.
     """
 
     session_id: str | None = None
@@ -132,6 +148,9 @@ class AnswerTranscript:
     _truncated: bool = False
     #: Set when a message chunk could not be read at all; the answer is then unusable.
     _rejected: str = ""
+    #: Every ``messageId`` that has started a message. One that returns after a different
+    #: message started leaves the final message unidentified and rejects the transcript.
+    _message_ids: set[str] = field(default_factory=set, repr=False)
     #: Incremented for message chunks rejected because they belong to another session, so
     #: replay can report what it excluded instead of silently dropping it.
     skipped_other_session: int = 0
@@ -151,9 +170,10 @@ class AnswerTranscript:
         if not isinstance(kind, str):
             return
         if kind != "agent_message_chunk":
-            # Thoughts, tool calls, plans and user/agent echoes are separate updates: seeing
-            # one ends the current message group, which is what makes the fallback grouping
-            # work when the runtime sends no messageId.
+            # Thoughts, tool calls, plans, usage and user/agent echoes are separate updates and
+            # never answer text. Seeing one ends the current message for the messageId-free
+            # fallback; a message that carries a messageId is ended only by a different id
+            # (see ``_group_for``).
             self._end_group()
             return
 
@@ -162,6 +182,10 @@ class AnswerTranscript:
             if session != self.session_id:
                 self.skipped_other_session += 1
                 return
+
+        if self._rejected:
+            # The first reason stands: nothing after an unusable chunk is retained.
+            return
 
         text = _chunk_text(update)
         if text is None:
@@ -176,15 +200,9 @@ class AnswerTranscript:
         message_id = update.get("messageId")
         identity = message_id if isinstance(message_id, str) and message_id else ""
 
-        if not self._groups:
-            self._groups.append([])
-        elif identity:
-            if self._groups[-1] and self._groups[-1][0].message_id != identity:
-                self._groups.append([])
-        elif self._groups[-1] and sequence != self._groups[-1][-1].sequence + 1:
-            # No messageId, but the chunk is not contiguous with the previous one: a new
-            # message started in between.
-            self._groups.append([])
+        group = self._group_for(identity, sequence=sequence, line_index=line_index)
+        if group is None:
+            return
 
         chunk = AnswerChunk(
             message_id=identity,
@@ -192,7 +210,7 @@ class AnswerTranscript:
             sequence=sequence,
             text=text,
         )
-        self._groups[-1].append(chunk)
+        group.append(chunk)
         size = len(text.encode("utf-8"))
         if not self._truncated:
             # Counted once per chunk: beyond the cap the content is unusable (never
@@ -200,6 +218,32 @@ class AnswerTranscript:
             self._retained_bytes += size
             if self._retained_bytes > MAX_ANSWER_BYTES:
                 self._truncated = True
+
+    def _group_for(
+        self, identity: str, *, sequence: int, line_index: int
+    ) -> list[AnswerChunk] | None:
+        """The message a chunk belongs to, or ``None`` once the final message is unidentifiable."""
+        previous = next((group for group in reversed(self._groups) if group), None)
+        if identity:
+            if previous is not None and previous[0].message_id == identity:
+                # The same message, resumed after a thought, usage update or tool call that
+                # ``_end_group`` treated as a boundary for the messageId-free fallback.
+                while not self._groups[-1]:
+                    self._groups.pop()
+                return previous
+            if identity in self._message_ids:
+                self.reject(
+                    f"agent_message_chunk on line {line_index} continues message {identity!r} "
+                    "after a later message started, so the final message is not identified"
+                )
+                return None
+            self._message_ids.add(identity)
+        elif self._groups and self._groups[-1] and sequence == self._groups[-1][-1].sequence + 1:
+            # No messageId: a contiguous chunk continues the open message.
+            return self._groups[-1]
+        if not self._groups or self._groups[-1]:
+            self._groups.append([])
+        return self._groups[-1]
 
     def _end_group(self) -> None:
         if self._groups and self._groups[-1]:

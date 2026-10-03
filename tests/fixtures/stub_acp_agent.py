@@ -18,6 +18,14 @@ Each mode models one behaviour the driver must handle honestly:
                   selects the reviewer's shape (``fenced``/``bare``/``invalid``/``ambiguous``/
                   ``prose``/``silent``); ``STUB_MESSAGE_IDS=0`` drops the optional
                   ``messageId`` so the messageId-free grouping path is covered too;
+                  ``STUB_ANSWER_SHAPE`` frames the reviewer's final message: ``split``
+                  (default) sends it as two same-id chunks; ``thought-inside`` puts a
+                  verdict-shaped ``agent_thought_chunk`` with the same ``messageId`` between
+                  them and a ``usage_update`` after, the way DSH frames a message whose
+                  content is [text, reasoning, text]; ``conflict-inside`` sends a complete
+                  rejection block, the message's own reasoning, then the accepted answer, all
+                  under one ``messageId``; ``resumed-id`` sends the second half under the
+                  earlier commentary's ``messageId``;
                   ``STUB_TERMINAL_RESPONSES`` (and ``STUB_REVIEWER_TERMINAL_RESPONSES`` for
                   the reviewer alone) replaces the terminal prompt response - ``id:stopReason``,
                   ``id:!code`` for a JSON-RPC error (message ``STUB_PROMPT_ERROR_MESSAGE``),
@@ -187,6 +195,31 @@ def emit_usage_update(session_id: str) -> None:
     )
 
 
+#: A verdict-shaped reasoning block. If a thought were ever read as answer text, the decoded
+#: verdict would change or become ambiguous.
+THOUGHT_VERDICT = '{"verdict": "changes_requested", "findings": [{"id": "thought"}]}'
+
+#: A complete rejection block: the first text block of a final message whose last block accepts.
+REJECTION_BLOCK = (
+    '```json\n{"verdict": "changes_requested", "findings": '
+    '[{"id": "F-1", "detail": "empty input still crashes"}]}\n```\n\n'
+)
+
+
+def emit_usage(session_id: str) -> None:
+    """The context-occupancy update DSH sends after each committed assistant message."""
+    emit(
+        {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {"sessionUpdate": "usage_update", "used": 1024, "size": 131072},
+            },
+        }
+    )
+
+
 def emit_terminal_responses(session_id: str, *, reviewer: bool) -> bool:
     """The turn's terminal response(s): by default one ``end_turn`` answering the prompt.
 
@@ -346,6 +379,7 @@ def structured_turn(session_id: str, task: str, scratch: Path) -> int:
     """
     review_mode = os.environ.get("STUB_REVIEW_MODE", "fenced")
     with_ids = os.environ.get("STUB_MESSAGE_IDS", "1") != "0"
+    answer_shape = os.environ.get("STUB_ANSWER_SHAPE", "split")
     # A multibyte character in the answer, so reassembly is exercised rather than assumed:
     # the real stream carries prose around the verdict object, not ASCII only.
     flourish = "\u2014 reviewed \u2713\n\n"
@@ -391,8 +425,24 @@ def structured_turn(session_id: str, task: str, scratch: Path) -> int:
         # Split the answer across chunks that share one message id. The cut is chosen so it
         # lands in the prose, leaving the verdict object assembled from more than one chunk.
         cut = answer.index("```json") + 3 if "```json" in answer else len(answer) // 2
-        for part in (answer[:cut], answer[cut:]):
-            emit_message_chunk(session_id, part, "m-5", with_id=with_ids)
+        if answer_shape == "thought-inside":
+            # DSH emits a committed message's blocks in content order under one messageId.
+            emit_message_chunk(session_id, answer[:cut], "m-5", with_id=with_ids)
+            emit_thought(session_id, THOUGHT_VERDICT, "m-5", with_id=with_ids)
+            emit_message_chunk(session_id, answer[cut:], "m-5", with_id=with_ids)
+            emit_usage(session_id)
+        elif answer_shape == "conflict-inside":
+            # One message, two verdicts, split by its own reasoning.
+            emit_message_chunk(session_id, REJECTION_BLOCK, "m-5", with_id=with_ids)
+            emit_thought(session_id, "On reflection the tests pass.", "m-5", with_id=with_ids)
+            emit_message_chunk(session_id, answer, "m-5", with_id=with_ids)
+            emit_usage(session_id)
+        elif answer_shape == "resumed-id":
+            emit_message_chunk(session_id, answer[:cut], "m-5", with_id=with_ids)
+            emit_message_chunk(session_id, answer[cut:], "m-4", with_id=with_ids)
+        else:
+            for part in (answer[:cut], answer[cut:]):
+                emit_message_chunk(session_id, part, "m-5", with_id=with_ids)
     if os.environ.get("STUB_REPORTED_USAGE") == "1":
         emit_usage_update(session_id)
     errored = emit_terminal_responses(session_id, reviewer=True)
