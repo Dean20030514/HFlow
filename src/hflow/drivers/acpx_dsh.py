@@ -1116,9 +1116,13 @@ class AcpxDshDriver:
         self._prompt_id_reused_by: dict[str, dict[tuple[str, Any], str]] = {}
         #: Non-empty protocol lines read so far: the next line's stream index. ``_lines`` is a
         #: bounded deque and ``_events`` is capped, so neither can number a line once it is full;
-        #: this never saturates, and while the retained log is whole it is the line's 0-based
-        #: number in ``events.ndjson``.
+        #: this never saturates. It is the 0-based non-empty-line ordinal, not a physical
+        #: line number (blank lines remain in the retained log).
         self._line_counts: dict[str, int] = {}
+        #: Framed raw bytes consumed, including blank and discarded line content. Every wire
+        #: record must fit this byte budget and the record budget before it can grow any state.
+        self._protocol_bytes: dict[str, int] = {}
+        self._output_limit_reasons: dict[str, set[str]] = {}
         #: The session the latest ``session/prompt`` named, and ``[updates, agent_message_chunk
         #: updates]`` per session a prompt named, counted from that prompt on. Bounded by the
         #: number of prompt requests, which is one for ``exec``.
@@ -1136,8 +1140,8 @@ class AcpxDshDriver:
         #: What ``release`` could not do, per invocation (a pipe left to a reader that is still
         #: blocked on it). Recorded facts, not part of the already-returned result.
         self._release_notes: dict[str, list[str]] = {}
-        #: Set once the in-memory event list stopped growing: the container is bounded too, not
-        #: only the retained file.
+        #: Set once all protocol state stopped growing. Only constant-size dispatch and drain
+        #: counters may change afterwards; the retained raw file has its independent byte cap.
         self._events_capped: dict[str, bool] = {}
         #: Highest byte offset ever read from a client's output file. Reported so the retention
         #: bound is a measured number rather than a claim: the file is trimmed back to the budget,
@@ -1149,7 +1153,7 @@ class AcpxDshDriver:
         #: number of bytes on purpose: with a fixed share, a small configured budget would leave
         #: the protocol stream a zero-byte share, and the cap would silently mean "keep nothing".
         self.stderr_share_fraction = 0.125
-        #: Hard cap on retained events for one invocation, independent of their byte size.
+        #: Hard cap on all non-empty protocol records, including records with no neutral event.
         self.max_event_records = 20000
         self._results: dict[str, InvocationResult] = {}
         #: Digest of the prompt text each invocation was launched with, reported by ``collect``
@@ -1685,9 +1689,9 @@ class AcpxDshDriver:
     def _prepare_stream_state(self, request: InvocationRequest) -> None:
         """Per-invocation stream state, set before any thread that reads or writes it starts."""
         # One declared retention budget per invocation, split between the protocol stream and
-        # stderr. The reader enforces it by writing only up to its share and repeatedly trimming
-        # the client's own file back to that share: a looping client keeps writing, and the file
-        # keeps being returned to the budget instead of growing with it.
+        # stderr. The readers retain only each share; the protocol reader also freezes all
+        # accumulated wire state after its byte or record cap. The client's own output file is
+        # measured, not trimmed while another process owns it.
         self._events[request.invocation_id] = []
         # Bound in ``_note_message`` to the session the first ``session/prompt`` names: no message
         # chunk is read before that, and another session's are excluded and counted.
@@ -1700,6 +1704,8 @@ class AcpxDshDriver:
         self._prompt_errors[request.invocation_id] = []
         self._prompt_id_reused_by[request.invocation_id] = {}
         self._line_counts[request.invocation_id] = 0
+        self._protocol_bytes[request.invocation_id] = 0
+        self._output_limit_reasons[request.invocation_id] = set()
         self._prompt_session_updates[request.invocation_id] = {}
         self._lines[request.invocation_id] = deque(maxlen=MAX_BUFFERED_LINES)
         self._unparsed[request.invocation_id] = 0
@@ -1911,16 +1917,16 @@ class AcpxDshDriver:
         instead (``peak_raw_bytes``), so the difference between "bounded" and "measured" is
         visible rather than implied.
 
-        A line that never ends is bounded too. Without that, a client writing a gigabyte with no
-        newline would grow ``pending`` in memory exactly as fast as the file - the bound would be
-        nominal. An over-long line is reported as an unusable line (which makes the turn's result
-        unknown) and the buffer is reset.
+        Raw chunks are retained before decoding or framing. An over-long line is discarded
+        through its next newline: resetting the buffer alone would turn its tail into a new
+        protocol record.
         """
         handle = self._handles[invocation_id]
         process = self._processes[invocation_id]
         cap = self.protocol_share_bytes
         with BoundedTextSink(Path(handle.event_log), limit=cap) as sink:
             pending = b""
+            discarding = False
             offset = 0
             while True:
                 chunk = b""
@@ -1934,23 +1940,28 @@ class AcpxDshDriver:
                     offset += len(chunk)
                     if offset > self._peak_raw_bytes[invocation_id]:
                         self._peak_raw_bytes[invocation_id] = offset
-                    previous_total = sink.total_bytes
-                    pending += chunk
-                    *complete, pending = pending.split(b"\n")
-                    for raw in complete:
-                        self._project_line(invocation_id, sink, raw)
-                    if sink.total_bytes > sink.retained_bytes and (
-                        sink.total_bytes > previous_total or not self._overflow[invocation_id]
-                    ):
-                        # The budget ran out on this read: recorded now rather than on the next
-                        # line, so a stream whose *last* line crosses the cap is still reported.
-                        self._overflow[invocation_id] = True
-                    if len(pending) > MAX_PENDING_LINE_BYTES:
-                        # Unusable as a message; counted so the outcome cannot look clean. The
-                        # pending buffer is reset because an endless line is not a message.
-                        self._unparsed[invocation_id] += 1
-                        self._oversized[invocation_id] += 1
-                        pending = b""
+                    sink.write(chunk)
+                    parts = chunk.split(b"\n")
+                    for index, part in enumerate(parts):
+                        ended = index < len(parts) - 1
+                        self._protocol_bytes[invocation_id] += len(part) + int(ended)
+                        if not discarding:
+                            pending += part
+                            if len(pending) > MAX_PENDING_LINE_BYTES:
+                                self._unparsed[invocation_id] += 1
+                                self._oversized[invocation_id] += 1
+                                self._line_counts[invocation_id] += 1
+                                if self._line_counts[invocation_id] > self.max_event_records:
+                                    self._limit_output(invocation_id, "protocol_record_limit")
+                                pending = b""
+                                discarding = True
+                            elif ended:
+                                self._project_line(invocation_id, sink, pending)
+                                pending = b""
+                        if ended:
+                            discarding = False
+                    if sink.truncated:
+                        self._limit_output(invocation_id, "protocol_byte_limit")
                     continue
                 if process.poll() is not None:
                     try:
@@ -1963,7 +1974,7 @@ class AcpxDshDriver:
                         break
                     continue
                 time.sleep(STREAM_POLL_SECONDS)
-            if pending:
+            if pending and not discarding:
                 self._project_line(invocation_id, sink, pending)
             self._overflow[invocation_id] = self._overflow[invocation_id] or sink.truncated
             final_capture = sink.capture()
@@ -1998,24 +2009,39 @@ class AcpxDshDriver:
         return max(0, self.max_raw_log_bytes - self.stderr_share_bytes)
 
     def _project_line(self, invocation_id: str, sink: BoundedTextSink, raw: bytes) -> None:
-        """Retain one output line within the budget and project it to an event.
+        """Project a framed line. Raw retention belongs to the reader, before decoding.
 
-        Two things stay bounded together. The retained file stops at the sink's limit, and the
-        in-memory event list stops growing once that budget is spent: parsing may continue (it is
-        how a stop reason is recognised), but nothing further is accumulated, so "the events are
-        capped" is a property of the container and not only of the file.
+        After either protocol limit is crossed, only a constant-size dispatch observation may
+        change. Prompt ids, terminals, model state, transcript and cached lines all stop growing.
         """
         if not raw:
             return
-        text = raw.decode("utf-8", errors="replace")
-        # Always written: the sink retains only up to its limit, but it *counts and digests* every
-        # byte it is given. Skipping the call once the limit was reached is what made the reported
-        # total describe HFlow's copy instead of the stream HFlow actually read.
-        sink.write(text.encode("utf-8") + b"\n")
-        self._lines[invocation_id].append(text)
         # Numbered before parsing, so unparseable and message-less lines take a number too.
         line_index = self._line_counts[invocation_id]
         self._line_counts[invocation_id] = line_index + 1
+        if self._protocol_bytes[invocation_id] > self.protocol_share_bytes:
+            self._limit_output(invocation_id, "protocol_byte_limit")
+        if line_index >= self.max_event_records:
+            self._limit_output(invocation_id, "protocol_record_limit")
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            # Keep the original bytes, but never turn an invalid wire string into a valid
+            # message by replacing bytes with U+FFFD.
+            self._unparsed[invocation_id] += 1
+            return
+        if self._events_capped[invocation_id]:
+            # Parse at most the bounded line, without constructing events or retaining its
+            # contents. A prompt observed in the discarded tail still proves dispatch.
+            if not self._handles[invocation_id].dispatched:
+                try:
+                    message = json.loads(text)
+                except (ValueError, TypeError, RecursionError):
+                    message = None
+                if isinstance(message, dict) and message.get("method") == "session/prompt":
+                    self._note_dispatch(invocation_id)
+            return
+        self._lines[invocation_id].append(text)
         try:
             observed = project_line(text, len(self._events[invocation_id]), utc_now())
         except Exception:  # noqa: BLE001 - a line the projection cannot read is unparseable
@@ -2038,12 +2064,17 @@ class AcpxDshDriver:
                     )
                 return
         if observed.event is not None:
-            if self._events_capped[invocation_id]:
-                return
-            if sink.truncated or len(self._events[invocation_id]) >= self.max_event_records:
-                self._events_capped[invocation_id] = True
-                return
             self._events[invocation_id].append(observed.event)
+
+    def _limit_output(self, invocation_id: str, reason: str) -> None:
+        self._overflow[invocation_id] = True
+        self._events_capped[invocation_id] = True
+        self._output_limit_reasons[invocation_id].add(reason)
+
+    def _note_dispatch(self, invocation_id: str) -> None:
+        handle = self._handles[invocation_id]
+        handle.dispatched = True
+        handle.dispatched_at = handle.dispatched_at or utc_now()
 
     def _consume_stderr(self, invocation_id: str, stderr_path: Path) -> None:
         """Drain the client's stderr from its pipe into a bounded sink.
@@ -2103,8 +2134,7 @@ class AcpxDshDriver:
             watch.observe(message)
         params = message.get("params") if isinstance(message.get("params"), dict) else {}
         if message.get("method") == "session/prompt":
-            handle.dispatched = True
-            handle.dispatched_at = handle.dispatched_at or utc_now()
+            self._note_dispatch(invocation_id)
             request_id = message.get("id")
             if request_id is not None:
                 prompt_ids = self._prompt_request_ids.setdefault(invocation_id, [])
@@ -2379,7 +2409,7 @@ class AcpxDshDriver:
             if prompt_error is not None
             else ""
         )
-        stream_order = self._stream_order(invocation_id, drained)
+        stream_order = self._stream_order(invocation_id, drained and not overflowed)
         receipt = self._receipts.get(invocation_id)
 
         if receipt is not None and receipt.status == "confirmed_stopped":
@@ -2421,8 +2451,10 @@ class AcpxDshDriver:
             outcome = InvocationOutcome.OUTCOME_UNKNOWN
             error_code = "output_limit_exceeded"
             error_message = (
-                f"client output exceeded the {self.max_raw_log_bytes} byte retention budget; the "
-                "protocol stream was cut, so the result cannot be trusted"
+                "client protocol output exceeded "
+                + ", ".join(sorted(self._output_limit_reasons.get(invocation_id) or {"protocol_byte_limit"}))
+                + f" (byte budget={self.protocol_share_bytes}, record budget={self.max_event_records}); "
+                "protocol state is incomplete, so the result cannot be trusted"
             )
         elif unparsed:
             outcome = InvocationOutcome.OUTCOME_UNKNOWN
@@ -2522,8 +2554,9 @@ class AcpxDshDriver:
             )
         if overflowed:
             limitations.append(
-                f"client stdout exceeded the {self.max_raw_log_bytes} byte retention cap; the retained "
-                "log is a prefix, not the whole stream"
+                "protocol state stopped accumulating after "
+                + ", ".join(sorted(self._output_limit_reasons.get(invocation_id) or {"protocol_byte_limit"}))
+                + "; model and stream-order observations are incomplete"
             )
         if not exit_boundary.emptied:
             limitations.append(f"boundary_not_empty: {exit_boundary.detail}")
@@ -2545,7 +2578,11 @@ class AcpxDshDriver:
         if stdin_note:
             limitations.append(stdin_note)
         if not handle.dispatched:
-            limitations.append("no session/prompt was observed; the harness never received the task")
+            limitations.append(
+                "no session/prompt was observed; dispatch is unknown in the incomplete protocol state"
+                if overflowed
+                else "no session/prompt was observed; the harness never received the task"
+            )
         if unbound:
             limitations.append(
                 f"unbound_completion: {self._unbound_detail(invocation_id)}; the turn's completion "
@@ -2604,7 +2641,7 @@ class AcpxDshDriver:
             candidate=None,
             review=review,
             prompt_digest=self._prompt_digests.get(invocation_id, ""),
-            agent_turns=1 if handle.dispatched else 0,
+            agent_turns=1 if handle.dispatched else (None if overflowed else 0),
             provider_billed_tokens=None,
             reported_cost=None,
             limitations=limitations,
@@ -2650,6 +2687,8 @@ class AcpxDshDriver:
         self, invocation_id: str, *, rejected: bool
     ) -> tuple[ModelObservation | None, ModelApplied | None]:
         """The invocation's model observation and what became of the requested model."""
+        if self._overflow.get(invocation_id):
+            return None, ModelApplied.UNKNOWN if self.launch.model else ModelApplied.NOT_PASSED
         watch = self._model_watches.get(invocation_id)
         if watch is None:
             return None, None

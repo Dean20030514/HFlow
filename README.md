@@ -8,6 +8,7 @@ Harness (DSH first) owns reasoning and tools.
 offline delivery slice; the batch E1 root ledger and the batch E2 bounded repair, offline-tested;
 the batch F hardening from the 2026-10-03 upstream survey (turn settlement, reviewer transcript,
 stop confirmation, shared Git metadata, launch and context records), offline-tested;
+immutable admission and workspace records, guarded cleanup and bounded wire metadata;
 three recorded live top-level M2 tasks (one stop trial, two attempts at one small change) under
 explicit one-time authorizations.**
 
@@ -125,6 +126,11 @@ tested, so they are recorded rather than asserted:
 | Snapshot | Command | Result |
 |---|---|---|
 | batch F on top of `f2796aa` (prompt errors and unknown stop reasons, stream order and after-response text, reviewer transcript by `messageId` and session, fail-safe exit checks, shared Git metadata, launch-surface and DSH-context records) | `python -m pytest -q` | `938 passed, 1 skipped in 610.03s` (exit 0; 939 collected) |
+| 2026-10-05 working tree on `35751aa` (immutable admission binding, guarded cleanup and reconciliation, bounded raw/protocol output, unreadable-record diagnostics) | `python -m pytest -q` | `1382 passed, 1 skipped in 771.05s` (exit 0; 1383 collected) |
+
+The 2026-10-05 snapshot is offline verification, including actual Git repositories and local
+stand-in processes. It adds no live-model compatibility observation or capability upgrade;
+the production driver and acpx 0.17.1 pin are unchanged.
 
 History, for orientation only: the suite grew from 225 tests (T02 admission) through 298 (batches
 A/B/C), 353 (batch D configuration wiring), 377 (reviewer-cancel routing and the coordinated spawn
@@ -203,9 +209,11 @@ It never lands inside a project checkout.
 Exit codes: `0` accepted, `2` refused at admission (no run state is created), `3` blocked after
 dispatch, `4` usage (including every argument-parsing error), `5` the run exists and is not
 finished (`DRAFT`/`READY`/`RUNNING`/`CHECKING`, e.g. a submission that found the run claimed by
-another owner process, or `resume` refusing a takeover because that owner may be alive).
-`6`: `status`/`report` found the run but a stored record of it no longer validates; one line names
-the record, nothing is rewritten, and `cancel`/`resume` still work from the run row.
+another owner process, `resume` refusing a takeover because that owner may be alive, or an
+undispatched run whose recorded admission binding is missing or differs from this submission).
+`6`: `status`/`report` found the run but a stored record it needs no longer validates
+(`StoredRecordUnreadable`); one line names the record and no replacement record is inferred.
+`cancel`/`resume` can still work from the run row without those presentation records.
 A `CANCELLED` task state, which this build never writes, would exit `3`.
 
 Without installing, run through the module path:
@@ -488,7 +496,8 @@ the project contract, the machine profile, the authorization artifact, the root 
   `outcome_unknown` (`unknown_stop_reason`). A prompt response with no `stopReason` (for example
   the `{messageId}` insertion acknowledgement sketched in an unreleased ACP v2 RFD) settles
   nothing (`outcome_unknown`, `no_stop_reason`), and a later idle `state_update` is an update, not
-  a settlement. Every bound result whose stream was read to its end records where its prompt
+  a settlement. Every bound result whose stream was read to its end without wire-state
+  truncation records where its prompt
   response fell and how many updates for the prompt's session followed it (`stream_order`;
   `status` prints them). An implementer's trailing updates are recorded and never judged. A result
   of **either role** that arrives after a recorded stop - confirmed or not - is only a
@@ -656,13 +665,22 @@ Not built around configuration either:
   processes on the identical TaskSpec no longer both run setup: the claim is a compare-and-set on
   a per-controller owner token (see "Owner lease" below), so the second finds the run claimed by
   another owner and returns it as it stands with a note naming that owner (pid, host, label,
-  generation) - exit `5`, no setup, no block. The one exception is a run whose owner is provably
-  gone and that has no attempt and no invocation (an `hflow run` interrupted in setup): the
+  generation) - exit `5`, no setup, no block. An undispatched run continues only when its
+  immutable admission binding matches this submission: project and repository identity, managed
+  workspace path, resolved base, project contract, effective configuration and launch content,
+  drivers, deadline, and root binding and limits. The binding is stored with the run in the same
+  creation transaction; an explicitly absent offline configuration is distinct from a missing
+  historical binding. A different authorization id may approve the same bound execution. A
+  missing, unreadable or changed binding leaves the run and counters unchanged (exit `5`): restore the
+  original configuration, or cancel the run and submit a new task revision. No historical binding
+  is synthesized from notes. With that match, a run whose owner is provably
+  gone and that has no attempt and no invocation (an `hflow run` interrupted in setup) is eligible:
+  the
   resubmission adopts it with one compare-and-set (old token and generation -> its own, generation
   + 1), keeps it `DRAFT`/`READY`, records "adopted from a controller that is provably gone; nothing
   had been dispatched" and continues it. The authorization check runs read-only before any claim
   or adoption, so its refusal leaves the run as it was and a new authorization for the same
-  TaskSpec continues it. Still guarded as before: no writer that sets
+  bound execution can continue it. Still guarded as before: no writer that sets
   `BLOCKED` relabels a run that already ended or carries a receipt, and a controller never records
   its own refusal as the block of a run whose attempt another controller reserved. A controller
   interrupted (Ctrl+C, `SystemExit`) while an invocation is starting or running leaves an
@@ -671,6 +689,31 @@ Not built around configuration either:
   its owner is proven gone, and blocks it `owner_lost` (below). And this covers the one driver that
   creates processes here (`AcpxDshDriver`); another driver must coordinate its own spawn the same
   way.
+- **Cleanup uses recorded workspace identity.** A managed run stores its project root, Git common
+  directory and worktree path as internal `WorkspaceProvenance` in the transaction that attaches
+  the worktree path.
+  `hflow clean` compares that identity with the workspace and its Git registration before using
+  the repository for cleanup; mutable notes and receipt paths cannot supply a replacement.
+  For historical records, the root ledger may identify the source repository; a missing path with
+  no reliable repository source is unknown, never a successful cleanup. The cleanup claim requires a terminal run and
+  no active attempt in the same transaction. Success requires both the directory and Git
+  registration to be gone; a zero Git exit code alone is insufficient. Reconciliation uses those
+  same removal facts. Repeated apply after a recorded success reports that historical removal
+  without removing or making a new observation about a directory that later appeared there.
+  This is local consistency enforcement, not authentication
+  of the store against another process running as the same user.
+- **Worker logs retain raw bytes and bound wire state.** The retained `events.ndjson` is the raw
+  prefix, including blank lines, invalid UTF-8 and an EOF without a final newline; its digest
+  covers that retained prefix, while `total_bytes` counts every byte read. Wire state is bounded
+  by the protocol byte share and 20,000 nonempty records, including records that produce no
+  neutral event. All message, model and transcript containers stop growing at the bound while
+  output continues to drain and be counted. An overlong line is discarded through its newline,
+  so its tail cannot become a new message. A byte or metadata overflow is `OUTCOME_UNKNOWN` /
+  `output_limit_exceeded`: no verdict, no refund and no re-dispatch. Incomplete wire state yields
+  no model observation or stream-order record; a requested model reads `unknown`, and a launch
+  without a model flag reads `not_passed`. Dispatch remains `agent_turns=1` when observed, or
+  `unknown` when the incomplete stream cannot establish its absence. Response positions keep
+  their existing zero-based nonempty-line ordinal, not a physical file line number.
 - **Owner lease (user ruling 2026-10-03).** A run is owned by a controller *process*: a random
   per-controller token, the process's pid, creation time (`GetProcessTimes`) and host (storage
   v6), plus an exclusive OS file lock on `<ledger dir>/owners/<token>.lock` held for the

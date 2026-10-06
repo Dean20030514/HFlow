@@ -646,7 +646,7 @@ def test_clean_refuses_a_missing_or_foreign_workspace(
     refused = _preview(cli_project, capsys, run_id)
     assert refused["allowed"] is False
     assert any(
-        item["reason"] in {"not_registered", "git_query_failed", "not_a_worktree"}
+        item["reason"] in {"not_registered", "git_query_failed", "not_a_worktree", "provenance_mismatch"}
         for item in refused["refusals"]
     ), refused["refusals"]
     assert worktree.exists(), "the real worktree is untouched by a foreign path claim"
@@ -735,7 +735,15 @@ def test_clean_reconcile_after_an_apply_that_did_not_finish_recording(
 
     code, reconciled = _cli_json(capsys, cli_project, "clean", run_id, "--reconcile")
     assert code == EXIT_OK
-    assert reconciled["status"] == "REMOVED"
+    assert reconciled["status"] == "PARTIAL"
+    connection = sqlite3.connect(str(cli_project["data"] / "hflow.sqlite"))
+    try:
+        row = connection.execute(
+            "SELECT cleanup_intent_at, cleanup_done_at FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        assert row[0] is not None and row[1] is None
+    finally:
+        connection.close()
 
     # a repeated identical submission still returns the historical run and does not rebuild
     code, _ = _run_cli(cli_project)

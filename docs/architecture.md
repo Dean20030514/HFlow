@@ -61,6 +61,31 @@ that holds no handle, answers a stop `unknown` and a reconcile `unknown`, and re
 anything. A controller's scratch and check artifacts go under the data directory of its own
 ledger (`<data-dir>/artifacts/...`, `<data-dir>/invocations/...`).
 
+Run creation writes its internal `RunAdmissionBinding` and effective configuration in that same
+transaction. `RunAdmissionBinding`
+fixes the admitted project/repository identity, workspace path, resolved base, project contract,
+effective configuration and launch content, drivers, deadline, and root binding and limits.
+An explicitly absent offline configuration is not a missing historical record. A never-dispatched
+run may be continued or adopted only under that same binding; authorization ids may change, but
+execution inputs may not. Missing, unreadable or different bindings return the existing run unchanged (exit
+`5`), with instructions to restore the original configuration or cancel and submit a new revision.
+`WorkspaceProvenance` fixes the project root, Git common directory and managed worktree path in
+the transaction that attaches the worktree path. Neither record is reconstructed from mutable
+notes or receipt paths, and neither
+authenticates the database against another process running as the same user.
+
+`cleanup.py` checks that provenance against the observed workspace and Git registration before
+repository operations. Its cleanup claim checks terminal run state and absence of active
+attempts inside the claim transaction. Each removal attempt rechecks the guards and claimed
+workspace identity, including index flags that can hide modified files. Removal succeeds only when both the directory and its
+registration are gone; reconciliation uses the same repository source. An already recorded
+success is an idempotent historical result, not a new removal or observation; a later directory
+at that path is not deleted. A
+historical root ledger may identify the repository when provenance is absent; missing paths
+without a reliable source stay unknown. Invalid stored context or repair records raise
+`StoredRecordUnreadable`: `status`/`report` exit `6`, naming the record instead of replacing it or
+exposing a traceback. Continuation and cleanup retain their conservative refusal paths.
+
 ## State
 
 Task state: `DRAFT → READY → RUNNING → CHECKING → ACCEPTED`, plus `BLOCKED` and
@@ -119,7 +144,8 @@ the report come first.
    registered, a run row inserted, a worktree attached or a turn reserved. A refusal is an
    `exit 2` with the issues listed, and leaves no run state at all; it is a different event
    from a run that dispatches and then blocks (`exit 3`), from an argument-parsing error
-   (`exit 4`) and from a run that exists but is not finished (`exit 5`).
+   (`exit 4`), from a run that exists but is not finished or cannot continue under its recorded
+   admission binding (`exit 5`), and from an unreadable stored record (`exit 6`).
 2. **Budget before dispatch.** `store.reserve_dispatch` is the one dispatch transaction of
    batch E1, for both roles: in one `BEGIN IMMEDIATE` it checks ownership, phase, the absence of
    a stop, the root (unresolved invocations, deadline, room for the rest of the loop, repair
@@ -314,7 +340,7 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
   with no stop requested for that invocation is `FAILED cancelled_unrequested`, because DSH also
   settles a prompt as cancelled when it disposes of a session. `end_turn` is turn settlement, not
   success - acceptance is decided by checks and review. Every bound result whose stream was read
-  to its end records where the prompt response fell and how many updates for the prompt's session
+  to its end without a wire-state truncation records where the prompt response fell and how many updates for the prompt's session
   followed it (`stream_order`), from one reading of the reader's drained flag that the verdict
   decision uses too. The reviewer's verdict is reassembled from the `agent_message_chunk` updates
   the driver observed for the session the first `session/prompt` request named - a chunk for any
@@ -338,6 +364,20 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
   controller's classification, not the driver's raw outcome), so `resume` can reconcile it.
   Only the review invocation may produce a verdict: an implementer whose output happens to
   contain a verdict-shaped object still reports `review=None`.
+- **Raw output and parsed state have separate bounds.** Each stdout read reaches the bounded
+  sink before decoding: `total_bytes` counts the complete read stream, the file retains its raw
+  prefix, and `StreamCapture.digest` hashes only the retained bytes. Blank lines, invalid UTF-8
+  and a final line without a newline are preserved. A 1 MiB line parser discards an overlong
+  line through its next newline rather than parsing its tail as a new record. The protocol byte
+  share and 20,000 nonempty wire records bound all accumulated state, including raw-line windows,
+  prompt/terminal/error records, model state and transcripts; eventless messages count too.
+  After either bound, draining and byte accounting continue but metadata cannot authorize an
+  outcome: `OUTCOME_UNKNOWN` / `output_limit_exceeded`, no review, model observation or
+  `stream_order`, no refund and no re-dispatch. A passed model flag reads `UNKNOWN`, an absent
+  flag `NOT_PASSED`; observed dispatch yields one turn, otherwise an incomplete stream yields
+  `agent_turns=None`. `prompt_response_line` remains a zero-based nonempty-line ordinal; raw
+  blank lines mean it need not equal the physical file line number. Historical ordinals and
+  replay indices are unchanged.
 - **A stop ends local processes, and nothing more.** The production driver owns one
   invocation's process boundary (a Windows Job Object, `drivers/winjob.py`): the child is
   created suspended inside the boundary so ownership exists from its first instruction, and

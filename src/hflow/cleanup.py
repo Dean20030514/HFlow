@@ -30,8 +30,11 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .contracts import AttemptState, RefusalCode, RefusedError, ResultReceipt, TaskSpec, TaskState
-from .gitworkspace import IGNORED_ARTIFACT_ALLOWLIST, GitError, GitRepo
+from .contracts import (
+    AttemptState, RefusalCode, RefusedError, ResultReceipt, TaskSpec, TaskState,
+    WorkspaceProvenance,
+)
+from .gitworkspace import IGNORED_ARTIFACT_ALLOWLIST, GitError, GitRepo, _base_env
 from .store import Store, StoreError
 from .workspace import matches_pattern
 
@@ -67,6 +70,8 @@ class CleanPlan:
     #: The refs (``refs/heads``, ``refs/tags``, ``refs/hflow``) that contain HEAD, when that was
     #: what allowed a run without a receipt to be cleaned. Empty when it was not checked.
     retained_by: list[str] = field(default_factory=list)
+    provenance: WorkspaceProvenance | None = None
+    root_repository: str | None = None
 
     def as_dict(self) -> dict:
         return {
@@ -204,6 +209,13 @@ def plan_cleanup(store: Store, run_id: str) -> CleanPlan:
     plan = CleanPlan(run_id=run_id, allowed=True)
     plan.workspace_state = str(row["worktree_state"])
     plan.task_state = str(row["task_state"])
+    if plan.task_state not in {
+        TaskState.ACCEPTED.value, TaskState.BLOCKED.value, TaskState.CANCELLED.value,
+    }:
+        _refuse(
+            plan, "run_in_flight",
+            f"the run is {plan.task_state}; only a terminal run's workspace may be released",
+        )
     receipt = (
         ResultReceipt.model_validate(__import__("json").loads(row["receipt_json"]))
         if row["receipt_json"]
@@ -232,6 +244,35 @@ def plan_cleanup(store: Store, run_id: str) -> CleanPlan:
 
     worktree = Path(recorded_path)
     plan.path = str(worktree)
+    try:
+        plan.provenance = store.workspace_provenance_for(run_id)
+    except StoreError as exc:
+        _refuse(plan, "provenance_unreadable", str(exc))
+        return plan
+    if plan.provenance is not None and (
+        str(worktree) != plan.provenance.worktree_path
+        or worktree.resolve() != Path(plan.provenance.worktree_path)
+    ):
+        _refuse(plan, "provenance_mismatch", "the workspace path differs from its recorded source")
+        return plan
+    try:
+        if plan.provenance is not None:
+            source_repo = GitRepo.discover(Path(plan.provenance.project_root))
+            source_common = str((source_repo.root / source_repo.common_dir).resolve())
+            if source_common != plan.provenance.git_common_dir:
+                _refuse(plan, "provenance_mismatch", "recorded repository now has a different Git common directory")
+                return plan
+        else:
+            root = store.root_budget_for_run(run_id)
+            if root is None:
+                _refuse(plan, "workspace_provenance_missing", "legacy rootless run has no reliable recorded repository source")
+                return plan
+            plan.root_repository = str(root["repo_path"])
+            source_repo = GitRepo.discover(Path(plan.root_repository))
+            source_common = str((source_repo.root / source_repo.common_dir).resolve())
+    except (GitError, RefusedError, OSError) as exc:
+        _refuse(plan, "provenance_unreadable", f"recorded repository source cannot be checked: {exc}")
+        return plan
 
     # --- 1. ownership: the real registration, not a string comparison
     if not worktree.exists():
@@ -247,7 +288,10 @@ def plan_cleanup(store: Store, run_id: str) -> CleanPlan:
     except RefusedError as exc:
         _refuse(plan, "not_a_worktree", str(exc))
         return plan
-    plan.common_dir = str(repo.common_dir)
+    plan.common_dir = str((repo.root / repo.common_dir).resolve())
+    if plan.common_dir != source_common:
+        _refuse(plan, "provenance_mismatch", "Git common directory differs from its recorded source")
+        return plan
     try:
         registration = repo.worktree_registration(worktree)
     except GitError as exc:
@@ -352,12 +396,19 @@ def plan_cleanup(store: Store, run_id: str) -> CleanPlan:
             )
     try:
         status = repo.status_report(worktree)
+        flagged = repo.index_flagged_paths(worktree)
     except (GitError, Exception) as exc:  # noqa: BLE001 - a failed read must refuse, not guess
         _refuse(plan, "status_failed", repr(exc))
         return plan
     plan.tracked_changes = list(status.changed)
     plan.ignored_paths = list(status.ignored)
     plan.unsupported = list(status.unsupported)
+    if flagged:
+        _refuse(
+            plan, "index_flags_hide_changes",
+            "Git index flags may hide uncommitted worktree bytes (assume-unchanged or "
+            "skip-worktree): " + ", ".join(flagged[:5]),
+        )
     if status.changed:
         _refuse(
             plan,
@@ -420,16 +471,54 @@ def plan_cleanup(store: Store, run_id: str) -> CleanPlan:
     return plan
 
 
+def _recheck_cleanup_claim(store: Store, claimed: CleanPlan) -> dict | None:
+    """Recheck each deletion against the identity claimed before any Git mutation."""
+    if not Path(claimed.path).exists():
+        return {"applied": False, **reconcile_cleanup(store, claimed.run_id)}
+    current = plan_cleanup(store, claimed.run_id)
+    identity = ("path", "provenance", "root_repository", "common_dir")
+    identity_changed = any(getattr(current, key) != getattr(claimed, key) for key in identity)
+    if not current.allowed or identity_changed:
+        reason = (
+            ("the workspace identity changed after the cleanup claim" if identity_changed else "")
+            or "; ".join(item["detail"] for item in current.refusals)
+            or "; ".join(current.reasons)
+            or "the workspace identity changed after the cleanup claim"
+        )
+        store.finish_cleanup(claimed.run_id, error=reason[:400])
+        return {
+            "applied": False, "status": "REFUSED", "plan": current.as_dict(),
+            "detail": "the cleanup guards or claimed workspace identity changed; nothing was removed",
+        }
+    return None
+
+
 def apply_cleanup(store: Store, run_id: str, *, operator: str = "local-controller") -> dict:
     """Remove the run's workspace after re-checking the guards. Idempotent and reconcilable.
 
     Order matters: re-plan (the earlier preview is not a standing permission), claim the
     intent transactionally, run git, then confirm the filesystem *and* the registration
     before recording the outcome. Git and SQLite cannot be one transaction, so both results
-    are verified separately and a partial outcome is recorded as an error rather than as
-    success.
+    are verified separately. A partial or unverifiable removal keeps its cleanup intent for
+    reconciliation instead of recording completion.
     """
-    claim = store.record_cleanup_intent(run_id, operator)
+    plan = plan_cleanup(store, run_id)
+    if plan.already_removed:
+        return {"applied": False, "status": WORKSPACE_REMOVED, "detail": "already removed (idempotent)"}
+    if not plan.allowed:
+        return {
+            "applied": False, "status": "REFUSED", "plan": plan.as_dict(),
+            "detail": "the cleanup guards refused; the workspace is untouched",
+        }
+    try:
+        claim = store.record_cleanup_intent(
+            run_id, operator, expected_path=plan.path, expected_provenance=plan.provenance,
+            expected_root_repository=plan.root_repository,
+        )
+    except StoreError as exc:
+        return {"applied": False, "status": "REFUSED", "detail": str(exc)}
+    if claim.startswith("refused:"):
+        return {"applied": False, "status": "REFUSED", "detail": claim}
     if claim == "already_removed":
         return {"applied": False, "status": WORKSPACE_REMOVED, "detail": "already removed (idempotent)"}
     if claim == "in_progress":
@@ -439,15 +528,9 @@ def apply_cleanup(store: Store, run_id: str, *, operator: str = "local-controlle
             "detail": "another cleanup already holds the intent for this run",
         }
 
-    plan = plan_cleanup(store, run_id)
-    if not plan.allowed:
-        store.finish_cleanup(run_id, error="; ".join(item["detail"] for item in plan.refusals)[:400])
-        return {
-            "applied": False,
-            "status": "REFUSED",
-            "plan": plan.as_dict(),
-            "detail": "the cleanup guards refused; the workspace is untouched",
-        }
+    refused = _recheck_cleanup_claim(store, plan)
+    if refused is not None:
+        return refused
 
     worktree = Path(plan.path)
     # A check's child process may still be closing its last handles when the run settles
@@ -461,10 +544,16 @@ def apply_cleanup(store: Store, run_id: str, *, operator: str = "local-controlle
     try:
         driver_repo = GitRepo.discover(worktree)
         command_root = driver_repo.main_worktree() or driver_repo.root
-    except RefusedError:
-        command_root = Path(plan.common_dir).parent if plan.common_dir else worktree.parent
+    except (RefusedError, GitError) as exc:
+        return {
+            "applied": False, "status": "REGISTRATION_UNKNOWN", "path": str(worktree),
+            "detail": f"workspace repository could not be checked: {exc}; cleanup intent kept",
+        }
     attempts: list[str] = []
     for attempt in range(2):
+        refused = _recheck_cleanup_claim(store, plan)
+        if refused is not None:
+            return {**refused, "attempts": attempts}
         try:
             GitRepo(command_root).remove_worktree_checked(worktree)
             attempts.append(f"attempt {attempt + 1}: removed")
@@ -474,6 +563,9 @@ def apply_cleanup(store: Store, run_id: str, *, operator: str = "local-controlle
             if attempt == 0:
                 time.sleep(1.5)
                 continue
+            if not worktree.exists():
+                reconciled = reconcile_cleanup(store, run_id)
+                return {"applied": False, **reconciled, "attempts": attempts, "path": str(worktree)}
             store.finish_cleanup(run_id, error=f"git worktree remove failed: {exc}")
             return {
                 "applied": False,
@@ -490,8 +582,11 @@ def apply_cleanup(store: Store, run_id: str, *, operator: str = "local-controlle
     gone = not worktree.exists()
     try:
         still_registered = git_registration_exists(plan.common_dir, worktree)
-    except Exception:  # noqa: BLE001 - an unreadable registration is not a success
-        still_registered = True
+    except Exception as exc:  # noqa: BLE001 - an unreadable registration is not a success
+        return {
+            "applied": False, "status": "REGISTRATION_UNKNOWN", "path": str(worktree),
+            "detail": f"Git registration could not be checked: {exc}; cleanup intent kept",
+        }
     if gone and not still_registered:
         store.finish_cleanup(run_id)
         # Only what exists is named: a run without a receipt has no receipt to keep, and a run
@@ -508,10 +603,6 @@ def apply_cleanup(store: Store, run_id: str, *, operator: str = "local-controlle
             "candidate_ref": plan.candidate_ref,
             "detail": "workspace removed; kept " + ", ".join(kept),
         }
-    store.finish_cleanup(
-        run_id,
-        error=f"partial removal: directory_gone={gone} registration_present={still_registered}",
-    )
     return {
         "applied": False,
         "status": "PARTIAL",
@@ -533,6 +624,7 @@ def git_registration_exists(common_dir: str, worktree: Path) -> bool:
         text=True,
         timeout=60,
         check=False,
+        env=_base_env(),
     )
     if completed.returncode != 0:
         raise GitError(completed.stderr.strip()[:200])
@@ -554,25 +646,37 @@ def reconcile_cleanup(store: Store, run_id: str) -> dict:
         return {"status": "NO_WORKSPACE", "detail": "this run never had a managed workspace"}
     worktree = Path(path)
     exists = worktree.exists()
-    registered = False
-    if exists:
-        try:
-            registered = git_registration_exists(str(GitRepo.discover(worktree).common_dir), worktree)
-        except (GitError, RefusedError):
-            registered = True  # unreadable means "not proven removed"
-    if not exists and state["cleanup_done_at"]:
-        return {"status": WORKSPACE_REMOVED, "detail": "removed and recorded"}
-    if not exists and not state["cleanup_done_at"]:
-        if state["cleanup_intent_at"]:
-            store.finish_cleanup(run_id)
-            return {
-                "status": WORKSPACE_REMOVED,
-                "detail": "a cleanup intent existed and the path is gone; recorded as removed",
-            }
+    if not exists and not state["cleanup_intent_at"] and not state["cleanup_done_at"]:
         return {
             "status": WORKSPACE_MISSING,
             "detail": "the path is gone with no cleanup intent: MISSING/unknown, not a success",
         }
+    try:
+        provenance = store.workspace_provenance_for(run_id)
+        if provenance is not None:
+            if provenance.worktree_path != str(worktree):
+                raise StoreError("workspace provenance names a different path")
+            common_dir = provenance.git_common_dir
+        else:
+            root = store.root_budget_for_run(run_id)
+            if root is None:
+                raise StoreError("legacy rootless run has no recorded repository source")
+            source_repo = GitRepo.discover(Path(root["repo_path"]))
+            common_dir = str((source_repo.root / source_repo.common_dir).resolve())
+        registered = git_registration_exists(common_dir, worktree)
+    except Exception as exc:  # noqa: BLE001 - a failed read never proves removal
+        return {
+            "status": "REGISTRATION_UNKNOWN",
+            "detail": f"Git registration could not be checked: {exc}; cleanup intent kept",
+        }
+    if not exists:
+        if registered:
+            return {
+                "status": "PARTIAL", "detail": "the path is gone but Git registration remains; cleanup intent kept",
+            }
+        if not state["cleanup_done_at"]:
+            store.finish_cleanup(run_id)
+        return {"status": WORKSPACE_REMOVED, "detail": "directory and Git registration confirmed gone"}
     return {
         "status": WORKSPACE_PRESENT if registered else "UNREGISTERED",
         "detail": f"path exists (registered={registered}); nothing was removed",

@@ -109,7 +109,7 @@ def _dead_identity() -> ProcessIdentity:
     return identity
 
 
-def _create_run(store: Store, run_request: RunRequest, run_id: str = "R-owner") -> str:
+def _create_run(store: Store, run_request: RunRequest, run_id: str = "R-owner", *, admitted: bool = False) -> str:
     spec = run_request.task
     return store.create_run(
         run_id=run_id,
@@ -120,6 +120,10 @@ def _create_run(store: Store, run_request: RunRequest, run_id: str = "R-owner") 
         checks_digest=run_request.project.checks_digest(),
         turn_limit=spec.budget.max_agent_turns,
         repair_limit=0,
+        admission_binding=(
+            _controller(store, Path(run_request.project_root), FakeScript())._admission_binding(run_id, run_request)
+            if admitted else None
+        ),
     )["run_id"]
 
 
@@ -917,6 +921,7 @@ def _owned_by_dead(store: Store, run_request: RunRequest) -> tuple[str, str, Pro
         controller_id=LABEL,
         owner_token=token,
         owner_identity=dead,
+        admission_binding=_controller(store, Path(run_request.project_root), FakeScript())._admission_binding("R-dead-owner", run_request),
     )
     return str(row["run_id"]), token, dead
 
@@ -1089,7 +1094,7 @@ def test_an_allowance_refusal_leaves_the_existing_run_as_it_was(
     refused process left no claim behind for the next process to trip over.
     """
     if owner == "unclaimed":
-        run_id = _create_run(store, run_request)
+        run_id = _create_run(store, run_request, admitted=True)
     else:
         run_id, _, _ = _owned_by_dead(store, run_request)
     before = _snapshot(store, run_id)

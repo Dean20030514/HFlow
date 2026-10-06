@@ -68,6 +68,8 @@ def _seed_live_run(
         checks_digest=request.project.checks_digest(),
         turn_limit=turn_limit,
         repair_limit=spec.budget.max_repair_cycles,
+        admission_binding=owner._admission_binding("R-seeded", request) if owner else None,
+        effective_config=owner.effective_config if owner else None,
     )
     run_id = run["run_id"]
     if owner is None:

@@ -959,6 +959,39 @@ class EffectiveConfig(BaseModel):
 # --------------------------------------------------------------------------
 
 
+class RunAdmissionBinding(BaseModel):
+    """Immutable inputs for continuing an admitted, never-dispatched run.
+
+    Stored with the run in one transaction. A missing historical record is not an
+    explicit ``effective_config_digest=None`` from an offline API caller. Approval
+    ids are deliberately absent: a new approval may cover the same execution.
+    """
+
+    model_config = Strict
+
+    project_root: str
+    git_common_dir: str = ""
+    worktree_path: str = ""
+    base_commit: str = ""
+    project_contract_digest: str
+    effective_config_digest: str | None
+    launch_content_digest: str = ""
+    driver_ids: list[str]
+    deadline_seconds: int
+    root_binding_digest: str | None = None
+    root_limits_digest: str | None = None
+
+
+class WorkspaceProvenance(BaseModel):
+    """Controller-recorded repository identity for one managed worktree."""
+
+    model_config = Strict
+
+    project_root: str
+    git_common_dir: str
+    worktree_path: str
+
+
 class CapabilityState(StrEnum):
     DOCUMENTED = "documented"
     PROBED = "probed"
@@ -1275,8 +1308,8 @@ class StreamOrder(BaseModel):
     model_config = Strict
 
     #: 0-based index, among the non-empty lines the client wrote, of the response that answers
-    #: the invocation's ``session/prompt``. While the retained log is whole it equals that line's
-    #: number in ``events.ndjson``.
+    #: the invocation's ``session/prompt``. Raw blank lines are retained, so this ordinal can
+    #: differ from the physical line number in ``events.ndjson``.
     prompt_response_line: int
     #: ``session/update`` notifications after that response for the session the prompt named.
     updates_after_prompt_response: int = 0
@@ -1393,12 +1426,14 @@ class InvocationResult(BaseModel):
     error_message: str | None = None
     #: The session's model option as observed in the stream, and what became of a requested
     #: model. ``None`` when the driver observed no stream (the offline driver, a launch that
-    #: never happened, a result recorded before these fields existed).
+    #: never happened, a result recorded before these fields existed), or when protocol state
+    #: exceeded its capture budget.
     model_observation: ModelObservation | None = None
     model_applied: ModelApplied | None = None
     #: ``None`` when no response answered the observed ``session/prompt``, when the driver's
     #: reader had not finished the stream when the result was folded, when the driver observed no
-    #: stream (offline driver), or for a result recorded before this field existed.
+    #: stream (offline driver), when protocol state exceeded its capture budget, or for a
+    #: result recorded before this field existed.
     stream_order: StreamOrder | None = None
     #: What DSH reads on its own at this invocation's launch, observed just before the spawn
     #: gate. Recorded, never enforced, never part of an approval. ``None`` when no launch was

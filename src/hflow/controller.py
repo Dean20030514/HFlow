@@ -26,7 +26,7 @@ from typing import Any, Callable, Protocol
 from pydantic import ValidationError
 
 from .admission import predictable_dispatch_problems, validate_task_spec
-from .authorization import AuthorizationRecord
+from .authorization import AuthorizationRecord, project_contract_digest
 from .contracts import (
     AttemptState,
     CancellationReceipt,
@@ -59,6 +59,7 @@ from .contracts import (
     ReviewResult,
     RootBudgetBinding,
     RootBudgetLimits,
+    RunAdmissionBinding,
     RunInspection,
     RunOwner,
     RunRequest,
@@ -71,7 +72,9 @@ from .contracts import (
     TaskState,
     UsageFacts,
     VerificationResult,
+    WorkspaceProvenance,
     canonical_json,
+    digest_of,
 )
 from .ids import (
     new_attempt_id,
@@ -109,6 +112,7 @@ from .store import (
     RunNotFound,
     Store,
     StoreError,
+    StoredRecordUnreadable,
 )
 from .ownership import (
     OwnerAssessment,
@@ -849,27 +853,92 @@ class Controller:
 
     # -- public entry points -------------------------------------------------
 
+    def _admission_binding(self, run_id: str, request: RunRequest) -> RunAdmissionBinding:
+        """Resolve durable execution inputs without writing or spending anything."""
+        project_root = Path(request.project_root).resolve()
+        common_dir = worktree_path = base = ""
+        if request.task.workspace.mode == "worktree":
+            try:
+                repo = GitRepo.discover(project_root)
+                common_dir = str((repo.root / repo.common_dir).resolve())
+                worktree_path = str(repo.worktree_parent() / run_id)
+                base = repo.resolve_commit(request.base_commit or request.task.workspace.base_commit or "HEAD")
+            except (GitError, OSError) as exc:
+                raise RefusedError(RefusalCode.SCOPE_VIOLATION, f"cannot resolve admission workspace: {exc}") from exc
+        return RunAdmissionBinding(
+            project_root=str(project_root),
+            git_common_dir=common_dir,
+            worktree_path=worktree_path,
+            base_commit=base,
+            project_contract_digest=project_contract_digest(request.project),
+            effective_config_digest=self.effective_config.digest() if self.effective_config else None,
+            launch_content_digest=self.effective_config.launch_content_digest() if self.effective_config else "",
+            driver_ids=[self.driver.driver_id, self.reviewer_driver.driver_id],
+            deadline_seconds=request.deadline_seconds,
+            root_binding_digest=digest_of(self.root_binding.model_dump(mode="json")) if self.root_binding else None,
+            root_limits_digest=digest_of(self.root_limits.model_dump(mode="json")) if self.root_limits else None,
+        )
+
+    def _continuation_problem(self, run_id: str, request: RunRequest) -> tuple[str, RunAdmissionBinding | None]:
+        """A continuation must prove that the admitted inputs and workspace still agree."""
+        try:
+            recorded = self.store.admission_binding_for(run_id)
+            if recorded is None:
+                return "the historical admission binding is missing", None
+            current = self._admission_binding(run_id, request)
+            if recorded != current:
+                fields = [name for name in type(recorded).model_fields if getattr(recorded, name) != getattr(current, name)]
+                return "admission binding differs: " + ", ".join(fields), None
+            config = self.store.effective_config_for(run_id)
+            if recorded.effective_config_digest is not None and (
+                config is None or config.digest() != recorded.effective_config_digest
+                or config.launch_content_digest() != recorded.launch_content_digest
+            ):
+                return "the recorded effective configuration is missing, unreadable or inconsistent", None
+            if recorded.effective_config_digest is None and config is not None:
+                return "the recorded effective configuration conflicts with its admission binding", None
+            if recorded.worktree_path:
+                worktree = Path(recorded.worktree_path)
+                if worktree.exists() or worktree.is_symlink():
+                    GitRepo.discover(Path(recorded.project_root)).validate_reusable_worktree(
+                        worktree, recorded.base_commit
+                    )
+                    provenance = self.store.workspace_provenance_for(run_id)
+                    expected = WorkspaceProvenance(
+                        project_root=recorded.project_root, git_common_dir=recorded.git_common_dir,
+                        worktree_path=recorded.worktree_path,
+                    )
+                    if provenance != expected or self.store.get_run(run_id)["worktree_path"] != recorded.worktree_path:
+                        return "the existing worktree has no matching recorded provenance", None
+                elif self.store.get_run(run_id)["worktree_path"]:
+                    return "the recorded worktree is missing", None
+            return "", recorded
+        except (StoredRecordUnreadable, GitError, RefusedError, OSError, ValueError) as exc:
+            return f"the continuation inputs cannot be verified: {exc}", None
+
     def run_task(self, request: RunRequest) -> RunOutcome:
         spec = request.task
         project = request.project
         project_root = Path(request.project_root)
-
-        report = validate_task_spec(
-            spec, project, project_root, allow_fake_checks=self.allow_fake_checks
-        )
-        if not report.ok:
-            first = report.issues[0]
-            raise RefusedError(first.code, f"task {spec.task_id} refused: {first.detail}")
-
         self.project_root = project_root
         spec_digest = spec.spec_digest()
+        existing = self.store.find_run_by_spec_digest(project.project_id, spec_digest)
+        continuation = existing is not None and TaskState(existing["task_state"]) not in {
+            TaskState.ACCEPTED, TaskState.BLOCKED, TaskState.CANCELLED
+        } and self._nothing_dispatched(existing["run_id"])
+        if not continuation:
+            report = validate_task_spec(
+                spec, project, project_root, allow_fake_checks=self.allow_fake_checks
+            )
+            if not report.ok:
+                first = report.issues[0]
+                raise RefusedError(first.code, f"task {spec.task_id} refused: {first.detail}")
 
         # --- an identical TaskSpec is a *history query*, not a new dispatch ---------------
         # This is checked before the authorization is registered, before any allowance is
         # checked and before any preflight: a task that already ended must return its recorded
         # outcome even when its authorization has since been used up. (Its own run keeps the
         # budget it was admitted with; nothing here spends anything.)
-        existing = self.store.find_run_by_spec_digest(project.project_id, spec_digest)
         if existing is not None:
             run_id = existing["run_id"]
             state = TaskState(existing["task_state"])
@@ -915,6 +984,23 @@ class Controller:
                 if not (assessment.gone and self._nothing_dispatched(run_id)):
                     return self._outcome_for(run_id, notes=[self._foreign_owner_note(existing)])
                 adopt = True
+            if not self._nothing_dispatched(run_id):
+                return self._outcome_for(run_id, notes=["this run already dispatched work; use resume to reconcile, never re-dispatch"])
+            problem, binding = self._continuation_problem(run_id, request)
+            if problem:
+                return self._outcome_for(run_id, notes=[
+                    f"continuation refused: {problem}. Nothing was claimed or dispatched and no allowance was consumed. "
+                    "Restore the original binding, or cancel this run and submit a new revision."
+                ])
+            assert binding is not None
+            report = validate_task_spec(spec, project, project_root, allow_fake_checks=self.allow_fake_checks)
+            if not report.ok:
+                return self._outcome_for(run_id, notes=[
+                    "continuation refused before claiming: " + report.issues[0].detail
+                    + ". Restore the original inputs, or cancel this run and submit a new revision."
+                ])
+            request = request.model_copy(update={"project_root": Path(binding.project_root), "base_commit": binding.base_commit})
+            self.project_root = Path(binding.project_root)
             self._assert_allowance_for(run_id, spec, project)
             if adopt:
                 if not self._adopt(run_id, existing, assessment):
@@ -944,7 +1030,10 @@ class Controller:
                     f"{exc.message} (this run was admitted earlier but never dispatched; it ends "
                     "here because no resubmission of the same TaskSpec can pass this gate)",
                 )
-            self._record_effective_config(run_id)
+            if self.authorization is not None:
+                # A fresh approval may cover the same immutable execution. Register it only
+                # after the read-only continuation and allowance checks have passed.
+                self.store.register_authorization(self.authorization.as_store_record())
             return self._drive(run_id, request)
 
         # --- a new dispatch: gate everything before the artifact is even registered -------
@@ -953,6 +1042,10 @@ class Controller:
         # placeholder path would let a packet pass this check and then fail after an allowance
         # had been claimed - the exact gap this ordering closes.
         run_id = new_run_id()
+        admission_binding = self._admission_binding(run_id, request)
+        request = request.model_copy(update={
+            "project_root": Path(admission_binding.project_root), "base_commit": admission_binding.base_commit
+        })
         repo, worktree_root = self._worktree_path(run_id, spec, request.base_commit)
         implementer_packet = self._render_implementer_packet(
             run_id=run_id,
@@ -1027,6 +1120,8 @@ class Controller:
             controller_id=self.controller_id,
             owner_token=self.owner_token,
             owner_identity=self.owner_identity,
+            admission_binding=admission_binding,
+            effective_config=self.effective_config,
         )
         run_id = row["run_id"]  # a concurrent identical submit may have won the insert
         if run_id != implementer_packet.run_id:
@@ -1046,35 +1141,7 @@ class Controller:
             return self._outcome_for(run_id, notes=[self._foreign_owner_note(row)])
         self._claims[run_id] = int(row["claim_generation"])
 
-        self._record_effective_config(run_id)
-
         return self._drive(run_id, request, implementer_packet=implementer_packet)
-
-    def _record_effective_config(self, run_id: str) -> None:
-        """Record the configuration this run is executing under, once, next to the run.
-
-        ``status`` and ``report`` read it back, so "which profile, which role bindings, which
-        permissions" is a recorded fact rather than something the reader infers from whatever
-        happens to be configured now. A run's first recorded configuration is never
-        overwritten: if a later invocation resolves a different one (another profile, a flipped
-        write opt-in), that is recorded as a divergence note and the run keeps its identity.
-        """
-        if self.effective_config is None:
-            return
-        existing = self.store.effective_config_for(run_id)
-        if existing is None:
-            self.store.record_effective_config(run_id, self.effective_config)
-            return
-        if existing.digest() != self.effective_config.digest():
-            self.store.record_note(
-                run_id,
-                "the configuration resolved for this invocation differs from the one recorded "
-                f"for this run: recorded profile={existing.profile_id or '(command line)'} "
-                f"digest={existing.digest()}, current "
-                f"profile={self.effective_config.profile_id or '(command line)'} "
-                f"digest={self.effective_config.digest()}. The run keeps the configuration it "
-                "was admitted with; nothing is re-dispatched under the new one.",
-            )
 
     def resume(self, run_id: str) -> RunOutcome:
         """Continue the state machine. Never replays a prompt and never re-dispatches."""
@@ -2438,7 +2505,11 @@ class Controller:
                 )
                 resolved_base = repo.resolve_commit(request.base_commit or base_name)
                 worktree = repo.create_worktree(run_id, resolved_base)
-                self.store.record_worktree(run_id, worktree)
+                self.store.record_worktree(run_id, worktree, provenance=WorkspaceProvenance(
+                    project_root=str(project_root.resolve()),
+                    git_common_dir=str((repo.root / repo.common_dir).resolve()),
+                    worktree_path=str(worktree.resolve()),
+                ))
                 # Taken after HFlow's own ``worktree add`` - which can itself write the shared config
                 # (``extensions.relativeWorktrees`` under ``worktree.useRelativePaths``) and the
                 # run's ``config.worktree`` - and before anything HFlow does not control runs.

@@ -193,7 +193,10 @@ def test_the_first_recorded_configuration_wins(
     second = first.model_copy(update={"profile_id": "second"})
 
     store.record_effective_config(outcome.run_id, first)
-    store.record_effective_config(outcome.run_id, second)
+    from hflow.store import StoreError
+
+    with pytest.raises(StoreError, match="conflicting immutable effective_config"):
+        store.record_effective_config(outcome.run_id, second)
 
     recorded = store.effective_config_for(outcome.run_id)
     assert recorded is not None and recorded.profile_id == "first"

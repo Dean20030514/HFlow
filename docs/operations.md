@@ -23,9 +23,11 @@ hflow cancel <run_id>
 write only the receipt, and check the exit code: `0` accepted, `2` refused at admission,
 `3` blocked after dispatch, `4` usage (any argument-parsing error), `5` the run exists and is
 not finished (`DRAFT`/`READY`/`RUNNING`/`CHECKING`: a submission that found the run claimed by
-another owner process, or `resume` refusing a takeover because that owner may be alive), `6`
-`status`/`report` found the run but a stored record of it no longer validates (nothing is
-rewritten).
+another owner process, `resume` refusing a takeover because that owner may be alive, or a
+never-dispatched run whose admission binding is missing, unreadable or changed), `6`
+`status`/`report` found a stored record that no longer validates (`StoredRecordUnreadable`). The
+error names the record; nothing substitutes guessed data for it. `cancel`/`resume` can still work
+from the run row without those presentation records.
 
 ## Configure once, then reuse it
 
@@ -148,7 +150,7 @@ is checked only once a run exists, and it says so in its notes.
 | a `write_allow` entry containing `*`, `?` or `[` (only literal file or directory paths are accepted; `write_deny` keeps its globs), a `write_allow` entry under the built-in deny list (`.git`, `.hflow`, `.acpxrc.json`), or a `write_allow` entry that is, or passes through, a symbolic link or junction in the checkout (a link can name a different place in the run's worktree) | admission (`scope_violation`) |
 | unknown check, scope violation, risk below the project floor, unmet delivery level, reuse not decided, budget above the project ceiling | admission |
 | an invalid `model_selection` in the profile | profile load (`invalid_spec`) |
-| not enough authorization allowance left for the whole fixed loop | controller, before a run row, a root row or an authorization record exists (`budget_exhausted`); for an admitted run that never dispatched, before it continues - read-only and before this process claims or adopts the run, so the run is left exactly as it was and a new authorization for the same TaskSpec, from any later process, continues it |
+| not enough authorization allowance left for the whole fixed loop | controller, before a run row, a root row or an authorization record exists (`budget_exhausted`); for an admitted run that never dispatched, before it continues - read-only and before this process claims or adopts the run, so the run is left exactly as it was and a new authorization for the same TaskSpec and unchanged admission binding, from any later process, can continue it |
 | a root with a policy armed whose `max_repairs` cannot cover the repair this run may buy (`used_repairs + needed > max_repairs`, where `needed` is 2 when an earlier run already dispatched an implementer on the root) | controller, before a run row, a root row, an authorization record or a dispatch exists (`budget_exhausted`), so resubmitting with a root file whose `max_repairs` covers it works; `prepare` reports `max_repairs` 0 with a policy armed under `dispatch_preconditions` (location `root_budget`) - the ledger-dependent part only the run sees. For an admitted run that never dispatched (unclaimed, this controller's, or adopted from a provably gone owner) the counter can never be raised, so the run ends `BLOCKED` `budget_exhausted` instead of staying `DRAFT` |
 | a run without `--root-budget-file` for a task that already has a root in this ledger | controller, before a run row or an authorization record exists (`budget_exhausted`, "pass --root-budget-file"), so resubmitting the same TaskSpec with its root and a covering authorization dispatches; `prepare` does not open the ledger and cannot see it. The dispatch transaction repeats the check as a race backstop: a root registered after the run was admitted blocks that run (no driver starts, no counter moves), and since an identical resubmission only returns it, that case needs a new revision |
 
@@ -705,7 +707,8 @@ for an unknown outcome of either role the code is quoted with it. What each one 
 
 `stream_order` (`prompt_response_line`, `updates_after_prompt_response`,
 `message_chunks_after_prompt_response`) is stored in `attempts.result_json` / `review_json` for
-every bound result whose stream was read to its end, and `status` prints it as a `stream` line per
+every bound result whose stream was read to its end without wire-state truncation, and `status`
+prints it as a `stream` line per
 invocation. A count above zero adds the limitation `updates_after_prompt_response=N: ...`. It
 changes no outcome except the reviewer case above (`review_ambiguous`). What is pinned:
 `test_real_client_prints_an_update_sent_right_after_the_prompt_response` shows that, with the
@@ -936,18 +939,30 @@ hflow clean <run-id> --apply      # remove this run's worktree
 hflow clean <run-id> --reconcile  # after an interruption, decide from recorded facts
 ```
 
+The run's internal `WorkspaceProvenance` records its project root, Git common directory and
+worktree path in the same transaction that attaches the worktree path. `clean` compares that
+identity with the observed workspace and Git registration before using the repository for
+cleanup. Run notes and receipt paths cannot redirect cleanup or replace that provenance record.
+Historical records may use the root ledger's source repository; a missing path without a reliable
+source is unknown, never proof that cleanup completed. Invalid provenance refuses cleanup or
+leaves reconciliation unknown.
+
 The preview prints the resolved path, the Git common directory, the registration, HEAD, the
 candidate ref and its target, the tracked/ignored/unsupported status, and every reason for
 the decision. It creates no ref and removes no file. `--dry-run` is the same preview;
 combining it with `--apply` is refused.
 
 `--apply` re-checks everything (an earlier preview is not a standing permission), claims the
-run's cleanup intent in a short transaction, and calls `git worktree remove` **without
-`--force`**. It refuses when:
+run's cleanup intent in a short transaction that requires a terminal run and no active attempt,
+and calls `git worktree remove` **without `--force`**. A run that becomes live before the claim
+cannot be removed. Success requires both the working directory and its Git registration to be
+gone; Git returning zero is not sufficient. It refuses when:
 
 | Refusal | Why |
 |---|---|
 | `no_managed_workspace` | the run did not use a worktree |
+| `workspace_provenance_missing` | a legacy rootless run has neither workspace provenance nor a root ledger repository; keep the workspace until its source can be established |
+| `provenance_unreadable`, `provenance_mismatch` | stored workspace provenance cannot be read, or the observed path or Git common directory differs from it; no replacement identity is inferred from notes or receipt paths |
 | `not_a_worktree`, `not_registered` | the path is not the linked worktree git has for this run |
 | `is_source_repository` | the path is the repository's main worktree |
 | `execution_active`, `run_in_flight` | an attempt or the run is still live |
@@ -955,19 +970,27 @@ run's cleanup intent in a short transaction, and calls `git worktree remove` **w
 | `unfrozen_changes`, `head_drift` | the worktree holds changes that were never frozen. For a run without a receipt, `head_drift` means HEAD is neither the latest attempt's recorded frozen candidate nor the run's base |
 | `unretained_commit` | a run without a receipt whose HEAD is not its base commit, and no branch, tag or `refs/hflow/` ref contains HEAD (a worker commit, or a commit refused after the freeze, which gets no candidate ref). Removing the worktree would drop that commit. Inspect it; to keep it, create a ref (`git branch <name> <commit>`) and run `clean` again |
 | `unknown_ignored_files` | ignored files that are not known build artifacts (an `.env`, local data - and also a check's cache such as `.ruff_cache` or `.mypy_cache`: only `__pycache__`, `*.pyc` and `.pytest_cache` are known) |
+| `index_flags_hide_changes` | assume-unchanged or skip-worktree flags can hide modified tracked bytes from Git status; inspect the files and flags before trying again |
 | `unsupported_status` | unmerged or submodule records that cannot be interpreted |
 
 A refusal keeps everything and releases the cleanup claim, so the same command works once
-you fix what blocked it. What survives a successful `clean`: the candidate commit (reachable
+you fix what blocked it. Every deletion attempt, including the bounded retry, rechecks the
+guards and the claimed workspace identity. What survives a successful `clean`: the candidate commit (reachable
 through `refs/hflow/candidates/<run-id>/<attempt-id>`), its tree, the receipt, the evidence,
 and the run's history. A run without a receipt has no receipt to keep; its HEAD is kept only
 because it is the run's base or a ref named in the preview contains it. Repeat `--apply` is idempotent; a path that vanished without a cleanup
-record is reported `MISSING`, never as a success.
+record is reported `MISSING`, never as a success. A new `--reconcile` conclusion uses the same
+repository source and both removal facts; a surviving registration or directory is unfinished
+cleanup, not a successful removal. A repeated `--apply` after a recorded success reports
+"previously removed and recorded": it removes nothing and makes no new observation about the
+path. It must not delete a directory that appeared there later. An existing completion record
+remains historical and is not rewritten by reconciliation.
 
 ## Known limits of `clean`
 
 - It protects against HFlow's own concurrent operations, not against another process running
-  as the same user that deliberately holds files open.
+  as the same user that deliberately holds files open or rewrites the ledger. Workspace
+  provenance is controller-recorded consistency data, not an authenticated record.
 - Windows can keep a directory undeletable for a moment after a check's child exits. HFlow
   retries once after a short settle; if git still refuses, it reports the failure and does
   not force anything.
@@ -980,10 +1003,9 @@ record is reported `MISSING`, never as a success.
   filter that metadata names. When `hflow status` shows a `git metadata` line, inspect and
   restore the metadata first (the "Shared Git metadata is compared ..." item under "M2 runs
   through the CLI").
-- For a run without a receipt, the base commit comes from the run's notes, its DSH context
-  record, or the task's own full `base_commit`. When none of them names it, a HEAD at the base
-  still needs a ref that contains it (normally the branch it came from); otherwise the run is
-  refused `unretained_commit`.
+- Without a receipt, HEAD still needs to be the recorded base or a commit retained by a ref.
+  Those retention gates do not prove removal: reconciliation still needs a reliable repository
+  source to check registration after the path has disappeared.
 
 ## Running a real Harness task (authorized only)
 
@@ -1201,13 +1223,18 @@ What the evidence row and the artifact say, precisely:
 
 Two different things live here, and the difference is stated rather than glossed:
 
-**Bounded (HFlow's own retention).** Everything HFlow keeps is inside one declared budget per
-invocation (32 MiB by default):
+**Bounded (HFlow's own retention and wire state).** Each invocation has a raw-log retention
+budget (32 MiB by default), a 1 MiB pending-line bound, and a 20,000 nonempty wire-record bound:
 
-- the retained protocol log (`events.ndjson`) stops at the protocol share of that budget
-  (`max_raw_log_bytes` minus the stderr share), and the in-memory event list stops growing with it
-  (`events_capped`). Parsing continues, because that is how a stop reason is recognised, but
-  nothing further is accumulated;
+- every stdout read is captured before parsing. `events.ndjson` retains the raw prefix up to
+  the protocol share (`max_raw_log_bytes` minus the stderr share), including empty lines,
+  invalid UTF-8 and an EOF without a final newline. `total_bytes` counts everything read;
+  `digest` is SHA-256 of the retained bytes, so it verifies the file that remains, not the full
+  discarded stream;
+- all accumulated wire state is limited by both that byte share and 20,000 nonempty records.
+  Records with no neutral event count too. At either bound the raw-line window, events,
+  prompt/terminal/error records, model state and answer transcripts stop growing; output still
+  drains and is counted. A stop reason beyond the bound cannot authorize completion;
 - the client's **stderr** is drained from a pipe this driver owns and retained up to the stderr
   share. What exceeds it is read, counted and digested but not written. (It used to be a file the
   child wrote into and a reader that had nothing to read: the record said "0 bytes, not truncated"
@@ -1217,11 +1244,19 @@ invocation (32 MiB by default):
   pipe to its daemon reader, which closes it at EOF, and records "stderr reader still blocked at
   release ..." in `driver.release_notes(invocation_id)` instead of hanging the controller after
   the outcome was already recorded;
-- a single line that never ends is bounded at 1 MiB: it is counted as an unusable line, which also
-  makes the turn unknown, instead of growing in memory as fast as the client writes;
+- a line over 1 MiB is counted as unusable and discarded through its next newline. Its raw bytes
+  still count toward capture; its suffix cannot become a new JSON message;
 - spending the budget is recorded **on the read that spends it**, not on the next line, so a stream
   whose final line crosses the budget is reported as `output_limit_exceeded` with an
-  `OUTCOME_UNKNOWN` outcome. A cut protocol stream is never trusted.
+  `OUTCOME_UNKNOWN` outcome. Reaching the wire-record bound has the same error code, with its
+  own reason named. Neither case produces a verdict, refunds allowance or re-dispatches.
+
+When wire state is incomplete, `model_observation` and `stream_order` are absent. A launch that
+passed `--model` records `model_applied=unknown`; one without it records `not_passed`. An observed
+prompt still records `agent_turns=1`; when none was observed and the stream is incomplete, the
+count is unknown rather than a claim that no prompt was sent. `prompt_response_line` keeps its
+zero-based **nonempty-line ordinal**, so raw blank lines can make it differ from a physical file
+line number. Historical records and replay indexing are not reinterpreted.
 
 **Measured, not bounded (the client's own protocol file).** The client writes `stdout.ndjson`
 itself. HFlow does **not** truncate a file another process is writing - that removes bytes nobody
@@ -1938,7 +1973,23 @@ the controller ended:
   controller process reads `not_recorded` and is taken over only when nothing was dispatched (see
   the README's "Owner lease" bullet for the exact rule and its limits). An `hflow run` interrupted
   in setup (no attempt, no invocation) needs no `resume`: once its owner is provably gone, resubmitting
-  the same TaskSpec adopts the run and continues it.
+  the same TaskSpec may adopt the run and continue it only under its original admission binding.
+
+The internal `RunAdmissionBinding` is written with the run in its creation transaction. It fixes
+the project root, Git common directory, managed workspace path and resolved base, project
+contract, effective configuration and launch-content digests, drivers, deadline, and root
+binding and limits. It is checked before claiming or adopting any never-dispatched run. An
+explicitly absent effective configuration from an offline API caller is a recorded value, not
+a missing historical binding. A fresh authorization may cover the same execution: its id is not
+part of this binding.
+
+A missing, unreadable or changed binding returns the existing run unchanged with exit `5`; no workspace is
+created, no owner is claimed or adopted, no authorization is consumed and no dispatch is bought.
+Restore the original configuration and inputs, or `hflow cancel <run_id>` and submit a new task
+revision. A new revision still faces the root's unresolved entries, deadline and repair allowance.
+HFlow never reconstructs a historical admission binding from notes, and does not replace an
+unreadable binding with a fresh admission. `status`/`report` use exit `6` for unreadable structured
+records; that presentation error does not widen the continuation path or grant a new allowance.
 
 `resume` and `cancel` build their observer per role from the run's recorded configuration (see
 "Stopping a run"), so their records name the recorded driver, never the offline fake for a

@@ -56,7 +56,8 @@ from .contracts import (
 
 if TYPE_CHECKING:  # imported for annotations only: authorization.py is not a CLI dependency
     from .authorization import AuthorizationBinding, AuthorizationRecord
-    from .contracts import RootBudgetLimits
+    from .contracts import RootBudgetLimits, RootBudgetPlan
+    from .prepare import ResolvedRun
 
 from .controller import Controller, RunOutcome, inspect_run
 from .drivers.fake import FakeDriver, FakeScript
@@ -67,7 +68,7 @@ from . import profiles
 from .profiles import ENV_PROFILE
 from .report import report_json, report_text
 from .runtime import controller_build
-from .store import RunNotFound, Store
+from .store import RunNotFound, Store, StoredRecordUnreadable
 from .verify import CheckRunners
 
 EXIT_OK = 0
@@ -650,6 +651,90 @@ def _zero_model_preflight(role_drivers: dict[str, object]):
     return check
 
 
+def _continuation_before_admission(
+    resolved: ResolvedRun, *, data_dir: Path, root_plan: RootBudgetPlan | None,
+) -> RunOutcome | None:
+    """Return existing-run drift before new-run admission or approval mismatch can hide it.
+
+    This only compares stored admission facts. A match still goes through every normal
+    admission and authorization gate; it grants no approval and claims or dispatches nothing.
+    An absent ledger is never created for this check, and role labels need no real driver.
+    """
+    path = database_path(data_dir)
+    if not path.exists():
+        return None
+    store = Store(path)
+    try:
+        existing = store.find_run_by_spec_digest(resolved.project.project_id, resolved.spec.spec_digest())
+        if existing is None or TaskState(existing["task_state"]) in {
+            TaskState.ACCEPTED, TaskState.BLOCKED, TaskState.CANCELLED,
+        }:
+            return None
+        run_id = str(existing["run_id"])
+        if store.attempts_for(run_id) or store.invocations_for(run_id):
+            return None
+        root_binding = None
+        if root_plan is not None:
+            from .authorization import resolve_root_binding
+
+            root_binding = resolve_root_binding(
+                project_id=resolved.project.project_id, request=resolved.request(), data_dir=data_dir,
+            )
+        drivers = {}
+        for role in ("implementer", "reviewer"):
+            bound = resolved.effective.role(role)
+            assert bound is not None
+            drivers[role] = _NotOwnedDriver(bound.driver_id)
+        controller = Controller(
+            store, drivers["implementer"], reviewer_driver=drivers["reviewer"],  # type: ignore[arg-type]
+            controller_build=controller_build(), production=False,
+            effective_config=resolved.effective, root_binding=root_binding,
+            root_limits=root_plan.limits if root_plan is not None else None,
+        )
+        problem, _ = controller._continuation_problem(run_id, resolved.request())
+        if not problem:
+            return None
+        return controller._outcome_for(run_id, notes=[
+            f"continuation refused: {problem}. Nothing was claimed or dispatched and no allowance was consumed. "
+            "Restore the original binding, or cancel this run and submit a new revision."
+        ])
+    finally:
+        store.close()
+
+
+def _write_run_outcome(
+    outcome: RunOutcome, args: argparse.Namespace, *, offline_root_note: str = "",
+) -> int:
+    payload = _outcome_payload(outcome)
+    if offline_root_note:
+        notes = payload["notes"]
+        assert isinstance(notes, list)
+        notes.append(offline_root_note)
+    if args.receipt_out:
+        receipt = outcome.receipt
+        _write_out(receipt.model_dump(mode="json") if receipt else payload, True, Path(args.receipt_out))
+    elif args.json:
+        _write_out(payload, True)
+    else:
+        print(f"run        {outcome.run_id}")
+        print(f"state      {outcome.task_state.value}" + (f" ({outcome.phase.value})" if outcome.phase else ""))
+        print(
+            f"turns      {outcome.turns_reserved}/{outcome.turns_limit} reserved "
+            f"(implementer={outcome.implementer_invocations} "
+            f"reviewer={outcome.reviewer_invocations})"
+        )
+        if outcome.block_code:
+            print(f"blocked    {outcome.block_code.value}: {outcome.block_reason}")
+        drift = _drift_note(outcome)
+        if drift:
+            print(f"candidate  {drift}")
+        for note in outcome.notes:
+            print(f"note       {note}")
+        if offline_root_note:
+            print(f"note       {offline_root_note}")
+    return _outcome_exit_code(outcome)
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     from .prepare import (
         load_repair_policy,
@@ -716,6 +801,10 @@ def cmd_run(args: argparse.Namespace) -> int:
             f"(was real_driver={is_real_driver}, now {resolved.is_real_driver}). Nothing was "
             "dispatched and no allowance was consumed; re-run when the configuration is stable.",
         )
+
+    continuation = _continuation_before_admission(resolved, data_dir=data_dir, root_plan=root_plan)
+    if continuation is not None:
+        return _write_run_outcome(continuation, args)
 
     if not resolved.admission.ok:
         _write_out(
@@ -886,48 +975,19 @@ def cmd_run(args: argparse.Namespace) -> int:
     finally:
         store.close()
 
-    payload = _outcome_payload(outcome)
-    if offline_root_note:
-        notes = payload["notes"]
-        assert isinstance(notes, list)
-        notes.append(offline_root_note)
-    if args.receipt_out:
-        receipt = outcome.receipt
-        _write_out(
-            receipt.model_dump(mode="json") if receipt else payload,
-            True,
-            Path(args.receipt_out),
-        )
-    elif args.json:
-        _write_out(payload, True)
-    else:
-        print(f"run        {outcome.run_id}")
-        print(f"state      {outcome.task_state.value}" + (f" ({outcome.phase.value})" if outcome.phase else ""))
-        print(
-            f"turns      {outcome.turns_reserved}/{outcome.turns_limit} reserved "
-            f"(implementer={outcome.implementer_invocations} "
-            f"reviewer={outcome.reviewer_invocations})"
-        )
-        if outcome.block_code:
-            print(f"blocked    {outcome.block_code.value}: {outcome.block_reason}")
-        drift = _drift_note(outcome)
-        if drift:
-            print(f"candidate  {drift}")
-        for note in outcome.notes:
-            print(f"note       {note}")
-        if offline_root_note:
-            print(f"note       {offline_root_note}")
-    return _outcome_exit_code(outcome)
+    return _write_run_outcome(outcome, args, offline_root_note=offline_root_note)
 
 
-def _unreadable_record(run_id: str, exc: ValueError) -> int:
+def _unreadable_record(run_id: str, exc: ValueError | StoredRecordUnreadable) -> int:
     """One line for a stored record that no longer validates, with a code that is not ``2``.
 
     ``EXIT_REFUSED`` promises that no run state exists; this run exists, with attempts and ledger
     charges, so the answer is :data:`EXIT_RECORD_UNREADABLE`. ``cancel`` and ``resume`` read the
     run row instead and keep working on such a run.
     """
-    if isinstance(exc, ValidationError):
+    if isinstance(exc, StoredRecordUnreadable):
+        reason = str(exc).splitlines()[0]
+    elif isinstance(exc, ValidationError):
         reason = f"invalid {exc.title}: {profiles.summarize_validation_error(exc)}"
     else:
         reason = f"not valid JSON: {exc}"
@@ -944,7 +1004,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     except RunNotFound:
         print(f"unknown run {args.run_id}", file=sys.stderr)
         return EXIT_USAGE
-    except (ValidationError, json.JSONDecodeError) as exc:
+    except (ValidationError, json.JSONDecodeError, StoredRecordUnreadable) as exc:
         return _unreadable_record(args.run_id, exc)
     finally:
         store.close()
@@ -966,7 +1026,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     except RunNotFound:
         print(f"unknown run {args.run_id}", file=sys.stderr)
         return EXIT_USAGE
-    except (ValidationError, json.JSONDecodeError) as exc:
+    except (ValidationError, json.JSONDecodeError, StoredRecordUnreadable) as exc:
         return _unreadable_record(args.run_id, exc)
     finally:
         store.close()
@@ -1037,7 +1097,16 @@ def _observer_controller(store: Store, args: argparse.Namespace, run_id: str) ->
     another controller owns, which is the point.
     """
     project_root = Path(args.project_root).resolve()
-    effective = store.effective_config_for(run_id)
+    try:
+        effective = store.effective_config_for(run_id)
+    except StoredRecordUnreadable:
+        effective = None
+        store.record_note(
+            run_id,
+            "stored_config_unreadable: effective_config could not be decoded; role driver "
+            "identity remains unrecorded and this observer holds no process handle",
+            only_if_absent_prefix="stored_config_unreadable: ",
+        )
     offline = FakeDriver(project_root)
     drivers: dict[str, object] = {}
     for role in ("implementer", "reviewer"):

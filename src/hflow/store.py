@@ -54,11 +54,13 @@ from .contracts import (
     RootBudgetBinding,
     RootBudgetLimits,
     RootBudgetUsage,
+    RunAdmissionBinding,
     RunSummary,
     SpawnFact,
     SpawnKind,
     TaskSpec,
     TaskState,
+    WorkspaceProvenance,
     canonical_json,
     digest_of,
     json_schema,
@@ -85,13 +87,12 @@ OFFLINE_REPROCESSING_KIND = "offline_reprocessing"
 #: schema change: the note table already has the durability this record needs, and a reader
 #: that does not know the prefix simply sees one more note.
 _EFFECTIVE_CONFIG_PREFIX = "effective_config: "
-#: The effective configuration is a document, not a one-line operator remark, so it gets its
-#: own bound instead of the 1000-character default (which would cut it mid-JSON).
-EFFECTIVE_CONFIG_NOTE_LIMIT = 8000
 #: Prefix of the run note that carries one frozen candidate's DSH context record. Kept in
 #: ``run_notes`` like the effective configuration: no storage version change, and an older build
 #: sees one more note.
 _DSH_CONTEXT_PREFIX = "dsh_context: "
+_ADMISSION_BINDING_PREFIX = "admission_binding: "
+_WORKSPACE_PROVENANCE_PREFIX = "workspace_provenance: "
 
 
 def _same_offline_reprocessing(
@@ -200,6 +201,10 @@ def _invocation_from_row(row: sqlite3.Row) -> InvocationIntent:
 
 class StoreError(RuntimeError):
     pass
+
+
+class StoredRecordUnreadable(StoreError):
+    """A durable structured record cannot be decoded without losing facts."""
 
 
 class RunNotFound(StoreError):
@@ -364,6 +369,8 @@ class Store:
         controller_id: str | None = None,
         owner_token: str | None = None,
         owner_identity: ProcessIdentity | None = None,
+        admission_binding: RunAdmissionBinding | None = None,
+        effective_config: EffectiveConfig | None = None,
     ) -> sqlite3.Row:
         """Insert a run, or return the existing row for the same ``(project_id, spec_digest)``.
 
@@ -420,6 +427,14 @@ class Store:
                     *owner_values,
                 ),
             )
+            if admission_binding is not None:
+                self._record_structured_note_locked(
+                    conn, run_id, _ADMISSION_BINDING_PREFIX, admission_binding
+                )
+            if effective_config is not None:
+                self._record_structured_note_locked(
+                    conn, run_id, _EFFECTIVE_CONFIG_PREFIX, effective_config
+                )
             return conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
 
     def get_run(self, run_id: str) -> sqlite3.Row:
@@ -2911,13 +2926,11 @@ class Store:
         transition clears that column and an audit fact (an authorization being consumed, a
         dirty target being left alone) must survive the run reaching a final state.
 
-        ``limit`` bounds an operator note by default. A structured record that happens to ride
-        in this table (the effective configuration) passes its own, larger bound instead of
-        being silently truncated into something a reader could misread.
+        ``limit`` bounds an operator note by default. Structured documents use separate write
+        helpers that preserve them verbatim and reject conflicts.
 
         ``only_if_absent_prefix`` makes the note write-once for that prefix: the first recorded
-        value wins and a later one is dropped. That is what keeps a run's recorded configuration
-        part of its identity rather than a field a later invocation can rewrite.
+        value wins and a later operator remark with the prefix is dropped.
         """
         with self.transaction() as conn:
             if only_if_absent_prefix is not None and self._note_with_prefix(
@@ -2963,32 +2976,59 @@ class Store:
         re-derives the same identity from the same contract. Written only when absent: a run's
         recorded configuration is part of its identity and is never rewritten.
         """
-        self.record_note(
-            run_id,
-            _EFFECTIVE_CONFIG_PREFIX + canonical_json(config.model_dump(mode="json")),
-            limit=EFFECTIVE_CONFIG_NOTE_LIMIT,
-            only_if_absent_prefix=_EFFECTIVE_CONFIG_PREFIX,
-        )
+        with self.transaction() as conn:
+            self._record_structured_note_locked(conn, run_id, _EFFECTIVE_CONFIG_PREFIX, config)
+
+    def _structured_note_locked(
+        self, conn: sqlite3.Connection, run_id: str, prefix: str, model: Any
+    ) -> Any:
+        rows = conn.execute(
+            "SELECT note FROM run_notes WHERE run_id = ? AND substr(note, 1, ?) = ?",
+            (run_id, len(prefix), prefix),
+        ).fetchall()
+        records = []
+        for row in rows:
+            try:
+                records.append(model.model_validate_json(row["note"][len(prefix):]))
+            except (ValidationError, ValueError) as exc:
+                raise StoredRecordUnreadable(
+                    f"run {run_id} has an unreadable {prefix.rstrip(': ')} record"
+                ) from exc
+        if records and any(record != records[0] for record in records[1:]):
+            raise StoredRecordUnreadable(
+                f"run {run_id} has conflicting {prefix.rstrip(': ')} records"
+            )
+        return records[0] if records else None
+
+    def _record_structured_note_locked(
+        self, conn: sqlite3.Connection, run_id: str, prefix: str, record: Any
+    ) -> None:
+        existing = self._structured_note_locked(conn, run_id, prefix, type(record))
+        if existing is not None:
+            if existing != record:
+                raise StoreError(f"run {run_id}: conflicting immutable {prefix.rstrip(': ')}")
+            return
+        note = prefix + canonical_json(record.model_dump(mode="json"))
+        self._record_note_locked(conn, run_id, note, limit=len(note))
+
+    def admission_binding_for(self, run_id: str) -> RunAdmissionBinding | None:
+        with self._lock:
+            return self._structured_note_locked(
+                self.conn, run_id, _ADMISSION_BINDING_PREFIX, RunAdmissionBinding
+            )
+
+    def workspace_provenance_for(self, run_id: str) -> WorkspaceProvenance | None:
+        with self._lock:
+            return self._structured_note_locked(
+                self.conn, run_id, _WORKSPACE_PROVENANCE_PREFIX, WorkspaceProvenance
+            )
 
     def effective_config_for(self, run_id: str) -> EffectiveConfig | None:
         """The recorded configuration, or ``None`` for a run that predates config binding."""
-        for note in self.notes_for(run_id):
-            if not note.startswith(_EFFECTIVE_CONFIG_PREFIX):
-                continue
-            try:
-                loaded = json.loads(note[len(_EFFECTIVE_CONFIG_PREFIX) :])
-            except json.JSONDecodeError:
-                # A truncated or hand-edited note is not a configuration. Reporting "not
-                # recorded" is honest; guessing one from a partial document is not.
-                return None
-            if not isinstance(loaded, dict):
-                return None
-            try:
-                return EffectiveConfig.model_validate(loaded)
-            except ValidationError:
-                return None
-        return None
-        return None
+        with self._lock:
+            return self._structured_note_locked(
+                self.conn, run_id, _EFFECTIVE_CONFIG_PREFIX, EffectiveConfig
+            )
 
     def record_dsh_context(self, run_id: str, record: DshContextRecord) -> None:
         """Record which of a frozen candidate's changed paths are on the DSH context list."""
@@ -3010,28 +3050,55 @@ class Store:
                 continue
             try:
                 loaded = json.loads(note[len(_DSH_CONTEXT_PREFIX) :])
-            except json.JSONDecodeError as exc:
-                raise StoreError(
+            except (json.JSONDecodeError, RecursionError) as exc:
+                raise StoredRecordUnreadable(
                     f"run {run_id} has an unreadable dsh_context record ({exc}); it is not skipped"
                 ) from exc
             try:
                 records.append(DshContextRecord.model_validate(loaded))
             except ValidationError as exc:
-                raise StoreError(
+                raise StoredRecordUnreadable(
                     f"run {run_id} has a dsh_context record that is not a valid "
                     f"DshContextRecord: {exc}"
                 ) from exc
         return records
 
-    def record_worktree(self, run_id: str, path: Path) -> None:
+    def record_worktree(
+        self, run_id: str, path: Path, *, provenance: WorkspaceProvenance | None = None
+    ) -> None:
         """Record the workspace this run was given. Written before any work happens in it."""
         with self.transaction() as conn:
+            row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                raise RunNotFound(run_id)
+            binding = self._structured_note_locked(
+                conn, run_id, _ADMISSION_BINDING_PREFIX, RunAdmissionBinding
+            )
+            if binding is not None:
+                expected = WorkspaceProvenance(
+                    project_root=binding.project_root, git_common_dir=binding.git_common_dir,
+                    worktree_path=binding.worktree_path,
+                )
+                if provenance != expected or str(path) != expected.worktree_path:
+                    raise StoreError(f"run {run_id}: worktree provenance differs from admission binding")
+            if row["worktree_path"] and row["worktree_path"] != str(path):
+                raise StoreError(f"run {run_id}: recorded worktree path is immutable")
+            if provenance is not None:
+                if str(path) != provenance.worktree_path:
+                    raise StoreError(f"run {run_id}: worktree provenance has another path")
+                self._record_structured_note_locked(
+                    conn, run_id, _WORKSPACE_PROVENANCE_PREFIX, provenance
+                )
             conn.execute(
                 "UPDATE runs SET worktree_path = ?, worktree_state = ?, updated_at = ? WHERE run_id = ?",
                 (str(path), "READY", utc_now(), run_id),
             )
 
-    def record_cleanup_intent(self, run_id: str, operator: str) -> str:
+    def record_cleanup_intent(
+        self, run_id: str, operator: str, *, expected_path: str | None = None,
+        expected_provenance: WorkspaceProvenance | None = None,
+        expected_root_repository: str | None = None,
+    ) -> str:
         """Claim the right to remove this run's workspace, transactionally (CAS-style).
 
         Refuses while another cleanup is in flight, so two operators cannot both decide to
@@ -3041,7 +3108,7 @@ class Store:
         """
         with self.transaction() as conn:
             row = conn.execute(
-                "SELECT cleanup_intent_at, cleanup_done_at, worktree_state FROM runs WHERE run_id = ?",
+                "SELECT * FROM runs WHERE run_id = ?",
                 (run_id,),
             ).fetchone()
             if row is None:
@@ -3050,6 +3117,29 @@ class Store:
                 return "already_removed"
             if row["worktree_state"] == "REMOVING" and row["cleanup_intent_at"]:
                 return "in_progress"
+            if row["task_state"] not in _TERMINAL_STATES:
+                return "refused: run is not terminal"
+            if conn.execute(
+                "SELECT 1 FROM attempts WHERE run_id = ? AND state IN (?, ?) LIMIT 1",
+                (run_id, AttemptState.ACTIVE.value, AttemptState.CREATED.value),
+            ).fetchone() is not None:
+                return "refused: an attempt is active"
+            if expected_path is not None and row["worktree_path"] != expected_path:
+                return "refused: worktree path changed"
+            if expected_path is not None:
+                actual = self._structured_note_locked(
+                    conn, run_id, _WORKSPACE_PROVENANCE_PREFIX, WorkspaceProvenance
+                )
+                if actual != expected_provenance:
+                    return "refused: worktree provenance changed"
+            if expected_root_repository is not None:
+                root = conn.execute(
+                    "SELECT rb.repo_path FROM root_budgets rb WHERE rb.root_id = "
+                    "(SELECT root_id FROM attempts WHERE run_id = ? AND root_id <> '' "
+                    "ORDER BY created_at LIMIT 1)", (run_id,),
+                ).fetchone()
+                if root is None or root["repo_path"] != expected_root_repository:
+                    return "refused: recorded repository source changed"
             now = utc_now()
             conn.execute(
                 """
@@ -3590,14 +3680,14 @@ class Store:
         ):
             try:
                 loaded = json.loads(str(row["record_json"]))
-            except json.JSONDecodeError as exc:
-                raise StoreError(
+            except (json.JSONDecodeError, RecursionError) as exc:
+                raise StoredRecordUnreadable(
                     f"run {run_id} has an unreadable repair record ({exc}); it is not skipped"
                 ) from exc
             try:
                 records.append(RepairRecord.model_validate(loaded))
             except ValidationError as exc:
-                raise StoreError(
+                raise StoredRecordUnreadable(
                     f"run {run_id} has a repair record that is not a valid RepairRecord: {exc}"
                 ) from exc
         return records

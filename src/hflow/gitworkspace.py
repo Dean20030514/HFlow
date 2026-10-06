@@ -575,6 +575,26 @@ class GitRepo:
         """Where a run's worktree goes: beside the repository, never inside it."""
         return self.root.parent / f"{self.root.name}.hflow-worktrees"
 
+    def validate_reusable_worktree(self, target: Path, base_commit: str) -> None:
+        """Refuse a foreign, modified or linked target before it is given to a worker."""
+        for entry in (target.parent, target, target / ".git"):
+            if entry.is_symlink() or entry.is_junction():
+                raise GitError(f"worktree reuse refused: linked path {entry}")
+        if not target.is_dir() or not (target / ".git").is_file():
+            raise GitError(f"worktree reuse refused: {target} is not a linked Git worktree")
+        actual = GitRepo.discover(target)
+        if actual.root != target.resolve() or (actual.root / actual.common_dir).resolve() != (self.root / self.common_dir).resolve():
+            raise GitError("worktree reuse refused: repository identity differs")
+        if self.worktree_registration(target) is None or self.is_main_worktree(target):
+            raise GitError("worktree reuse refused: missing registration or source checkout")
+        if actual.resolve_commit("HEAD") != base_commit:
+            raise GitError("worktree reuse refused: HEAD differs from the admitted base")
+        if actual.index_flagged_paths(target):
+            raise GitError("worktree reuse refused: index flags can hide worktree changes")
+        status = actual.status_report()
+        if status.changed or status.ignored or status.unsupported:
+            raise GitError("worktree reuse refused: worktree is not clean")
+
     def create_worktree(self, run_id: str, base_commit: str) -> Path:
         """Attach a detached worktree at ``base_commit``.
 
@@ -587,16 +607,16 @@ class GitRepo:
         repair is part of creating it, not an optional extra.
         """
         parent = self.worktree_parent()
+        if parent.is_symlink() or parent.is_junction():
+            raise GitError(f"worktree creation refused: linked parent {parent}")
         parent.mkdir(parents=True, exist_ok=True)
         target = parent / run_id
-        if target.exists() and any(target.iterdir()):
-            # This run already has a worktree (a resumed run, or a kept failed candidate).
+        if target.exists() or target.is_symlink():
+            self.validate_reusable_worktree(target, base_commit)
             return target
-        if target.exists():
-            target.rmdir()
         staging = parent / f"{run_id}.staging-{os.getpid()}"
         if staging.exists():
-            shutil.rmtree(staging, ignore_errors=True)
+            raise GitError(f"worktree creation refused: staging path already exists: {staging}")
         self.run("worktree", "add", "--detach", str(staging), base_commit)
         staging.replace(target)
         self.run("worktree", "repair", str(target))

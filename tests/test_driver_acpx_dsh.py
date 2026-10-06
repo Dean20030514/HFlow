@@ -974,6 +974,9 @@ def test_exhausted_budget_never_reaches_the_cli(
             checks_digest=project.checks_digest(),
             turn_limit=1,
             repair_limit=0,
+            admission_binding=controller._admission_binding("R-seeded", RunRequest(
+                task=task_spec, project=project, project_root=project_root, workspace_root=project_root,
+            )),
         )
         # Claimed for this controller's owner identity (owner lease): a label-only claim is never
         # adopted by a controller.
