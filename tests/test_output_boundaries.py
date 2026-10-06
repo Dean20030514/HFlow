@@ -220,8 +220,11 @@ def test_all_wire_records_share_the_record_budget(run_bytes, neutral_events):
 
 def test_record_limit_freezes_prompt_error_model_and_transcript_containers(run_bytes):
     messages = [
+        wire({"id": 10, "method": "session/new", "params": {}}),
+        wire({"id": 10, "result": {"sessionId": "S"}}),
         prompt(1),
-        wire({"id": 77, "method": "session/set_config_option", "params": {"configId": "model"}}),
+        wire({"id": 77, "method": "session/set_config_option",
+              "params": {"sessionId": "S", "configId": "model"}}),
         wire({"id": 1, "error": {"code": -1, "message": "first error"}}),
         wire({"method": "session/update", "params": {"sessionId": "S", "update": {
             "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "first"},
@@ -229,14 +232,15 @@ def test_record_limit_freezes_prompt_error_model_and_transcript_containers(run_b
     ]
     tail = b"".join([
         prompt(2),
-        wire({"id": 88, "method": "session/set_config_option", "params": {"configId": "model"}}),
+        wire({"id": 88, "method": "session/set_config_option",
+              "params": {"sessionId": "S", "configId": "model"}}),
         wire({"id": 2, "error": {"code": -2, "message": "tail error"}}),
         wire({"method": "session/update", "params": {"sessionId": "S", "update": {
             "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "tail"},
         }}}),
         settled(2),
     ])
-    driver, handle, result = run_bytes(b"".join(messages) + tail * 100, records=4, role="reviewer")
+    driver, handle, result = run_bytes(b"".join(messages) + tail * 100, records=6, role="reviewer")
     invocation_id = handle.invocation_id
     assert driver._prompt_request_ids[invocation_id] == [1]
     assert len(driver._prompt_errors[invocation_id]) == 1
@@ -244,7 +248,7 @@ def test_record_limit_freezes_prompt_error_model_and_transcript_containers(run_b
     assert driver._model_watches[invocation_id].set_requests == 1
     assert driver._prompt_session_updates[invocation_id] == {"S": [1, 1]}
     assert driver._transcripts[invocation_id].final_answer().text == "first"
-    assert len(driver.raw_lines(invocation_id)) == 4
+    assert len(driver.raw_lines(invocation_id)) == 6
     assert driver._terminal_responses[invocation_id] == []
     assert result.error_code == "output_limit_exceeded"
     assert result.review is None

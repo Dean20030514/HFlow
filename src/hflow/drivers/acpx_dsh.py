@@ -725,8 +725,16 @@ class _ModelWatch:
         self.thought_level: str | None = None
         self.changes: list[ModelChange] = []
         self.session_created = False
-        #: Outbound requests awaiting their response: id key -> method.
-        self._pending: dict[tuple[str, Any], str] = {}
+        self.session_id = ""
+        self._prompt_seen = False
+        self._ambiguous = False
+        #: Request ids are only unique within one direction; the raw stream has both.
+        self._seen_request_ids: set[tuple[str, Any]] = set()
+        self._tracked_request_ids: set[tuple[str, Any]] = set()
+        #: Outbound requests awaiting their response: id key -> (method, session).
+        self._pending: dict[tuple[str, Any], tuple[str, str]] = {}
+        self.skipped_updates = 0
+        self.skipped_sets = 0
         #: Outcomes of the model's set_config_option requests, in order: True = succeeded.
         self.set_results: list[bool] = []
         self.set_requests = 0
@@ -738,22 +746,53 @@ class _ModelWatch:
         key = _rpc_id(message.get("id"))
         if isinstance(method, str):
             params = message.get("params") if isinstance(message.get("params"), dict) else {}
-            if key is not None and method == "session/new":
-                self._pending[key] = method
-            elif key is not None and method == "session/set_config_option":
-                config_id = params.get("configId")
-                if config_id == (self.config_id or "model"):
-                    self._pending[key] = method
+            session = _session_of(params)
+            model_set = (
+                method == "session/set_config_option"
+                and params.get("configId") == (self.config_id or "model")
+            )
+            tracked = method == "session/new" or (
+                model_set and bool(self.session_id) and session == self.session_id
+            )
+            if key is not None:
+                if key in self._seen_request_ids and (
+                    tracked or key in self._tracked_request_ids
+                ):
+                    self._ambiguous = True
+                self._seen_request_ids.add(key)
+                if tracked:
+                    self._tracked_request_ids.add(key)
+            if key is not None and method == "session/new" and not self.session_created:
+                self._pending[key] = (method, "")
+            elif model_set:
+                if key is not None and self.session_id and session == self.session_id:
+                    self._pending[key] = (method, session)
                     self.set_requests += 1
+                else:
+                    self.skipped_sets += 1
             elif method == "session/update":
                 update = params.get("update") if isinstance(params.get("update"), dict) else {}
                 if update.get("sessionUpdate") == "config_option_update":
-                    self._read_options(update.get("configOptions"), "config_option_update")
+                    if self.session_id and session == self.session_id:
+                        self._read_options(update.get("configOptions"), "config_option_update")
+                    else:
+                        self.skipped_updates += 1
             return
         answered = self._pending.pop(key, None) if key is not None else None
         result = message.get("result")
-        if answered == "session/new" and isinstance(result, dict):
+        if answered is not None and self._ambiguous:
+            return
+        method, session = answered if answered is not None else (None, "")
+        if (
+            method == "session/new"
+            and not self.session_created
+            and isinstance(result, dict)
+            and "error" not in message
+            and isinstance(result.get("sessionId"), str)
+            and result["sessionId"]
+        ):
             self.session_created = True
+            self.session_id = result["sessionId"]
             option = _option_of(result.get("configOptions"), "model", "model")
             if option is not None:
                 self.advertised = True
@@ -764,7 +803,7 @@ class _ModelWatch:
                 self.effective_value = self.initial_value
                 self.source = "session/new"
             self._read_thought_level(result.get("configOptions"))
-        elif answered == "session/set_config_option":
+        elif method == "session/set_config_option" and session == self.session_id:
             # Any JSON-RPC success counts as the agent accepting the request, whatever shape its
             # result has; the effective value is only taken from a result that reports one.
             ok = "result" in message and "error" not in message
@@ -780,6 +819,14 @@ class _ModelWatch:
         ):
             error = message.get("error") if isinstance(message.get("error"), dict) else {}
             self.client_error = str(error.get("message") or error)[:500]
+
+    def bind_prompt(self, session: str) -> None:
+        """Check the first prompt against the session whose configuration was observed."""
+        if self._prompt_seen:
+            return
+        self._prompt_seen = True
+        if not session or not self.session_id or session != self.session_id:
+            self._ambiguous = True
 
     def _read_options(self, config_options: Any, source: str) -> None:
         option = _option_of(config_options, "model", self.config_id or "model")
@@ -804,7 +851,7 @@ class _ModelWatch:
         change request with an error. A value that was already current needs no request, so its
         absence is not a refusal, and a request still awaiting its answer is unknown, not refused.
         """
-        if self._pending:
+        if self._ambiguous or not self.session_created or self._pending:
             return False
         if self.set_requests == 0:
             return self.requested is not None and (
@@ -836,6 +883,8 @@ class _ModelWatch:
         """
         if not self.requested:
             return ModelApplied.NOT_PASSED
+        if self._ambiguous or not self.session_created:
+            return ModelApplied.UNKNOWN
         if rejected or (self.set_results and not any(self.set_results)):
             return ModelApplied.REJECTED
         if any(self.set_results):
@@ -848,7 +897,11 @@ class _ModelWatch:
             return ModelApplied.UNKNOWN
         # No change request went out. The rejection branch did not confirm a refusal (rule 7: no
         # upgrade without an observation), so a refusal or a different value is unknown.
-        if self.refused() or self.effective_value != self.requested:
+        if (
+            self.refused()
+            or self.initial_value != self.requested
+            or self.effective_value != self.requested
+        ):
             return ModelApplied.UNKNOWN
         return ModelApplied.PASSED
 
@@ -1929,13 +1982,11 @@ class AcpxDshDriver:
             discarding = False
             offset = 0
             while True:
-                chunk = b""
-                try:
-                    with stdout_path.open("rb") as source:
-                        source.seek(offset)
-                        chunk = source.read(CAPTURE_READ_CHUNK)
-                except OSError:
-                    chunk = b""
+                # The file was created before spawn. A failed open/read is not EOF, even after
+                # the client exited: the unread suffix may invalidate an otherwise settled turn.
+                with stdout_path.open("rb") as source:
+                    source.seek(offset)
+                    chunk = source.read(CAPTURE_READ_CHUNK)
                 if chunk:
                     offset += len(chunk)
                     if offset > self._peak_raw_bytes[invocation_id]:
@@ -1964,12 +2015,9 @@ class AcpxDshDriver:
                         self._limit_output(invocation_id, "protocol_byte_limit")
                     continue
                 if process.poll() is not None:
-                    try:
-                        with stdout_path.open("rb") as source:
-                            source.seek(offset)
-                            tail = source.read(CAPTURE_READ_CHUNK)
-                    except OSError:
-                        tail = b""
+                    with stdout_path.open("rb") as source:
+                        source.seek(offset)
+                        tail = source.read(CAPTURE_READ_CHUNK)
                     if not tail:
                         break
                     continue
@@ -2135,11 +2183,13 @@ class AcpxDshDriver:
         params = message.get("params") if isinstance(message.get("params"), dict) else {}
         if message.get("method") == "session/prompt":
             self._note_dispatch(invocation_id)
+            session = _session_of(params)
+            if watch is not None:
+                watch.bind_prompt(session)
             request_id = message.get("id")
             if request_id is not None:
                 prompt_ids = self._prompt_request_ids.setdefault(invocation_id, [])
                 prompt_ids.append(request_id)
-                session = _session_of(params)
                 if len(prompt_ids) == 1:
                     transcript = self._transcripts.get(invocation_id)
                     if transcript is not None:
@@ -2327,7 +2377,7 @@ class AcpxDshDriver:
                     invocation_id, ExitBoundary(emptied=emptied, left_behind=None, detail=stop_detail)
                 )
             close_output_handles(process)
-            observation, applied = self._model_facts(invocation_id, rejected=False)
+            observation, applied = self._model_facts(invocation_id, rejected=False, complete=False)
             timeout_limitations = [
                 "the invocation deadline was reached while waiting for the client; the "
                 "managed process boundary was used to stop it",
@@ -2632,8 +2682,17 @@ class AcpxDshDriver:
             limitations.append(note)
         if self._surface_notes.get(invocation_id):
             limitations.append(self._surface_notes[invocation_id])
+        watch = self._model_watches.get(invocation_id)
+        if watch is not None:
+            if watch.skipped_updates or watch.skipped_sets:
+                limitations.append(
+                    f"model_other_session: ignored {watch.skipped_updates} configuration update(s) "
+                    f"and {watch.skipped_sets} model set request(s) without the bound session"
+                )
+            if watch._ambiguous:
+                limitations.append("model_binding_unknown: session or request attribution is ambiguous")
         observation, applied = self._model_facts(
-            invocation_id, rejected=error_code == "model_rejected_before_prompt"
+            invocation_id, rejected=error_code == "model_rejected_before_prompt", complete=drained
         )
         result = InvocationResult(
             invocation_id=invocation_id,
@@ -2684,10 +2743,10 @@ class AcpxDshDriver:
         )
 
     def _model_facts(
-        self, invocation_id: str, *, rejected: bool
+        self, invocation_id: str, *, rejected: bool, complete: bool = True
     ) -> tuple[ModelObservation | None, ModelApplied | None]:
         """The invocation's model observation and what became of the requested model."""
-        if self._overflow.get(invocation_id):
+        if not complete or self._overflow.get(invocation_id):
             return None, ModelApplied.UNKNOWN if self.launch.model else ModelApplied.NOT_PASSED
         watch = self._model_watches.get(invocation_id)
         if watch is None:

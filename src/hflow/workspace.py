@@ -314,6 +314,17 @@ def expand_scope(root: Path, scope: Scope) -> list[Path]:
     return kept
 
 
+def _file_content_facts(path: Path) -> tuple[int, str]:
+    """Hash bytes in bounded chunks and count what was actually read, not a prior stat."""
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as source:
+        while chunk := source.read(64 * 1024):
+            size += len(chunk)
+            digest.update(chunk)
+    return size, "sha256:" + digest.hexdigest()
+
+
 def manifest(root: Path) -> dict[str, str]:
     """Path -> content digest for every ``.gitignore``-free file under ``root``.
 
@@ -328,7 +339,7 @@ def manifest(root: Path) -> dict[str, str]:
             path = Path(dirpath) / name
             relative = path.relative_to(root_resolved).as_posix()
             try:
-                entries[relative] = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+                entries[relative] = _file_content_facts(path)[1]
             except OSError:
                 entries[relative] = "unreadable"
     return entries
@@ -353,12 +364,12 @@ def candidate_fingerprint(root: Path, scope: Scope) -> str:
     for path in expand_scope(root_resolved, scope):
         relative = path.relative_to(root_resolved).as_posix()
         try:
-            data = path.read_bytes()
+            size, content_digest = _file_content_facts(path)
             entries.append(
                 {
                     "path": relative,
-                    "size": len(data),
-                    "digest": "sha256:" + hashlib.sha256(data).hexdigest(),
+                    "size": size,
+                    "digest": content_digest,
                 }
             )
         except OSError:

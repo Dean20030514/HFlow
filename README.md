@@ -127,10 +127,18 @@ tested, so they are recorded rather than asserted:
 |---|---|---|
 | batch F on top of `f2796aa` (prompt errors and unknown stop reasons, stream order and after-response text, reviewer transcript by `messageId` and session, fail-safe exit checks, shared Git metadata, launch-surface and DSH-context records) | `python -m pytest -q` | `938 passed, 1 skipped in 610.03s` (exit 0; 939 collected) |
 | 2026-10-05 working tree on `35751aa` (immutable admission binding, guarded cleanup and reconciliation, bounded raw/protocol output, unreadable-record diagnostics) | `python -m pytest -q` | `1382 passed, 1 skipped in 771.05s` (exit 0; 1383 collected) |
+| 2026-10-06 working tree on `bdb33ba` (void-aware repair admission, session-bound model observations, protocol read failures, artifact IO settlement, streaming candidate hashes; 82 added regression cases) | `python -m pytest -q` | `1464 passed, 1 skipped in 843.65s` (exit 0; 1465 collected) |
 
 The 2026-10-05 snapshot is offline verification, including actual Git repositories and local
 stand-in processes. It adds no live-model compatibility observation or capability upgrade;
 the production driver and acpx 0.17.1 pin are unchanged.
+
+The 2026-10-06 snapshot is also offline: real temporary Git repositories and local stand-in
+processes, with no model call, dependency upgrade, database-version change or capability upgrade.
+Scoped Ruff passed for all modified Python files. An additional
+`python -m mypy src/hflow/verify.py` exploration reported 38 errors across that module and its
+imports; no baseline comparison was performed, and this snapshot makes no whole-project typing
+claim. Mypy is not a configured acceptance command for this project.
 
 History, for orientation only: the suite grew from 225 tests (T02 admission) through 298 (batches
 A/B/C), 353 (batch D configuration wiring), 377 (reviewer-cancel routing and the coordinated spawn
@@ -290,7 +298,9 @@ the project contract, the machine profile, the authorization artifact, the root 
   default) keeps every counter spent; `void` is allowed only for `launch_unknown` (an `unknown`
   launch was reported, so provider spend may have occurred) and returns exactly that dispatch's
   root charge - one top-level submission, plus the repair if it was charged as one - but not the
-  authorization's counter or the run's turns. An entry is settled once. The run's state and
+  authorization's counter or the run's turns. A voided implementer is excluded from both the
+  controller's advance repair check and the dispatch transaction's history; `consumed` still
+  counts, and a new revision still needs a new approval. An entry is settled once. The run's state and
   outcome do not change and nothing is re-dispatched: the only effect is that the root stops
   being blocked by that entry, so a *new* revision may dispatch (with its own approval).
   `status`/`report`/`doctor` show it as "settled by operator attestation (not observed)", and
@@ -365,6 +375,8 @@ the project contract, the machine profile, the authorization artifact, the root 
   not require it. Only both saying no may skip it.
 - An unknown outcome blocks and never auto-retries.
 - Verification is bound to a candidate fingerprint and a checks digest.
+  File contents are hashed in 64 KiB chunks with the same digest, size and path-order contract,
+  so a large scoped file does not require an equally large in-memory byte string.
 - Ignored bytecode never stands in for the committed source: every freeze refuses
   `scope_violation` on an ignored file the scoped fingerprint would hash (no commit holds it) and
   on a sourceless `.pyc` outside `__pycache__`, and in a worktree run every regular `.pyc`
@@ -410,6 +422,13 @@ the project contract, the machine profile, the authorization artifact, the root 
   than inheriting the other's agent. A binding's declared **harness** must be one its driver
   actually launches, so a profile cannot record `codex` next to a driver whose every process is
   DSH.
+- Model observations are attributed to the first valid created session and checked against the
+  first prompt. Foreign or missing-session configuration cannot confirm a requested model;
+  ambiguous request ids stay `unknown`. A protocol-file read error is `reader_failed`, even
+  after a valid terminal response: no review verdict, final model observation or complete-stream
+  ordering is taken from the prefix. Check artifact directory and manifest errors instead record
+  verification ERROR evidence and end the run `BLOCKED`, preserving the spent allowance and
+  any captured streams rather than leaving it in `CHECKING`.
 - `prepare` and `run` derive everything - task overrides, project contract, role bindings,
   driver names, the resolved launch, write permission, admission - from one resolution
   (`prepare.resolve_run`), so a preview cannot describe a configuration the run does not execute.

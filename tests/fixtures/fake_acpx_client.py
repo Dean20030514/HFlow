@@ -227,6 +227,19 @@ def main(argv: list[str] | None = None) -> int:
         out(
             {"jsonrpc": "2.0", "id": SET_CONFIG_ID, "result": {"configOptions": catalog(args.model)}}
         )
+    if other_model := os.environ.get("STUB_OTHER_SESSION_MODEL"):
+        out(
+            {
+                "jsonrpc": "2.0", "method": "session/update",
+                "params": {
+                    "sessionId": "unrelated-session",
+                    "update": {
+                        "sessionUpdate": "config_option_update",
+                        "configOptions": catalog(other_model),
+                    },
+                },
+            }
+        )
     if not refusal and os.environ.get("STUB_CLIENT_FAIL_BEFORE_PROMPT") == "1":
         refusal = "stub client failed before the prompt"
     if refusal:

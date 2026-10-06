@@ -1324,6 +1324,9 @@ def test_status_shows_each_invocations_model_and_old_runs_say_not_recorded(
 
     harness = harness_factory("cooperative", binding=_model_binding(STAND_IN_OTHER_MODEL))
     harness.driver.extra_env["STUB_MODEL_CATALOG"] = "grouped"
+    # A foreign session reports the old model after the genuine session's successful set.
+    # The controller must store the genuine value and both report forms must preserve it.
+    harness.driver.extra_env["STUB_OTHER_SESSION_MODEL"] = STAND_IN_INITIAL_MODEL
     store = Store(tmp_path / "hflow.sqlite")
     controller = Controller(
         store,
@@ -1343,6 +1346,7 @@ def test_status_shows_each_invocations_model_and_old_runs_say_not_recorded(
             )
         )
         inspection = inspect_run(store, outcome.run_id)
+        invocation_result = harness.driver._results[inspection.attempts[0].invocation_id]
         # An attempt row written before model observation existed: its stored result simply
         # has no model fields.
         with store.transaction() as conn:
@@ -1360,10 +1364,15 @@ def test_status_shows_each_invocations_model_and_old_runs_say_not_recorded(
     assert implementer.model_applied is ModelApplied.ACCEPTED
     assert implementer.model_observation is not None
     assert implementer.model_observation.effective_value == STAND_IN_OTHER_MODEL
+    assert any(note.startswith("model_other_session:") for note in invocation_result.limitations)
     rendered = status_text(inspection)
     assert "model_applied=accepted" in rendered
     assert STAND_IN_OTHER_MODEL in rendered
     assert report_json(inspection)["attempts"][0]["model_applied"] == "accepted"
+    assert (
+        report_json(inspection)["attempts"][0]["model_observation"]["effective_value"]
+        == STAND_IN_OTHER_MODEL
+    )
 
     assert legacy.attempts[0].model_observation is None
     assert legacy.attempts[0].model_applied is None

@@ -344,7 +344,10 @@ What the root file does, and what it does not:
   refused for `unknown` and, for `launch_unknown`, returns that dispatch's root charge (one
   top-level submission, plus one repair if it was charged as the repair; a voided implementer
   entry is also no longer counted as the root's first attempt). The authorization counter and
-  the run's turns are not returned. Resolve-once; open or final entries, a run that has not
+  the run's turns are not returned. Both the controller's advance repair-allowance check and
+  the transactional dispatch charge use that same effective implementer history: a voided
+  first implementer does not make the next revision's first implementer a repair; a `consumed`
+  entry still does. Resolve-once; open or final entries, a run that has not
   ended and a blank or oversized attestation are refused (exit 2); an unknown id exits 4. The
   run keeps its state, block code and outcome, nothing is re-dispatched, and the entry renders
   as "settled by operator attestation (not observed)" in `status`/`report` (and as counts in
@@ -1216,6 +1219,11 @@ What the evidence row and the artifact say, precisely:
 - a check whose output pipes are still held open after it exits (a descendant inherited them) is
   reported as `output_capture_error` with `ERROR`, not as a clean pass. The wait for the readers is
   bounded, and what was read is still digested;
+- an artifact factory or directory-creation failure records `ERROR/no_artifact_dir` without
+  starting the check. A manifest write failure records `ERROR/output_capture_error`, keeping
+  the observed exit code and captured stream references; `artifact=` names the directory,
+  rather than presenting a missing or partial manifest as readable evidence. The run ends
+  `BLOCKED/verification_failed`, not `CHECKING`; neither failure can buy a repair;
 - `elapsed` covers launch, the check itself, the settle window and the reaping, so it is not a
   claim that the check's own timeout bounds the whole call.
 
@@ -1257,6 +1265,12 @@ prompt still records `agent_turns=1`; when none was observed and the stream is i
 count is unknown rather than a claim that no prompt was sent. `prompt_response_line` keeps its
 zero-based **nonempty-line ordinal**, so raw blank lines can make it differ from a physical file
 line number. Historical records and replay indexing are not reinterpreted.
+
+The protocol file is created before its reader starts. Failure to open, seek or read it,
+including the final tail read after client exit, is `reader_failed`, not EOF. A valid prompt
+response already read from the prefix cannot turn that failure into completion. No reviewer
+verdict, complete-stream ordering or final model observation is taken from that prefix;
+confirmed operator stops and unconfirmed process boundaries keep their existing precedence.
 
 **Measured, not bounded (the client's own protocol file).** The client writes `stdout.ndjson`
 itself. HFlow does **not** truncate a file another process is writing - that removes bytes nobody
@@ -1574,6 +1588,14 @@ its own JSON-RPC error and no prompt sent, which HFlow records as `FAILED`
 `model_rejected_before_prompt` (nothing reached a model; nothing is refunded). acpx also copies the
 value into `session/new` `_meta.claudeCode.options.model` - the same bound value, in a second
 place. Every other missing-stop-reason case stays `OUTCOME_UNKNOWN`.
+
+Model and reasoning observations belong to the first valid created session, checked against
+the first prompt's session. Updates or model-set requests for another or missing session do
+not alter them. A creation/prompt mismatch or request-id collision leaves the requested model
+`unknown`. With no model-set request, `passed` needs both the initial and final values to match
+the request. The effective value remains the session's last reported configuration, including
+same-session updates after the prompt response; it is not proof of the model used to reason
+during that turn. A failed protocol read supplies no final model observation.
 
 What `status` and `report` show: one `model` line per invocation, with `model_applied`, whether
 a catalog was `advertised`, the `requested` and `effective` values and where the effective one

@@ -500,22 +500,31 @@ class CommandCheckRunner:
                 f" retained output was truncated at {self.stream_limit_bytes} byte(s) per stream;"
                 " the digest covers the retained head, the artifact holds exactly that head"
             )
-        manifest = write_artifact_manifest(
-            artifact_dir,
-            {
-                "check_id": check.id,
-                "argv": argv,
-                "retained": outcome.artifacts,
-                "truncated": bool(truncated),
-                "capture_failure": capture_failure,
-                "exit_code": outcome.exit_code,
-                "exit_reason": outcome.exit_reason,
-                "status": outcome.status.value,
-                "elapsed_seconds": elapsed,
-                "environment": summary,
-            },
-        )
-        outcome.artifact_path = str(manifest)
+        try:
+            manifest = write_artifact_manifest(
+                artifact_dir,
+                {
+                    "check_id": check.id,
+                    "argv": argv,
+                    "retained": outcome.artifacts,
+                    "truncated": bool(truncated),
+                    "capture_failure": capture_failure,
+                    "exit_code": outcome.exit_code,
+                    "exit_reason": outcome.exit_reason,
+                    "status": outcome.status.value,
+                    "elapsed_seconds": elapsed,
+                    "environment": summary,
+                },
+            )
+        except OSError as exc:
+            # The check already ended and its streams remain real evidence. Keep their
+            # directory reference, not an unwritten (or partial) manifest, and refuse a
+            # clean result without replacing the observed command or exit code.
+            outcome.status = EvidenceStatus.ERROR
+            outcome.exit_reason = REASON_OUTPUT_CAPTURE_ERROR
+            outcome.detail += f" its artifact manifest could not be written ({exc})"
+        else:
+            outcome.artifact_path = str(manifest)
         if not keep_artifacts:
             self._discard_artifacts(artifact_dir)
         return outcome
@@ -525,6 +534,9 @@ class CommandCheckRunner:
         if self._artifact_factory is not None:
             try:
                 directory = Path(self._artifact_factory(check.id, ""))
+            except OSError as exc:
+                return f"the artifact directory factory failed: {exc}", None, True
+            try:
                 directory.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
                 return f"could not create {directory}: {exc}", None, True

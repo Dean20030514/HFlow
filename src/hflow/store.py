@@ -67,14 +67,14 @@ from .contracts import (
 )
 from .ids import new_attempt_id, new_evidence_id, new_id, parse_ts, utc_now
 from .migrate import (
-    MIGRATION_BACKUP_SUFFIX,
-    STORAGE_VERSION,
-    SUPPORTED_STORAGE_VERSION,
+    MIGRATION_BACKUP_SUFFIX as MIGRATION_BACKUP_SUFFIX,
+    STORAGE_VERSION as STORAGE_VERSION,
+    SUPPORTED_STORAGE_VERSION as SUPPORTED_STORAGE_VERSION,
     MigrationError,
     StepHook,
-    effective_version,
+    effective_version as effective_version,
     migrate,
-    recorded_version,
+    recorded_version as recorded_version,
 )
 from .ownership import OwnerFence, ProcessIdentity
 
@@ -1990,15 +1990,8 @@ class Store:
         # A ``void`` operator settlement returned this entry's charge to the root, so it is not
         # the root's first implementer attempt either: counting it would charge the next
         # implementer as a repair the void just gave back. ``consumed`` entries still count.
-        implementers_before = int(
-            conn.execute(
-                "SELECT COUNT(*) AS n FROM invocations i WHERE i.root_id = ?"
-                " AND i.role = 'implementer' AND NOT EXISTS (SELECT 1 FROM invocation_settlements"
-                " s WHERE s.invocation_id = i.invocation_id AND s.settled_as = 'void')",
-                (root_binding.root_id,),
-            ).fetchone()["n"]
-        )
-        is_repair = bool(is_repair) or (role == "implementer" and implementers_before > 0)
+        implementers_before = self._charged_implementer_rows_locked(conn, root_binding.root_id)
+        is_repair = bool(is_repair) or (role == "implementer" and bool(implementers_before))
         if is_repair and int(row["used_repairs"]) + 1 > int(row["max_repairs"]):
             raise StoreError(
                 f"root {root_binding.root_id} has used its {row['max_repairs']} repair attempt(s); "
@@ -2113,6 +2106,32 @@ class Store:
                 (root_id,),
             )
         ]
+
+    @staticmethod
+    def _charged_implementer_rows_locked(
+        conn: sqlite3.Connection, root_id: str
+    ) -> list[sqlite3.Row]:
+        """Read implementation charges through the caller's existing lock/transaction."""
+        return list(conn.execute(
+            "SELECT i.* FROM invocations i WHERE i.root_id = ?"
+            " AND i.role = 'implementer' AND NOT EXISTS (SELECT 1 FROM invocation_settlements"
+            " s WHERE s.invocation_id = i.invocation_id AND s.settled_as = 'void')"
+            " ORDER BY i.reserved_at, i.rowid",
+            (root_id,),
+        ))
+
+    def charged_implementers_for_root(self, root_id: str) -> list[InvocationIntent]:
+        """Implementations still charged to this root; a consumed settlement still counts.
+
+        A void returns the root charge without deleting history or refunding the run or approval.
+        Admission and dispatch must use the same history when deciding whether the next
+        implementation consumes a repair. Unresolved entries are included, not forgiven.
+        """
+        with self._lock:
+            return [
+                _invocation_from_row(row)
+                for row in self._charged_implementer_rows_locked(self.conn, root_id)
+            ]
 
     def pending_invocations(self, root_id: str) -> list[InvocationIntent]:
         return [entry for entry in self.invocations_for_root(root_id) if entry.pending]

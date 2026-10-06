@@ -1836,7 +1836,7 @@ class Controller:
         if self.root_binding is None or self.root_limits is None:
             return
         entries = self.store.invocations_for_root(self.root_binding.root_id)
-        implementers = [entry for entry in entries if entry.role == "implementer"]
+        implementers = self.store.charged_implementers_for_root(self.root_binding.root_id)
         if any(entry.run_id == run_id for entry in implementers):
             return
         armed = spec.repair_policy is not None

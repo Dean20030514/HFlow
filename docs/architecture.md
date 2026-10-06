@@ -316,6 +316,10 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
   write scope and detects drift afterwards. `workspace.py` produces the fingerprint; a run
   without a worktree reports an empty `git_commit` and says so, rather than presenting one as
   the other.
+  Manifests and scoped fingerprints hash file contents in 64 KiB chunks and count the bytes
+  actually read. This bounds file-content working memory without changing sorted path entries,
+  content digests, candidate identity or missing/unreadable semantics; it does not bound the
+  number of paths in a snapshot.
 - **Implementer and reviewer are separate invocations, but the reviewer is not sandboxed.**
   They are separate processes with separate reserved turns, separate sessions and separate
   allowance claims, and a reviewer never inherits the implementer's write permission. The
@@ -378,6 +382,17 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
   `agent_turns=None`. `prompt_response_line` remains a zero-based nonempty-line ordinal; raw
   blank lines mean it need not equal the physical file line number. Historical ordinals and
   replay indices are unchanged.
+- **A failed protocol read is incomplete evidence.** The stdout file exists before its reader
+  starts; an open, seek or read error propagates to the reader guard rather than masquerading
+  as EOF. Even a prefix containing a completed prompt response cannot authorize success or a
+  review verdict. Final model observations and stream ordering are absent on `reader_failed`.
+  Model/reasoning updates and model-set responses are scoped to the first valid created session
+  and checked against the first prompt; mismatches or ambiguous request ids cannot upgrade a
+  requested model to `passed` or `accepted`.
+- **Check artifact errors settle as verification errors.** Factory/directory failures produce
+  `ERROR/no_artifact_dir` before launch; manifest errors produce `ERROR/output_capture_error`
+  after execution, retaining actual exit and stream facts and naming the existing directory.
+  These errors block verification and cannot buy a repair or leave the run in `CHECKING`.
 - **A stop ends local processes, and nothing more.** The production driver owns one
   invocation's process boundary (a Windows Job Object, `drivers/winjob.py`): the child is
   created suspended inside the boundary so ownership exists from its first instruction, and
