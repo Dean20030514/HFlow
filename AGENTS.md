@@ -32,6 +32,7 @@ not restate the design; read the plan and `docs/architecture.md` when the task n
 | Which driver is production | `src/hflow/drivers/selected.py` |
 | Transport decision and its evidence | `docs/adr/0001-transport.md`, `docs/m0-results.md` |
 | Root budget and bounded repair design (batch E) | `docs/batch-e-plan.md`; operator view in `docs/operations.md` |
+| Next-session priority: a recoverable small-task authorization-to-integration loop before Team expansion | `docs/ai/agents/next-session.md`; read when continuing implementation or planning the next milestone |
 
 ## Rules that must not be relaxed to make a test pass
 
