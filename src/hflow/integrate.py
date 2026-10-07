@@ -29,6 +29,8 @@ No step here calls a model, dispatches an agent or spends any budget.
 from __future__ import annotations
 
 import json
+import os
+import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -49,6 +51,7 @@ from .contracts import (
 from .gitworkspace import MIN_INTEGRATION_GIT, GitError, GitRepo
 from .ids import new_integration_id, utc_now
 from .ownership import ProcessIdentity, current_identity, probe
+from .paths import database_path, default_data_dir
 from .store import IntegrationConflict, IntegrationNotFound, Store
 from .verify import CheckRunners, verify_candidate
 from .workspace import candidate_fingerprint, paths_outside_scope
@@ -558,7 +561,7 @@ def _build_and_check(
     )
     outcome = IntegrationOutcome(record=record, notes=[*notes, detail])
     if state is IntegrationState.READY:
-        outcome.handoff = _ready_handoff(repo, record)
+        outcome.handoff = _ready_handoff(store, repo, record)
     return outcome
 
 
@@ -618,15 +621,83 @@ def _release_worktree(repo: GitRepo, record: IntegrationRecord) -> tuple[str, st
     return "REMOVED", ""
 
 
-def _ready_handoff(repo: GitRepo, record: IntegrationRecord) -> list[str]:
-    commands = [
-        f"hflow integrate apply {record.integration_id} --expect-target {record.target_tip}"
-    ]
+#: Characters PowerShell reads inside a double-quoted string: ``$`` and the backtick expand, and
+#: the typographic double quotes end the string as ``"`` does.
+_POWERSHELL_DOUBLE_QUOTED_SPECIAL = frozenset('"`$\u201c\u201d\u201e')
+#: The characters PowerShell takes for a single quote; doubling one keeps it literal.
+_POWERSHELL_SINGLE_QUOTES = frozenset("'\u2018\u2019\u201a\u201b")
+
+
+def _shell_word(text: str, *, windows: bool = os.name == "nt") -> str:
+    """The path ``text`` as one word of a command an operator pastes into their shell.
+
+    A printed command is for PowerShell on Windows (PowerShell 7 or Windows PowerShell 5.1) and
+    for ``sh`` elsewhere - not for cmd.exe, which expands ``%VAR%`` inside double quotes and hands
+    PowerShell's single quotes to the program as part of the argument. On Windows a path goes in
+    double quotes unless it holds a character PowerShell would expand there or end the string at;
+    then it goes in PowerShell's literal single quotes, each single quote doubled. A path ending
+    in a backslash - a root, ``C:\\`` or ``\\\\server\\share\\``, is the only directory printed
+    with one - gets a ``.`` appended first: the same directory, with no backslash before the
+    closing quote. Windows PowerShell 5.1 re-quotes an argument that holds a space for the program,
+    and a backslash there escapes that quote (observed: ``"C:\\my dir\\" next`` reached the program
+    as the one argument ``C:\\my dir" next``). Elsewhere :func:`shlex.quote`.
+    """
+    if not windows:
+        return shlex.quote(text)
+    if text.endswith("\\"):
+        text += "."
+    if not any(char in _POWERSHELL_DOUBLE_QUOTED_SPECIAL for char in text):
+        return f'"{text}"'
+    doubled = (char * 2 if char in _POWERSHELL_SINGLE_QUOTES else char for char in text)
+    return "'" + "".join(doubled) + "'"
+
+
+def _named_data_dir(store: Store) -> str | None:
+    """The data directory a printed command must name, or ``None`` when the default reaches it.
+
+    ``--data-dir`` selects the ledger (``<data-dir>/hflow.sqlite``) an ``hflow`` command opens,
+    and an integration exists only in the ledger it was prepared in. A command printed without
+    it opens the default ledger (``HFLOW_DATA_DIR``, else the platform directory) and exits 4
+    (unknown integration) for anyone who passed another one. Absolute, so the command works from
+    any working directory.
+    """
+    path = getattr(store, "path", None)
+    if path is None or str(path) == ":memory:":
+        return None
+    ledger = os.path.normcase(os.path.abspath(path))
+    if ledger == os.path.normcase(os.path.abspath(database_path(default_data_dir()))):
+        return None
+    return os.path.dirname(os.path.abspath(path))
+
+
+def _hflow_command(store: Store, *words: str) -> str:
+    """A follow-up ``hflow`` command that can be pasted as printed.
+
+    ``words`` are fixed subcommand names, validated ids and full object ids, which need no
+    quoting. The data directory is appended when the ledger is not the default one
+    (:func:`_named_data_dir`), quoted by :func:`_shell_word`.
+    """
+    command = ["hflow", *words]
+    data_dir = _named_data_dir(store)
+    if data_dir is not None:
+        command += ["--data-dir", _shell_word(data_dir)]
+    return " ".join(command)
+
+
+def _apply_command(store: Store, record: IntegrationRecord) -> str:
+    return _hflow_command(
+        store, "integrate", "apply", record.integration_id, "--expect-target", record.target_tip
+    )
+
+
+def _ready_handoff(store: Store, repo: GitRepo, record: IntegrationRecord) -> list[str]:
+    commands = [_apply_command(store, record)]
     checked_out = repo.checked_out_at(record.target_ref)
     if checked_out:
         commands = [
-            f"git -C \"{checked_out[0]}\" merge --ff-only {record.integration_commit}",
-            f"hflow integrate reconcile {record.integration_id}",
+            f"git -C {_shell_word(str(checked_out[0]))} merge --ff-only "
+            f"{record.integration_commit}",
+            _hflow_command(store, "integrate", "reconcile", record.integration_id),
         ]
     return commands
 
@@ -706,7 +777,7 @@ def apply_integration(
         )
         store.record_note(record.run_id, f"integration: {integration_id}: {note}")
         return IntegrationOutcome(
-            record=record, notes=[note], handoff=_ready_handoff(repo, record)
+            record=record, notes=[note], handoff=_ready_handoff(store, repo, record)
         )
 
     identity = current_identity()
@@ -741,11 +812,7 @@ def apply_integration(
                 detail=f"the ref update failed and {record.target_ref} is unchanged: {exc}"[:2000],
             )
             return IntegrationOutcome(
-                record=record,
-                notes=[record.detail],
-                handoff=[
-                    f"hflow integrate apply {integration_id} --expect-target {record.target_tip}"
-                ],
+                record=record, notes=[record.detail], handoff=[_apply_command(store, record)]
             )
         return _settle_moved_target(
             store,
@@ -1038,7 +1105,7 @@ def _reconcile(
                 ),
             )
             return IntegrationOutcome(
-                record=record, notes=[record.detail], handoff=_ready_handoff(repo, record)
+                record=record, notes=[record.detail], handoff=_ready_handoff(store, repo, record)
             )
         return _settle_moved_target(
             store,
@@ -1054,7 +1121,7 @@ def _reconcile(
         return IntegrationOutcome(
             record=record,
             notes=[f"{record.target_ref} is still at {record.target_tip}; ready to apply"],
-            handoff=_ready_handoff(repo, record),
+            handoff=_ready_handoff(store, repo, record),
         )
     return _settle_moved_target(
         store, repo, record, current, expected=IntegrationState.READY, build=controller_build

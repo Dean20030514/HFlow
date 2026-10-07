@@ -547,6 +547,50 @@ def launch_dsh_home_problem(
     return ""
 
 
+def launch_credential_problem(
+    launches: Sequence[LaunchConfig],
+    *,
+    data_dir: Path,
+    env: Mapping[str, str] | None = None,
+    extra_env: Mapping[str, str] | None = None,
+) -> str:
+    """Why a launch would start DSH with no credential source visible, or ``""``.
+
+    User ruling 2026-10-07. Each launch is judged on the child environment the driver builds
+    from ``env`` (else this process's environment) and ``extra_env``
+    (``acpx_dsh.child_environment``, which sets or removes ``DSH_HOME`` from the launch) and on
+    its effective DSH home (``acpx_dsh.effective_dsh_home``; the per-invocation one is named under
+    ``data_dir``, never created). The rule is ``acpx_dsh.credential_source_problem``, which the
+    driver's spawn gate applies again to the environment it actually builds. A presence check:
+    ``DEEPSEEK_API_KEY`` by name, a bound home's ``.credentials.yaml`` and ``.env`` by stat;
+    nothing is opened, and no value is read.
+    """
+    from .drivers.acpx_dsh import (
+        INVOCATION_ID_PLACEHOLDER,
+        child_environment,
+        child_home_for,
+        credential_source_problem,
+        effective_dsh_home,
+    )
+
+    source = env if env is not None else os.environ
+    child_home = child_home_for(Path(data_dir).resolve(), INVOCATION_ID_PLACEHOLDER)
+    seen: set[str] = set()
+    for launch in launches:
+        if launch.dsh_home in seen:
+            continue
+        seen.add(launch.dsh_home)
+        kind, home = effective_dsh_home(launch, child_home=child_home)
+        problem = credential_source_problem(
+            child_environment(source, extra_env=extra_env or {}, dsh_home=launch.dsh_home),
+            dsh_home_kind=kind,
+            dsh_home=home,
+        )
+        if problem:
+            return problem
+    return ""
+
+
 def resolve_permissions(
     spec: TaskSpec, env: Mapping[str, str] | None = None
 ) -> tuple[bool, bool]:
@@ -855,6 +899,13 @@ def resolve_run(
         workspace_env_file=start_workspace_env_file(spec, root, base) if is_real else "",
         dsh_home_in_workspace=(
             launch_dsh_home_problem(resolved_launches(effective), workspaces) if is_real else ""
+        ),
+        no_credential_source=(
+            launch_credential_problem(
+                resolved_launches(effective), data_dir=Path(data_dir), env=env
+            )
+            if is_real
+            else ""
         ),
     )
     if root_limits is not None:
@@ -1259,36 +1310,15 @@ def build_prepare_report(
                 "spawn and refuses a difference (launch_content_changed); a file swapped between "
                 "that check and process creation is not caught on Windows (no exec-by-handle)"
             )
-        if any(
-            surface.dsh_home_kind == "per_invocation" and not surface.deepseek_api_key_inherited
-            for surface in surfaces.values()
-        ):
-            if resolved.spec.workspace.mode == "worktree":
-                env_source = "worktree: only what the base commit tracks"
-            else:
-                workspace_envs = [
-                    surface.workspace_env
-                    for surface in surfaces.values()
-                    if surface.workspace_env is not None
-                ]
-                env_file = workspace_envs[0] if workspace_envs else None
-                env_state = (
-                    "present"
-                    if env_file is not None and env_file.present
-                    else "unknown"
-                    if env_file is not None and env_file.present is None
-                    else "absent"
-                )
-                env_path = env_file.path if env_file is not None else str(resolved.project_root)
-                env_source = f"in-place: {env_state} at {env_path}"
-            notes.append(
-                "DEEPSEEK_API_KEY is not in the launch environment and DSH_HOME is unbound, so "
-                "the per-invocation DSH home holds no stored credential (inferred from upstream "
-                "source); the documented source left is a .env in the workspace DSH starts in "
-                f"({env_source}), and a real launch refuses a workspace that holds one "
-                "(workspace_env_file), so DSH would start with no credential. M0 observed DSH "
-                "fail with a no-API-key error when it had no credential"
-            )
+        # A launch with no credential source visible is not a note any more but a dispatch
+        # precondition (no_credential_source, user ruling 2026-10-07), listed below with the
+        # others. Passing it says only that a source is present, never that it is valid.
+        notes.append(
+            "credential sources are checked by presence only (DEEPSEEK_API_KEY by name in the "
+            "launch environment, a bound DSH home's .credentials.yaml and .env by stat - never "
+            "opened): a launch with none visible is refused (no_credential_source), and passing "
+            "that check does not prove a credential is valid"
+        )
     if not budget.within_budget:
         notes.append(
             "this task does not fit its budget: it needs more reserved turns than are "

@@ -18,6 +18,7 @@ from tests.test_batch_e_repair import (
     _scoped_spec, scoped_repo,  # noqa: F401 - pytest fixture
 )
 from hflow.verify import CheckRunners
+from tests.owner_exit import owner_exits
 
 
 @pytest.fixture()
@@ -312,7 +313,7 @@ def test_legacy_root_source_is_checked_against_the_actual_worktree_common_dir(st
 @pytest.mark.parametrize("record", ["dsh_context", "repair", "effective_config"])
 @pytest.mark.parametrize("invalid", ["{invalid", "{}", "[" * 2000 + "0" + "]" * 2000], ids=["json", "contract", "deep_json"])
 def test_bad_record_reports_exit_six_then_cancel_and_resume_still_work(
-    store, run_request, check_runner, capsys, record, invalid,
+    store, run_request, check_runner, capsys, record, invalid, monkeypatch,
 ):
     import json
 
@@ -353,6 +354,8 @@ def test_bad_record_reports_exit_six_then_cancel_and_resume_still_work(
             assert list(store.conn.iterdump()) == snapshot
     assert main(["cancel", run_id, *common, "--json"]) == EXIT_OK
     assert json.loads(capsys.readouterr().out)["status"] == "unknown"
+    # resume reconciles outcome_unknown once the owner is gone
+    owner_exits(store, run_id, owner, monkeypatch)
     assert main(["resume", run_id, *common, "--json"]) == EXIT_BLOCKED
     resumed = capsys.readouterr()
     assert "Traceback" not in resumed.err

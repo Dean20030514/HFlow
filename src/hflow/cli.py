@@ -12,7 +12,7 @@ operator-approved delivery: ``prepare`` builds and checks one commit without mov
 ``reconcile`` settles an interrupted record from what Git shows. It never calls a model.
 
 ``doctor``, ``prepare``, ``status``, ``report``, ``schema`` and ``clean`` never call a model;
-``doctor`` never boots a DSH profile either - it reports what is *known* locally and marks the
+``doctor`` never boots a DSH profile or runs ``dsh``: it reports what is *known* locally, marks the
 rest ``unknown``. ``resume`` reconciles and never re-dispatches; on a live run it takes over only
 from an owner process proven gone, and that takeover blocks the run ``owner_lost``.
 
@@ -25,8 +25,13 @@ for the process's lifetime.
 user authorization artifact.
 
 Exit codes: 0 accepted (or the command succeeded), 2 refused at admission (no run state),
-3 blocked after dispatch, 4 usage, 5 the run exists and is not finished, 6 status/report found
-the run but a stored record of it no longer validates.
+3 blocked after dispatch, 4 usage, 5 the run exists and is not finished - and, whatever the run's
+own state, a ``resume`` that refused on the owner rule and wrote nothing (an ``outcome_unknown``
+run whose owner may still be alive, or an ended run whose open ledger entries it may not close
+yet: an owner that may be alive, or a pre-v6 owner nobody attested gone) or whose store write
+failed, never the 3 or 0 that would read as done - 6 status/report found the run but a stored
+record of it no longer validates, 130 interrupted (Ctrl+C): what was recorded before the
+interrupt is authoritative - read it with ``hflow status``.
 """
 
 from __future__ import annotations
@@ -34,11 +39,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, NoReturn
+from typing import TYPE_CHECKING, Literal, NoReturn
 
 from pydantic import ValidationError
 
@@ -88,13 +92,21 @@ EXIT_BLOCKED = 3
 EXIT_USAGE = 4
 #: The run exists and is not finished (DRAFT / READY / RUNNING / CHECKING): a submission that
 #: found the run claimed by another owner process (the payload's note names it), or a ``resume``
-#: that refused a takeover because that owner may be alive. Never ``EXIT_REFUSED``, which promises
-#: that no run state was created.
+#: that refused a takeover because that owner may be alive. Also a ``resume`` that refused to act
+#: on an ended run because its owner is not proven gone (``RunOutcome.waiting_on_owner``: the
+#: reconcile of an ``outcome_unknown`` run, the closure of an ended run's open ledger entries) -
+#: that owner and its agent may still be working on it - and a ``resume`` whose store write failed
+#: (rolled back; run it again). Never ``EXIT_REFUSED``, which promises that no run state was
+#: created.
 EXIT_IN_PROGRESS = 5
 #: ``status`` / ``report`` found the run but one of its stored records no longer validates (it was
 #: written under another build's contracts, or edited). The run exists, so this is never
 #: ``EXIT_REFUSED``; nothing is repaired or rewritten.
 EXIT_RECORD_UNREADABLE = 6
+#: Ctrl+C reached the command (a ``KeyboardInterrupt`` at the top level): 128 + SIGINT, the shell
+#: convention. Not ``EXIT_USAGE`` - the arguments were fine - and not a run outcome: whatever the
+#: command recorded before the interrupt is authoritative, and ``hflow status <run-id>`` reads it.
+EXIT_INTERRUPTED = 130
 
 
 def _load_json(path: Path) -> object:
@@ -106,8 +118,32 @@ def _load_json(path: Path) -> object:
         raise RefusedError(RefusalCode.INVALID_SPEC, f"{path} is not valid JSON: {exc}") from exc
 
 
+def _text_value(value: object) -> str:
+    """One value for text output: a string as it is, anything else as compact JSON."""
+    return value if isinstance(value, str) else canonical_json(value)
+
+
+def _text_lines(payload: object) -> str:
+    """A payload for a reader: ``key: value`` lines, a list as ``- item`` lines below its key.
+
+    Text mode only; ``--json`` prints the canonical JSON and is unaffected. Keys keep the
+    payload's own order, and a nested object (a receipt, an admission issue) stays one compact
+    JSON line rather than a Python ``repr``, so nothing is dropped or re-interpreted.
+    """
+    if not isinstance(payload, dict):
+        return str(payload)
+    lines: list[str] = []
+    for key, value in payload.items():
+        if isinstance(value, list):
+            lines.append(f"{key}:" + ("" if value else " (none)"))
+            lines.extend(f"  - {_text_value(item)}" for item in value)
+        else:
+            lines.append(f"{key}: {_text_value(value)}")
+    return "\n".join(lines)
+
+
 def _write_out(payload: object, as_json: bool, path: Path | None = None) -> None:
-    text = canonical_json(payload) if as_json else str(payload)
+    text = canonical_json(payload) if as_json else _text_lines(payload)
     if path is None:
         print(text)
     else:
@@ -218,6 +254,7 @@ def _doctor_profile_section(
         section["detail"] = exc.message
         return section, EXIT_REFUSED
 
+    from .drivers.acpx_dsh import resolve_launch_config
     from .drivers.selected import build_driver, resolve_driver_id
 
     roles: dict[str, object] = {}
@@ -248,7 +285,12 @@ def _doctor_profile_section(
             roles[role] = entry
             continue
         try:
-            instance = build_driver(binding, data_dir=data_dir)
+            # The resolution the driver itself performs when built without a launch (and the one
+            # ``prepare`` performs per role), done once here so its facts can be shown even when
+            # the launch is not resolvable; the driver is then built from this very launch.
+            launch = resolve_launch_config(data_dir=data_dir, binding=binding)
+            entry["launch"] = _doctor_launch_facts(launch)
+            instance = build_driver(binding, data_dir=data_dir, launch=launch)
         except Exception as exc:  # noqa: BLE001 - an unusable binding is a report, not a crash
             entry["usable"] = False
             entry["detail"] = f"{type(exc).__name__}: {exc}"
@@ -356,8 +398,222 @@ def _doctor_ledger_settlements(data_dir: Path) -> dict[str, object]:
     return result
 
 
+#: Executables doctor runs, with ``--version`` only and always from the absolute path PATH lookup
+#: found. ``dsh`` is deliberately not one of them: the ``dsh`` on PATH may be the DSH Desktop app's
+#: shim, and running it could start that app - doctor reports its path and nothing else.
+_DOCTOR_VERSION_PROBES = frozenset({"git", "node"})
+#: The DSH Desktop app's command-line shim, relative to ``%LOCALAPPDATA%`` (per-user install).
+#: Doctor only checks that this file exists; it never runs it and never edits PATH.
+DESKTOP_DSH_SHIM_RELATIVE = Path(
+    "Programs", "DeepSeek Harness", "resources", "runtime", "cli", "bin", "dsh.cmd"
+)
+
+
+def _doctor_version(program: str) -> str:
+    """The first line ``<program> --version`` prints, or why it could not be read."""
+    try:
+        completed = subprocess.run(  # noqa: S603 - an absolute path and a fixed metadata flag
+            [program, "--version"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            timeout=20,
+            check=False,
+        )
+        return (completed.stdout or completed.stderr).strip().splitlines()[0]
+    except (OSError, subprocess.SubprocessError, IndexError) as exc:
+        return f"probe failed: {exc}"
+
+
+def _doctor_launch_facts(launch: object) -> dict[str, object]:
+    """Which acpx entry (and its version), dsh and node a launch resolved. Nothing is executed.
+
+    The version is the acpx package.json's ``version`` field (``observe_client_identity``), which
+    is what the package says, not a compatibility proof.
+    """
+    from .drivers.dsh_surfaces import observe_client_identity
+
+    client_entry = getattr(launch, "client_entry", "")
+    version = ""
+    if client_entry:
+        try:
+            version = observe_client_identity(launch).acpx_version  # type: ignore[arg-type]
+        except Exception:  # noqa: BLE001 - a record, never a reason doctor fails
+            version = ""
+    return {
+        "client_entry": client_entry or None,
+        "acpx_version": version or None,
+        "dsh_executable": getattr(launch, "dsh_executable", "") or None,
+        "node": getattr(launch, "node", "") or None,
+        "resolvable": bool(getattr(launch, "resolvable", False)),
+    }
+
+
+def _doctor_integrate_readiness(git: dict[str, object]) -> dict[str, object]:
+    """Whether ``hflow integrate`` can run with the Git on PATH, judged by its version only."""
+    from .gitworkspace import MIN_INTEGRATION_GIT, GitError, parse_git_version
+
+    needed = ".".join(str(part) for part in MIN_INTEGRATION_GIT)
+    section: dict[str, object] = {
+        "usable": None,
+        "minimum_git": needed,
+        "git": git.get("path"),
+        "git_version": None,
+    }
+    if not git.get("path"):
+        section["usable"] = False
+        section["detail"] = (
+            f"hflow integrate: NOT USABLE (needs Git {needed} or later; no git on PATH)"
+        )
+        return section
+    reported = str(git.get("version") or "")
+    try:
+        version = parse_git_version(reported)
+    except GitError:
+        section["detail"] = (
+            f"hflow integrate: unknown (needs Git {needed} or later; `git --version` gave "
+            f"{reported[:80]!r})"
+        )
+        return section
+    found = ".".join(str(part) for part in version)
+    section["git_version"] = found
+    section["usable"] = version[:2] >= MIN_INTEGRATION_GIT
+    section["detail"] = (
+        f"hflow integrate: usable (Git {found}; needs Git {needed} or later)"
+        if section["usable"]
+        else f"hflow integrate: NOT USABLE (needs Git {needed} or later; this Git is {found})"
+    )
+    return section
+
+
+def _doctor_acpx_readiness(launch: object, on_path: dict[str, object]) -> dict[str, object]:
+    """Where the acpx client entry resolves from - which is never PATH - and its version."""
+    from .drivers.acpx_dsh import DEV_ACPX_RELATIVE, ENV_ACPX_CLI, PROBE_ACPX_RELATIVE
+
+    facts = _doctor_launch_facts(launch)
+    order = (
+        f"${ENV_ACPX_CLI}, then <data-dir>/{DEV_ACPX_RELATIVE.as_posix()}, then this HFlow "
+        f"checkout's {PROBE_ACPX_RELATIVE.as_posix()}"
+    )
+    section: dict[str, object] = {
+        "client_entry": facts["client_entry"],
+        "acpx_version": facts["acpx_version"],
+        "on_path": on_path.get("path"),
+        "resolution_order": order,
+    }
+    if facts["client_entry"]:
+        section["detail"] = (
+            f"{facts['client_entry']} (acpx {facts['acpx_version'] or 'version unknown'}, read "
+            "from its package.json; nothing executed)"
+        )
+        return section
+    path_note = (
+        f"the acpx on PATH ({on_path['path']}) is not used"
+        if on_path.get("path")
+        else "acpx is not on PATH either, and PATH is not where HFlow looks"
+    )
+    section["detail"] = (
+        f"NOT FOUND - HFlow resolves the acpx entry from {order}; {path_note}. Set "
+        f"{ENV_ACPX_CLI} to the dist/cli.js of an acpx package installed outside any project. "
+        "A machine profile does not name the acpx entry in this build"
+    )
+    return section
+
+
+def _doctor_dsh_readiness(on_path: dict[str, object]) -> dict[str, object]:
+    """The ``dsh`` PATH lookup found, or where the Desktop shim is when it found none."""
+    section: dict[str, object] = {"on_path": on_path.get("path"), "desktop_shim": None}
+    if on_path.get("path"):
+        section["detail"] = (
+            f"{on_path['path']} (path only: doctor never runs dsh, which may start the DSH "
+            "Desktop app)"
+        )
+        return section
+    detail = (
+        "NOT FOUND on PATH (only absolute PATH entries are searched, never the current "
+        "directory): a real launch is not resolvable without it"
+    )
+    local = os.environ.get("LOCALAPPDATA") if os.name == "nt" else None
+    if local:
+        shim = Path(local) / DESKTOP_DSH_SHIM_RELATIVE
+        if shim.is_file():  # stat only: the shim is never read or run here
+            section["desktop_shim"] = str(shim)
+            detail += (
+                f". The DSH Desktop shim exists at {shim}: prepend {shim.parent} to PATH in the "
+                "shell that runs hflow. A machine profile cannot name the dsh path in this build"
+            )
+    section["detail"] = detail
+    return section
+
+
+def _doctor_credentials(child_kind: str, child_home: Path) -> dict[str, object]:
+    """Which credential sources an HFlow child could have, and whether a real launch is refused.
+
+    The facts are ``dsh_surfaces.credential_sources``' and the verdict is the launch rule's
+    (``acpx_dsh.credential_source_problem``, user ruling 2026-10-07), applied to the child
+    environment a launch would build from this one - so doctor cannot disagree with ``prepare``
+    or the spawn gate. ``DEEPSEEK_API_KEY`` is reported by name: its value is never read, printed
+    or hashed. A bound DSH home's stored-credentials file and ``.env`` are checked by stat only.
+    A fact line: it never changes doctor's exit code.
+    """
+    from .drivers.acpx_dsh import child_environment, credential_source_problem
+    from .drivers.dsh_surfaces import (
+        DEEPSEEK_API_KEY_NAME,
+        STORED_CREDENTIALS_NAME,
+        credential_sources,
+    )
+
+    kind: Literal["bound", "per_invocation"] = (
+        "bound" if child_kind == "bound" else "per_invocation"
+    )
+    child_env = child_environment(
+        os.environ, extra_env={}, dsh_home=str(child_home) if kind == "bound" else ""
+    )
+    sources = credential_sources(child_env, dsh_home_kind=kind, dsh_home=child_home)
+    key = "present" if sources.api_key_in_env else "absent"
+    refused = bool(
+        credential_source_problem(child_env, dsh_home_kind=kind, dsh_home=child_home)
+    )
+    section: dict[str, object] = {
+        DEEPSEEK_API_KEY_NAME: key,
+        "child_dsh_home_kind": child_kind,
+        "dsh_home_files": dict(sources.home_files),
+        "real_launch_refused": refused,
+    }
+    key_text = f"{DEEPSEEK_API_KEY_NAME} {key} in this environment (name only, value never read)"
+    if kind == "bound":
+        listed = ", ".join(f"{name} {state}" for name, state in sources.home_files)
+        detail = (
+            f"{key_text}; bound DSH home {child_home}: {listed} (stat only, never opened). DSH's "
+            "documented precedence (not observed): the launch environment, then the home's "
+            f"{STORED_CREDENTIALS_NAME}, then <cwd>/.env, then the home's .env"
+        )
+    else:
+        detail = (
+            f"{key_text}; DSH_HOME is not bound, so a child's DSH home is the per-invocation one, "
+            "created empty - no stored credentials - and the launch environment is its only "
+            "credential source (inferred from upstream source, not observed)"
+        )
+    section["detail"] = detail + (
+        ". A real launch from this environment would be REFUSED before dispatch "
+        "(no_credential_source): no credential source is visible"
+        if refused
+        else ". A real launch is not refused for credentials: a source is present (a presence "
+        "check only - it does not prove the credential is valid)"
+    )
+    return section
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
-    """Read-only environment probe. Never installs, never modifies global config."""
+    """Read-only environment probe. Never installs, never modifies global config.
+
+    It runs ``git --version`` and ``node --version`` (from the absolute paths PATH lookup found)
+    and nothing else: never ``dsh``, never the acpx client, never a model. The readiness lines it
+    adds (integrate's Git minimum, where the acpx entry and ``dsh`` resolve from, which
+    credential sources a child could have) are facts for the operator; the exit code stays
+    ``0``, or ``2`` when a named profile cannot be used.
+    """
     data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
     profile_source = (
         "--profile"
@@ -375,24 +631,26 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "doctor performed no model calls, built no run and did not boot any DSH profile",
         ],
     }
+    from .drivers.acpx_dsh import (
+        INVOCATION_ID_PLACEHOLDER,
+        child_home_for,
+        effective_dsh_home,
+        find_on_path,
+        resolve_launch_config,
+    )
+
     executables = report["executables"]
     assert isinstance(executables, dict)
     for name in ("python", "git", "dsh", "acpx", "node"):
-        found = shutil.which(name)
-        entry: dict[str, object] = {"path": found, "available": bool(found)}
-        if found and name in {"git", "dsh", "node"}:
-            try:
-                completed = subprocess.run(  # noqa: S603 - fixed, read-only version probes
-                    [found, "--version"],
-                    capture_output=True,
-                    text=True,
-                    timeout=20,
-                    check=False,
-                )
-                entry["version"] = (completed.stdout or completed.stderr).strip().splitlines()[0]
-            except (OSError, subprocess.SubprocessError, IndexError) as exc:
-                entry["version"] = f"probe failed: {exc}"
-        report["executables"][name] = entry  # type: ignore[index]
+        # Absolute PATH entries only, as a launch resolves its programs: ``shutil.which`` looks in
+        # the current directory first on Windows and can return a relative path.
+        found = find_on_path(name, os.environ)
+        entry: dict[str, object] = {"path": found or None, "available": bool(found)}
+        if found and name in _DOCTOR_VERSION_PROBES:
+            entry["version"] = _doctor_version(found)
+        elif found and name == "dsh":
+            entry["note"] = "not run: doctor never starts dsh (it may be the DSH Desktop app)"
+        executables[name] = entry
 
     dsh_home = Path(os.environ.get("DSH_HOME") or Path.home() / ".dsh")
     profiles_dir = dsh_home / "profiles"
@@ -405,15 +663,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         report["dsh_home"] = str(dsh_home)
     # ``dsh_home`` above is the home *your* shell's dsh uses. An HFlow child gets the launch's
     # bound DSH_HOME or none at all, so its home is named separately (read-only resolution).
-    from .drivers.acpx_dsh import (
-        INVOCATION_ID_PLACEHOLDER,
-        child_home_for,
-        effective_dsh_home,
-        resolve_launch_config,
-    )
-
+    # The same resolution says where the acpx entry comes from, which is never PATH.
+    ambient_launch = resolve_launch_config(data_dir=data_dir)
     child_kind, child_home = effective_dsh_home(
-        resolve_launch_config(data_dir=data_dir),
+        ambient_launch,
         child_home=child_home_for(data_dir.resolve(), INVOCATION_ID_PLACEHOLDER),
     )
     report["child_dsh_home"] = {
@@ -432,6 +685,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     }
 
     report["ledger_settlements"] = _doctor_ledger_settlements(data_dir)
+    # Facts an operator needs before a first real run or an integration. None of them changes
+    # the exit code: they are reported, and `prepare` / the run gates still decide.
+    report["readiness"] = {
+        "integrate": _doctor_integrate_readiness(executables["git"]),
+        "acpx": _doctor_acpx_readiness(ambient_launch, executables["acpx"]),
+        "dsh": _doctor_dsh_readiness(executables["dsh"]),
+        "credentials": _doctor_credentials(child_kind, child_home),
+    }
 
     probe = local_probe()
     report["capability_record"] = probe.model_dump(mode="json")
@@ -461,10 +722,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         report["notes"].append(default_refusal_reason())  # type: ignore[union-attr]
     report["notes"].append(  # type: ignore[union-attr]
         "capability states are the recorded table, not a live compatibility proof; doctor "
-        "observed executables, file presence and, with --profile, the dsh shim's text (to "
-        "classify its carrier), the version fields of package and manifest files and the SHA-256 "
-        "of a bound DSH home's patch files and AGENTS.md - nothing else was read and no .env or "
-        "credential file was opened"
+        "found executables on the absolute PATH entries and ran only `git --version` and "
+        "`node --version` (never dsh, never the acpx client), and observed file presence, the "
+        "dsh shim's text (to classify its carrier), the version fields of package and manifest "
+        "files, the SHA-256 of the launch entry files and, with --profile, of a bound DSH home's "
+        "patch files and AGENTS.md - nothing else was read and no .env or credential file was "
+        "opened (their presence is checked by stat only)"
     )
     report["notes"].append(  # type: ignore[union-attr]
         "dsh_home/dsh_profiles describe the DSH home your own shell's dsh uses; an HFlow child "
@@ -477,13 +740,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"python        {report['python']}")
         for name, entry in executables.items():  # type: ignore[union-attr]
             version = entry.get("version", "")
-            print(f"{name:<13} {entry['path'] or 'NOT FOUND'}{('  ' + version) if version else ''}")
+            note = entry.get("note", "")
+            suffix = f"  {version}" if version else (f"  ({note})" if note else "")
+            print(f"{name:<13} {entry['path'] or 'NOT FOUND'}{suffix}")
         print(f"your dsh home {report.get('dsh_home', 'not found')}")
         child = report["child_dsh_home"]
         print(f"child dsh home {child['kind']} {child['path']}")  # type: ignore[index]
         print(f"dsh profiles  {', '.join(report['dsh_profiles']) or 'none'}")  # type: ignore[arg-type]
         print(f"data dir      {report['data_dir']} (writable={report['data_dir_writable']})")
         print(f"ledger settle {report['ledger_settlements']['detail']}")  # type: ignore[index]
+        readiness = report["readiness"]
+        print(f"integrate     {readiness['integrate']['detail']}")  # type: ignore[index]
+        print(f"acpx client   {readiness['acpx']['detail']}")  # type: ignore[index]
+        print(f"dsh launcher  {readiness['dsh']['detail']}")  # type: ignore[index]
+        print(f"credentials   {readiness['credentials']['detail']}")  # type: ignore[index]
         print(
             f"profile       {profile_section['requested'] or '(none selected)'} "
             f"[via {profile_section['requested_via']}] "
@@ -499,6 +769,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             )
             if entry.get("detail"):
                 print(f"               {entry['detail']}")
+            launch = entry.get("launch")
+            if launch:
+                print(
+                    f"               launch acpx={launch['client_entry'] or 'NOT FOUND'} "
+                    f"(acpx {launch['acpx_version'] or 'version unknown'}) "
+                    f"dsh={launch['dsh_executable'] or 'NOT FOUND'}"
+                )
             for dependency in entry.get("dependencies") or []:
                 print(f"               dep  {dependency}")
         print(f"driver        {report['selected_driver']} [{report['driver_status']}]")
@@ -1305,7 +1582,29 @@ class _NotOwnedDriver:
         )
 
 
+#: The write-once run note an observer leaves when the run's stored effective configuration
+#: cannot be decoded (``cancel`` at once; ``resume`` only once it has written something itself).
+STORED_CONFIG_UNREADABLE_PREFIX = "stored_config_unreadable: "
+
+
+def _note_stored_config_unreadable(store: Store, run_id: str) -> None:
+    store.record_note(
+        run_id,
+        f"{STORED_CONFIG_UNREADABLE_PREFIX}effective_config could not be decoded; role driver "
+        "identity remains unrecorded and this observer holds no process handle",
+        only_if_absent_prefix=STORED_CONFIG_UNREADABLE_PREFIX,
+    )
+
+
 def _observer_controller(store: Store, args: argparse.Namespace, run_id: str) -> Controller:
+    """:func:`_observer`, recording an undecodable effective configuration at once (``cancel``)."""
+    controller, config_unreadable = _observer(store, args, run_id)
+    if config_unreadable:
+        _note_stored_config_unreadable(store, run_id)
+    return controller
+
+
+def _observer(store: Store, args: argparse.Namespace, run_id: str) -> tuple[Controller, bool]:
     """A controller for ``cancel`` / ``resume``, answering through each role's recorded driver.
 
     The roles are labelled from the run's recorded effective configuration. A role recorded as
@@ -1313,18 +1612,17 @@ def _observer_controller(store: Store, args: argparse.Namespace, run_id: str) ->
     did not start itself; every other role - a production driver, or a run whose configuration
     was never recorded - gets :class:`_NotOwnedDriver`. Neither can confirm a stop of a process
     another controller owns, which is the point.
+
+    Writes nothing to the store. The second value says the stored configuration could not be
+    decoded, which the caller records (:func:`_note_stored_config_unreadable`) when it acts.
     """
     project_root = Path(args.project_root).resolve()
+    config_unreadable = False
     try:
         effective = store.effective_config_for(run_id)
     except StoredRecordUnreadable:
         effective = None
-        store.record_note(
-            run_id,
-            "stored_config_unreadable: effective_config could not be decoded; role driver "
-            "identity remains unrecorded and this observer holds no process handle",
-            only_if_absent_prefix="stored_config_unreadable: ",
-        )
+        config_unreadable = True
     offline = FakeDriver(project_root)
     drivers: dict[str, object] = {}
     for role in ("implementer", "reviewer"):
@@ -1333,7 +1631,7 @@ def _observer_controller(store: Store, args: argparse.Namespace, run_id: str) ->
             drivers[role] = offline
         else:
             drivers[role] = _NotOwnedDriver(bound.driver_id if bound is not None else "unrecorded")
-    return Controller(
+    controller = Controller(
         store,
         drivers["implementer"],  # type: ignore[arg-type]
         reviewer_driver=drivers["reviewer"],  # type: ignore[arg-type]
@@ -1341,6 +1639,7 @@ def _observer_controller(store: Store, args: argparse.Namespace, run_id: str) ->
         controller_id=args.controller_id,
         effective_config=effective,
     )
+    return controller, config_unreadable
 
 
 def cmd_cancel(args: argparse.Namespace) -> int:
@@ -1361,19 +1660,87 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
+    """Reconcile, take over, or close an ended run's open entries; never re-dispatches.
+
+    Exit code: the run's own (``_outcome_exit_code``; a refused takeover of a live run is ``5`` by
+    its state), except ``EXIT_IN_PROGRESS`` (5) whenever ``resume`` refused to act on an ended run
+    because its owner is not proven gone and wrote nothing (``RunOutcome.waiting_on_owner``: the
+    reconcile of an ``outcome_unknown`` run whose owner may still be alive, or the closure of an
+    ended run's open ledger entries) - so a caller never reads "blocked" (3) or "accepted" (0) as
+    "resume did it".
+
+    ``--legacy-owner-gone`` mirrors ``hflow ledger settle``'s flag: the operator attests that the
+    controller a pre-v6 run recorded (a pid with no host) has exited. It needs ``--attest`` with
+    what the operator knows and why (the settle bounds); a blank, oversized or NUL-bearing text,
+    or ``--attest`` without the flag, is a usage error (4) and nothing is read or written. The OS
+    user is recorded as ``attested_by`` - recorded, not authenticated.
+
+    A store error (``database is locked``, for one) is reported on stderr and exits
+    ``EXIT_IN_PROGRESS`` (5) - never a traceback, and never the 3 or 0 that would read as done.
+    The failed transaction was rolled back whole (an ended run's entry closure and the
+    attestation it records commit together); what was recorded before it is authoritative.
+
+    An undecodable stored effective configuration is noted (``stored_config_unreadable``) only
+    when this resume wrote something itself: a resume that wrote nothing - a refusal on the owner
+    rule says "Nothing was written" - leaves the run's notes as they were.
+    """
+    import sqlite3
+
+    from .controller import LegacyOwnerAttestation, attestation_problem
+    from .store import StoreError
+
+    legacy_owner_gone: LegacyOwnerAttestation | None = None
+    if args.attest is not None and not args.legacy_owner_gone:
+        print(
+            "refusing: --attest is read only with --legacy-owner-gone; nothing was done",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+    if args.legacy_owner_gone:
+        problem = (
+            "--legacy-owner-gone needs --attest with what you know and why"
+            if args.attest is None
+            else attestation_problem(args.attest)
+        )
+        if problem is not None:
+            print(f"refusing: {problem}; nothing was done", file=sys.stderr)
+            return EXIT_USAGE
+        import getpass
+
+        try:
+            attested_by = getpass.getuser()
+        except Exception:  # noqa: BLE001 - getuser raises OSError/KeyError/ImportError by platform
+            attested_by = "unknown"
+        legacy_owner_gone = LegacyOwnerAttestation(
+            attested_by=attested_by.strip() or "unknown", attestation=args.attest
+        )
     store = _open_store(args)
     try:
         # As in ``cmd_cancel``: resolved from the run row, so an unreadable stored record fails
         # status/report only and never keeps a run from being reconciled.
         run_id = str(store.get_run(args.run_id)["run_id"])
-        controller = _observer_controller(store, args, run_id)
-        outcome = controller.resume(run_id)
+        controller, config_unreadable = _observer(store, args, run_id)
+        changes = store.total_changes()
+        outcome = controller.resume(run_id, legacy_owner_gone=legacy_owner_gone)
+        if config_unreadable and store.total_changes() != changes:
+            _note_stored_config_unreadable(store, run_id)
     except RunNotFound:
         print(f"unknown run {args.run_id}", file=sys.stderr)
         return EXIT_USAGE
+    except (StoreError, sqlite3.Error) as exc:
+        print(
+            f"resume failed on a store error ({type(exc).__name__}: {exc}). A failed transaction "
+            "is rolled back whole - an ended run's entry closure and the attestation it records "
+            "commit together or not at all - and what was recorded before it is authoritative: "
+            f"read `hflow status {args.run_id}`, then run `hflow resume` again",
+            file=sys.stderr,
+        )
+        return EXIT_IN_PROGRESS
     finally:
         store.close()
     _write_out(_outcome_payload(outcome), args.json)
+    if outcome.waiting_on_owner:
+        return EXIT_IN_PROGRESS
     return _outcome_exit_code(outcome)
 
 
@@ -1784,6 +2151,20 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument("run_id")
     resume.add_argument("--project-root", default=".")
     resume.add_argument("--controller-id", default="local-controller")
+    resume.add_argument(
+        "--legacy-owner-gone",
+        action="store_true",
+        help=(
+            "for an ended run written before owner identity existed that left ledger entries "
+            "open: attest that the controller process it recorded has exited (HFlow cannot check "
+            "it; recorded as your attestation, never as an observation). Needs --attest"
+        ),
+    )
+    resume.add_argument(
+        "--attest",
+        default=None,
+        help="with --legacy-owner-gone: what you know and why (required, at most 2000 characters)",
+    )
     resume.add_argument("--json", action="store_true")
     _add_store_args(resume)
     resume.set_defaults(func=cmd_resume)
@@ -1921,7 +2302,41 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def forbid_current_directory_program_search() -> None:
+    """Stop Windows from running a program it finds in this process's current directory.
+
+    ``CreateProcess`` given a bare program name - ``subprocess.run(["git", ...])`` - searches the
+    *parent* process's current directory before ``PATH``, unless the parent's environment holds
+    ``NoDefaultCurrentDirectoryInExePath``. HFlow starts bare ``git`` for every worktree, freeze
+    and integration step (``gitworkspace``) and runs an approved check's argv exactly as approved
+    (``verify``), so whoever can write the directory ``hflow`` is started in - typically a
+    checkout - could plant ``git.exe`` there and have it run with this process's rights. That was
+    observed on Windows 11 with Python 3.14.7: a planted ``git.exe`` ran instead of Git until
+    the variable was set in the parent. Children started with this process's environment inherit
+    it; the driver sets it again on every agent child (``acpx_dsh.child_environment``).
+
+    Set in exactly that spelling after every other spelling is removed, as the driver does. It is
+    process-wide on purpose and harmless off Windows, where nothing reads it.
+    """
+    from .drivers.acpx_dsh import NO_CWD_EXE_SEARCH_ENV
+
+    for key in [key for key in os.environ if key.upper() == NO_CWD_EXE_SEARCH_ENV.upper()]:
+        del os.environ[key]
+    os.environ[NO_CWD_EXE_SEARCH_ENV] = "1"
+
+
+#: What a Ctrl+C that reaches the top level prints. The process stopped where it was; it did not
+#: roll anything back, so the recorded state is the answer, not this message.
+INTERRUPTED_MESSAGE = (
+    "interrupted: this command stopped where it was. What it recorded before the interrupt is "
+    "authoritative - read it with `hflow status <run-id>` (or `hflow integrate show "
+    "<integration-id>`); nothing was retried"
+)
+
+
 def main(argv: list[str] | None = None) -> int:
+    # First, before anything can start a process (see the function's docstring).
+    forbid_current_directory_program_search()
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
@@ -1933,8 +2348,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"unknown run: {exc}", file=sys.stderr)
         return EXIT_USAGE
     except KeyboardInterrupt:
-        print("interrupted", file=sys.stderr)
-        return EXIT_USAGE
+        print(INTERRUPTED_MESSAGE, file=sys.stderr)
+        return EXIT_INTERRUPTED
     # No catch-all for pydantic's ValidationError here: the input loaders raise RefusedError
     # themselves, and mapping any other one to EXIT_REFUSED would tell a caller "no run state"
     # about a run that exists (review G, R12). status/report handle an unreadable stored record.

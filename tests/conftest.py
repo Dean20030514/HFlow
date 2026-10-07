@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -77,6 +79,24 @@ def _dsh_launcher_on_path(
         launcher.chmod(0o755)
     monkeypatch.setenv("PATH", f"{directory}{os.pathsep}{os.environ.get('PATH', '')}")
     return directory
+
+
+#: What every test's environment carries as ``DEEPSEEK_API_KEY``: obviously not a credential.
+STAND_IN_API_KEY = "hflow-test-stand-in-not-a-credential"
+
+
+@pytest.fixture(autouse=True)
+def _stand_in_credential(monkeypatch: pytest.MonkeyPatch) -> str:
+    """Give every test a stand-in ``DEEPSEEK_API_KEY`` - and never the shell's real one.
+
+    A real launch is refused when no credential source is visible (``no_credential_source``, user
+    ruling 2026-10-07), and the real-driver tests launch a stand-in client and stub agent that
+    need none - so whether they launch would otherwise depend on this machine's shell. Replacing
+    any ambient value also keeps a real key out of every child a test starts. A test about the
+    refusal removes the name itself (``monkeypatch.delenv``).
+    """
+    monkeypatch.setenv("DEEPSEEK_API_KEY", STAND_IN_API_KEY)
+    return STAND_IN_API_KEY
 
 
 @pytest.fixture()
@@ -301,3 +321,22 @@ def write_project(path: Path, project: ProjectConfig) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(project.model_dump(mode="json"), indent=2), encoding="utf-8")
     return path
+
+
+def copy_recorded_file(source: Path, target: Path, *, attempts: int = 100) -> None:
+    """``shutil.copyfile``, retried while another test process holds a SQLite lock on ``source``.
+
+    The recorded live ledger under ``.probe/m2-live`` is a WAL database that several tests read
+    with ``mode=ro`` connections. On Windows such a reader holds byte-range locks on the ``-shm``
+    sidecar, and a concurrent pytest-xdist worker copying that sidecar fails with
+    ``PermissionError`` (a lock violation) until the reader closes - milliseconds later. The copy
+    is retried briefly instead of failing the test; it is still a byte copy of the record.
+    """
+    for attempt in range(attempts):
+        try:
+            shutil.copyfile(source, target)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.05)

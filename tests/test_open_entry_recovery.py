@@ -11,9 +11,10 @@ everything it must not do:
   run that was then ``ACCEPTED``, each closed by ``resume`` and then settled by
   ``hflow ledger settle``;
 * the owner rule is the one ``ledger settle`` applies: an owner that may be alive (this very
-  controller, or another live one) refuses and writes nothing; a pre-v6 run with a recorded
-  controller pid is refused (``resume`` takes no attestation); a pre-v6 run that recorded no
-  controller passes;
+  controller, or another live one) refuses, writes nothing and is an outcome ``hflow resume``
+  exits ``5`` for; a pre-v6 run with a recorded controller pid is refused unless the operator
+  attests that controller gone (``--legacy-owner-gone``, batch J: see
+  ``tests/test_resume_owner_check.py``); a pre-v6 run that recorded no controller passes;
 * a confirmed stop that ended the run closes its entry from that stop fact, exactly as the stop
   would have (a still-``reserved`` target becomes ``not_started`` and releases the root); a stop
   that did not end the run - recorded after it ended, or on a run blocked for another reason - is
@@ -23,8 +24,9 @@ everything it must not do:
 * overlapping resumes over the same open snapshot: nothing is closed twice, a call that changed
   nothing writes nothing, and each note describes only its own call's closures;
 * ``status`` says, in one line, what closes such entries: ``resume`` once the owner is gone,
-  ``resume``'s reconcile for an ``outcome_unknown`` / ``owner_lost`` run, or nothing in this build
-  for a pre-v6 run that recorded a controller pid.
+  ``resume``'s reconcile for an ``outcome_unknown`` / ``owner_lost`` run (for an ``outcome_unknown``
+  run with an owner token, once that owner is gone), or ``resume --legacy-owner-gone`` on the
+  operator's attestation for a pre-v6 run that recorded a controller pid.
 
 Offline only: ``FakeDriver`` subclasses, ``FakeCheckRunner``, a real ``Store`` under ``tmp_path``.
 A dead owner is simulated the way the owner-lease tests do it: the controller releases its lock
@@ -51,7 +53,7 @@ from hflow.contracts import (
     TaskSpec,
     TaskState,
 )
-from hflow.controller import NOTE_DISPATCH, Controller, assess_run_owner, inspect_run
+from hflow.controller import NOTE_DISPATCH, Controller, inspect_run
 from hflow.drivers.fake import FakeDriver, FakeScript
 from hflow.report import status_text
 from hflow.store import Store, StoreError
@@ -72,7 +74,8 @@ from .test_batch_e_ledger import (
     _reserve,
     _seed_ready_run,
 )
-from .test_owner_lease import _controller, _dead_identity, windows_only
+from .owner_exit import owner_exits
+from .test_owner_lease import _controller, windows_only
 
 ATTEST = "Checked the provider console: no request from this launch appears."
 
@@ -161,18 +164,11 @@ def _root_run_controller(
     return controller, binding.root_id
 
 
-def _owner_exits(store: Store, controller: Controller, run_id: str) -> None:
+def _owner_exits(
+    store: Store, controller: Controller, run_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The run's owning controller is gone: its lock released, its recorded identity exited."""
-    controller.close()
-    dead = _dead_identity()
-    with store.transaction() as conn:
-        updated = conn.execute(
-            "UPDATE runs SET owner_pid = ?, owner_created = ?, owner_host = ?"
-            " WHERE run_id = ? AND owner_token = ?",
-            (dead.pid, dead.created, dead.host, run_id, controller.owner_token),
-        ).rowcount
-    assert updated == 1
-    assert assess_run_owner(store, store.get_run(run_id)).gone
+    owner_exits(store, run_id, controller, monkeypatch)
 
 
 def _frozen(store: Store, run_id: str) -> dict[str, object]:
@@ -224,6 +220,7 @@ def _no_driver_call(controller: Controller) -> None:
 def test_a_driver_failure_entry_is_closed_by_resume_and_then_voided_by_ledger_settle(
     store: Store, task_spec: TaskSpec, project_root: Path, run_request: RunRequest,
     tmp_path: Path, fake_script: FakeScript, capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     owner, root_id = _root_run_controller(
         store, task_spec, project_root, tmp_path, RaisingDriver(project_root)
@@ -250,18 +247,20 @@ def test_a_driver_failure_entry_is_closed_by_resume_and_then_voided_by_ledger_se
     frozen, notes = _frozen(store, run_id), store.notes_for(run_id)
     alive = owner.resume(run_id)
     assert alive.block_code is RefusalCode.INTERNAL_ERROR
+    assert alive.waiting_on_owner, "a refusal on the owner rule is exit 5, not the run's own 3"
     assert any("this controller owns the run" in note and "Nothing was written" in note
                for note in alive.notes), alive.notes
     assert _frozen(store, run_id) == frozen and store.notes_for(run_id) == notes
     assert _states(store, run_id) == {entry.invocation_id: InvocationStartState.REQUESTED}
 
-    _owner_exits(store, owner, run_id)
+    _owner_exits(store, owner, run_id, monkeypatch)
     successor = _controller(store, project_root, fake_script)
     resumed = successor.resume(run_id)
 
     assert (resumed.task_state, resumed.block_code) == (
         TaskState.BLOCKED, RefusalCode.INTERNAL_ERROR,
     ), "the run keeps the outcome it ended with"
+    assert not resumed.waiting_on_owner
     assert _frozen(store, run_id) == frozen, "state, block, receipt, attempts and rows unchanged"
     _no_driver_call(successor)
     closed = store.invocation(entry.invocation_id)
@@ -308,6 +307,7 @@ def test_a_live_second_owner_refuses_and_writes_nothing(
     refused = other.resume(run_id)
 
     note = " ".join(refused.notes)
+    assert refused.waiting_on_owner
     assert "may still be alive" in note and "lock=held" in note, note
     assert "Nothing was written" in note and f"`hflow resume {run_id}` again" in note
     assert _frozen(store, run_id) == frozen
@@ -325,6 +325,7 @@ def test_a_live_second_owner_refuses_and_writes_nothing(
 def test_a_reviewer_driver_failure_entry_is_closed_by_cli_resume(
     store: Store, task_spec: TaskSpec, project_root: Path, run_request: RunRequest,
     tmp_path: Path, fake_script: FakeScript, capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     owner, root_id = _root_run_controller(
         store, task_spec, project_root, tmp_path, FakeDriver(project_root, fake_script),
@@ -338,7 +339,7 @@ def test_a_reviewer_driver_failure_entry_is_closed_by_cli_resume(
     assert reviewer.role == "reviewer" and reviewer.state is InvocationStartState.REQUESTED
     frozen = _frozen(store, run_id)
 
-    _owner_exits(store, owner, run_id)
+    _owner_exits(store, owner, run_id, monkeypatch)
     capsys.readouterr()
     code = main([
         "resume", run_id, "--project-root", str(project_root),
@@ -405,7 +406,7 @@ def test_a_confirmed_stop_whose_ledger_write_failed_is_closed_from_the_stop_fact
     frozen = _frozen(store, run_id)
     assert frozen["run"]["block_code"] == RefusalCode.CANCELLED_BY_OPERATOR.value  # type: ignore[index]
 
-    _owner_exits(store, owner, run_id)
+    _owner_exits(store, owner, run_id, monkeypatch)
     successor = _controller(store, project_root, fake_script)
     resumed = successor.resume(run_id)
 
@@ -764,11 +765,11 @@ def test_overlapping_resumes_that_each_closed_part_describe_only_their_own_part(
     entered: list[str] = []
     other: list[object] = []
 
-    def overlap(run_id_: str, detail: str) -> int:
+    def overlap(run_id_: str, detail: str, **note: object) -> int:
         if not entered:  # once: the overlapping resume's own step 3 is the real one
             entered.append(run_id_)
             other.append(_controller(store, project_root, fake_script).resume(run_id_))
-        return real(run_id_, detail)
+        return real(run_id_, detail, **note)  # type: ignore[arg-type]
 
     monkeypatch.setattr(store, "mark_unsettled_invocations_unknown", overlap)
     mine = _controller(store, project_root, fake_script).resume(run_id)
@@ -826,7 +827,7 @@ def test_an_accepted_runs_unsettled_entry_is_closed_without_touching_the_receipt
     frozen = _frozen(store, run_id)
     assert frozen["run"]["receipt_json"]  # type: ignore[index]
 
-    _owner_exits(store, owner, run_id)
+    _owner_exits(store, owner, run_id, monkeypatch)
     capsys.readouterr()
     code = main([
         "resume", run_id, "--project-root", str(project_root),
@@ -905,9 +906,10 @@ def test_a_run_that_recorded_no_owner_and_no_controller_is_closed(
 def test_a_pre_v6_run_with_a_recorded_controller_pid_is_refused_and_unchanged(
     store: Store, project, task_spec: TaskSpec, project_root: Path, fake_script: FakeScript,
 ) -> None:
-    """``resume`` has no attestation flag, so a controller pid with no host is never judged.
+    """A controller pid with no host is never judged: without an attestation, nothing closes.
 
-    ``status`` says so instead of naming ``resume`` as the way out: this build has none.
+    ``status`` names the one way out - ``resume --legacy-owner-gone`` on the operator's
+    attestation (``tests/test_resume_owner_check.py``) - instead of "once the owner is gone".
     """
     run_id = _legacy_ended_run(store, project, task_spec, project_root)
     _record_controller_pid(store, run_id)
@@ -915,15 +917,23 @@ def test_a_pre_v6_run_with_a_recorded_controller_pid_is_refused_and_unchanged(
     status = status_text(inspect_run(store, run_id))
     (line,) = [item for item in status.splitlines() if item.startswith("open entries")]
     assert "1 ledger entry left open on this ended run (I-legacy)" in line, line
-    assert "this build cannot close it" in line and "recorded a controller pid with no host" in line
-    assert f"`hflow resume {run_id}` refuses (it takes no attestation)" in line, line
+    assert "recorded a controller pid with no host" in line, line
+    assert "HFlow can never prove its owner gone" in line, line
+    assert (
+        f"`hflow resume {run_id} --legacy-owner-gone --attest \"<what you know and why>\"` "
+        "closes it on your attestation (recorded as one, never as an observation), then "
+        "`hflow ledger settle <invocation_id> --legacy-owner-gone`"
+    ) in line, line
     assert "`hflow ledger settle` refuses an open entry, so it keeps blocking the root" in line
     assert "closes it once" not in line and "reconciles" not in line, line
 
     refused = _controller(store, project_root, fake_script).resume(run_id)
 
+    assert refused.waiting_on_owner, "refused on the owner rule: exit 5"
     note = " ".join(refused.notes)
-    assert "carries no host" in note and "takes no attestation" in note, note
+    assert "carries no host" in note, note
+    assert f"`hflow resume {run_id} --legacy-owner-gone --attest" in note, note
+    assert "an attestation, never an observation" in note
     assert "Nothing was written" in note
     assert _frozen(store, run_id) == frozen and store.notes_for(run_id) == notes
     entry = store.invocation("I-legacy")
@@ -940,26 +950,36 @@ def test_status_names_resumes_reconcile_for_an_outcome_unknown_or_owner_lost_run
     store: Store, project, task_spec: TaskSpec, project_root: Path, fake_script: FakeScript,
     block: RefusalCode, legacy_pid: bool,
 ) -> None:
-    """Such a run is reconciled by ``resume``'s existing path, which waits on no owner.
+    """Such a run is reconciled by ``resume``'s reconcile path, which waits on no owner here.
 
-    That path comes first in ``resume``, so it holds even for a pre-v6 run that recorded a
-    controller pid - the case whose ``open entries`` line otherwise says this build cannot close it.
+    The run has no owner token: an ``outcome_unknown`` one is reconciled without an owner check
+    (none can be proven gone - ``cancel`` + ``resume`` is its documented way out), an ``owner_lost``
+    one because the takeover already proved its owner gone. That path comes first in ``resume``,
+    so it holds even for a pre-v6 run that recorded a controller pid - the case whose
+    ``open entries`` line otherwise asks for ``--legacy-owner-gone``. (An ``outcome_unknown`` run
+    with an owner token waits for that owner: ``tests/test_resume_owner_check.py``.)
     """
     run_id = _legacy_ended_run(store, project, task_spec, project_root, block)
     if legacy_pid:
         _record_controller_pid(store, run_id)
     status = status_text(inspect_run(store, run_id))
     (line,) = [item for item in status.splitlines() if item.startswith("open entries")]
+    why = (
+        "a run with no owner token is reconciled without waiting on an owner, since none can be "
+        "proven gone"
+        if block is RefusalCode.OUTCOME_UNKNOWN
+        else "the takeover that blocked this run owner_lost already proved its previous owner gone"
+    )
     assert (
-        f"`hflow resume {run_id}` reconciles it - a run blocked {block.value} is reconciled "
-        "without waiting on its owner - recording each as unknown or launch_unknown, then "
-        "`hflow ledger settle <invocation_id>`"
+        f"`hflow resume {run_id}` reconciles it - {why} - recording each as unknown or "
+        "launch_unknown, then `hflow ledger settle <invocation_id>`"
     ) in line, line
-    assert "cannot close" not in line and "once the run's owner is gone" not in line, line
+    assert "--legacy-owner-gone" not in line and "once the run's owner is gone" not in line, line
 
     successor = _controller(store, project_root, fake_script)
     resumed = successor.resume(run_id)
 
+    assert not resumed.waiting_on_owner
     assert any("reconciled an interrupted attempt" in n for n in resumed.notes), resumed.notes
     entry = store.invocation("I-legacy")
     assert entry is not None and entry.state is InvocationStartState.UNKNOWN, entry

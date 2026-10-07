@@ -36,6 +36,7 @@ from hflow.store import Store, StoreError
 from hflow.verify import CheckRunners, FakeCheckRunner
 
 from .conftest import unit_only
+from .owner_exit import owner_exits, successor
 
 
 # --------------------------------------------------------------------------
@@ -402,6 +403,7 @@ def test_unknown_outcome_blocks_and_never_re_dispatches(
     driver,
     run_request: RunRequest,
     fake_script: FakeScript,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake_script.unknown_invocations = 1
 
@@ -418,7 +420,9 @@ def test_unknown_outcome_blocks_and_never_re_dispatches(
     assert again.run_id == outcome.run_id
     assert len(driver.started) == 1, "re-submitting the same spec must not re-dispatch"
 
-    resumed = controller.resume(outcome.run_id)
+    # Reconciled once the owner has exited: an outcome_unknown block does not prove it stopped.
+    owner_exits(store, outcome.run_id, controller, monkeypatch)
+    resumed = successor(controller).resume(outcome.run_id)
     assert driver.reconciled, "resume must reconcile the interrupted attempt"
     assert len(driver.started) == 1, "resume must not start a new invocation"
     assert resumed.task_state is TaskState.BLOCKED

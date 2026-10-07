@@ -35,7 +35,9 @@ Each mode models one behaviour the driver must handle honestly:
                   ``id:v2:<stopReason>`` - see ``emit_terminal_responses``;
                   ``STUB_TRAILING_UPDATES`` (and ``STUB_REVIEWER_TRAILING_UPDATES``) sends
                   updates *after* it, see ``emit_trailing_updates``; ``STUB_REPORTED_USAGE=1``
-                  adds agent-reported usage and cost, see ``emit_usage_update``.
+                  adds agent-reported usage and cost, see ``emit_usage_update``;
+                  ``STUB_DIE_MID_TURN`` (and ``STUB_REVIEWER_DIE_MID_TURN``) ends the agent
+                  process mid-turn with no response at all, see ``die_mid_turn``.
 
 Invoked as: ``python stub_acp_agent.py <mode> --task-file -`` with the prompt on stdin.
 """
@@ -352,6 +354,38 @@ def emit_trailing_updates(session_id: str, *, reviewer: bool, with_ids: bool) ->
             raise SystemExit(f"stub: unknown trailing update kind {kind!r}")
 
 
+#: Where ``die_mid_turn`` may end the agent: after the first chunk of the turn's final message
+#: (for the reviewer, in the default ``split`` answer shape only), or after the whole final
+#: message (a complete verdict for the reviewer) but before any response.
+DIE_STAGES = ("partial", "answer")
+
+
+def die_mid_turn(stage: str, *, reviewer: bool) -> None:
+    """End the agent process at ``stage``, after flushing what it streamed, and settle nothing.
+
+    ``STUB_DIE_MID_TURN`` is ``<stage>:<exit code>`` (exit code 1 when omitted);
+    ``STUB_REVIEWER_DIE_MID_TURN`` replaces it for the reviewer only. No ``stopReason`` and no
+    JSON-RPC error is written: the agent simply dies, and the fake client relays its exit code
+    without an error envelope of its own. That is the shape the pinned acpx 0.17.1 leaves under
+    ``exec --format json`` when the agent dies mid-turn - a partial message chunk, exit 1, nothing
+    else (acpx issue #770, fixed upstream in 0.19.3). An unknown stage ends the stub with an error,
+    so a typo cannot pass as "the agent did not die".
+    """
+    spec = os.environ.get("STUB_DIE_MID_TURN", "")
+    if reviewer:
+        spec = os.environ.get("STUB_REVIEWER_DIE_MID_TURN", spec)
+    if not spec:
+        return
+    where, _, code = spec.partition(":")
+    if where not in DIE_STAGES:
+        raise SystemExit(f"stub: unknown die-mid-turn stage {where!r}")
+    if where != stage:
+        return
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(int(code or "1"))
+
+
 def verdict_document(verdict: str, detail: str) -> str:
     """The reviewer's answer, in the form the recorded reviewer actually produced."""
     payload = json.dumps(
@@ -429,9 +463,11 @@ def structured_turn(session_id: str, task: str, scratch: Path) -> int:
             )
         emit_thought(session_id, "The empty-input crash is in parse().", "m-1", with_id=with_ids)
         emit_message_chunk(session_id, "Fixed parse() to handle empty input.", "m-1", with_id=with_ids)
+        die_mid_turn("partial", reviewer=False)
         emit_message_chunk(
             session_id, "The change is inside src/parser.py.", "m-2", with_id=with_ids
         )
+        die_mid_turn("answer", reviewer=False)
         if os.environ.get("STUB_REPORTED_USAGE") == "1":
             emit_usage_update(session_id)
         errored = emit_terminal_responses(session_id, reviewer=False)
@@ -480,8 +516,11 @@ def structured_turn(session_id: str, task: str, scratch: Path) -> int:
             other = "stub-other-session" if answer_shape == "other-session-last" else None
             emit_message_chunk(other, OTHER_SESSION_VERDICT, "m-8", with_id=with_ids)
         else:
-            for part in (answer[:cut], answer[cut:]):
+            for index, part in enumerate((answer[:cut], answer[cut:])):
                 emit_message_chunk(session_id, part, "m-5", with_id=with_ids)
+                if index == 0:
+                    die_mid_turn("partial", reviewer=True)
+    die_mid_turn("answer", reviewer=True)
     if os.environ.get("STUB_REPORTED_USAGE") == "1":
         emit_usage_update(session_id)
     errored = emit_terminal_responses(session_id, reviewer=True)

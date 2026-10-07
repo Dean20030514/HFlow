@@ -442,7 +442,8 @@ def _empty_hooks_dir() -> str:
     """An empty, HFlow-owned directory that ``core.hooksPath`` names for every git call.
 
     Created once per process with :func:`tempfile.mkdtemp` (private to the user, never inside a
-    repository or a worktree, so no worker can put a hook in it) and removed at exit.
+    repository or a worktree, so no worker can put a hook in it) and removed at exit. It also
+    holds the never-created path ``GIT_GRAFT_FILE`` names (:func:`_absent_graft_file`).
     """
     global _EMPTY_HOOKS_DIR
     if _EMPTY_HOOKS_DIR is None or not os.path.isdir(_EMPTY_HOOKS_DIR):
@@ -465,7 +466,22 @@ def _forced_config() -> tuple[tuple[str, str], ...]:
     * ``commit.gpgsign`` is off, so a freeze never waits on gpg;
     * ``core.ignoreStat`` and ``core.sparseCheckout`` are off, so HFlow's own ``worktree add``
       never checks entries out with the assume-unchanged or skip-worktree flag, which would hide
-      a worker's edit from the freeze (a flag set any other way refuses the freeze instead).
+      a worker's edit from the freeze (a flag set any other way refuses the freeze instead);
+    * ``safe.bareRepository`` is ``explicit``, so git never adopts a directory it would only
+      *implicitly* take for a bare repository - one holding ``HEAD``, ``objects/`` and ``refs/``
+      but no ``.git``. A worker that deletes its worktree's ``.git`` file and leaves that layout
+      in the worktree root would otherwise have HFlow's next git call there (the freeze, the
+      metadata snapshot, a cleanup) read the worker's ``config`` as the repository's, with every
+      command-running key in it (openai/codex PR #36924: ``core.fsmonitor``, which is forced off
+      above anyway). Git honours this key only from protected configuration, and these keys are
+      ``command`` scope, which is protected. Every HFlow call names its repository by the
+      ``cwd`` of a checkout or linked worktree (found through its ``.git``, also when the main
+      repository is bare) or by ``--git-dir``; git allows both, and a ``cwd`` inside a ``.git``
+      directory too. Only a bare repository found by discovery from the ``cwd`` is refused, and
+      HFlow never runs in one (``rev-parse --show-toplevel`` refuses a bare repository anyway).
+
+    Being ``command`` scope, none of these keys enters :meth:`GitRepo.metadata_snapshot`, so
+    adding one does not change a snapshot taken before.
 
     :func:`_base_env` also appends these to an inherited ``GIT_CONFIG_PARAMETERS``, which git
     reads after ``GIT_CONFIG_COUNT``, so a caller's ``git -c`` cannot override them either.
@@ -476,20 +492,84 @@ def _forced_config() -> tuple[tuple[str, str], ...]:
         ("commit.gpgsign", "false"),
         ("core.ignoreStat", "false"),
         ("core.sparseCheckout", "false"),
+        ("safe.bareRepository", "explicit"),
     )
 
 
+def _absent_graft_file() -> str:
+    """A path that never exists, for ``GIT_GRAFT_FILE``: git then reads no graft file at all.
+
+    Inside the HFlow-owned directory of :func:`_empty_hooks_dir`, which nothing ever writes to.
+    A missing graft file is skipped silently; an existing empty one (``os.devnull``) would make
+    git print its grafts deprecation hint on every call.
+    """
+    return os.path.join(_empty_hooks_dir(), "no-graft-file")
+
+
 #: Variables that point git at a repository, index or object store other than the one the
-#: command's ``cwd`` names. Inherited when HFlow is started from inside a git hook or alias; every
-#: HFlow call names its repository by ``cwd``, so they are dropped rather than obeyed.
+#: command's ``cwd`` names, or that widen how far git looks for one. Inherited when HFlow is
+#: started from inside a git hook or alias (git exports its repository-local state to its
+#: children: ``git rev-parse --local-env-vars``); every HFlow call names its repository by
+#: ``cwd``, so they are dropped rather than obeyed. ``GIT_IMPLICIT_WORK_TREE`` and ``GIT_PREFIX``
+#: are what git sets beside ``GIT_DIR`` for a hook or a shell alias (the latter is the alias's
+#: subdirectory). ``GIT_DISCOVERY_ACROSS_FILESYSTEM`` lets discovery climb across a mount point
+#: into a repository on another file system.
+#:
+#: ``GIT_CEILING_DIRECTORIES`` is deliberately kept: it can only stop discovery from climbing, so
+#: with it a ``cwd`` resolves to the same repository or to none - never to another one. Dropping
+#: it would let a project directory outside any repository resolve to an enclosing repository the
+#: user fenced off with it (a home directory under version control, for example).
 _REPOSITORY_LOCATING_ENV = (
     "GIT_DIR",
     "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
     "GIT_INDEX_FILE",
     "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_COMMON_DIR",
     "GIT_NAMESPACE",
+    "GIT_PREFIX",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+)
+
+#: Variables that change what HFlow's git reads from the repository it found - its history, its
+#: configuration, its attributes, its diff output or what a path argument matches - from outside
+#: anything the metadata snapshot or a recorded commit describes. Dropped, never obeyed:
+#:
+#: * ``GIT_CONFIG`` makes ``git config`` read that one file instead of the system, global,
+#:   repository and worktree files, listed as ``command`` scope - which
+#:   :meth:`GitRepo.metadata_snapshot` skips, so the snapshot would digest no configuration at all
+#:   and a worker's change to the shared config would go unseen;
+#: * ``GIT_SHALLOW_FILE`` names a list of commits whose parents git then ignores, so ancestry
+#:   (``merge-base --is-ancestor``, which an integration decides on) and ``rev-list`` change.
+#:   The repository's own ``shallow`` file is still read - a shallow clone needs it - and it can
+#:   only take parents away: an ancestry check it changes turns a yes into a no, never a no into
+#:   a yes. ``GIT_GRAFT_FILE``, which can also *add* parents, is not dropped but replaced: see
+#:   :func:`_base_env`;
+#: * ``GIT_REPLACE_REF_BASE`` moves the replace refs, already ignored (``GIT_NO_REPLACE_OBJECTS``);
+#: * ``GIT_ATTR_SOURCE`` (Git 2.42+) makes git read ``.gitattributes`` from a tree-ish instead of
+#:   the working tree, which changes which filter or diff driver applies, outside the attribute
+#:   files the metadata snapshot digests;
+#: * ``GIT_EXTERNAL_DIFF`` names a program git runs for patch output and ``GIT_DIFF_OPTS``
+#:   overrides the context a ``--unified=3`` asked for. The one patch HFlow reads,
+#:   :meth:`GitRepo.diff_text_bounded`, passes ``--no-ext-diff --no-textconv`` as well; every
+#:   other diff HFlow runs is ``--name-only``, which runs no diff program;
+#: * ``GIT_LITERAL_PATHSPECS``, ``GIT_GLOB_PATHSPECS``, ``GIT_NOGLOB_PATHSPECS`` and
+#:   ``GIT_ICASE_PATHSPECS`` change what a path argument matches. HFlow sets the literal one
+#:   itself on every call that passes a path; an inherited glob or icase one makes such a call
+#:   fail outright (git refuses to combine it with literal), so a freeze could never stage
+#:   anything. None of them is left to apply to a call HFlow did not mark.
+_CONTENT_REDIRECTING_ENV = (
+    "GIT_CONFIG",
+    "GIT_SHALLOW_FILE",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_ATTR_SOURCE",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_DIFF_OPTS",
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
 )
 
 
@@ -502,10 +582,17 @@ def _base_env() -> dict[str, str]:
     env = dict(os.environ)
     # Deterministic, inert git: a fixed identity (no ambient one), no system config, no
     # interactive prompts, no replacement objects (``refs/replace`` cannot make one commit read as
-    # another), no inherited repository-locating variables, and the forced configuration above:
-    # no hooks (the repository's, the user's, a worker's or a caller's ``git -c``), no fsmonitor
-    # command, no signing, no flagged checkout. The user's global config is still read for
-    # everything else.
+    # another), no grafts, no inherited repository-locating or content-redirecting variables, and
+    # the forced configuration above: no hooks (the repository's, the user's, a worker's or a
+    # caller's ``git -c``), no fsmonitor command, no signing, no flagged checkout, no implicitly
+    # bare repository. The user's global config is still read for everything else.
+    #
+    # Grafts: ``GIT_NO_REPLACE_OBJECTS`` does not switch them off. Git reads ``GIT_GRAFT_FILE``,
+    # else ``info/grafts`` in the common git directory - which a worker can write from its
+    # worktree - and a graft can give a commit any parents, so ``merge-base --is-ancestor`` would
+    # answer about a history that is not in the objects (an integration could then take a
+    # target tip for an ancestor of the candidate). Naming a graft file that never exists makes
+    # git read none, inherited or written.
     env.update(
         {
             "GIT_AUTHOR_NAME": CANDIDATE_AUTHOR_NAME,
@@ -515,9 +602,10 @@ def _base_env() -> dict[str, str]:
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_GRAFT_FILE": _absent_graft_file(),
         }
     )
-    for name in _REPOSITORY_LOCATING_ENV:
+    for name in (*_REPOSITORY_LOCATING_ENV, *_CONTENT_REDIRECTING_ENV):
         env.pop(name, None)
     # Appended after any ``GIT_CONFIG_COUNT`` entries the caller's environment already carries, so
     # those still apply and these, later in the same list, win. Git reads

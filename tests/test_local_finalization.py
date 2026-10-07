@@ -31,6 +31,8 @@ from hflow.contracts import (
 )
 from hflow.store import OFFLINE_REPROCESSING_KIND, Store, StoreError
 
+from .conftest import copy_recorded_file
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROBE = REPO_ROOT / ".probe" / "m2-live"
 PRODUCTION_STORE = PROBE / "attempt-2-data" / "hflow.sqlite"
@@ -76,11 +78,11 @@ def ledger_copy(tmp_path: Path) -> Path:
     _require_recorded_ledger()
     target = tmp_path / "ledger" / "hflow.sqlite"
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(PRODUCTION_STORE, target)
+    copy_recorded_file(PRODUCTION_STORE, target)
     for suffix in ("-wal", "-shm"):
         sidecar = Path(str(PRODUCTION_STORE) + suffix)
         if sidecar.exists():
-            shutil.copyfile(sidecar, Path(str(target) + suffix))
+            copy_recorded_file(sidecar, Path(str(target) + suffix))
     return target
 
 

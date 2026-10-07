@@ -44,7 +44,7 @@ Git 最低版本：`merge-tree --write-tree` 需要 2.38，`--merge-base` 需要
    * 等于 `T`：继续；
    * 包含 `M`（`M` 是其祖先）：记为 `integrated`，basis `operator_merge_observed`；
    * 其他（含分支被删）：`stale`（终态，需重新 prepare）。
-4. **目标分支被任何 worktree（含用户主 checkout）检出时不写 ref**（只改 ref 会让那个工作树的 index/工作区与 HEAD 错位）。状态保持 `ready`，输出交接说明：`git -C <checkout> merge --ff-only <M>`，之后 `hflow integrate reconcile <id>` 观察到目标包含 `M` 即记为 `integrated`（basis `operator_merge_observed`）。
+4. **目标分支被任何 worktree（含用户主 checkout）检出时不写 ref**（只改 ref 会让那个工作树的 index/工作区与 HEAD 错位）。状态保持 `ready`，输出交接说明：`git -C <checkout> merge --ff-only <M>`，之后 `hflow integrate reconcile <id>` 观察到目标包含 `M` 即记为 `integrated`（basis `operator_merge_observed`）。集成命令打印的每条后续 `hflow` 命令（`apply`、`reconcile`），在所用账本不是默认账本（`HFLOW_DATA_DIR`，否则平台目录）时都带 `--data-dir <绝对路径>`，路径按 Windows 上的 PowerShell（7 或 Windows PowerShell 5.1）、其他平台上的 `sh` 加引号，原样粘贴到这两种 shell 即可执行（不适用于 cmd.exe：它在双引号内仍展开 `%VAR%`，也不去掉 PowerShell 的单引号；根目录打印为 `C:\.`，使右引号前没有反斜杠）；否则命令会打开默认账本并以 `4`（未知 id）退出。
 5. 意图先行：CAS `ready → applying`（记录 `apply_intent_at`、`applied_by` = OS 用户、本进程身份），事务提交后才写 ref。
 6. `git update-ref -m <reason> refs/heads/<target> M T`（Git 的原子 compare-and-set）。
 7. 成功 → CAS `applying → integrated`，basis `hflow_ref_update`，同一事务写 `IntegrationReceipt` 与 run note。失败 → 重读目标：等于 `M` → `integrated`；等于 `T` → 回到 `ready`（记录错误）；包含 `M` → `integrated`；其他 → `stale`。

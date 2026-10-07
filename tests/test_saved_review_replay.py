@@ -18,13 +18,14 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
-import shutil
 import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+from .conftest import copy_recorded_file
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROBE = REPO_ROOT / ".probe" / "m2-live"
@@ -93,11 +94,11 @@ def ledger_copy(tmp_path: Path) -> Path:
     _require_saved_evidence()
     target = tmp_path / "ledger" / "hflow.sqlite"
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(STORE, target)
+    copy_recorded_file(STORE, target)
     for suffix in ("-wal", "-shm"):
         sidecar = Path(str(STORE) + suffix)
         if sidecar.exists():
-            shutil.copyfile(sidecar, Path(str(target) + suffix))
+            copy_recorded_file(sidecar, Path(str(target) + suffix))
     return target
 
 

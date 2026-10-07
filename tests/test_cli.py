@@ -36,6 +36,7 @@ from hflow.store import Store, StoreError
 from hflow.verify import CheckRunners, FakeCheckRunner
 
 from .conftest import write_profile, write_project, write_task
+from .owner_exit import owner_exits
 
 @pytest.fixture()
 def cli_env(tmp_path: Path, project, task_spec) -> dict[str, Path]:
@@ -201,8 +202,11 @@ def test_blocked_run_exits_with_its_own_code(
 
 
 def test_doctor_makes_no_model_calls_and_admits_what_is_unknown(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Unbound, so no DSH home's stored-credentials file is even named (a bound one is checked
+    # by stat only: test_cli_doctor.py).
+    monkeypatch.delenv("DSH_HOME", raising=False)
     exit_code = main(["doctor", "--json", "--data-dir", str(tmp_path / "data")])
     assert exit_code == EXIT_OK
     payload = json.loads(capsys.readouterr().out)
@@ -330,7 +334,13 @@ def test_doctor_names_the_dsh_home_a_child_actually_uses(
     assert payload["child_dsh_home"]["path"] == str(bound)
     dependencies = " ".join(payload["profile"]["roles"]["implementer"]["dependencies"])
     assert "DSH home: bound" in dependencies
-    assert ".credentials" not in json.dumps(payload)
+    # A bound home's stored-credentials file and .env are named with their presence, by stat
+    # only - never opened, sized or hashed (the sentinel test is in test_cli_doctor.py).
+    assert payload["readiness"]["credentials"]["dsh_home_files"] == {
+        ".credentials.yaml": "absent",
+        ".env": "absent",
+    }
+    assert "sha256" not in json.dumps(payload["readiness"]["credentials"])
 
 
 def test_doctor_refuses_a_profile_it_cannot_resolve(
@@ -818,6 +828,7 @@ def test_cli_cancel_of_an_offline_run_owned_by_another_fake_driver_is_unknown(
 def test_an_interrupted_controller_leaves_a_run_resume_reconciles(
     store: Store, project_root: Path, run_request: RunRequest, tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Ctrl+C while the implementer runs: the run blocks ``outcome_unknown`` and `resume` works.
 
@@ -852,6 +863,7 @@ def test_an_interrupted_controller_leaves_a_run_resume_reconciles(
     assert attempt["outcome"] == InvocationOutcome.OUTCOME_UNKNOWN.value
     assert attempt["reconcile_json"] is None
 
+    owner_exits(store, run_id, owner, monkeypatch)  # an interrupted `hflow run` process exits
     exit_code = main(["resume", run_id, "--json", "--data-dir", str(tmp_path / "data")])
     payload = json.loads(capsys.readouterr().out)
 
@@ -870,7 +882,7 @@ def test_an_interrupted_controller_leaves_a_run_resume_reconciles(
 )
 def test_an_unreadable_stored_record_fails_status_but_never_blocks_resume_or_cancel(
     store: Store, project_root: Path, run_request: RunRequest, tmp_path: Path,
-    capsys: pytest.CaptureFixture[str], note: str,
+    capsys: pytest.CaptureFixture[str], note: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """`cancel` and `resume` resolve the run from its row, not from the status projection.
 
@@ -902,6 +914,7 @@ def test_an_unreadable_stored_record_fails_status_but_never_blocks_resume_or_can
     with pytest.raises(StoreError):
         inspect_run(store, run_id)
 
+    owner_exits(store, run_id, owner, monkeypatch)  # an interrupted `hflow run` process exits
     exit_code = main(["resume", run_id, "--json", "--data-dir", str(tmp_path / "data")])
     payload = json.loads(capsys.readouterr().out)
     assert exit_code == EXIT_BLOCKED, payload

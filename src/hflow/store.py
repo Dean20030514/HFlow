@@ -405,6 +405,16 @@ class Store:
         with self._lock:
             self.conn.close()
 
+    def total_changes(self) -> int:
+        """Rows this store's connection has inserted, updated or deleted since it was opened.
+
+        SQLite's own counter (``sqlite3_total_changes``). Two readings tell a caller whether
+        anything in between wrote through this store; a statement whose transaction was rolled
+        back still counts, so the comparison can over-report a write, never miss one.
+        """
+        with self._lock:
+            return int(self.conn.total_changes)
+
     def _fetchone(self, sql: str, params: Sequence[Any] = ()) -> sqlite3.Row | None:
         """Locked single-row read. Every query goes through a locked helper."""
         with self._lock:
@@ -2585,7 +2595,14 @@ class Store:
                 ),
             )
 
-    def mark_unsettled_invocations_unknown(self, run_id: str, detail: str) -> int:
+    def mark_unsettled_invocations_unknown(
+        self,
+        run_id: str,
+        detail: str,
+        *,
+        note_if_closed: str | None = None,
+        closed_before: int = 0,
+    ) -> int:
         """Close the loop on a controller that died mid-dispatch.
 
         Two outcomes, because the ledger knows two different things:
@@ -2599,9 +2616,18 @@ class Store:
 
         A row that a driver explicitly reported as creating nothing stays ``NOT_STARTED``: nothing
         is unknown about it, and inventing an unknown would block the root for no reason.
+
+        ``note_if_closed`` is a run note recorded verbatim (not cut to the default bound) in the
+        **same** transaction, and only when an entry was closed - by this statement, or by the
+        caller's own earlier write (``closed_before``). ``resume --legacy-owner-gone`` records the
+        operator's attestation this way: a closure that names an attestation and the attestation's
+        words commit together, and a failed note write rolls the closure back with it.
         """
         with self.transaction() as conn:
-            return self._mark_unsettled_invocations_unknown_locked(conn, run_id, detail)
+            closed = self._mark_unsettled_invocations_unknown_locked(conn, run_id, detail)
+            if note_if_closed is not None and closed + closed_before > 0:
+                self._record_note_locked(conn, run_id, note_if_closed, limit=len(note_if_closed))
+            return closed
 
     def _mark_unsettled_invocations_unknown_locked(
         self, conn: sqlite3.Connection, run_id: str, detail: str

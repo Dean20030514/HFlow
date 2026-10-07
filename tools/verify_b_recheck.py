@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -13,6 +14,10 @@ from hflow.artifacts import BoundedTextSink  # noqa: E402
 from hflow.contracts import CheckDef  # noqa: E402
 from hflow.verify import CommandCheckRunner  # noqa: E402
 from tests.test_driver_acpx_dsh import DriverHarness  # noqa: E402
+
+# The stub agent needs no credential, but a real launch with none visible is refused
+# (no_credential_source); a stand-in that is obviously not a key, never a real one.
+os.environ["DEEPSEEK_API_KEY"] = "hflow-verify-stand-in-not-a-credential"
 
 work = Path(sys.argv[1]).resolve()
 work.mkdir(parents=True, exist_ok=True)

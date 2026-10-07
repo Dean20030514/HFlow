@@ -23,6 +23,11 @@ Facts baked in from the M0 probe and the installed acpx 0.17.1 bundle (not assum
   - and so is a bound ``DSH_HOME`` that is relative, unresolvable, inside the workspace (or the
   user's checkout and its worktree directory) or around it: the agent could write what DSH
   loads from its home.
+* Without a credential DSH fails with a no-API-key error before any model work (observed in
+  M0), so a launch whose child environment lacks ``DEEPSEEK_API_KEY`` (by name) and whose DSH
+  home holds neither ``.credentials.yaml`` nor ``.env`` (by stat; an unbound home is the empty
+  per-invocation one) is refused before spawn too (user ruling 2026-10-07). A presence check:
+  it does not prove the credential is valid.
 * The task body goes through acpx's documented stdin path (``-f -``), written from its own
   thread after both output readers started, then the child's stdin is closed so input is
   complete. The ACP stdin between acpx and DSH is acpx's own
@@ -1029,6 +1034,56 @@ def dsh_home_workspace_problem(dsh_home: str, workspaces: Sequence[Path]) -> str
     return ""
 
 
+def credential_source_problem(
+    child_env: Mapping[str, str],
+    *,
+    dsh_home_kind: Literal["bound", "per_invocation"],
+    dsh_home: Path,
+) -> str:
+    """Why DSH started with ``child_env`` and this home would have no credential source, or ``""``.
+
+    User ruling 2026-10-07, "refuse before dispatch". DSH's credential precedence (documented at
+    dsh-v0.2.0-rc.2, not observed) is the launch environment, then ``$DSH_HOME/.credentials.yaml``,
+    then ``<cwd>/.env``, then ``$DSH_HOME/.env``. A real launch never starts on a workspace
+    ``.env`` (``workspace_env_file``), so what is left is ``DEEPSEEK_API_KEY`` among the child's
+    variable *names* and, for a bound home, a regular file by either home name - the facts
+    ``dsh_surfaces.credential_sources`` reports, by name and stat only (nothing is opened, sized
+    or hashed). With ``DSH_HOME`` unbound (``dsh_home_kind="per_invocation"``) the home is the
+    per-invocation one, created empty, so only the environment counts.
+
+    A presence check, not a validity check: an empty or revoked key, or a home file that holds no
+    credential, passes. What it rules out is the launch M0 observed fail with a no-API-key error
+    before any model work - which HFlow would record as ``outcome_unknown``, with the approved
+    submission spent and a ledger entry left for ``hflow ledger settle``.
+    """
+    # Imported here: ``dsh_surfaces`` imports this module.
+    from .dsh_surfaces import DEEPSEEK_API_KEY_NAME, ENV_FILE_NAME, STORED_CREDENTIALS_NAME
+    from .dsh_surfaces import credential_sources
+
+    sources = credential_sources(child_env, dsh_home_kind=dsh_home_kind, dsh_home=dsh_home)
+    if sources.visible:
+        return ""
+    key = (
+        f"{DEEPSEEK_API_KEY_NAME} is not in the launch environment (its name was looked for; no "
+        "value is ever read)"
+    )
+    if sources.dsh_home_kind == "per_invocation":
+        home = (
+            f"DSH_HOME is unbound, so DSH's home is the per-invocation {sources.dsh_home}, created "
+            "empty for each invocation (inferred from upstream source, not observed)"
+        )
+    else:
+        listed = ", ".join(f"{name} {state}" for name, state in sources.home_files)
+        home = (
+            f"the bound DSH home {sources.dsh_home} holds neither {STORED_CREDENTIALS_NAME} nor "
+            f"{ENV_FILE_NAME} as a regular file ({listed}; stat only, never opened)"
+        )
+    return (
+        f"no credential source is visible to DSH: {key}, and {home}; a workspace "
+        f"{ENV_FILE_NAME} is never launched on (workspace_env_file)"
+    )
+
+
 def spawn_workspaces(workspace: Path) -> list[Path]:
     """The directories a launch in ``workspace`` must keep a bound DSH home out of.
 
@@ -1334,8 +1389,11 @@ class AcpxDshDriver:
         notes.append(
             "a workspace containing .acpxrc.json is refused before spawn: acpx would let it "
             "override this driver's config, agent argv included; so is a workspace whose root "
-            "holds a .env (DSH loads it at launch; listed only, never opened) and a bound "
-            "DSH_HOME that is relative, inside the workspace or around it"
+            "holds a .env (DSH loads it at launch; listed only, never opened), a bound "
+            "DSH_HOME that is relative, inside the workspace or around it, and a launch with no "
+            "credential source visible - DEEPSEEK_API_KEY not among the child's variable names "
+            "and neither the stored-credentials file nor .env in a bound DSH home (stat only; a "
+            "presence check, not a validity check)"
         )
         return CapabilityReport(
             driver_id=DRIVER_ID,
@@ -1676,6 +1734,32 @@ class AcpxDshDriver:
                     )
                     self._report_spawn(request, created=False, pid=None, detail=message)
                     raise RefusedError(RefusalCode.DSH_HOME_IN_WORKSPACE, message)
+                home_kind, dsh_home = effective_dsh_home(self.launch, child_home=child_home)
+                credential_problem = credential_source_problem(
+                    env, dsh_home_kind=home_kind, dsh_home=dsh_home
+                )
+                if credential_problem:
+                    # Judged on the environment this child is about to be given and the home it
+                    # would use, for every invocation - a repair round's included - so a variable
+                    # removed, or a home file deleted, after admission is caught here. Admission
+                    # refuses the same rule before anything is reserved
+                    # (``prepare.launch_credential_problem``). Names and stat only.
+                    boundary.close()
+                    message = (
+                        f"{credential_problem}. No client process was started: without a "
+                        "credential DSH fails with a no-API-key error before any model work "
+                        "(observed in M0). (A run that starts without one is refused at "
+                        "admission, before anything is reserved; this one was found at launch, "
+                        "when the dispatch was already reserved, so the run stays blocked.) Make "
+                        "a credential visible - DEEPSEEK_API_KEY in the environment hflow runs "
+                        "in, or a .credentials.yaml or .env in a bound DSH home - then submit a "
+                        "new revision of the task: an identical TaskSpec returns this blocked "
+                        "run, and under a root budget the new revision's first implementer "
+                        "counts as a repair, so it needs a repair attempt left on the root. This "
+                        "is a presence check: it does not prove a credential is valid."
+                    )
+                    self._report_spawn(request, created=False, pid=None, detail=message)
+                    raise RefusedError(RefusalCode.NO_CREDENTIAL_SOURCE, message)
                 content_refusal = self._launch_content_refusal()
                 if content_refusal:
                     # The last check before the process exists: the entry files are hashed again

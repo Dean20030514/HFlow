@@ -1132,13 +1132,14 @@ def test_launch_surfaces_are_recorded_but_never_bound(
     assert implementer.workspace_env.present is True and implementer.workspace_env.sha256 == ""
     assert "sk-sentinel-789" not in second.model_dump_json()
 
-    def credential_note(report) -> str:
-        notes = [n for n in report.notes if "DEEPSEEK_API_KEY is not in the launch environment" in n]
-        assert len(notes) == 1
-        return notes[0]
+    # No key and an unbound home: no credential source is visible, which is a dispatch
+    # precondition (ruling 2026-10-07), not a note; a workspace .env is refused on its own.
+    def precondition_codes(report) -> list[str]:
+        return [issue.code.value for issue in report.dispatch_preconditions]
 
-    assert "absent" in credential_note(first)
-    assert "present" in credential_note(second)
+    assert "no_credential_source" in precondition_codes(first)
+    assert "workspace_env_file" not in precondition_codes(first)
+    assert {"workspace_env_file", "no_credential_source"} <= set(precondition_codes(second))
     assert not [note for note in second.notes if "would exit" in note]
     # The conftest stand-in shim matches neither the Desktop nor the npm layout.
     assert implementer.client.dsh_carrier == "unknown"

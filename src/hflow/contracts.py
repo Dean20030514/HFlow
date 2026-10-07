@@ -2220,6 +2220,13 @@ class RefusalCode(StrEnum):
     #: inside the workspace / the user's checkout / the worktree directory, or contains one of
     #: them: the agent could write what DSH loads from its home at the next launch.
     DSH_HOME_IN_WORKSPACE = "dsh_home_in_workspace"
+    #: A real launch would start DSH with no credential source visible: ``DEEPSEEK_API_KEY`` is
+    #: not a variable of the child's launch environment, and the DSH home the child would use
+    #: holds neither ``.credentials.yaml`` nor ``.env`` as a regular file (stat only, never
+    #: opened; an unbound ``DSH_HOME`` means the empty per-invocation home, so only the
+    #: environment counts). A presence check, not a validity check. User ruling 2026-10-07:
+    #: refused at admission when knowable, otherwise before any process.
+    NO_CREDENTIAL_SOURCE = "no_credential_source"
     #: A launch entry file bound by content (node.exe, the acpx entry and its package.json, the
     #: dsh launcher and its carrier entry and package.json) no longer has the bytes - or the final
     #: path - it had when the launch was resolved or approved. Refused before any process exists.

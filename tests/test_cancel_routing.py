@@ -50,6 +50,7 @@ from hflow.drivers.fake import FakeDriver, FakeScript
 from hflow.store import Store
 from hflow.verify import CheckRunners, FakeCheckRunner
 
+from .owner_exit import owner_exits, successor
 from .test_driver_acpx_dsh import FAKE_CLIENT, STUB_AGENT
 
 
@@ -1195,6 +1196,7 @@ def test_a_rootless_stop_between_the_reservation_and_the_registration_wins_the_h
 def test_a_confirmed_stop_that_loses_the_race_returns_its_own_receipt(
     store: Store, project, task_spec, project_root: Path, run_request: RunRequest,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Two stops race on a running run: the second keeps its own answer, not the first one's.
 
@@ -1283,7 +1285,9 @@ def test_a_confirmed_stop_that_loses_the_race_returns_its_own_receipt(
     # The run is terminal: a repeated stop returns the stored (first) receipt and changes nothing.
     assert owner.cancel(run_id) == first
     started = list(implementer.started)
-    outcome = owner.resume(run_id)
+    # resume reconciles outcome_unknown once the owner is gone
+    owner_exits(store, run_id, owner, monkeypatch)
+    outcome = successor(owner).resume(run_id)
     assert outcome.task_state is TaskState.BLOCKED
     assert outcome.block_code is RefusalCode.OUTCOME_UNKNOWN
     assert implementer.started == started, "resume must not re-dispatch"

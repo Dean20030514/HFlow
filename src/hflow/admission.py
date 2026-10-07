@@ -440,6 +440,7 @@ def predictable_dispatch_problems(
     workspace_client_config: str = "",
     workspace_env_file: str = "",
     dsh_home_in_workspace: str = "",
+    no_credential_source: str = "",
 ) -> list[ValidationIssue]:
     """Problems knowable before a dispatch, from the task, the contract and this machine.
 
@@ -476,6 +477,10 @@ def predictable_dispatch_problems(
     a launch's bound ``DSH_HOME`` lies inside or around the run's directories
     (``prepare.launch_dsh_home_problem``); both empty when there is none or no role uses a real
     client, and both reported for offline-checked runs for the same reason.
+    ``no_credential_source`` is why a launch would start DSH with no credential source visible
+    (``prepare.launch_credential_problem``: ``DEEPSEEK_API_KEY`` not among the child's variable
+    names and no ``.credentials.yaml`` / ``.env`` file in a bound DSH home; user ruling
+    2026-10-07), empty and reported under the same conditions.
     """
     issues: list[ValidationIssue] = list(
         repair_policy_problems(
@@ -534,6 +539,29 @@ def predictable_dispatch_problems(
                     "authorization for the new binding"
                 ),
                 location="launch.dsh_home",
+            )
+        )
+    #    Without a credential DSH fails before any model work, but only after the dispatch was
+    #    reserved: the invocation then ends outcome_unknown, the approved submission is spent and
+    #    a ledger entry waits for `ledger settle`. The driver's spawn gate refuses it as well;
+    #    knowable now from the resolved launch and this environment, so it is refused here first.
+    if no_credential_source:
+        issues.append(
+            ValidationIssue(
+                code=RefusalCode.NO_CREDENTIAL_SOURCE,
+                detail=(
+                    f"{no_credential_source}. Without a credential DSH fails with a no-API-key "
+                    "error before any model work (observed in M0), and HFlow would record that "
+                    "invocation outcome_unknown, spend the approved submission and leave a "
+                    "ledger entry for `hflow ledger settle`. Refused before anything was "
+                    "dispatched or charged: set DEEPSEEK_API_KEY in the environment hflow runs "
+                    "in (the child inherits it; HFlow never reads its value), or bind DSH_HOME "
+                    "to an absolute directory outside the project that holds .credentials.yaml "
+                    "or .env (DSH_HOME is part of the launch, so a real run then needs an "
+                    "authorization for the new binding), then prepare again. A presence check "
+                    "only: it does not prove the credential is valid"
+                ),
+                location="launch.credentials",
             )
         )
 

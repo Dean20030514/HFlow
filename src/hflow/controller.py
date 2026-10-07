@@ -19,6 +19,8 @@ import glob
 import json
 import os
 import weakref
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -108,6 +110,7 @@ from .gitworkspace import (
     GitStatusParseError,
 )
 from .store import (
+    ATTESTATION_MAX_CHARS,
     INVOCATION_OPEN_STATES,
     INVOCATION_UNRESOLVED_STATES,
     RunNotFound,
@@ -212,6 +215,11 @@ NOTE_REPAIR = "repair"
 #: taken before the first dispatch; each later comparison that found a change records the digests
 #: and the changed keys and files, never values.
 NOTE_GIT_METADATA = "git_metadata"
+#: An operator's attestation that ``hflow resume --legacy-owner-gone`` acted on: who (the OS user,
+#: recorded, not authenticated) attested that a pre-v6 run's controller has exited, and their own
+#: words, verbatim. Written only when the attestation was what let ``resume`` close entries; it is
+#: an attestation, never an observation.
+NOTE_OPERATOR_ATTESTATION = "operator_attestation"
 #: The ``git_metadata`` notes that warn rather than record a baseline: a comparison that found the
 #: metadata changed or unreadable. ``inspect_run`` projects exactly these for ``status``/``report``.
 GIT_METADATA_WARNING_PREFIXES = (
@@ -255,6 +263,13 @@ class RunOutcome:
         #: This is a drift check against the recorded scope fingerprint, not re-verification.
         self.workspace_matches_receipt = workspace_matches_receipt
         self.notes = notes or []
+        #: ``resume`` refused to act on this *ended* run because its owner is not proven gone - one
+        #: that may still be alive, or a pre-v6 owner nobody attested gone - and wrote nothing: the
+        #: reconcile of an ``outcome_unknown`` run, or the closure of an ended run's open entries.
+        #: The run's own state says it ended (``BLOCKED``, ``ACCEPTED``), so ``hflow resume`` exits
+        #: ``5`` ("another process is or may still be working on it") instead of the state's code.
+        #: A refused takeover of a live run needs no flag: its state already exits ``5``.
+        self.waiting_on_owner = False
 
     @property
     def driver_invocations(self) -> int:
@@ -382,10 +397,12 @@ def ended_run_owner_blocker(
 ) -> tuple[str | None, OwnerAssessment]:
     """The owner half of the rule for acting on an ended run's ledger entries. Read-only.
 
-    One rule, shared by the two commands that close an entry a controller may still be driving:
-    ``hflow ledger settle`` (through :func:`operator_settle_refusal`) and ``hflow resume`` on an
-    ended run that left entries open (:meth:`Controller.resume`). ``(None, assessment)`` means the
-    owner half passes:
+    One rule, shared by the commands that close an entry a controller may still be driving:
+    ``hflow ledger settle`` (through :func:`operator_settle_refusal`), ``hflow resume`` on an
+    ended run that left entries open (:meth:`Controller._close_open_entries_of_ended_run`), and
+    ``hflow resume``'s reconcile of an ``outcome_unknown`` run whose owner this build recorded
+    (:meth:`Controller._reconcile_owner_check`). ``(None, assessment)`` means the owner half
+    passes:
 
     * an owner recorded by this build (``owner_token`` set) passes only when it is provably gone
       by the takeover rule (:func:`assess_run_owner`: its lock can be taken **and** its identity
@@ -395,11 +412,12 @@ def ended_run_owner_blocker(
       recorded that could still act, never an observation;
     * a run with no owner token whose attempts recorded a controller pid (no host, so never
       probed) passes only on the operator's attestation (``legacy_owner_gone_attested``, which
-      only ``ledger settle --legacy-owner-gone`` can give); otherwise
-      :data:`OWNER_LEGACY_UNPROVEN`.
+      only ``--legacy-owner-gone`` on ``ledger settle`` or on ``resume`` can give); otherwise
+      :data:`OWNER_LEGACY_UNPROVEN`. The attestation passes nothing else: an owner recorded by
+      this build is judged by the takeover rule whatever an operator attests.
 
-    The caller words its own refusal: what to do next differs between the two commands. Never
-    calls a model and writes nothing; the probe describes the moment of the check.
+    The caller words its own refusal: what to do next differs between the commands. Never calls
+    a model and writes nothing; the probe describes the moment of the check.
     """
     assessment = assess_run_owner(store, row)
     legacy = row["owner_token"] is None
@@ -412,6 +430,62 @@ def ended_run_owner_blocker(
     if not assessment.gone:
         return OWNER_MAY_BE_ALIVE, assessment
     return None, assessment
+
+
+@dataclass(frozen=True)
+class LegacyOwnerAttestation:
+    """``hflow resume --legacy-owner-gone --attest``: the operator says a pre-v6 owner has exited.
+
+    The ``resume`` counterpart of ``hflow ledger settle --legacy-owner-gone`` (user ruling
+    2026-10-03, batch H): a run written before owner identity existed recorded its controller's pid
+    without a host, so HFlow can never prove that controller gone, and the entries the ended run
+    left open could not be closed at all. This is the operator's statement that it has exited. It
+    passes exactly :data:`OWNER_LEGACY_UNPROVEN` in
+    :meth:`Controller._close_open_entries_of_ended_run` and nothing else; when it is what let the
+    closure go ahead, it is recorded verbatim in a :data:`NOTE_OPERATOR_ATTESTATION` run note and
+    named in each closed entry's detail as an attestation - never as an observation.
+
+    ``attested_by`` is the OS user, recorded, not authenticated (as for ``ledger settle``).
+    ``attestation`` is the operator's own words: non-blank, at most
+    :data:`hflow.store.ATTESTATION_MAX_CHARS` characters, no NUL - the bounds ``ledger settle``
+    applies; anything else raises ``ValueError`` before a run is read.
+    """
+
+    attested_by: str
+    attestation: str
+
+    def __post_init__(self) -> None:
+        problem = attestation_problem(self.attestation)
+        if problem is not None:
+            raise ValueError(problem)
+
+
+#: What ``resume`` says when ``--legacy-owner-gone`` was given and decided nothing (nothing of it is
+#: recorded then).
+LEGACY_ATTESTATION_UNUSED = (
+    "--legacy-owner-gone was not used and nothing of it was recorded: it applies only when "
+    "`hflow resume` closes the ledger entries an ended run left open and that run has no owner "
+    "token while its attempts recorded a controller pid (a pre-v6 owner HFlow cannot judge). It "
+    "never takes a live run over, never lets an outcome_unknown run be reconciled past an owner "
+    "this build recorded, and passes no other owner check"
+)
+
+
+def attestation_problem(attestation: str | None) -> str | None:
+    """Why an operator attestation text cannot be recorded, or ``None``. The settle bounds."""
+    if not isinstance(attestation, str) or not attestation.strip():
+        return (
+            "the attestation is blank; an attestation records what the operator claims and why, "
+            "and an empty claim records nothing"
+        )
+    if len(attestation) > ATTESTATION_MAX_CHARS:
+        return (
+            f"the attestation is {len(attestation)} characters; the bound is "
+            f"{ATTESTATION_MAX_CHARS}. Shorten it (it is a statement, not a log)"
+        )
+    if "\x00" in attestation:
+        return "the attestation contains a NUL character"
+    return None
 
 
 def operator_settle_refusal(
@@ -1188,38 +1262,60 @@ class Controller:
 
         return self._drive(run_id, request, implementer_packet=implementer_packet)
 
-    def resume(self, run_id: str) -> RunOutcome:
+    def resume(
+        self, run_id: str, *, legacy_owner_gone: LegacyOwnerAttestation | None = None
+    ) -> RunOutcome:
         """Continue the state machine. Never replays a prompt and never re-dispatches.
 
         Three shapes, decided from the run row:
 
         * a **live** run (``DRAFT``/``READY``/``RUNNING``/``CHECKING``) is taken over only from a
           provably gone owner, which blocks it ``owner_lost`` (:meth:`_take_over`);
-        * a run blocked ``outcome_unknown`` or ``owner_lost`` is reconciled (:meth:`reconcile`);
+        * a run blocked ``outcome_unknown`` or ``owner_lost`` is reconciled (:meth:`reconcile`) -
+          an ``outcome_unknown`` run whose owner this build recorded only once that owner is
+          provably gone (:meth:`_reconcile_owner_check`): a cross-process ``hflow cancel`` blocks
+          a run ``outcome_unknown`` while its controller and agent may keep running;
         * any other **ended** run (``ACCEPTED``, ``BLOCKED`` with another code, ``CANCELLED``)
           keeps its outcome. If it left ledger entries open (``reserved``/``requested``/
           ``started``) - a driver that raised before reporting a spawn fact, a confirmed stop whose
           ledger write failed, a settlement the store refused - they are closed once the run's
           owner is provably gone (:meth:`_close_open_entries_of_ended_run`), so that
           ``hflow ledger settle`` can act on them. A run with no open entry is left as it is.
+
+        Whenever the owner rule refuses, nothing is written and the outcome has
+        ``waiting_on_owner`` set (``hflow resume`` exits ``5``). ``legacy_owner_gone`` is the
+        operator's attestation that a pre-v6 owner has exited (:class:`LegacyOwnerAttestation`);
+        it is used only to close an ended run's open entries when that run's owner is otherwise
+        :data:`OWNER_LEGACY_UNPROVEN`, and in every other shape the outcome says it was not used
+        and nothing of it is recorded.
         """
         row = self.store.get_run(run_id)
         state = TaskState(row["task_state"])
         if state in {TaskState.DRAFT, TaskState.READY, TaskState.RUNNING, TaskState.CHECKING}:
             # A live run: take it over only from a provably gone owner (owner lease), which
             # blocks it owner_lost; otherwise change nothing.
-            return self._take_over(run_id, row)
+            return self._attestation_unused(self._take_over(run_id, row), legacy_owner_gone)
         if state is TaskState.BLOCKED and row["block_code"] in {
             RefusalCode.OUTCOME_UNKNOWN.value,
             RefusalCode.OWNER_LOST.value,
         }:
+            basis = ""
+            if row["block_code"] == RefusalCode.OUTCOME_UNKNOWN.value:
+                waiting, basis = self._reconcile_owner_check(run_id, row)
+                if waiting is not None:
+                    return self._attestation_unused(waiting, legacy_owner_gone)
             self.reconcile(run_id)
-            return self._outcome_for(
-                run_id,
-                notes=[
-                    "reconciled an interrupted attempt; this build does not re-dispatch on an "
-                    "unknown outcome - submit a new revision to proceed"
-                ],
+            return self._attestation_unused(
+                self._outcome_for(
+                    run_id,
+                    notes=[
+                        "reconciled an interrupted attempt"
+                        + (f" once {basis}" if basis else "")
+                        + "; this build does not re-dispatch on an unknown outcome - submit a "
+                        "new revision to proceed"
+                    ],
+                ),
+                legacy_owner_gone,
             )
         open_entries = [
             entry
@@ -1227,14 +1323,103 @@ class Controller:
             if entry.state.value in INVOCATION_OPEN_STATES
         ]
         if open_entries:
-            return self._close_open_entries_of_ended_run(run_id, row, open_entries)
-        return self._outcome_for(
-            run_id,
-            notes=[f"resume is a no-op for a run in state {state.value} in this build"],
+            return self._close_open_entries_of_ended_run(
+                run_id, row, open_entries, legacy_owner_gone=legacy_owner_gone
+            )
+        return self._attestation_unused(
+            self._outcome_for(
+                run_id,
+                notes=[f"resume is a no-op for a run in state {state.value} in this build"],
+            ),
+            legacy_owner_gone,
         )
 
+    @staticmethod
+    def _attestation_unused(
+        outcome: RunOutcome, legacy_owner_gone: LegacyOwnerAttestation | None
+    ) -> RunOutcome:
+        """Say so when ``--legacy-owner-gone`` was given but did not decide anything here."""
+        if legacy_owner_gone is not None:
+            outcome.notes.append(LEGACY_ATTESTATION_UNUSED)
+        return outcome
+
+    def _reconcile_owner_check(self, run_id: str, row: Any) -> tuple[RunOutcome | None, str]:
+        """May ``resume`` reconcile this ``outcome_unknown`` run now? ``(refusal, basis)``.
+
+        ``outcome_unknown`` is not proof that the controller which owned the run has stopped. A
+        cross-process ``hflow cancel`` cannot stop that controller's child (it holds no handle to
+        it), so it blocks the run ``outcome_unknown`` while the owner and the agent it launched
+        keep running. Reconciling then would record the in-flight entry ``unknown``, record a
+        reconcile and say "reconciled an interrupted attempt" about work that is still going on.
+
+        So the owner half ``ledger settle`` and :meth:`_close_open_entries_of_ended_run` apply
+        (:func:`ended_run_owner_blocker`) decides here too, for a run whose owner this build
+        recorded (``owner_token`` set):
+
+        * this controller's own token refuses: it is still running, so its agent may be too (the
+          same answer the closure of an ended run's entries gives its own owner);
+        * another owner passes only when it is provably gone - its lock can be taken **and** its
+          identity reads ``gone``. A held lock, ``matching`` or ``unknown`` (another host, access
+          denied, off Windows) refuses.
+
+        A refusal writes **nothing** - no ledger closure, no reconcile record, no note, no driver
+        call - and is returned as an outcome with ``waiting_on_owner`` set, which ``hflow resume``
+        exits ``5`` for; ``basis`` is then ``""``. ``(None, basis)`` means the reconcile may go
+        ahead; ``basis`` says why (``""`` when nothing was judged).
+
+        Not judged here, and reconciled as before:
+
+        * a run with no owner token (written before storage v6, or a label-only claim): its owner
+          can never be proven gone (a controller pid it recorded carries no host), and
+          ``hflow cancel`` followed by ``hflow resume`` is the documented way out for such a run.
+          The reconcile then waits on no owner;
+        * ``owner_lost`` (the caller does not ask): the takeover that wrote it already proved the
+          previous owner gone.
+
+        Never calls a driver or a model; the probe describes the moment of the check (as for
+        ``ledger settle``), and an ended run is never reclaimed, so its owner cannot change in
+        between.
+        """
+        if row["owner_token"] is None:
+            return None, ""
+        if row["owner_token"] == self.owner_token:
+            why = (
+                "this controller owns the run and is still running, so the agent it launched may "
+                f"still be running too. Run `hflow resume {run_id}` from another process once this "
+                "controller has exited"
+            )
+        else:
+            blocker, assessment = ended_run_owner_blocker(self.store, row)
+            if blocker is None:
+                return None, (
+                    f"its owner was proven gone (lock {assessment.lock}, identity "
+                    f"{assessment.probe.verdict})"
+                )
+            why = (
+                f"the run's owner may still be alive ({_owner_words(row)}; {assessment.summary}), "
+                "so the agent it launched may still be running: an outcome_unknown block - from "
+                "an `hflow cancel` in another process, which cannot stop that agent, for one - "
+                "does not end them. Wait for that controller to exit, or stop its process tree "
+                f"yourself, then run `hflow resume {run_id}` again"
+            )
+        outcome = self._outcome_for(
+            run_id,
+            notes=[
+                f"run {run_id} is blocked {RefusalCode.OUTCOME_UNKNOWN.value} and was not "
+                f"reconciled: {why}. Nothing was written - no ledger entry was closed, no "
+                "reconcile was recorded, no driver was asked and nothing was re-dispatched"
+            ],
+        )
+        outcome.waiting_on_owner = True
+        return outcome, ""
+
     def _close_open_entries_of_ended_run(
-        self, run_id: str, row: Any, open_entries: list[InvocationIntent]
+        self,
+        run_id: str,
+        row: Any,
+        open_entries: list[InvocationIntent],
+        *,
+        legacy_owner_gone: LegacyOwnerAttestation | None = None,
     ) -> RunOutcome:
         """Close the ledger entries an ended run left open. Nothing else about the run changes.
 
@@ -1247,9 +1432,12 @@ class Controller:
         The order of the rule, and what each step may write:
 
         1. the run's owner must be provably gone, by exactly the owner half ``ledger settle``
-           applies (:func:`ended_run_owner_blocker`). ``resume`` takes no attestation, so a pre-v6
-           run whose attempts recorded a controller pid is refused. A refusal writes **nothing**
-           and says why: an owner that may be alive may also have a child that is still working;
+           applies (:func:`ended_run_owner_blocker`). A pre-v6 run whose attempts recorded a
+           controller pid (no host, so never probed: :data:`OWNER_LEGACY_UNPROVEN`) passes only on
+           the operator's attestation ``legacy_owner_gone`` (``--legacy-owner-gone --attest``, as
+           ``ledger settle`` takes it); it passes no other blocker. A refusal writes **nothing**,
+           says why and sets ``waiting_on_owner`` (``hflow resume`` exits ``5``): an owner that may
+           be alive may also have a child that is still working;
         2. an entry named by the run's own recorded confirmed stop - the stop that ended this run
            (``cancelled_by_operator``, the receipt not marked ``run_already_ended``) - is closed
            from that stop fact, exactly as the stop would have closed it
@@ -1270,6 +1458,15 @@ class Controller:
         writes and describes the moment of the check (as for ``ledger settle``); an ended run is
         never reopened or reclaimed, so its owner cannot change in between.
 
+        An attestation that let the closure go ahead is recorded once the closure wrote something:
+        a :data:`NOTE_OPERATOR_ATTESTATION` note with the operator's words verbatim, and the basis
+        each closed entry's detail and the closure note name ("the operator attested ...; an
+        attestation, not an observation"). That note is written in the step-3 transaction
+        (``Store.mark_unsettled_invocations_unknown``'s ``note_if_closed``), so entries closed on
+        an attestation never exist without its words: a failed note write rolls their closure back
+        and the store error propagates (``hflow resume`` reports it, exit ``5``). A call that
+        closed nothing records nothing of it.
+
         What overlapping calls are guaranteed: every closure is a compare-and-set from the open
         states, so nothing is closed twice, and a ``resume`` that starts after another finished
         finds nothing open (the old no-op). Two calls that read the same open entries are not
@@ -1285,13 +1482,23 @@ class Controller:
         ids = _change_list([entry.invocation_id for entry in open_entries])
         count = len(open_entries)
         blocker, assessment = ended_run_owner_blocker(self.store, row)
+        attested: LegacyOwnerAttestation | None = None
+        if blocker == OWNER_LEGACY_UNPROVEN and legacy_owner_gone is not None:
+            # The one blocker an operator's attestation passes, by the rule ``ledger settle``
+            # applies with the same flag.
+            blocker, assessment = ended_run_owner_blocker(
+                self.store, row, legacy_owner_gone_attested=True
+            )
+            attested = legacy_owner_gone if blocker is None else None
         if blocker is not None:
             if blocker == OWNER_LEGACY_UNPROVEN:
                 why = (
                     f"the run was written before owner identity existed ({_owner_words(row)}; "
                     f"{assessment.summary}). Its recorded controller process carries no host, so "
-                    "HFlow cannot tell whether it still runs, and `resume` takes no attestation: "
-                    "this build cannot close these entries, and they keep blocking the root"
+                    "HFlow cannot tell whether it still runs - on this machine or another. If you "
+                    f"know it has exited, run `hflow resume {run_id} --legacy-owner-gone --attest "
+                    '"<what you know and why>"`, which records that you attest it (an attestation, '
+                    "never an observation)"
                 )
             elif row["owner_token"] == self.owner_token:
                 why = (
@@ -1306,7 +1513,7 @@ class Controller:
                     "for that controller to exit, or stop its process tree yourself, then run "
                     f"`hflow resume {run_id}` again"
                 )
-            return self._outcome_for(
+            refused = self._outcome_for(
                 run_id,
                 notes=[
                     f"run {run_id} ended {ended} with {count} ledger entr"
@@ -1315,8 +1522,18 @@ class Controller:
                     "Nothing was written"
                 ],
             )
+            refused.waiting_on_owner = True
+            if blocker != OWNER_LEGACY_UNPROVEN:
+                self._attestation_unused(refused, legacy_owner_gone)
+            return refused
 
-        if assessment.gone:
+        if attested is not None:
+            basis = (
+                f"the operator attested that its pre-v6 controller has exited (attested_by "
+                f"{attested.attested_by}, OS user, not authenticated; an attestation, not an "
+                "observation - a controller pid recorded with no host cannot be checked)"
+            )
+        elif assessment.gone:
             basis = (
                 f"its owner was proven gone (lock {assessment.lock}, identity "
                 f"{assessment.probe.verdict})"
@@ -1326,6 +1543,12 @@ class Controller:
                 "no owner and no controller process were recorded for it, so nothing recorded "
                 "can still act (an inference, not an observation)"
             )
+        # Given, but this run's owner half passed without it: said so, and nothing of it recorded.
+        unused = (
+            [LEGACY_ATTESTATION_UNUSED]
+            if legacy_owner_gone is not None and attested is None
+            else []
+        )
         notes: list[str] = []
         stop_closed = ""  # the entry *this call* closed from the run's recorded confirmed stop
         _intent, receipt = self.store.cancel_state(run_id)
@@ -1363,7 +1586,26 @@ class Controller:
             "No result was recorded on this entry: the consumption stands, nothing "
             "re-dispatches, and `hflow ledger settle` records what an operator attests"
         )
-        closed = self.store.mark_unsettled_invocations_unknown(run_id, detail)
+        statement: str | None = None
+        if attested is not None:
+            # Verbatim: the operator's words are the record, so the note is not cut to the default
+            # bound. Written in the closure's own transaction, and only when that closure (or this
+            # call's stop closure above) closed something: entries closed on an attestation never
+            # exist without its words, and a failed note write leaves every entry open.
+            statement = (
+                f"{NOTE_OPERATOR_ATTESTATION}: `hflow resume --legacy-owner-gone` closed ledger "
+                f"entries of run {run_id} on an operator attestation, not an observation. "
+                f"attested_by {attested.attested_by} (OS user; recorded, not authenticated) "
+                "attests that the controller this pre-v6 run recorded has exited; HFlow did not "
+                f"and cannot check it ({assessment.summary}). Their statement: "
+                f"{attested.attestation}"
+            )
+        closed = self.store.mark_unsettled_invocations_unknown(
+            run_id,
+            detail,
+            note_if_closed=statement,
+            closed_before=1 if stop_closed else 0,
+        )
         made = closed + (1 if stop_closed else 0)
         if not made:
             # Every entry this call read as open was closed by someone else before it wrote: an
@@ -1378,7 +1620,8 @@ class Controller:
                     f"to close {them} - concurrently, by an overlapping `hflow resume` or another "
                     f"writer, after this call read {them}. This resume closed nothing and wrote "
                     f"nothing; `hflow status {run_id}` shows each entry's state"
-                ],
+                ]
+                + unused,
             )
         moved: list[str] = []  # snapshot entries now closed, as "id from->to"
         moved_not_by_stop = 0  # ... of which this call's stop closure is not the cause
@@ -1416,13 +1659,17 @@ class Controller:
             "was recorded) or launch_unknown (no launch recorded). Nothing was re-dispatched or "
             "refunded, and the run's state, block code, receipt and outcome are unchanged. An "
             "unknown or launch_unknown entry keeps blocking the root until "
-            "`hflow ledger settle <invocation_id>` records an operator attestation"
+            "`hflow ledger settle <invocation_id>"
+            + (" --legacy-owner-gone" if attested is not None else "")
+            + "` records an operator attestation"
         )
         if still_open:  # pragma: no cover - the closures are compare-and-set from the open states
             note += f"; {still_open} could not be closed and stay open"
+        if statement is not None:  # recorded with the closure above
+            notes.append(statement)
         self.store.record_note(run_id, note)
         notes.append(note)
-        return self._outcome_for(run_id, notes=notes)
+        return self._outcome_for(run_id, notes=notes + unused)
 
     def reconcile(self, run_id: str) -> ReconcileOutcome:
         """Observe an interrupted attempt. Must not start new model work.
@@ -2000,11 +2247,43 @@ class Controller:
                 if real_transport and self.project_root is not None
                 else ""
             ),
+            no_credential_source=self._credential_problem() if real_transport else "",
         )
         if problems:
             first = problems[0]
             more = f" (+{len(problems) - 1} more admission problem(s))" if len(problems) > 1 else ""
             raise RefusedError(first.code, first.detail + more)
+
+    def _credential_problem(self) -> str:
+        """Why a launch of this run would start DSH with no credential source visible, or ``""``.
+
+        Each held driver's launch is judged on this process's environment plus that driver's
+        ``extra_env`` - the child environment its spawn gate builds and checks again; a resolved
+        launch no held driver carries, on this process's environment alone, which is what a
+        driver ``build_driver`` makes from it passes on. A driver without a launch (the fake, a
+        test double) adds nothing: the gate cannot know, which is different from knowing it is
+        fine.
+        """
+        from .prepare import launch_credential_problem
+
+        held: list[tuple[LaunchConfig, Mapping[str, str] | None, Path]] = []
+        for driver in (self.driver, self.reviewer_driver):
+            launch = getattr(driver, "launch", None)
+            if isinstance(launch, LaunchConfig):
+                extra_env = getattr(driver, "extra_env", None)
+                held.append((
+                    launch,
+                    extra_env if isinstance(extra_env, Mapping) else None,
+                    Path(getattr(driver, "data_dir", None) or self.data_dir),
+                ))
+        for launch in self._resolved_launches():
+            if not any(launch == carried for carried, _, _ in held):
+                held.append((launch, None, self.data_dir))
+        for launch, extra_env, data_dir in held:
+            problem = launch_credential_problem([launch], data_dir=data_dir, extra_env=extra_env)
+            if problem:
+                return problem
+        return ""
 
     def _real_transport(self) -> bool:
         """Is any role dispatched to something other than the offline fake driver?

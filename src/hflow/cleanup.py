@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .contracts import (
-    AttemptState, RefusalCode, RefusedError, ResultReceipt, TaskSpec, TaskState,
+    AttemptState, RefusedError, ResultReceipt, TaskSpec, TaskState,
     WorkspaceProvenance,
 )
 from .gitworkspace import IGNORED_ARTIFACT_ALLOWLIST, GitError, GitRepo, _base_env

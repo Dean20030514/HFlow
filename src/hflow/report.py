@@ -158,14 +158,19 @@ def _open_entry_lines(inspection: RunInspection) -> list[str]:
 
     Such an entry keeps the root blocked, and ``hflow ledger settle`` refuses it while it is open.
     What closes it follows the order ``hflow resume`` decides in, read from stored facts only (no
-    process is probed here):
+    process is probed here, so the line names the condition, never whether it holds now):
 
-    * a run blocked ``outcome_unknown`` or ``owner_lost``: ``resume`` reconciles it - its existing
-      reconcile path, which waits on no owner - and records each open entry ``unknown`` or
+    * a run blocked ``owner_lost``: ``resume`` reconciles it - the takeover that blocked it already
+      proved the previous owner gone - and records each open entry ``unknown`` or
       ``launch_unknown``;
-    * a run with no owner token (written before storage v6, or a label-only claim) whose attempts
-      recorded a controller pid: that pid carries no host, so the owner can never be proven gone,
-      and ``resume`` takes no attestation - this build cannot close the entries;
+    * a run blocked ``outcome_unknown`` whose owner this build recorded (an owner token): the same
+      reconcile, but only once that owner is provably gone - the block (a cross-process
+      ``hflow cancel``, for one) does not prove its controller and agent stopped;
+    * a run blocked ``outcome_unknown`` with no owner token: reconciled without waiting on an owner
+      (none can be proven gone; ``cancel`` + ``resume`` is the documented way out for it);
+    * any other ended run with no owner token whose attempts recorded a controller pid: that pid
+      carries no host, so the owner can never be proven gone - ``resume`` closes the entries only
+      on the operator's attestation (``--legacy-owner-gone --attest``);
     * otherwise ``resume`` closes them once the run's owner is provably gone, as ``unknown`` or
       ``launch_unknown`` (or from the run's own recorded confirmed stop).
 
@@ -187,25 +192,42 @@ def _open_entry_lines(inspection: RunInspection) -> list[str]:
         f"open entries  {count} ledger entr{'y' if count == 1 else 'ies'} left open on this ended "
         f"run ({', '.join(open_ids)}) keep{'s' if count == 1 else ''} the root blocked: "
     )
-    if run.task_state is TaskState.BLOCKED and run.block_code in {
-        RefusalCode.OUTCOME_UNKNOWN.value,
-        RefusalCode.OWNER_LOST.value,
-    }:
+    owner_token = inspection.owner.token if inspection.owner is not None else None
+    reconciled = (
+        "recording each as unknown or launch_unknown, then `hflow ledger settle <invocation_id>`"
+    )
+    if run.task_state is TaskState.BLOCKED and run.block_code == RefusalCode.OWNER_LOST.value:
         return [
             head
-            + f"`hflow resume {run.run_id}` reconciles {them} - a run blocked {run.block_code} "
-            "is reconciled without waiting on its owner - recording each as unknown or "
-            "launch_unknown, then `hflow ledger settle <invocation_id>`"
+            + f"`hflow resume {run.run_id}` reconciles {them} - the takeover that blocked this "
+            f"run owner_lost already proved its previous owner gone - {reconciled}"
         ]
-    owner_token = inspection.owner.token if inspection.owner is not None else None
+    if run.task_state is TaskState.BLOCKED and run.block_code == RefusalCode.OUTCOME_UNKNOWN.value:
+        if owner_token is not None:
+            return [
+                head
+                + f"`hflow resume {run.run_id}` reconciles {them} once the run's owner is gone - "
+                "an outcome_unknown block (a cross-process `hflow cancel`, for one) does not "
+                "prove its controller and agent stopped, and while that owner may be alive "
+                f"resume writes nothing (exit 5) - {reconciled}"
+            ]
+        return [
+            head
+            + f"`hflow resume {run.run_id}` reconciles {them} - a run with no owner token is "
+            "reconciled without waiting on an owner, since none can be proven gone - "
+            f"{reconciled}"
+        ]
     if owner_token is None and any(a.process_id is not None for a in inspection.attempts):
         return [
             head
-            + f"this build cannot close {them}. The run has no owner token (written before "
-            "storage v6, or a label-only claim) and its attempts recorded a controller pid with "
-            f"no host, so its owner can never be proven gone: `hflow resume {run.run_id}` "
-            "refuses (it takes no attestation) and `hflow ledger settle` refuses an open entry, "
-            f"so {'it keeps' if count == 1 else 'they keep'} blocking the root"
+            + "the run has no owner token (written before storage v6, or a label-only claim) and "
+            "its attempts recorded a controller pid with no host, so HFlow can never prove its "
+            "owner gone. If you know that controller has exited, "
+            f"`hflow resume {run.run_id} --legacy-owner-gone --attest \"<what you know and why>\"` "
+            f"closes {them} on your attestation (recorded as one, never as an observation), then "
+            "`hflow ledger settle <invocation_id> --legacy-owner-gone`; until then `hflow ledger "
+            f"settle` refuses an open entry, so {'it keeps' if count == 1 else 'they keep'} "
+            "blocking the root"
         ]
     return [
         head

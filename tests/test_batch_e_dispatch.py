@@ -63,6 +63,7 @@ from hflow.report import report_json, status_text
 from hflow.store import Store, StoreError
 from hflow.verify import CheckRunners, FakeCheckRunner
 
+from .owner_exit import owner_exits, successor
 from .test_driver_acpx_dsh import FAKE_CLIENT, STUB_AGENT
 
 PROJECT_ID = "demo-project"
@@ -812,6 +813,7 @@ def test_a_silent_role_stopped_mid_run_is_not_recorded_as_never_launched(
     run_request: RunRequest,
     tmp_path: Path,
     role: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A cancelled, workless result after a stop recorded *during* the run proves no non-launch.
 
@@ -847,7 +849,9 @@ def test_a_silent_role_stopped_mid_run_is_not_recorded_as_never_launched(
         entry.invocation_id
     ]
 
-    controller.resume(outcome.run_id)
+    # Reconciled once the owner has exited: the cross-process stop did not end it.
+    owner_exits(store, outcome.run_id, controller, monkeypatch)
+    successor(controller).resume(outcome.run_id)
 
     reconciled = store.invocation(entry.invocation_id)
     assert reconciled is not None
@@ -1033,6 +1037,7 @@ def test_a_controller_interrupted_during_the_review_blocks_the_root_for_resume(
     project_root: Path,
     run_request: RunRequest,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``SystemExit`` escaping the reviewer's ``start`` is recorded before it propagates.
 
@@ -1078,7 +1083,8 @@ def test_a_controller_interrupted_during_the_review_blocks_the_root_for_resume(
     }, states
     assert [entry.role for entry in store.pending_invocations(binding.root_id)] == ["reviewer"]
 
-    controller.resume(run_id)
+    owner_exits(store, run_id, controller, monkeypatch)  # the interrupted controller exits
+    successor(controller).resume(run_id)
 
     assert implementer.cancel_calls == [] and reviewer.cancel_calls == []
     assert len(implementer.started) == 1 and len(reviewer.started) == 1, "resume never re-dispatches"
@@ -1934,6 +1940,7 @@ def test_a_stop_after_an_unknown_outcome_keeps_the_entry_unknown_and_the_run_rec
     project_root: Path,
     run_request: RunRequest,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A confirmed *local* stop says nothing about a result nobody observed.
 
@@ -1987,7 +1994,8 @@ def test_a_stop_after_an_unknown_outcome_keeps_the_entry_unknown_and_the_run_rec
         )
     assert "unresolved invocation" in str(refused.value), str(refused.value)
 
-    resumed = controller.resume(run_id)
+    owner_exits(store, run_id, controller, monkeypatch)  # reconciled once its owner has exited
+    resumed = successor(controller).resume(run_id)
     assert resumed.block_code is RefusalCode.OUTCOME_UNKNOWN
     assert driver.reconciled == [before.invocation_id], "resume still reconciles the run"
     assert len(driver.started) == 1, "resume never re-dispatches"
@@ -2136,6 +2144,7 @@ def test_a_late_result_after_an_unconfirmed_stop_changes_nothing_for_either_role
     tmp_path: Path,
     role: str,
     late: InvocationOutcome,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """AGENTS rules 4 and 8, with one rule for both roles.
 
@@ -2191,7 +2200,8 @@ def test_a_late_result_after_an_unconfirmed_stop_changes_nothing_for_either_role
     assert "unresolved invocation" in str(refused.value), str(refused.value)
 
     started = len(driver.started)
-    resumed = controller.resume(run_id)
+    owner_exits(store, run_id, controller, monkeypatch)  # reconciled once the owner has exited
+    resumed = successor(controller).resume(run_id)
     assert resumed.block_code is RefusalCode.OUTCOME_UNKNOWN
     assert len(driver.started) == started, "resume never re-dispatches"
     reconciled = store.invocation(entry.invocation_id)
@@ -2556,6 +2566,7 @@ def test_a_cancel_that_fails_before_the_block_is_finished_by_the_next_cancel(
     assert store.cancel_state(run_id)[1] == receipt
     if stopper == "observer":
         (entry,) = store.invocations_for(run_id)
+        owner_exits(store, run_id, controller, monkeypatch)  # reconciled once the owner has exited
         resumed = stopping.resume(run_id)
         assert resumed.block_code is RefusalCode.OUTCOME_UNKNOWN
         assert observer_driver.reconciled == [entry.invocation_id], "resume must reconcile it"

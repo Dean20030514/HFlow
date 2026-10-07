@@ -8,6 +8,8 @@ model: integration itself never does.
 from __future__ import annotations
 
 import json
+import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -37,7 +39,12 @@ from hflow.contracts import (
 from hflow.controller import Controller
 from hflow.drivers.fake import FakeDriver, FakeScript
 from hflow.gitworkspace import GitRepo
-from hflow.integrate import apply_integration, prepare_integration, reconcile_integration
+from hflow.integrate import (
+    _shell_word,
+    apply_integration,
+    prepare_integration,
+    reconcile_integration,
+)
 from hflow.ownership import Probe
 from hflow.store import Store
 from hflow.verify import CheckRunners
@@ -258,8 +265,10 @@ def test_squash_prepare_builds_one_checked_commit_and_moves_nothing(scene: Scene
     assert record.worktree_state == "REMOVED"
     assert not Path(record.worktree_path).exists()
     assert scene.user_state() == user_before
+    # The scene's ledger is not the default one, so the printed command names it.
     assert outcome.handoff == [
-        f"hflow integrate apply {record.integration_id} --expect-target {scene.base}"
+        f"hflow integrate apply {record.integration_id} --expect-target {scene.base} "
+        f"--data-dir {_shell_word(os.path.abspath(scene.data_dir))}"
     ]
 
 
@@ -635,6 +644,179 @@ def test_cli_prepare_apply_show_and_status(
     assert main(["integrate", "show", "G-missing", *data]) == 4
 
 
+# --------------------------------------------------------------------------
+# printed next commands: pasted as printed, they reach the same ledger
+# --------------------------------------------------------------------------
+
+
+def _paste(command: str) -> list[str]:
+    """The argv an operator's shell hands ``hflow`` for a printed command, without ``hflow``.
+
+    POSIX word splitting reads the double-quoted Windows form of these paths as PowerShell does.
+    """
+    argv = shlex.split(command)
+    assert argv[0] == "hflow", command
+    return argv[1:]
+
+
+def test_a_printed_apply_command_names_the_data_dir_and_works_as_pasted(
+    scene: Scene, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """With a non-default ``--data-dir`` the printed command used to omit it and exit 4."""
+    run_id = scene.accept()
+    project_file = tmp_path / "project.json"
+    project_file.write_text(scene.project.model_dump_json(), encoding="utf-8")
+    scene.store.close()
+
+    assert main(["--data-dir", str(scene.data_dir), "integrate", "prepare", run_id, "--target",
+                 "main", "--project", str(project_file)]) == 0
+    printed = capsys.readouterr().out.splitlines()
+    [command] = [line.removeprefix("next").strip() for line in printed if line.startswith("next ")]
+    assert command.endswith(f" --data-dir {_shell_word(os.path.abspath(scene.data_dir))}")
+    argv = _paste(command)
+
+    # Without it the command opens the default ledger, where this integration does not exist.
+    at = argv.index("--data-dir")
+    assert main(argv[:at] + argv[at + 2 :]) == 4
+    capsys.readouterr()
+
+    assert main(argv) == 0
+    assert "INTEGRATED (hflow_ref_update)" in capsys.readouterr().out
+    assert scene.tip() != scene.base
+
+
+def test_a_printed_command_names_no_data_dir_when_the_default_reaches_the_ledger(
+    scene: Scene, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HFLOW_DATA_DIR", str(scene.data_dir))
+    run_id = scene.accept()
+
+    outcome = scene.prepare(run_id)
+
+    assert outcome.handoff == [
+        f"hflow integrate apply {outcome.record.integration_id} --expect-target {scene.base}"
+    ]
+
+
+def test_a_checked_out_hand_off_prints_commands_that_work_as_pasted(
+    scene_on_main: Scene, capsys: pytest.CaptureFixture[str]
+) -> None:
+    scene = scene_on_main
+    run_id = scene.accept()
+    prepared = scene.prepare(run_id)
+    record = prepared.record
+    merge, reconcile = prepared.handoff
+    assert merge.startswith("git -C ") and merge.endswith(
+        f" merge --ff-only {record.integration_commit}"
+    )
+    assert reconcile == (
+        f"hflow integrate reconcile {record.integration_id} "
+        f"--data-dir {_shell_word(os.path.abspath(scene.data_dir))}"
+    )
+
+    subprocess.run(  # noqa: S603 - the printed command, as an operator would paste it
+        shlex.split(merge),
+        capture_output=True,
+        check=True,
+        timeout=60,
+        env={
+            **os.environ,
+            "GIT_COMMITTER_NAME": "Sample Author",
+            "GIT_COMMITTER_EMAIL": "author@example.invalid",
+        },
+    )
+    assert scene.tip() == record.integration_commit
+    scene.store.close()
+    assert main(_paste(reconcile)) == 0
+    assert "INTEGRATED (operator_merge_observed)" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("text", "windows", "expected"),
+    [
+        ("C:\\Users\\a b\\HFlow data", True, '"C:\\Users\\a b\\HFlow data"'),
+        ("C:\\$data\\x", True, "'C:\\$data\\x'"),
+        ("C:\\it's `x`", True, "'C:\\it''s `x`'"),
+        ("C:\\a\u2019b$", True, "'C:\\a\u2019\u2019b$'"),
+        ("C:\\a\u201cb", True, "'C:\\a\u201cb'"),
+        # A root is the one directory printed with a trailing backslash: ``.`` keeps that
+        # backslash away from the closing quote.
+        ("C:\\", True, '"C:\\."'),
+        ("\\\\srv\\my share\\", True, '"\\\\srv\\my share\\."'),
+        ("D:\\$x y\\", True, "'D:\\$x y\\.'"),
+        ("/srv/hflow data", False, "'/srv/hflow data'"),
+        ("/srv/it's", False, "'/srv/it'\"'\"'s'"),
+        ("/srv/plain", False, "/srv/plain"),
+        ("/", False, "/"),
+    ],
+)
+def test_a_printed_path_is_one_word_in_the_documented_shells(
+    text: str, windows: bool, expected: str
+) -> None:
+    """PowerShell on Windows (double quotes unless it would expand or end there), sh elsewhere."""
+    assert _shell_word(text, windows=windows) == expected
+
+
+def _powershell(name: str) -> str | None:
+    """``pwsh.exe`` / ``powershell.exe`` on an absolute PATH entry, on Windows only."""
+    if os.name != "nt":
+        return None
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = Path(entry) / f"{name}.exe"
+        if entry and Path(entry).is_absolute() and candidate.is_file():
+            return str(candidate)
+    return None
+
+
+@pytest.mark.parametrize(
+    "shell",
+    [
+        pytest.param(
+            _powershell(name),
+            id=name,
+            marks=pytest.mark.skipif(_powershell(name) is None, reason=f"needs {name} on Windows"),
+        )
+        for name in ("pwsh", "powershell")
+    ],
+)
+def test_a_printed_path_reaches_the_program_as_that_directory_through_powershell(
+    tmp_path: Path, shell: str | None
+) -> None:
+    """Pasted into PowerShell, each word arrives as one argument naming the same directory.
+
+    Windows PowerShell 5.1 is the strict one: it re-quotes an argument that holds a space for
+    the program, so a printed ``"C:\\my dir\\"`` would arrive as ``C:\\my dir" <next word>``.
+    """
+    paths = [
+        "C:\\",
+        "C:\\my dir\\",
+        "C:\\Users\\a b\\HFlow data",
+        "C:\\$data x\\",
+        "C:\\it's `x`",
+        "C:\\100% done",
+    ]
+    echo = tmp_path / "echo_argv.py"
+    echo.write_text("import json, sys\nprint(json.dumps(sys.argv[1:]))\n", encoding="utf-8")
+    words = " ".join(f"{_shell_word(path, windows=True)} next" for path in paths)
+    script = tmp_path / "paste.ps1"
+    script.write_text(
+        f"& {_shell_word(sys.executable, windows=True)} {_shell_word(str(echo), windows=True)} "
+        f"{words}\n",
+        encoding="utf-8-sig",  # Windows PowerShell 5.1 reads a script without a BOM as ANSI
+    )
+    completed = subprocess.run(
+        [str(shell), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
+         str(script)],
+        capture_output=True, text=True, timeout=120, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    argv = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert argv[1::2] == ["next"] * len(paths), argv
+    assert [os.path.normpath(word) for word in argv[0::2]] == [
+        os.path.normpath(path) for path in paths
+    ], argv
+
+
 def test_a_prepare_that_dies_right_after_worktree_add_leaves_nothing_unrecorded(
     scene: Scene, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -699,7 +881,10 @@ def test_a_failed_ref_update_returns_to_ready_and_does_not_exit_zero(
     assert code == 3, "a branch that did not move is not a successful apply"
     out = capsys.readouterr().out
     assert "cannot lock ref" in out
-    assert f"next          hflow integrate apply {prepared.integration_id}" in out
+    assert (
+        f"next          hflow integrate apply {prepared.integration_id} --expect-target "
+        f"{scene.base} --data-dir {_shell_word(os.path.abspath(scene.data_dir))}\n"
+    ) in out
     store = Store(scene.data_dir / "hflow.sqlite")
     try:
         record = store.integration(prepared.integration_id)

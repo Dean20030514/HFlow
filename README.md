@@ -141,6 +141,7 @@ tested, so they are recorded rather than asserted:
 | 2026-10-05 working tree on `35751aa` (immutable admission binding, guarded cleanup and reconciliation, bounded raw/protocol output, unreadable-record diagnostics) | `python -m pytest -q` | `1382 passed, 1 skipped in 771.05s` (exit 0; 1383 collected) |
 | 2026-10-06 working tree on `bdb33ba` (void-aware repair admission, session-bound model observations, protocol read failures, artifact IO settlement, streaming candidate hashes; 82 added regression cases) | `python -m pytest -q` | `1464 passed, 1 skipped in 843.65s` (exit 0; 1465 collected) |
 | 2026-10-06 batch I working tree on `9d4fc3b` (controlled integration `hflow integrate`, storage v8, ledger close-out of ended runs by `resume`, and the fixes from two adversarial reviews) | `python -m pytest -q -n 8 -p no:cacheprovider` (pytest-xdist) | `1633 passed, 1 skipped in 314.30s` (exit 0) |
+| 2026-10-07 batch J tree on `76f1437` (credential-source refusal, `resume` owner check and legacy attestation, no current-directory program search, doctor readiness, inert git environment, printed `--data-dir`, CLI end-to-end loop, real-process fault drills, acpx #770 regression) | `python -m pytest -q -n 8 -p no:cacheprovider -rs` (pytest-xdist; `.probe/acpx` and `.probe/m2-live` present) | `1762 passed, 1 skipped in 595.04s` (exit 0) |
 
 The 2026-10-05 snapshot is offline verification, including actual Git repositories and local
 stand-in processes. It adds no live-model compatibility observation or capability upgrade;
@@ -185,7 +186,8 @@ locale, and one more when the temp directory lies inside a Git checkout.
 ## Commands
 
 ```sh
-hflow doctor   --json                     # read-only environment probe, no model calls
+hflow doctor   --json                     # read-only environment probe, no model calls; never
+                                          # runs dsh; integrate/acpx/dsh/credential readiness
 hflow doctor   --profile dsh-local        # resolve a profile per role; non-zero if unusable
 hflow prepare  --task t.json --profile dsh-local   # zero-model preview: config, admission,
                                                    # scope, checks, budget, packet preview
@@ -200,8 +202,11 @@ hflow run      --task t.json --profile dsh-local --authorization-file auth.json 
 hflow status   R-xxxxxxxxxx               # pure SQLite read, zero model calls
 hflow report   R-xxxxxxxxxx --json        # receipt + evidence + the config it ran under
 hflow resume   R-xxxxxxxxxx               # reconcile an interrupted attempt, or close the
-                                          # open ledger entries of an ended run once its
-                                          # owner is gone; never re-dispatches
+                                          # open ledger entries of an ended run - both once
+                                          # its owner is gone; never re-dispatches
+hflow resume   R-xxxxxxxxxx --legacy-owner-gone --attest "<what you know and why>"
+                                          # a pre-v6 ended run: close its open entries on
+                                          # your attestation that its controller exited
 hflow cancel   R-xxxxxxxxxx               # for a run another process is executing: records
                                           # the stop, reports unknown, blocks outcome_unknown
 hflow clean    R-xxxxxxxxxx               # preview releasing the run's worktree
@@ -243,6 +248,13 @@ dispatch, `4` usage (including every argument-parsing error), `5` the run exists
 finished (`DRAFT`/`READY`/`RUNNING`/`CHECKING`, e.g. a submission that found the run claimed by
 another owner process, `resume` refusing a takeover because that owner may be alive, or an
 undispatched run whose recorded admission binding is missing or differs from this submission).
+`resume` also exits `5`, whatever the run's own state, whenever it refused on the owner rule and
+wrote nothing: an `outcome_unknown` run whose owner may still be alive, or an ended run whose open
+ledger entries it may not close yet (an owner that may be alive, or a pre-v6 owner nobody attested
+gone) - never the `3` or `0` that would read as "done". It also exits `5` when one of its store
+writes failed (`database is locked`, for one): stderr says so, that transaction was rolled back
+whole (an ended run's entry closure and the attestation it records commit together), and `resume`
+can be run again.
 `6`: `status`/`report` found the run but a stored record it needs no longer validates
 (`StoredRecordUnreadable`); one line names the record and no replacement record is inferred.
 `cancel`/`resume` can still work from the run row without those presentation records.
@@ -254,10 +266,31 @@ branch is checked out, or a ref update that failed), `4` unknown id, `5` another
 still be working on it, `6` an unreadable stored record (see `docs/operations.md`, "Integrating an
 accepted candidate").
 
-Without installing, run through the module path:
+`130`: interrupted - a Ctrl+C reached the command (it was `4` before). The process stopped where it
+was and retried nothing; what it recorded before the interrupt is authoritative, so read it with
+`hflow status <run-id>` (or `hflow integrate show <integration-id>`). `hflow doctor` exits `0`, or
+`2` when a named profile cannot be used; its readiness lines - whether `hflow integrate` can run
+with the Git on PATH (it needs Git 2.40), where the acpx entry resolves from (never PATH:
+`HFLOW_ACPX_CLI`, then `<data-dir>/m0/acpx`, then the checkout's `.probe/acpx`; a profile cannot
+name it), where `dsh` is (path only, never run; with none on PATH on Windows, the DSH Desktop shim
+under `%LOCALAPPDATA%\Programs\DeepSeek Harness\resources\runtime\cli\bin` if it exists, which you
+prepend to PATH yourself) and the credential sources a child could have (`DEEPSEEK_API_KEY` by name,
+a bound `DSH_HOME`'s `.credentials.yaml` and `.env` by stat), saying plainly when a real launch
+would be refused for having none (`no_credential_source`) - never change it.
+
+Text output of `run` refusals and `resume` is `key: value` lines (a list as `- item` lines, a
+nested record as one compact JSON line); `--json` is unchanged canonical JSON.
+
+`python -m hflow` is the same entry point as the `hflow` command (`src/hflow/__main__.py`): after
+`python -m pip install -e .` it works from anywhere; without installing, put `src` on the module
+path from the checkout root:
 
 ```sh
-python -c "import sys; sys.path.insert(0,'src'); from hflow.cli import main; raise SystemExit(main())" run --task examples/task.json --project-root . --driver fake
+PYTHONPATH=src python -m hflow run --task examples/task.json --project-root . --driver fake
+```
+
+```powershell
+$env:PYTHONPATH = "src"; python -m hflow run --task examples/task.json --project-root . --driver fake
 ```
 
 ## Data ownership (three kinds, kept apart)
@@ -357,20 +390,49 @@ the project contract, the machine profile, the authorization artifact, the root 
   failed, or any outcome (`ACCEPTED` included) after a settlement write failed - with an entry
   still `reserved`/`requested`/`started`, which blocks its root and which `ledger settle`
   refuses. Once the run's owner is provably gone, by the same owner rule `ledger settle` applies
-  (a pre-v6 run that recorded a controller pid is refused: `resume` takes no attestation),
-  `resume` closes such an entry from the run's own recorded confirmed stop when that stop ended
-  the run (as the stop would have), and otherwise as `unknown` (a launch was recorded) or
+  (a pre-v6 run that recorded a controller pid only on your attestation: `--legacy-owner-gone
+  --attest "<text>"`, below), `resume` closes such an entry from the run's own recorded confirmed
+  stop when that stop ended the run (as the stop would have), and otherwise as `unknown` (a
+  launch was recorded) or
   `launch_unknown` (no launch recorded), then writes a `dispatch:` note. It never dispatches, calls
   no driver, refunds nothing and leaves the run's state, block code, receipt and outcome as they
   were. An entry closed from the stop fact (`settled` or `not_started`) is final and no longer
   blocks the root; an `unknown`/`launch_unknown` one blocks it until `hflow ledger settle`
   closes it. While the owner
-  may be alive it writes nothing and says why, a second `resume` is a no-op, and every closure is
-  a compare-and-set, so two overlapping calls never close an entry twice and each describes only
-  what it closed (one that closed nothing writes no note). `status`/`report` show one
-  `open entries` line naming what closes them: `resume` once the owner is gone; `resume`'s
-  reconcile, without waiting on the owner, for a run blocked `outcome_unknown`/`owner_lost`; or
-  nothing in this build, for a pre-v6 run whose attempts recorded a controller pid.
+  may be alive it writes nothing, says why and exits `5`, a second `resume` is a no-op, and every
+  closure is a compare-and-set, so two overlapping calls never close an entry twice and each
+  describes only what it closed (one that closed nothing writes no note). `status`/`report` show
+  one `open entries` line naming what closes them: `resume` once the owner is gone; `resume`'s
+  reconcile for a run blocked `owner_lost` (its owner was proven gone by the takeover) or
+  `outcome_unknown` (once its owner is gone when it has an owner token, at once when it has none);
+  or `resume --legacy-owner-gone --attest` for a pre-v6 run whose attempts recorded a controller
+  pid.
+- **`hflow resume <run_id> --legacy-owner-gone --attest "<text>"`** (batch J, mirroring
+  `ledger settle --legacy-owner-gone`). A run written before owner identity existed recorded its
+  controller pid with no host, so HFlow can never prove that controller gone, and an ended run
+  of that kind left its open entries blocking the root for good. With the flag you attest that
+  the controller has exited; `--attest` is required with it (1-2000 characters, no NUL; blank,
+  oversized, `--attest` without the flag, or the flag without `--attest` is a usage error, exit
+  `4`, and nothing is read or written). It passes exactly that one blocker: `resume` then closes
+  the entries as above, every closed entry's detail and the `dispatch:` note say "the operator
+  attested ...; an attestation, not an observation", and an `operator_attestation:` run note
+  keeps your words verbatim with the OS user (recorded, not authenticated). It is recorded only
+  when it closed something. An owner recorded by this build is judged by the takeover rule
+  whatever you attest, a live run is never taken over on it, and when the flag decides nothing
+  `resume` says it was not used and records none of it. Settling each entry afterwards is its own
+  attestation: `hflow ledger settle <invocation_id> --legacy-owner-gone`.
+- **`resume` reconciles an `outcome_unknown` run only once its owner is gone** (batch J). An
+  `outcome_unknown` block does not prove the owning controller stopped: a cross-process
+  `hflow cancel` holds no handle to its agent, so it blocks the run while that controller and
+  agent may keep running. For a run whose owner this build recorded, `resume` applies the owner
+  half `ledger settle` applies - its own controller refuses, and another owner passes only when its
+  lock can be taken **and** its identity reads `gone` - and otherwise writes nothing (no ledger
+  closure, no reconcile record, no note, no driver call), says why and exits `5`; run it again
+  once that controller has exited or you have stopped its process tree. A run with no owner token
+  (pre-v6, or a label-only claim) is reconciled as before - `hflow cancel` followed by
+  `hflow resume` stays its way out - and `owner_lost` is unchanged. Limit: an owner that reads
+  `unknown` (another host, elevated or another user, every owner off Windows) keeps such a run
+  from being reconciled, as it keeps a live run from being taken over; no attestation passes it.
 - **A repair is classified from a stored execution fact, never from prose.** `evidence.exit_reason`
   records *why* a check ended (`completed`, `nonzero_exit`, `timed_out`, `settlement_forced`,
   `output_capture_error`, ...), and an automatic repair needs that reason to say the check ran to
@@ -454,9 +516,11 @@ the project contract, the machine profile, the authorization artifact, the root 
   the scope and every deny list again after the freeze and at acceptance, and every path list is
   taken with `--no-renames`, so a moved file names both its old and its new path. HFlow's own Git
   commands run with hooks, `core.fsmonitor`, commit signing, `core.ignoreStat` and sparse
-  checkout switched off - settings a caller's `git -c` cannot override - and without an inherited
-  `GIT_DIR` or other repository-locating variable. The shared Git metadata those commands read
-  from outside the worktree - every configuration key in your checkout and the run's worktree, the
+  checkout switched off and `safe.bareRepository=explicit` - settings a caller's `git -c` cannot
+  override - with no graft file, and without an inherited `GIT_DIR` or other repository-locating
+  variable or one that redirects history, configuration, attributes or diff output. The shared Git
+  metadata those commands read from outside the worktree - every configuration key in your
+  checkout and the run's worktree, the
   files it comes from, both `config.worktree` files, `.git/info/attributes` and the global
   attributes file - is snapshotted after `worktree add` and before the first dispatch, and
   compared before the freeze, before a repair round (`workspace_drift`) and at acceptance. Any
@@ -485,8 +549,8 @@ the project contract, the machine profile, the authorization artifact, the root 
 - `prepare` exits non-zero both for a task admission refuses **and** for a dispatch precondition
   a run would refuse on (a write scope with no worktree or no write opt-in, a required review the
   budget cannot cover, a launch this machine cannot resolve, a starting workspace that already
-  holds `.acpxrc.json`). Reporting "ready" for a task the
-  run refuses would be answering a different question than the user asked.
+  holds `.acpxrc.json`, a launch with no credential source visible). Reporting "ready" for a task
+  the run refuses would be answering a different question than the user asked.
 - An authorization binds the **effective configuration**, not just the task: profile, per-role
   agents and drivers, model selections, limits, write permission, and the *resolved launch* -
   the client entry point, the interpreter that starts it, the launcher argv (the DSH batch shim
@@ -503,8 +567,10 @@ the project contract, the machine profile, the authorization artifact, the root 
   inherited. With none bound, DSH uses a per-invocation, empty home
   `<data-dir>/invocations/<id>/home/.dsh` - no stored credentials, patch files, AGENTS.md or
   skills (inferred from upstream source, not observed); `prepare`, `doctor` and each invocation's
-  record name it. An artifact written before config binding still loads and still keys its own
-  ledger row, but it cannot authorize a run that resolved a configuration. The binding also
+  record name it. Such a launch therefore needs `DEEPSEEK_API_KEY` in its environment, or it is
+  refused `no_credential_source` (see "Not implemented"). An artifact written before config
+  binding still loads and still keys its own ledger row, but it cannot authorize a run that
+  resolved a configuration. The binding also
   carries the project contract's digest and the roles the run will dispatch, so **every artifact
   issued before the project-contract binding must be re-issued**, whenever it was written (one
   without the contract digest is refused, naming why); copy a fresh binding from
@@ -555,6 +621,22 @@ the project contract, the machine profile, the authorization artifact, the root 
   inherited as they are), and ambient `DSH_PERMISSION_MODE` / `DSH_TOOLS_MODE` are removed, so
   neither a repository file nor the operator's shell can change what was approved. See "Client
   launch hardening" in `docs/operations.md`.
+- **No real launch starts with no credential source visible** (user ruling 2026-10-07: refuse
+  before dispatch). `DEEPSEEK_API_KEY` missing from the child's launch environment (looked up by
+  name; the value is never read) and neither `.credentials.yaml` nor `.env` in the DSH home the
+  child would use (stat only; an unbound `DSH_HOME` means the empty per-invocation home, so only
+  the environment counts) refuses the run `no_credential_source` - at admission before anything
+  is recorded, reserved or charged, and at the driver's spawn gate before any process exists. It
+  is a presence check, not a validity check.
+- **HFlow itself never runs a program from the directory it was started in.** Before any command
+  runs, `hflow` sets `NoDefaultCurrentDirectoryInExePath=1` in its own environment (every other
+  spelling removed first). On Windows, `CreateProcess` given a bare name searches the *parent's*
+  current directory before `PATH`; HFlow starts bare `git` for worktrees, freezing and
+  integration and starts an approved check's argv as approved, so a `git.exe` planted in the
+  directory `hflow` was started from ran instead of Git (observed on Windows 11, Python 3.14.7).
+  This covers what the HFlow process starts. It is not passed to an approved check's own
+  environment (the check allowlist), so a bare name a check process itself starts is still
+  searched in that process's working directory first, as Windows does by default.
 - A turn's outcome is taken only from the response to its own observed prompt: a completion that
   answers another request is `outcome_unknown` (`unbound_completion`) for either role; a JSON-RPC
   error answering that prompt (ACP v1's failed-prompt shape; DSH sends `Internal error: turn
@@ -656,10 +738,11 @@ command; publish delivery (no push, no pull request, no remote of any kind) and 
 a branch that is checked out (HFlow hands that merge to you instead of writing your checkout); a
 second review of a `replayed` integration tree (it is checked, not reviewed again); automatic
 resolution of an integration conflict; reuse-research automation; teams and
-native subagents; real billing observation; metrics against a direct-DSH baseline; an operator
-command that closes an entry left open on an ended pre-v6 run whose attempts recorded a
-controller pid (`resume` refuses it because that pid carries no host and `resume` takes no
-attestation, so that root stays blocked); the upgrade of the pinned acpx
+native subagents; real billing observation; metrics against a direct-DSH baseline; any
+operator attestation for an owner that reads `unknown` although this build recorded it (another
+host, elevated, off Windows: such a run's open entries and an `outcome_unknown` reconcile wait for
+an owner HFlow can never prove gone - `--legacy-owner-gone` covers only a pre-v6 owner); the
+upgrade of the pinned acpx
 from 0.17.1 to 0.19.x (surveyed, deliberately deferred); reading a prompt answered with a
 JSON-RPC error as `failed` - it stays `outcome_unknown` with its code recorded, even for DSH's
 pre-model forms, because telling them apart means reading DSH's message text, and that
@@ -722,9 +805,10 @@ Not built around configuration either:
   receipt, names the
   driver recorded for the run (never the offline fake for a production run), and blocks the run
   `outcome_unknown` - for offline runs too, since the fake confirms only the stops of
-  invocations its own instance started; `resume` reconciles once the owning controller has
-  exited. The root stays blocked only while the stopped invocation's ledger entry is still open:
-  such a cancel settles no entry, but one that lands during the checks or the review handoff
+  invocations its own instance started; `resume` reconciles once the owning controller is
+  provably gone, and until then writes nothing and exits `5`. The root stays blocked only while
+  the stopped invocation's ledger entry is still open: such a cancel settles no entry, but one
+  that lands during the checks or the review handoff
   (the implementer's entry already settled, no reviewer registered yet) leaves no open entry, and
   the run is no longer live once it is blocked, so the root accepts a new revision immediately -
   even while the original controller is still finishing its checks, in the same workspace for an
@@ -752,8 +836,9 @@ Not built around configuration either:
   `BLOCKED` relabels a run that already ended or carries a receipt, and a controller never records
   its own refusal as the block of a run whose attempt another controller reserved. A controller
   interrupted (Ctrl+C, `SystemExit`) while an invocation is starting or running leaves an
-  `outcome_unknown` run that `resume` reconciles. A hard kill, a power loss or an interrupt outside
-  a driver start records nothing and leaves the run `RUNNING`; `resume` then takes it over only if
+  `outcome_unknown` run that `resume` reconciles once that controller's process has exited. A
+  hard kill, a power loss or an interrupt outside a driver start records nothing and leaves the
+  run `RUNNING`; `resume` then takes it over only if
   its owner is proven gone, and blocks it `owner_lost` (below). And this covers the one driver that
   creates processes here (`AcpxDshDriver`); another driver must coordinate its own spawn the same
   way.
@@ -809,7 +894,8 @@ Not built around configuration either:
   does not detect such a location. An owner running elevated or as another user, an owner on
   another host, and every owner off Windows (no creation time is read there - documented, not
   observed) read `unknown`, so their runs stay blocked from takeover until the operator ends them
-  some other way. The OS releases a hard-killed owner's lock promptly but not instantly, so a
+  some other way - and, since batch J, an `outcome_unknown` block (an `hflow cancel`) is no such
+  way: `resume` does not reconcile it while its owner reads `unknown` either. The OS releases a hard-killed owner's lock promptly but not instantly, so a
   takeover right after a kill can be refused once (fail closed; run `resume` again). Sleep or
   hibernation keeps the owner alive, so nothing is taken over. A pre-v6 run that recorded a
   controller pid cannot be taken over at all: that pid carries no host, and a local lookup of
@@ -869,6 +955,26 @@ Not built around configuration either:
   absolute directory outside them, or unset it; the per-invocation home HFlow creates when it is
   unbound is unaffected. Not covered: 8.3 short names that `realpath` does not expand, and other
   directories the agent can write.
+- **A real launch with no credential source visible is refused, by presence only** (user ruling
+  2026-10-07, given in chat: "Refuse before dispatch"). Without a credential DSH fails with a
+  no-API-key error before any model work (observed in M0); HFlow would then record
+  `outcome_unknown`, spend the approved submission and leave a ledger entry for
+  `hflow ledger settle`. So on a real driver a launch is refused `no_credential_source` when
+  `DEEPSEEK_API_KEY` is not among the child's launch-environment variable names and the DSH home the child would use
+  holds neither `.credentials.yaml` nor `.env` as a regular file. DSH's documented precedence (not
+  observed) is the launch environment, `$DSH_HOME/.credentials.yaml`, `<cwd>/.env` (never launched
+  on: `workspace_env_file`), `$DSH_HOME/.env`; with `DSH_HOME` unbound the home is the empty
+  per-invocation one, so only the environment counts and the home is not looked into. `prepare`
+  lists it as a dispatch precondition and the run gate refuses it before a run row, an
+  authorization record, a reservation or a process exists (exit `2`); the driver's spawn gate
+  checks again on the environment it actually builds (its own `extra_env` included), for every
+  invocation, a repair round's too, so a variable removed or a home file deleted after admission
+  blocks the run with nothing started - the remedy is then a new revision, as for the other
+  spawn-gate refusals. `hflow doctor` says when a real launch would be refused. The key's value and
+  the files' contents are never read, printed, hashed or stored; the files are only stat'ed - never
+  opened, and no size or digest of them is kept. Not covered: whether the credential is valid - an
+  empty, mistyped, revoked or unfunded key, or a home file that holds no credential, passes, and
+  DSH still fails after the dispatch. The offline fake driver is unaffected.
 - **A candidate's change to the files DSH loads as context is refused unless declared; a declared
   one is shown as data, but DSH still loads it.** The list is `AGENTS.md`, `CLAUDE.md`,
   `AGENTS.local.md` and `CLAUDE.local.md` at any depth, the root `.dsh/skills/**` and
@@ -916,16 +1022,23 @@ Not verified, even where something works on one binding:
   a forced stop or a deadline teardown (`completion_timeout`) does not kill even the direct child.
 - **Shared Git metadata is compared, not confined.** Every Git command HFlow runs through
   its repository handle forces `core.hooksPath` to an empty HFlow-owned directory,
-  `core.fsmonitor=false`, `commit.gpgsign=false`, `core.ignoreStat=false` and
-  `core.sparseCheckout=false` - through `GIT_CONFIG_COUNT`, and appended to an inherited
-  `GIT_CONFIG_PARAMETERS` as well, so a caller's `git -c` cannot override them - sets
-  `GIT_CONFIG_NOSYSTEM` and `GIT_NO_REPLACE_OBJECTS`, and drops an inherited `GIT_DIR`,
-  `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
-  `GIT_COMMON_DIR` and `GIT_NAMESPACE`; the freeze commit also passes `--no-verify`. So no
-  repository, user, worker or caller hook, monitor command or signer runs while a worktree is
-  created, a candidate is frozen or a ref is written, HFlow's own `worktree add` never checks an
-  entry out flagged assume-unchanged or skip-worktree (a flag set any other way refuses the
-  freeze), and the user's global config is still read for everything else. But a worktree shares
+  `core.fsmonitor=false`, `commit.gpgsign=false`, `core.ignoreStat=false`,
+  `core.sparseCheckout=false` and `safe.bareRepository=explicit` - through `GIT_CONFIG_COUNT`,
+  and appended to an inherited `GIT_CONFIG_PARAMETERS` as well, so a caller's `git -c` cannot
+  override them - sets `GIT_CONFIG_NOSYSTEM` and `GIT_NO_REPLACE_OBJECTS`, points
+  `GIT_GRAFT_FILE` at a file that never exists (so neither an inherited graft file nor a
+  worker-written `.git/info/grafts` changes ancestry), and drops an inherited `GIT_DIR`,
+  `GIT_WORK_TREE`, `GIT_IMPLICIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`,
+  `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_COMMON_DIR`, `GIT_NAMESPACE`, `GIT_PREFIX`,
+  `GIT_DISCOVERY_ACROSS_FILESYSTEM`, `GIT_CONFIG`, `GIT_SHALLOW_FILE`, `GIT_REPLACE_REF_BASE`,
+  `GIT_ATTR_SOURCE`, `GIT_EXTERNAL_DIFF`, `GIT_DIFF_OPTS` and the four `GIT_*_PATHSPECS`
+  variables; `GIT_CEILING_DIRECTORIES` is kept, since it can only stop discovery. The freeze
+  commit also passes `--no-verify`. So no repository, user, worker or caller hook, monitor command
+  or signer runs while a worktree is created, a candidate is frozen or a ref is written, a worker
+  that replaces its worktree's `.git` file with a bare repository's layout gets every later HFlow
+  git call there refused instead of its configuration read, HFlow's own `worktree add` never
+  checks an entry out flagged assume-unchanged or skip-worktree (a flag set any other way refuses
+  the freeze), and the user's global config is still read for everything else. But a worktree shares
   `.git/config` with the repository and a worker can write it: it can configure a clean, smudge or
   process filter there and select it through `.git/info/attributes` or `core.attributesFile`,
   with no `.gitattributes` in its scope. A status read can run such a filter, not only `git add` -
@@ -984,7 +1097,9 @@ Not verified, even where something works on one binding:
   (rulings 2026-10-03, bullets above): a root `.env` in the workspace DSH starts in
   (`workspace_env_file`; never parsed or opened) and a bound DSH home inside or around the
   workspace (`dsh_home_in_workspace`); the rest is recorded only, and a `$DSH_HOME/.env` outside
-  the workspace is not refused.
+  the workspace is not refused. A launch with no credential source at all - no
+  `DEEPSEEK_API_KEY` name and no home `.credentials.yaml` or `.env` - is refused too
+  (`no_credential_source`, ruling 2026-10-07).
 - **Nothing is sandboxed.** `command` checks and a real worker run with the current user's
   rights: no filesystem confinement, no credential confinement, and no protection against
   another process of the same user changing the workspace, the authorization artifact or the
@@ -1030,6 +1145,7 @@ python -m pytest -q tests/test_check_resources.py        # 22 tests: bounded out
 python -m pytest -q tests/test_batch_e_dispatch.py       # 52 tests: the one dispatch transaction, open-state settlement, stop/ledger races
 python -m pytest -q tests/test_batch_e_repair.py         # 92 tests: the bounded repair, late results after a stop, base SHA, freeze scope
 python -m pytest -q tests/test_launch_refusals.py        # 30 tests: a workspace .env (never opened) and a DSH_HOME in the workspace refused on a real driver
+python -m pytest -q tests/test_credential_source.py      # 24 tests: no visible credential source refused at prepare, the run gate and the spawn gate; names and stat only
 python -m pytest -q tests/test_owner_lease.py            # 27 tests: owner identity and lock, adoption and takeover only from a provably gone owner, fenced writes
 python -m pytest -q tests/test_ledger_settle.py          # 37 tests: operator settlement of unknown/launch_unknown entries, never shown as observed
 python -m pytest -q tests/test_typed_findings.py         # 40 tests: the typed reviewer finding, strict, no text fallback
@@ -1067,7 +1183,10 @@ usage and cost (`STUB_REPORTED_USAGE`); the mock agent has matching `prompt-erro
 `trailing-update` scenarios. `real_client_checks.py` and
 `test_real_client_review.py` are the ones that exercise the *installed* acpx: a metadata probe and
 full one-shot `exec` runs against the project's mock agent, all with zero model calls. None of
-them is evidence about real DSH.
+them is evidence about real DSH. Every test runs with a stand-in `DEEPSEEK_API_KEY` that replaces
+any real one (`tests/conftest.py`; `tools/m0_probe/real_client_checks.py` and
+`tools/verify_b_recheck.py` set their own), because a real launch with no credential source visible
+is refused (`no_credential_source`); the tests of that refusal remove it.
 
 Two of the `tools/` commands in this README need a warning label, because both can write
 something: `python tools/m0_probe/write_results_doc.py` regenerates `docs/m0-results.md` - a

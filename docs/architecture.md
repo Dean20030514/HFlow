@@ -251,9 +251,12 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
   carrier versions read from files. Two of these inputs are refused on a real driver, at
   admission and again at the driver's spawn gate: a root `.env` in the workspace DSH starts in
   (`workspace_env_file`; never parsed or opened) and a bound `DSH_HOME` inside or around the
-  workspace (`dsh_home_in_workspace`). The rest of the record is not enforced or bound into an
-  approval, and DSH reads the files after the look; a `$DSH_HOME/.env` outside the workspace is
-  not refused. With `DSH_HOME` unbound the child's DSH home is the
+  workspace (`dsh_home_in_workspace`). A launch with no credential source visible - no
+  `DEEPSEEK_API_KEY` name in the child's environment and neither `.credentials.yaml` nor `.env` in
+  its DSH home (stat only) - is refused the same way (`no_credential_source`, user ruling
+  2026-10-07); a presence check, not a validity check. The rest of the record is not enforced or
+  bound into an approval, and DSH reads the files after the look; a `$DSH_HOME/.env` outside the
+  workspace is not refused. With `DSH_HOME` unbound the child's DSH home is the
   per-invocation, empty `<data-dir>/invocations/<id>/home/.dsh` (inferred from upstream source).
 - **No sandbox.** `command` checks and workers run as ordinary child processes with the
   current user's rights. Scope is enforced by *detection after the fact* plus refusal to
@@ -290,11 +293,18 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
   `GIT_CONFIG_PARAMETERS`, which git reads after that list, so a caller's `git -c` cannot override
   it): `core.hooksPath` set to an empty, HFlow-owned temporary directory, `core.fsmonitor=false`,
   `commit.gpgsign=false`, `core.ignoreStat=false` and `core.sparseCheckout=false` (so HFlow's own
-  `worktree add` never checks an entry out flagged assume-unchanged or skip-worktree), plus
-  `GIT_CONFIG_NOSYSTEM=1`, `GIT_NO_REPLACE_OBJECTS=1` and a fixed identity. Inherited
-  repository-locating variables (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`,
-  `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_COMMON_DIR`, `GIT_NAMESPACE`)
-  are dropped, because every call names its repository by its working directory. The freeze commit also passes
+  `worktree add` never checks an entry out flagged assume-unchanged or skip-worktree) and
+  `safe.bareRepository=explicit` (a directory git would only implicitly take for a bare
+  repository, such as a worktree root a worker turned into one, is refused rather than read),
+  plus `GIT_CONFIG_NOSYSTEM=1`, `GIT_NO_REPLACE_OBJECTS=1`, a `GIT_GRAFT_FILE` that never exists
+  (no grafts, inherited or written into `.git/info/grafts`) and a fixed identity. Inherited
+  repository-locating variables (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_IMPLICIT_WORK_TREE`,
+  `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_COMMON_DIR`,
+  `GIT_NAMESPACE`, `GIT_PREFIX`, `GIT_DISCOVERY_ACROSS_FILESYSTEM`) are dropped, because every
+  call names its repository by its working directory, and so are variables that redirect what git
+  reads there (`GIT_CONFIG`, `GIT_SHALLOW_FILE`, `GIT_REPLACE_REF_BASE`, `GIT_ATTR_SOURCE`,
+  `GIT_EXTERNAL_DIFF`, `GIT_DIFF_OPTS`, the `GIT_*_PATHSPECS` modes); `GIT_CEILING_DIRECTORIES`
+  only narrows discovery and is kept. The freeze commit also passes
   `--no-verify`. No repository, user, worker or caller hook, monitor command or signer runs during
   `worktree add`, the freeze or a ref write; the user's global config is still read for everything
   else. Filters are not disabled (that would break LFS); instead `GitRepo.metadata_snapshot`

@@ -50,6 +50,7 @@ from hflow.drivers.acp_events import V1_STOP_REASONS, project_line
 from hflow.drivers.winjob import process_gone
 from hflow.store import Store
 from hflow.verify import CheckRunners, FakeCheckRunner
+from tests.conftest import STAND_IN_API_KEY
 from tests.test_winjob import ERROR_ACCESS_DENIED, kernel32_stand_in
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -1387,8 +1388,10 @@ def test_status_shows_each_invocations_model_and_old_runs_say_not_recorded(
 def test_an_invocation_records_the_empty_per_invocation_dsh_home_it_launched_with(
     harness_factory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The empty per-invocation home holds no credential, so a launch needs DEEPSEEK_API_KEY in
+    # its environment (no_credential_source, tests/test_credential_source.py): the conftest
+    # stand-in is that variable here, and the record holds its name only.
     monkeypatch.delenv("DSH_HOME", raising=False)
-    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     harness = harness_factory("cooperative")
     handle, _ = harness.start()
     result = harness.driver.collect(handle)
@@ -1405,7 +1408,8 @@ def test_an_invocation_records_the_empty_per_invocation_dsh_home_it_launched_wit
     assert surfaces.dsh_home_files
     assert all(entry.present is False for entry in surfaces.dsh_home_files)
     assert surfaces.workspace == str(harness.workspace)
-    assert surfaces.deepseek_api_key_inherited is False
+    assert surfaces.deepseek_api_key_inherited is True
+    assert STAND_IN_API_KEY not in result.model_dump_json(), "a name, never a value"
     # The stand-in launch is an override argv, so no resolved dsh is started.
     assert surfaces.client.dsh_carrier == "not_applicable"
     harness.driver.release(handle.invocation_id)

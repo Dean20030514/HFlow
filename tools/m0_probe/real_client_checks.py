@@ -41,6 +41,10 @@ from hflow.drivers.winjob import process_gone  # noqa: E402
 PROBE_ROOT = REPO_ROOT / ".probe" / "real-client-checks"
 INSTALLED_ACPX = REPO_ROOT / ".probe" / "acpx" / "node_modules" / "acpx" / "dist" / "cli.js"
 MOCK_AGENT = Path(__file__).resolve().parent / "mock_acp_agent.py"
+#: What the mock-agent runs pass as ``DEEPSEEK_API_KEY``: obviously not a credential. A real
+#: launch with no credential source visible is refused (``no_credential_source``), and the
+#: mock agent needs none; setting it in ``extra_env`` also keeps a real key out of the child.
+MOCK_AGENT_STAND_IN_KEY = "hflow-mock-agent-stand-in-not-a-credential"
 
 
 def resolve_node() -> str:
@@ -135,6 +139,7 @@ def check_mock(node: str, *, deadline_seconds: int = 60) -> dict:
     home.mkdir(parents=True, exist_ok=True)
     driver.extra_env["USERPROFILE"] = str(home)
     driver.extra_env["HOME"] = str(home)
+    driver.extra_env["DEEPSEEK_API_KEY"] = MOCK_AGENT_STAND_IN_KEY
 
     nonce = f"nonce{int(time.time())}"
     request = InvocationRequest(
@@ -311,6 +316,7 @@ def check_permission(node: str, *, allow_writes: bool) -> dict:
     )
     driver.extra_env["USERPROFILE"] = str(home)
     driver.extra_env["HOME"] = str(home)
+    driver.extra_env["DEEPSEEK_API_KEY"] = MOCK_AGENT_STAND_IN_KEY
 
     request = InvocationRequest(
         invocation_id=f"I-perm-{'writes' if allow_writes else 'reads'}",

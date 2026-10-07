@@ -11,7 +11,9 @@ This module checks a FIXED list of paths. It never lists a directory, never open
 the home's stored-credentials file, never records a value, executes nothing, refuses nothing and
 binds nothing. :func:`_read_regular` is the only place a file is opened. :func:`carrier_files`
 and :func:`package_manifest_for` only *name* files; the binding by content is
-``launch_content``'s.
+``launch_content``'s. :func:`credential_sources` reports which credential sources a launch would
+have (a variable's name, two home files by stat); the refusal built on it lives in the driver
+(``acpx_dsh.credential_source_problem``).
 """
 
 from __future__ import annotations
@@ -55,6 +57,15 @@ SURFACE_HASH_LIMIT_BYTES = 4 * 1024 * 1024
 MANIFEST_READ_LIMIT_BYTES = 256 * 1024
 #: DSH's credential variable. Only whether the name reaches the child is recorded.
 DEEPSEEK_API_KEY_NAME = "DEEPSEEK_API_KEY"
+#: DSH's stored-credentials file in its home (documented at dsh-v0.2.0-rc.2, not observed). Like a
+#: ``.env`` it is never opened, sized or hashed: only whether it exists is checked, by stat.
+STORED_CREDENTIALS_NAME = ".credentials.yaml"
+#: The files in a DSH home that DSH takes a credential from, in its documented precedence order
+#: (the launch environment comes before both, ``<cwd>/.env`` between them; pinned to
+#: dsh-v0.2.0-rc.2, not observed).
+HOME_CREDENTIAL_FILE_NAMES = (STORED_CREDENTIALS_NAME, ENV_FILE_NAME)
+#: :func:`stat_presence`'s answer for a regular file - the only answer that counts as a source.
+PRESENT = "present"
 #: The acpx version ADR 0001 recorded, and the @agentclientprotocol/sdk version observed with the
 #: pinned acpx on 2026-10-02. A different version is noted, never refused.
 RECORDED_ACPX_VERSION = "0.17.1"
@@ -170,6 +181,82 @@ def env_has_name(env: Mapping[str, str], name: str) -> bool:
     if os.name == "nt":
         return any(key.upper() == name.upper() for key in env)
     return name in env
+
+
+def stat_presence(path: Path) -> str:
+    """``present`` / ``absent`` / ``present (not a file)`` / ``unknown (<error>)``, by one stat.
+
+    Links are followed (a broken one is ``absent``). The file is never opened, and the size the
+    stat returns is neither kept nor reported.
+    """
+    try:
+        info = os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return "absent"
+    except (OSError, ValueError) as exc:
+        return f"unknown ({type(exc).__name__})"
+    return PRESENT if stat.S_ISREG(info.st_mode) else "present (not a file)"
+
+
+class CredentialSources(NamedTuple):
+    """Which credential sources DSH would have at one launch. Names and presence only.
+
+    No value, size, digest or content is part of it. ``home_files`` is ``(name, presence)`` for
+    each :data:`HOME_CREDENTIAL_FILE_NAMES` entry of a *bound* home (:func:`stat_presence`), and
+    empty for the per-invocation home, which is created empty and never looked into.
+    """
+
+    api_key_in_env: bool
+    dsh_home_kind: Literal["bound", "per_invocation"]
+    dsh_home: str
+    home_files: tuple[tuple[str, str], ...]
+
+    @property
+    def visible(self) -> bool:
+        """The variable's name is in the launch environment, or a home file is a regular file.
+
+        A presence check, not a validity check: an empty or revoked key, or a home file holding
+        no credential, counts as visible. A directory, a broken link or an entry that could not
+        be examined does not count: DSH could not read a credential from it either.
+        """
+        return self.api_key_in_env or any(state == PRESENT for _, state in self.home_files)
+
+
+def credential_sources(
+    child_env: Mapping[str, str],
+    *,
+    dsh_home_kind: Literal["bound", "per_invocation"],
+    dsh_home: Path,
+) -> CredentialSources:
+    """The credential sources visible to DSH started with ``child_env`` and this home.
+
+    DSH's precedence (documented at dsh-v0.2.0-rc.2, not observed): the launch environment, then
+    ``$DSH_HOME/.credentials.yaml``, then ``<cwd>/.env``, then ``$DSH_HOME/.env``. The workspace
+    ``.env`` is not looked at here: a real launch never starts on one (``workspace_env_file``).
+    ``child_env`` is the environment the child is (or would be) started with
+    (``acpx_dsh.child_environment``); ``DEEPSEEK_API_KEY`` is looked up by name only
+    (:func:`env_has_name`). A bound home that is not absolute is not looked into - where DSH
+    resolves it depends on its working directory - so its files read ``unknown``. Records only:
+    the refusal built on it is ``acpx_dsh.credential_source_problem``.
+    """
+    home = Path(dsh_home)
+    files: tuple[tuple[str, str], ...] = ()
+    if dsh_home_kind == "bound":
+        files = tuple(
+            (
+                name,
+                stat_presence(home / name)
+                if home.is_absolute()
+                else "unknown (relative DSH_HOME: not looked into)",
+            )
+            for name in HOME_CREDENTIAL_FILE_NAMES
+        )
+    return CredentialSources(
+        api_key_in_env=env_has_name(child_env, DEEPSEEK_API_KEY_NAME),
+        dsh_home_kind=dsh_home_kind,
+        dsh_home=str(home),
+        home_files=files,
+    )
 
 
 def dsh_env_names(env: Mapping[str, str]) -> list[str]:
@@ -624,7 +711,8 @@ def probe_notes(surfaces: LaunchSurfaces) -> list[str]:
             "home is then this directory, created empty for each invocation (no stored "
             "credentials, no cordis.patch.yml, no AGENTS.md, no skills, a fresh anonymous id), so "
             "credentials come only from the launch environment or a workspace .env (inferred "
-            "from upstream source, not observed); a real launch refuses a workspace .env"
+            "from upstream source, not observed); a real launch refuses a workspace .env, and "
+            "refuses one without DEEPSEEK_API_KEY in its environment (no_credential_source)"
         )
     client = surfaces.client
     carrier = client.dsh_carrier

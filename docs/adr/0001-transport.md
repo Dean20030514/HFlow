@@ -372,3 +372,24 @@ prompt (rule 5); DSH #8608 keeps a forced Job Object stop with an empty-boundary
 basis for `confirmed_stopped` (rule 8); and DSH #1485 means parallel tasks must not share one
 `DSH_HOME` - a constraint for any future Team work, which this build does not do. A future pin bump
 should note that acpx `main` now locks SDK 1.7.0 and fs-safe 0.22.
+
+## Addendum 2026-10-07 — fifth read of the upstreams
+
+Appended; the decision and every capability state above stand. Release metadata, compare views,
+source and npm dist-tags only; nothing was executed against DSH or a model, so every row is
+*documented*.
+
+| Fact | Label |
+|---|---|
+| acpx: still no release after `v0.19.4` (`8e396609`); npm `latest` is 0.19.4. `compare b3cd8433...main` is identical (0 commits), and `src/async-control.ts` is still blob `2e318c1d`. #835, #850 and #854 are unchanged. New: #861 proposes per-agent `env` and `configOptions` (its example points an agent's home at a separate directory for headless runs); not in `v0.19.4` or `main` | documented |
+| acpx 0.17.1 declares `@agentclientprotocol/sdk ^1.4.0` and ships no lockfile, so a fresh install today resolves SDK 1.7.0; `v0.19.4` declares `^1.5.0`. HFlow already records the SDK version Node would resolve (`dsh_surfaces`), so the pin covers acpx but the SDK is a recorded fact, not a pinned one | documented |
+| acpx #770 (fixed by #778 in `v0.19.3`, present in 0.17.1): when the agent dies mid-turn under `exec --format json`, acpx forwards the partial chunk, exits 1 and writes no error envelope and no `stopReason`. HFlow classifies that as `OUTCOME_UNKNOWN` without needing an error line; batch J adds a regression test of exactly that stream for both roles | documented (upstream); offline-tested (HFlow) |
+| DSH: no commit, tag or release after `dsh-v0.2.1-alpha.1` (`5badb150`); `packages/acp/acp/src` is still tree `f6f88229`; npm `latest`/`next` 0.2.0-rc.2, `alpha` 0.2.1-alpha.1. Discussions: #7978's reported root cause is a profile whose bundles hold only `dsh-base` (no app bundle), which hangs with no output, while a profile created from the `headless` template boots; #8312/#8453 report that the Windows `workspace-write` sandbox leaves inherited ACEs and a Low mandatory label on the workspace root; #9038 and related threads report every pwsh command under that sandbox exiting `0xC0000142` on some Windows configurations; #8947 reports undici's 300 s body timeout surfacing as a generic transport failure | documented (unconfirmed by maintainers) |
+| ACP: no schema release after `schema-v1.24.1`; `schema/v1/schema.json` is still blob `fa1242c6`. Release PR #2280 (schema-v1.25.0) is still open and carries only #2281 (`stopReason: "error"` in v2 and the v1 *unstable* subagent update). RFD #2308 (merged 2026-10-06) lets an agent keep background children running after a session cancel. `@agentclientprotocol/sdk` `latest` is still 1.7.0 | documented |
+
+Nothing here needs a transport change and the acpx 0.17.1 pin stays. What bears on the first live
+task: keep it short (well under DSH's reported 300 s stream timeout), expect the Windows sandbox
+reports above to surface as an implementer failure or as permissions left on the worktree that
+`hflow clean` may then refuse to remove - both are recorded, never retried - and do not create a
+per-run `DSH_HOME` from nothing (#7978); a bound home must hold a profile that boots. RFD #2308 is
+one more reason a stop stays the Job Object's empty boundary, never a protocol cancel (rule 8).

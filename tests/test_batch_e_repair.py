@@ -57,6 +57,8 @@ from hflow.store import Store
 from hflow.verify import CheckOutcome, CheckRunners, FakeCheckRunner
 from hflow.workspace import DSH_CONTEXT_LIST_SOURCE
 
+from .owner_exit import owner_exits, successor
+
 
 def _wait_for_exit(pid: int, *, timeout_seconds: float) -> bool:
     """Has this process terminated, checked by its exit code rather than by its signal.
@@ -931,7 +933,7 @@ class StopThenCompleteDriver(RepairingDriver):
     ids=["in_place-I1", "worktree-I1", "worktree-I2"],
 )
 def test_a_late_completed_after_an_unconfirmed_stop_changes_nothing(
-    tmp_path: Path, sample_repo: Path, mode: str, stop_round: int
+    tmp_path: Path, sample_repo: Path, mode: str, stop_round: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AGENTS rules 4 and 8: the stop decided the run; the late success is only a note.
 
@@ -1004,9 +1006,11 @@ def test_a_late_completed_after_an_unconfirmed_stop_changes_nothing(
         else:
             assert refs.strip() == ""
 
-        # ``resume`` still reconciles: the open entry becomes unknown, nothing is re-dispatched.
+        # ``resume`` still reconciles once the owner has exited: the open entry becomes unknown,
+        # nothing is re-dispatched.
         dispatched = list(driver.labels)
-        resumed = controller.resume(outcome.run_id)
+        owner_exits(store, outcome.run_id, controller, monkeypatch)
+        resumed = successor(controller).resume(outcome.run_id)
         assert resumed.block_code is RefusalCode.OUTCOME_UNKNOWN
         assert driver.labels == dispatched
         entry = store.invocation(entries[0].invocation_id)
