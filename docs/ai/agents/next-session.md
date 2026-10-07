@@ -1,40 +1,36 @@
-# Next-session handoff — 2026-10-06
+# Next-session handoff — 2026-10-06 (after batch I)
 
-## User decision
-
-The user confirmed this implementation priority:
+## User decision (unchanged)
 
 > 先完成“小任务从授权到集成、异常后可恢复”的真实闭环，再扩展 Team，最接近实际可用。
 
-This session records the decision only. Implementation is deferred to a new session.
+## What batch I delivered (offline only)
 
-## Starting point
+Contract: `docs/batch-i-integration-plan.md`. Operator view: `docs/operations.md`,
+"Integrating an accepted candidate".
 
-- Last implementation commit: `e0fd7bf8046739623630458553e50c6e20d2d553`
-  (`Fix budget recovery, session attribution, and evidence I/O`).
-- Its recorded full offline validation: **1464 passed, 1 skipped in 843.65s**.
-  Scoped Ruff and diff checks passed. These are historical results, not future-session validation.
-- HFlow implements a controlled single-task loop through `LOCAL_CANDIDATE`;
-  integration/publish delivery and Team scheduling are not implemented.
-- The original live M2 run was blocked; its later acceptance came from offline
-  reprocessing of recorded evidence. It does not prove uninterrupted live acceptance
-  on the current build.
+- **I2 controlled integration** — `hflow integrate prepare | apply | reconcile | show`
+  (`src/hflow/integrate.py`, storage v8 `integrations`, `IntegrationRecord`/`IntegrationReceipt`).
+  One checked commit on an existing local branch (`squash` when the target has not moved,
+  `replayed` via `merge-tree --merge-base` when it has), checks re-run in a worktree of its own
+  (`integration-check` evidence), operator approval via `--expect-target`, intent before a
+  compare-and-set `update-ref`, never a checked-out branch (hand-off + `reconcile` observes a
+  hand merge), crash reconciliation without re-running the update or the checks. The run's own
+  `ResultReceipt` stays `LOCAL_CANDIDATE`.
+- **I1 ledger close-out** — `hflow resume` on an ended run closes ledger entries left
+  `reserved`/`requested`/`started` once the owner is provably gone (from the run's own confirmed
+  stop when that stop ended the run, otherwise `unknown`/`launch_unknown`), after which
+  `hflow ledger settle` applies. Remaining gap: a pre-v6 ended run with a recorded controller pid.
+- 2026-10-06 GitHub survey recorded in ADR 0001 (no transport change; acpx pin 0.17.1 kept).
 
-## Next implementation direction
+## Next step
 
-1. Start with GitHub investigation, the current checkout and existing contracts.
-   Recheck these handoff facts before choosing a concrete implementation plan.
-2. Prioritize a small-task path from bound authorization through implementation,
-   frozen candidate, checks, independent review, acceptance and controlled integration.
-   Define the integration contract before implementing it.
-3. Include recoverable failure handling, particularly currently unclosable OPEN
-   invocation entries. Preserve evidence, budget consumption and operator decisions;
-   unknown outcomes must not trigger blind re-dispatch.
-4. Prove ordered failure/recovery paths offline, then validate the resulting complete
-   path with a small real task under separately approved live allowance.
-5. Defer DAG scheduling, parallel Workers, native subagents and broader Team features
-   until this small-task loop has adequate implementation and real evidence.
+1. A small real task, end to end, under a **separately approved** live allowance (the new live
+   budget is still **0**; each live task needs its own explicit approval): `prepare` → `run` with
+   an authorization → `ACCEPTED/LOCAL_CANDIDATE` → `hflow integrate prepare` → `apply` (or the
+   hand-off when the target branch is checked out) → `status`. Integration itself calls no model.
+2. Only after that real evidence: Team/DAG work. Before parallel tasks, note DSH #1485 (concurrent
+   instances sharing one `DSH_HOME` corrupt workspace session membership) — use per-run homes or
+   serialize.
 
-This is a priority decision, not a detailed approved design or a new live authorization.
-The new live budget remains **0**. Each live task still requires its own explicit approval.
 Do not rewrite historical evidence or reactivate the archived `workflow` installation.

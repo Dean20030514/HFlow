@@ -353,3 +353,22 @@ source only; nothing was executed against DSH or a model, so every row is *docum
 Nothing here needs a transport change: an unknown stop reason (including `error`) and a JSON-RPC
 error answering the prompt both stay `OUTCOME_UNKNOWN`, and the stop reason stays bound to the
 observed `session/prompt` id.
+
+## Addendum 2026-10-06 — fourth read of the upstreams
+
+Appended; the decision and every capability state above stand. Release metadata, compare views and
+source only; nothing was executed against DSH or a model, so every row is *documented*.
+
+| Fact | Label |
+|---|---|
+| acpx: still no release after `v0.19.4` (`8e396609`). `main` moved `27efb1b...b3cd8433` (6 commits, all under CHANGELOG "Unreleased"): autoreview tooling (#852); a lockfile bump of `@agentclientprotocol/sdk` 1.5.1 -> 1.7.0 and `@openclaw/fs-safe` to `^0.22.0` (Windows path admission) (#863); the `sessions ensure` scope lock keyed on the canonical agent command, closing #851 (#864); the **text** renderer skipping a malformed tool-call update with a `[error] RUNTIME` line and still exiting 0 (#856; `--format json` is still the raw ACP NDJSON); a 1,024-segment cap on imported journals (#855); `session_origin` on persistent sessions (#858). `src/async-control.ts` is blob `2e318c1d` at `v0.17.1`, `v0.19.4` and `b3cd843`: `exec` still sends `session/cancel` only on SIGINT/SIGTERM/SIGHUP and `--timeout` still sends none. Nothing under `src/cli/` changed except `output/output.ts` | documented |
+| acpx issues: #835 (`.acpxrc.json` pin/skip) and #850 (a provider error ending in `end_turn` exits 0) are still open. New: #854 - `requestId` is not an idempotency key, so a caller retrying after a crash cannot tell whether the earlier turn was submitted, and the same id after a finished turn starts a second turn | documented |
+| DSH: no release or commit after `dsh-v0.2.1-alpha.1` (`5badb150`); `packages/acp/acp/src` is still tree `f6f88229`. Issues are disabled; community Discussions (unconfirmed by maintainers) report a Windows terminal cancel that leaves the command and its `cmd.exe` grandchild alive (#8608), a programmatic cancel writing `turn/end` with `reason:null` (#9060), a newly created profile hanging headless with no output (#7978), and concurrent instances sharing one `DSH_HOME` corrupting workspace session membership (#1485) | documented |
+| ACP: no release after `schema-v1.24.1`; `schema/v1/schema.json` is still blob `fa1242c6`. **Correction** to the 2026-10-03 row: #2281 also changed `schema/v1/schema.unstable.json`, adding `ErrorStopReason` (`error`) to the unstable subagent `IdleStateUpdate` only; `PromptResponse.stopReason` in v1 (stable and unstable) is still `end_turn`/`max_tokens`/`max_turn_requests`/`refusal`/`cancelled`, and `PromptRequest` still has no prompt id. Release PR #2280 (schema-v1.25.0) is open and carries only that unstable change. `@agentclientprotocol/sdk` is still 1.7.0 | documented |
+
+Nothing here needs a transport change and the acpx 0.17.1 pin stays. Three facts bear on HFlow's
+rules rather than its code: acpx #854 is one more reason `resume` reconciles and never re-sends a
+prompt (rule 5); DSH #8608 keeps a forced Job Object stop with an empty-boundary check as the only
+basis for `confirmed_stopped` (rule 8); and DSH #1485 means parallel tasks must not share one
+`DSH_HOME` - a constraint for any future Team work, which this build does not do. A future pin bump
+should note that acpx `main` now locks SDK 1.7.0 and fs-safe 0.22.

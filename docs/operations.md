@@ -15,7 +15,7 @@ hflow run --task task.json --project-root <repo> --driver fake --json
 hflow run --task task.json --profile <id> --authorization-file auth.json --json
 hflow status <run_id>
 hflow report <run_id>
-hflow resume <run_id>                      # never re-dispatches: reconciles a blocked run, or takes a live run over from a provably gone owner (blocks it owner_lost)
+hflow resume <run_id>                      # never re-dispatches: reconciles a blocked run, takes a live run over from a provably gone owner (blocks it owner_lost), or closes an ended run's open ledger entries once its owner is gone
 hflow cancel <run_id>
 ```
 
@@ -331,11 +331,23 @@ What the root file does, and what it does not:
   refunded, retried or re-dispatched; `resume` records an observation and settles nothing. An
   `unknown` or `launch_unknown` entry of a run that has ended is closed only by
   `hflow ledger settle` (next item), an operator attestation; until then the root stays blocked.
-  The same holds for an entry left open on a run that is not `outcome_unknown` - a confirmed stop
-  whose ledger write failed (`cancelled_by_operator`), or a driver that raised without reporting
-  a spawn fact (`internal_error`, or `review_protocol_error` for the reviewer): `resume`
-  reconciles only an `outcome_unknown` run and `hflow ledger settle` refuses an open entry, so
-  nothing closes it, and the run's note says so rather than promising a reconcile.
+  An entry left **open** on a run that ended for another reason - a confirmed stop whose ledger
+  write failed (`cancelled_by_operator`), a driver that raised without reporting a spawn fact
+  (`internal_error`, or `review_protocol_error` for the reviewer), a settlement write that failed
+  on a run that then ended (`ACCEPTED` included) - is refused by `hflow ledger settle`, so
+  `hflow resume <run_id>` closes it first (batch I1). It acts only once the run's owner is
+  provably gone, by the owner half of the settle rule below (a run with no owner token passes
+  only when it recorded no controller process: `resume` takes no attestation, so a pre-v6 run
+  with a recorded controller pid is refused and its entry stays open); otherwise it writes
+  nothing and says why. An entry named by the run's own recorded confirmed stop - the stop that
+  ended the run, not one that reached a run already ended - is closed from that stop fact, as the
+  stop would have closed it (`started` -> `settled`/cancelled, requested -> `launch_unknown`,
+  never requested -> `not_started`); every other open entry becomes `unknown` (a launch was
+  recorded) or `launch_unknown` (no launch recorded), with a `dispatch: resume closed ...` note. No
+  driver is called, nothing is dispatched or refunded, and the run's state, block code, receipt
+  and outcome stay as they were; a second `resume` is a no-op. `status`/`report` show one
+  `open entries` line naming `hflow resume <run_id>` while such entries remain, and the run's
+  failure note names the same two steps.
 - `hflow ledger settle <invocation_id> --as consumed|void --attest "<text>"` (ruling
   2026-10-03; storage version 7) moves one `unknown` or `launch_unknown` entry of a run that has
   ended to `operator_settled` and appends a row to `invocation_settlements` (prior state, choice,
@@ -588,8 +600,8 @@ The database records its own **storage version**, separate from the public contr
 Batch E1 adds `root_budgets` and `invocations` (plus a few columns); batch E2 adds
 `evidence.exit_reason` - the structured reason a check ended - the `run_repair_records` table
 that holds the run's repair decisions, and `attempts.is_repair`. The file is migrated to the
-current `migrate.STORAGE_VERSION` (5 as of E2) the first time a build that understands it opens
-it. All DDL lives in `src/hflow/migrate.py`; `store.py` only decides when to migrate.
+current `migrate.STORAGE_VERSION` (8 as of batch I) the first time a build that understands it
+opens it. All DDL lives in `src/hflow/migrate.py`; `store.py` only decides when to migrate.
 
 | Version | What it adds, and what an older row gets |
 |---|---|
@@ -598,6 +610,9 @@ it. All DDL lives in `src/hflow/migrate.py`; `store.py` only decides when to mig
 | v3 | `invocations.launch_requested_at`, splitting "a launch was requested" from "a launch happened", and `authorizations.origin`. Every v2 row past `reserved` keeps its own state and outcome and becomes a launch *request*, because v2 wrote that timestamp before asking the driver |
 | v4 | the process facts a driver reports (`process_started_at`, `process_pid`, `spawn_kind`); older rows keep `spawn_kind = unknown`, because nothing reported a process to inherit. v4 also repairs rows the first v3 step left behind (a `settled`/`unknown` v2 row that kept its request time in `started_at`): only rows with `started_at` set and `launch_requested_at` empty are touched, so a correctly migrated row is never rewritten |
 | v5 | `evidence.exit_reason`, `run_repair_records` and `attempts.is_repair`; older rows keep an empty reason and `is_repair = 0`, because the build that wrote them observed neither |
+| v6 | the run's owner identity (`owner_token`, `owner_pid`, `owner_created`, `owner_host`, `claim_generation`); an older row keeps a NULL owner, read as "owner unknown" |
+| v7 | `invocation_settlements`, the append-only record of `hflow ledger settle`; only adds a table |
+| v8 | `integrations` (batch I2), one row per attempt to integrate a run's accepted candidate into a local branch, with partial unique indexes (one `preparing`/`checking`/`applying` record per run, one `applying` record per repository and target branch); only adds a table. A run accepted before v8 has no integration record and its receipt is untouched |
 
 A file whose bootstrap never stamped a version is read by its *shape*, newest first, so a v2 file
 without a version is never re-`ALTER`ed as if it were v1.
@@ -1009,6 +1024,95 @@ remains historical and is not rewritten by reconciliation.
 - Without a receipt, HEAD still needs to be the recorded base or a commit retained by a ref.
   Those retention gates do not prove removal: reconciliation still needs a reliable repository
   source to check registration after the path has disappeared.
+
+## Integrating an accepted candidate (`integrate`, batch I2)
+
+A run ends at `ACCEPTED / LOCAL_CANDIDATE`: a frozen commit in a detached worktree. Putting that
+change on a branch you work with is a **separate delivery** with its own record and its own
+receipt. The run's `ResultReceipt` is never rewritten: `status` and `report` keep showing
+`delivery LOCAL_CANDIDATE` for the run and list its integrations beside it. Nothing in this
+section calls a model, dispatches an agent or spends a budget. The contract is
+`docs/batch-i-integration-plan.md`.
+
+```sh
+hflow integrate prepare <run-id> --target main --project .hflow/project.json
+hflow integrate apply   <integration-id> --expect-target <full tip printed by prepare>
+hflow integrate reconcile <integration-id> [--owner-gone --attest "<what you know>"]
+hflow integrate show    <integration-id> [--json]
+```
+
+**prepare** fixes the target branch's current tip `T` and builds exactly one integration commit
+`M` on top of it, with Git plumbing only:
+
+| The target since the task's base `B` | Mode | `M` |
+|---|---|---|
+| unchanged (`T == B`) | `squash` | one new commit with the candidate's tree on `B`. Earlier repair rounds (each round's candidate is a child of the previous one) never enter the branch's history |
+| moved on (`B` is an ancestor of `T`) | `replayed` | `git merge-tree --write-tree --merge-base=B T C`, committed on `T`. A conflict is recorded as `conflict` with its paths; nothing is committed |
+| rewritten (`B` is not an ancestor of `T`) | - | refused `target_moved`: HFlow does not guess how the candidate relates to that history |
+
+`M` is kept reachable by `refs/hflow/integrations/<run-id>/<integration-id>`, then checked out in a
+fresh detached worktree of its own (`<repo>.hflow-worktrees/<integration-id>`) where the run's
+required checks run again (evidence kind `integration-check`, a new execution every time). The
+paths `T..M` changes must be paths the accepted delivery changed and inside the task's scope.
+The worktree is then removed **without `--force`**; if Git refuses (a check left untracked files),
+it is left in place and named, and the integration's result does not depend on it. A passing
+prepare ends `ready` and prints the apply command; prepare itself never moves a branch and never
+writes your checkout or index. The project contract must be the one the run was accepted under
+(same checks digest), and a `kind=fake` check is refused: it cannot verify a tree that is about to
+land on a real branch. Git 2.40 or later is required. `--target` must be the branch's exact
+spelling: on a case-insensitive file system `MAIN` resolves through `main`'s file, and every later
+comparison (which worktree has it checked out, which ref an apply locks) would then miss the real
+branch, so a name no ref carries exactly is refused. A run whose change already reached that branch
+through an earlier integration is refused too, even if the change was reverted since; a `ready`
+integration of the run whose commit the branch now contains (your merge after a hand-off) is first
+recorded as `integrated`, never superseded.
+
+**apply** is your approval. `--expect-target` must be the exact tip the integration was checked
+against. Before anything moves, apply re-checks that the run is still `ACCEPTED`, that the
+integration ref still points at `M` and that its evidence still describes `M`, records its intent
+(`applying`) in SQLite, and only then runs `git update-ref refs/heads/<target> M T` - Git's
+compare-and-set. It never forces and never creates or deletes a branch.
+
+| What apply finds | Result |
+|---|---|
+| the target at `T`, not checked out anywhere | moved to `M`; `integrated`, basis `hflow_ref_update`; an `IntegrationReceipt` is written |
+| the target checked out in any worktree - your main checkout included, or a worktree rebasing or bisecting it | **not moved** (moving it would leave that checkout's index and files at the old commit while its HEAD names the new one). You get `git -C <checkout> merge --ff-only <M>` to run yourself, then `hflow integrate reconcile <id>`. Exit `3` |
+| the target already contains `M` | `integrated`, basis `operator_merge_observed` |
+| the target moved elsewhere | `stale` (terminal); prepare again against the new tip |
+| `<ref>.lock` exists | refused; HFlow never deletes a Git lock file |
+
+A second apply of an integrated record writes nothing and returns the same receipt.
+
+**reconcile** settles a record from what Git shows and never re-runs the update or a check. An
+`applying` record whose process is gone becomes `integrated` (`observed_after_interruption`)
+when the target contains `M`, `ready` again when the target is still `T`, `stale` otherwise. A
+`preparing`/`checking` record whose process is gone becomes `interrupted` (its worktree is removed
+without force when possible). A `ready` record becomes `integrated` (`operator_merge_observed`)
+once the target contains `M` - this is how a hand merge after a hand-off is recorded. While the
+recorded process may still run, reconcile refuses and writes nothing (exit `5`). When HFlow
+cannot tell (`unknown`: another host, no creation time recorded, a pid it may not open),
+`--owner-gone --attest "<what you know>"` lets you attest that the process has exited; the
+attestation and your OS user name are recorded as such, never as an observation. A process HFlow
+sees running (`matching`) is never overridden. `apply` runs the same reconciliation first when it
+finds an `applying` record. A record another process settled in the meantime is reported as stored
+rather than raised.
+
+States: `preparing -> checking -> ready -> applying -> integrated`; terminal `conflict`,
+`checks_failed`, `stale`, `interrupted`, `superseded` (a newer prepare of the same run replaced a
+ready one) and `failed`. A run has at most one `preparing`/`checking`/`applying` integration, and
+a repository has at most one `applying` integration per target branch.
+
+Exit codes: `0` when the subcommand did what it was asked - `prepare` left the record `ready`,
+`apply` left it `integrated`, `reconcile` left it `ready` or `integrated`; `3` for anything that
+needs your decision (a conflict, failed checks, a stale or interrupted record, a hand-off because
+the branch is checked out, a ref update that failed and left the record `ready`); `5` for a record
+another process is still working on, or whose process may still run; `2` refused, nothing written
+(including a Git error); `4` unknown id; `6` a stored integration record no longer validates.
+
+What an integration receipt does **not** claim: anything about a remote (nothing is pushed), a
+review of a merged tree (a `replayed` tree is checked, not reviewed again - the review covered
+`B..C`), or who merged a hand-off (`operator_merge_observed` records only that the branch contains
+`M`). The integration commit carries HFlow's fixed identity, not yours.
 
 ## Running a real Harness task (authorized only)
 
@@ -1788,8 +1892,9 @@ What the stop does to the run depends on where the run is:
   and a retried `cancel` asks the driver again and ends the run. A confirmed stop then finishes
   the attempt and closes the invocation's ledger entry if it is still open; if that bookkeeping
   fails, the failure is a `dispatch:` note on a run that is already terminal - it can no longer
-  leave a run `RUNNING` with its root owned forever (the note says that no command in this build
-  closes such an entry). A receipt found on a run that is still live (a database written while
+  leave a run `RUNNING` with its root owned forever (the note names `hflow resume <run_id>`, which
+  closes such an entry from this recorded stop once the run's owner has exited, then
+  `hflow ledger settle`). A receipt found on a run that is still live (a database written while
   the receipt and the block were separate writes) is not returned as if the stop had finished:
   the block it implies is re-applied, with a "re-applied" `cancel_target` note, and the driver is
   not asked again. On a run with no ledger (no root), a stop recorded between the attempt's
@@ -1905,7 +2010,7 @@ success in its own transaction: the run is left in the state the stop recorded, 
 and `hflow run` reports that outcome (with a note saying so) instead of exiting with a traceback.
 
 `resume` then reconciles such a run: it records what it observed and closes every entry still
-open as `unknown` (a launch was reported) or `launch_unknown` (only requested), with the detail
+open as `unknown` (a launch was reported) or `launch_unknown` (no launch recorded), with the detail
 "no result was applied for this invocation - none was observed, or one arrived after the run's
 stop and is recorded as a late_result note; reconciled by an operator. The consumption stands and
 this root does not re-dispatch."
@@ -1972,7 +2077,7 @@ the controller ended:
   invocation was starting or running.** Before the exception propagates, the controller writes,
   best effort and in this order: the run's block `outcome_unknown` ("controller interrupted
   during <role> invocation; its result was never observed"), the run's open ledger entries as
-  `unknown` (a launch was reported) or `launch_unknown` (only requested), and the attempt as an
+  `unknown` (a launch was reported) or `launch_unknown` (no launch recorded), and the attempt as an
   unknown outcome. The root stays blocked and nothing is refunded. `hflow resume <run_id>` then
   reconciles: it records what it observed (`reconcile_json`, outcome `unknown`) and does not
   re-dispatch. A second Ctrl+C during those writes can still interrupt them.

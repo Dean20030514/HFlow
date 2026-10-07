@@ -2436,9 +2436,11 @@ def test_the_ledger_failure_note_of_a_stop_promises_no_reconcile_that_cannot_hap
 ) -> None:
     """The note left by a failed ledger write must describe a way out that exists.
 
-    The run is ``BLOCKED/cancelled_by_operator``, and ``resume`` reconciles only an
-    ``outcome_unknown`` run, so a note saying the open entry blocks the root "until an operator
-    reconciles it" sent an operator to a command that does nothing for this run.
+    The run is ``BLOCKED/cancelled_by_operator``. A note saying the open entry blocks the root
+    "until an operator reconciles it" once sent an operator to a command that did nothing for this
+    run; batch I1 made ``hflow resume`` close such an entry once the run's owner is gone (see
+    ``tests/test_open_entry_recovery.py``), so the note now names that command and what follows
+    it.
     """
     binding = _binding(store, task_spec, project_root)
     limits = _limits()
@@ -2467,9 +2469,11 @@ def test_the_ledger_failure_note_of_a_stop_promises_no_reconcile_that_cannot_hap
     assert running.error is None, f"the run raised instead of stopping: {running.error!r}"
     (note,) = [n for n in store.notes_for(run_id) if "injected ledger failure" in n]
     resumed = controller.resume(run_id)
-    assert resumed.block_code is RefusalCode.CANCELLED_BY_OPERATOR, "resume reconciles nothing here"
+    assert resumed.block_code is RefusalCode.CANCELLED_BY_OPERATOR, "resume never relabels it"
     assert "operator reconciles" not in note, note
-    assert "no command" in note and "cancelled_by_operator" in note, note
+    assert "no command" not in note and "cancelled_by_operator" in note, note
+    assert f"`hflow resume {run_id}` closes it from this recorded stop" in note, note
+    assert "`hflow ledger settle <invocation_id>`" in note, note
 
 
 @pytest.mark.parametrize("stopper", ["owner", "observer"])

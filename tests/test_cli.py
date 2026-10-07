@@ -391,6 +391,9 @@ def test_schema_command_prints_generated_contracts(capsys: pytest.CaptureFixture
         "RepairPolicy",
         # Output a script reads back, like PrepareReport: `hflow cancel --json`.
         "CancellationReceipt",
+        # ... and `hflow integrate ... --json` (batch I2).
+        "IntegrationRecord",
+        "IntegrationReceipt",
     }
     receipt_schema = payload["ResultReceipt"]
     # Enums are referenced, not inlined; the definition must be present in the same document.
@@ -499,7 +502,7 @@ def test_top_level_help_names_every_subcommand_and_the_live_driver(
     subcommands = next(
         action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
     ).choices
-    assert len(subcommands) == 10
+    assert len(subcommands) == 11
     for name in subcommands:
         assert name in description, name
     assert "offline in M1" not in description

@@ -413,6 +413,8 @@ def test_a_migration_interrupted_at_any_step_rolls_back_and_a_later_open_succeed
         assert "root_id" not in _columns(path, "authorizations")
         assert "root_id" not in _columns(path, "attempts")
         assert "owner_token" not in _columns(path, "runs")
+        assert "invocation_settlements" not in _tables(path)
+        assert "integrations" not in _tables(path)
         assert _content_digest(path)["runs"] == pristine_runs
 
         # The snapshot is taken before the transaction by design, so it is there to restore
@@ -425,7 +427,7 @@ def test_a_migration_interrupted_at_any_step_rolls_back_and_a_later_open_succeed
             assert later.storage_version == migrate.STORAGE_VERSION
             assert later.migrated_from == 1, "the interrupted file was still v1"
             _assert_legacy_rows_are_readable(later, task_spec)
-            assert {"root_budgets", "invocations"} <= _tables(path)
+            assert {"root_budgets", "invocations", "integrations"} <= _tables(path)
             assert "root_id" in _columns(path, "attempts")
         finally:
             later.close()

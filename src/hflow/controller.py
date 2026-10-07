@@ -40,6 +40,7 @@ from .contracts import (
     EvidenceStatus,
     Finding,
     HarnessDriver,
+    InvocationIntent,
     InvocationOutcome,
     InvocationRequest,
     InvocationResult,
@@ -367,6 +368,52 @@ def assess_run_owner(store: Store, row: Any) -> OwnerAssessment:
     )
 
 
+#: Why an ended run's owner does not let an operator act on its ledger entries yet (see
+#: :func:`ended_run_owner_blocker`): the run has no owner token and recorded a controller pid that
+#: carries no host, so nothing can be proven ...
+OWNER_LEGACY_UNPROVEN = "legacy_unproven"
+#: ... or the run's owner, recorded by this build, is not provably gone (its lock is held, or its
+#: identity reads ``matching`` or ``unknown``).
+OWNER_MAY_BE_ALIVE = "may_be_alive"
+
+
+def ended_run_owner_blocker(
+    store: Store, row: Any, *, legacy_owner_gone_attested: bool = False
+) -> tuple[str | None, OwnerAssessment]:
+    """The owner half of the rule for acting on an ended run's ledger entries. Read-only.
+
+    One rule, shared by the two commands that close an entry a controller may still be driving:
+    ``hflow ledger settle`` (through :func:`operator_settle_refusal`) and ``hflow resume`` on an
+    ended run that left entries open (:meth:`Controller.resume`). ``(None, assessment)`` means the
+    owner half passes:
+
+    * an owner recorded by this build (``owner_token`` set) passes only when it is provably gone
+      by the takeover rule (:func:`assess_run_owner`: its lock can be taken **and** its identity
+      reads ``gone``); otherwise :data:`OWNER_MAY_BE_ALIVE`;
+    * a run with no owner token (pre-v6, or a label-only claim) that recorded no controller
+      process at all (``not_recorded``) passes - an inference from an ended run with nothing
+      recorded that could still act, never an observation;
+    * a run with no owner token whose attempts recorded a controller pid (no host, so never
+      probed) passes only on the operator's attestation (``legacy_owner_gone_attested``, which
+      only ``ledger settle --legacy-owner-gone`` can give); otherwise
+      :data:`OWNER_LEGACY_UNPROVEN`.
+
+    The caller words its own refusal: what to do next differs between the two commands. Never
+    calls a model and writes nothing; the probe describes the moment of the check.
+    """
+    assessment = assess_run_owner(store, row)
+    legacy = row["owner_token"] is None
+    if legacy and assessment.probe.verdict == "not_recorded":
+        return None, assessment  # an ended run that recorded no controller: nothing can still act
+    if legacy and legacy_owner_gone_attested:
+        return None, assessment  # the operator attests the pre-v6 owner is gone; recorded by them
+    if legacy:
+        return OWNER_LEGACY_UNPROVEN, assessment
+    if not assessment.gone:
+        return OWNER_MAY_BE_ALIVE, assessment
+    return None, assessment
+
+
 def operator_settle_refusal(
     store: Store, invocation_id: str, *, legacy_owner_gone_attested: bool = False
 ) -> str | None:
@@ -377,7 +424,8 @@ def operator_settle_refusal(
     would let a new revision dispatch against the same root next to that agent. So an operator
     settles only when nothing recorded can still act, by the rule ``resume``'s takeover uses:
 
-    * the run's owner must be provably gone (:func:`assess_run_owner`): with an owner token, its
+    * the run's owner must be provably gone (:func:`ended_run_owner_blocker`, the half ``resume``
+      also applies before it closes an ended run's open entries): with an owner token, its
       lock can be taken **and** its identity reads ``gone``. With no token (a pre-v6 run, or a
       claim made without an owner) nothing can be proven: a run that recorded no controller
       process at all (``not_recorded``) passes this half - an inference from an ended run with
@@ -405,13 +453,10 @@ def operator_settle_refusal(
     except RunNotFound:
         return None
     run_id = invocation.run_id
-    assessment = assess_run_owner(store, row)
-    legacy = row["owner_token"] is None
-    if legacy and assessment.probe.verdict == "not_recorded":
-        pass  # an ended run that recorded no controller: nothing recorded can still act
-    elif legacy and legacy_owner_gone_attested:
-        pass  # the operator attests the pre-v6 owner is gone; recorded with the settlement
-    elif legacy:
+    blocker, assessment = ended_run_owner_blocker(
+        store, row, legacy_owner_gone_attested=legacy_owner_gone_attested
+    )
+    if blocker == OWNER_LEGACY_UNPROVEN:
         return (
             f"run {run_id} was written before owner identity existed ({_owner_words(row)}; "
             f"{assessment.summary}). Its recorded controller process carries no host, so HFlow "
@@ -419,7 +464,7 @@ def operator_settle_refusal(
             "exited, settle again with --legacy-owner-gone, which records that you attest it; "
             "nothing was written"
         )
-    elif not assessment.gone:
+    if blocker == OWNER_MAY_BE_ALIVE:
         return (
             f"the owner of run {run_id} may still be alive ({_owner_words(row)}; "
             f"{assessment.summary}), so the agent it launched may still be running. Wait for that "
@@ -1144,7 +1189,20 @@ class Controller:
         return self._drive(run_id, request, implementer_packet=implementer_packet)
 
     def resume(self, run_id: str) -> RunOutcome:
-        """Continue the state machine. Never replays a prompt and never re-dispatches."""
+        """Continue the state machine. Never replays a prompt and never re-dispatches.
+
+        Three shapes, decided from the run row:
+
+        * a **live** run (``DRAFT``/``READY``/``RUNNING``/``CHECKING``) is taken over only from a
+          provably gone owner, which blocks it ``owner_lost`` (:meth:`_take_over`);
+        * a run blocked ``outcome_unknown`` or ``owner_lost`` is reconciled (:meth:`reconcile`);
+        * any other **ended** run (``ACCEPTED``, ``BLOCKED`` with another code, ``CANCELLED``)
+          keeps its outcome. If it left ledger entries open (``reserved``/``requested``/
+          ``started``) - a driver that raised before reporting a spawn fact, a confirmed stop whose
+          ledger write failed, a settlement the store refused - they are closed once the run's
+          owner is provably gone (:meth:`_close_open_entries_of_ended_run`), so that
+          ``hflow ledger settle`` can act on them. A run with no open entry is left as it is.
+        """
         row = self.store.get_run(run_id)
         state = TaskState(row["task_state"])
         if state in {TaskState.DRAFT, TaskState.READY, TaskState.RUNNING, TaskState.CHECKING}:
@@ -1163,10 +1221,208 @@ class Controller:
                     "unknown outcome - submit a new revision to proceed"
                 ],
             )
+        open_entries = [
+            entry
+            for entry in self.store.invocations_for(run_id)
+            if entry.state.value in INVOCATION_OPEN_STATES
+        ]
+        if open_entries:
+            return self._close_open_entries_of_ended_run(run_id, row, open_entries)
         return self._outcome_for(
             run_id,
             notes=[f"resume is a no-op for a run in state {state.value} in this build"],
         )
+
+    def _close_open_entries_of_ended_run(
+        self, run_id: str, row: Any, open_entries: list[InvocationIntent]
+    ) -> RunOutcome:
+        """Close the ledger entries an ended run left open. Nothing else about the run changes.
+
+        An open entry (``reserved``/``requested``/``started``) keeps its root blocked, and
+        ``hflow ledger settle`` refuses one because a controller may still be driving it. A run
+        that ended with entries open - a driver that raised before it reported a spawn fact, a
+        confirmed stop whose ledger write failed, a result whose settlement the store refused -
+        therefore needs this step before an operator can settle anything.
+
+        The order of the rule, and what each step may write:
+
+        1. the run's owner must be provably gone, by exactly the owner half ``ledger settle``
+           applies (:func:`ended_run_owner_blocker`). ``resume`` takes no attestation, so a pre-v6
+           run whose attempts recorded a controller pid is refused. A refusal writes **nothing**
+           and says why: an owner that may be alive may also have a child that is still working;
+        2. an entry named by the run's own recorded confirmed stop - the stop that ended this run
+           (``cancelled_by_operator``, the receipt not marked ``run_already_ended``) - is closed
+           from that stop fact, exactly as the stop would have closed it
+           (:meth:`_close_open_entry_from_stop`, the writes of
+           :meth:`_settle_cancelled_invocation`). The entry is read again right before that write,
+           and the stop path is skipped - with no note - when it is no longer open. A stop of a
+           run that had already ended is not used: it says the child was stopped, not what the
+           invocation did before;
+        3. every other open entry becomes ``unknown`` (a launch was recorded) or
+           ``launch_unknown`` (no launch recorded: a ``reserved`` entry no driver was asked to
+           launch closes this way too), as a reconcile records it
+           (``Store.mark_unsettled_invocations_unknown``). Both keep blocking the root; the next
+           step is ``hflow ledger settle``, an operator attestation.
+
+        Never: a dispatch, a ``driver.start``, a driver call of any kind (the owner that held the
+        handles is gone, and no driver here can observe its children), a refund, or a change to
+        the run's task state, block code, receipt or outcome. The owner probe runs before those
+        writes and describes the moment of the check (as for ``ledger settle``); an ended run is
+        never reopened or reclaimed, so its owner cannot change in between.
+
+        What overlapping calls are guaranteed: every closure is a compare-and-set from the open
+        states, so nothing is closed twice, and a ``resume`` that starts after another finished
+        finds nothing open (the old no-op). Two calls that read the same open entries are not
+        serialised, so each describes only what it changed itself - the store's row count for
+        step 3 plus the stop closure of step 2 - and may each write a note for its own part. A
+        call that changed nothing writes no note and says the entries were already closed. When
+        an overlapping call closed some of the same entries, the note lists the transitions this
+        call observed and says how many were its own, because the ledger does not record which
+        call closed which entry. (Two stop closures racing on the same entry can both read it back
+        in the state they wrote; the store returns no row count for those two writes.)
+        """
+        ended = str(row["task_state"]) + (f"/{row['block_code']}" if row["block_code"] else "")
+        ids = _change_list([entry.invocation_id for entry in open_entries])
+        count = len(open_entries)
+        blocker, assessment = ended_run_owner_blocker(self.store, row)
+        if blocker is not None:
+            if blocker == OWNER_LEGACY_UNPROVEN:
+                why = (
+                    f"the run was written before owner identity existed ({_owner_words(row)}; "
+                    f"{assessment.summary}). Its recorded controller process carries no host, so "
+                    "HFlow cannot tell whether it still runs, and `resume` takes no attestation: "
+                    "this build cannot close these entries, and they keep blocking the root"
+                )
+            elif row["owner_token"] == self.owner_token:
+                why = (
+                    "this controller owns the run and is still running, so the agent it launched "
+                    f"may still be running too. Run `hflow resume {run_id}` from another process "
+                    "once this controller has exited"
+                )
+            else:
+                why = (
+                    f"the run's owner may still be alive ({_owner_words(row)}; "
+                    f"{assessment.summary}), so the agent it launched may still be running. Wait "
+                    "for that controller to exit, or stop its process tree yourself, then run "
+                    f"`hflow resume {run_id}` again"
+                )
+            return self._outcome_for(
+                run_id,
+                notes=[
+                    f"run {run_id} ended {ended} with {count} ledger entr"
+                    f"{'y' if count == 1 else 'ies'} still open ({ids}), which "
+                    f"keep{'s' if count == 1 else ''} blocking its root. Not closed: {why}. "
+                    "Nothing was written"
+                ],
+            )
+
+        if assessment.gone:
+            basis = (
+                f"its owner was proven gone (lock {assessment.lock}, identity "
+                f"{assessment.probe.verdict})"
+            )
+        else:
+            basis = (
+                "no owner and no controller process were recorded for it, so nothing recorded "
+                "can still act (an inference, not an observation)"
+            )
+        notes: list[str] = []
+        stop_closed = ""  # the entry *this call* closed from the run's recorded confirmed stop
+        _intent, receipt = self.store.cancel_state(run_id)
+        if (
+            receipt is not None
+            and receipt.status == "confirmed_stopped"
+            and not receipt.run_already_ended
+            and row["block_code"] == RefusalCode.CANCELLED_BY_OPERATOR.value
+            and any(entry.invocation_id == receipt.invocation_id for entry in open_entries)
+        ):
+            # Read again right before the write: an overlapping ``resume`` may have closed the
+            # entry since this call's snapshot, and a closed entry already records what is known.
+            # Skipped silently - the stop's own "left ... ; a stop closes only an open entry" note
+            # would describe a closure this call never attempted.
+            current = self.store.invocation(receipt.invocation_id)
+            if current is not None and current.state.value in INVOCATION_OPEN_STATES:
+                try:
+                    if self._close_open_entry_from_stop(run_id, current, receipt):
+                        stop_closed = receipt.invocation_id
+                except StoreError as exc:
+                    after_failure = self.store.invocation(receipt.invocation_id)
+                    # Refused because another writer closed the entry in between: not a failure
+                    # of this call, and nothing to say. Still open: a real refusal, said so.
+                    if (
+                        after_failure is not None
+                        and after_failure.state.value in INVOCATION_OPEN_STATES
+                    ):
+                        notes.append(
+                            f"the recorded confirmed stop ({receipt.mechanism}) of invocation "
+                            f"{receipt.invocation_id} could not be recorded on its ledger entry "
+                            f"({exc}); that entry is closed with the others instead"
+                        )
+        detail = (
+            f"left open when run {run_id} ended {ended}; closed by `hflow resume` after {basis}. "
+            "No result was recorded on this entry: the consumption stands, nothing "
+            "re-dispatches, and `hflow ledger settle` records what an operator attests"
+        )
+        closed = self.store.mark_unsettled_invocations_unknown(run_id, detail)
+        made = closed + (1 if stop_closed else 0)
+        if not made:
+            # Every entry this call read as open was closed by someone else before it wrote: an
+            # overlapping ``resume`` (or a late spawn report). Its own note says what it did.
+            them = "it" if count == 1 else "them"
+            return self._outcome_for(
+                run_id,
+                notes=[
+                    f"run {run_id} ended {ended} with {count} ledger entr"
+                    f"{'y' if count == 1 else 'ies'} open when this resume read {them} ({ids}), "
+                    f"but {'it was' if count == 1 else 'they were'} already closed when it came "
+                    f"to close {them} - concurrently, by an overlapping `hflow resume` or another "
+                    f"writer, after this call read {them}. This resume closed nothing and wrote "
+                    f"nothing; `hflow status {run_id}` shows each entry's state"
+                ],
+            )
+        moved: list[str] = []  # snapshot entries now closed, as "id from->to"
+        moved_not_by_stop = 0  # ... of which this call's stop closure is not the cause
+        still_open = 0
+        for entry in open_entries:
+            now = self.store.invocation(entry.invocation_id)
+            after = now.state.value if now is not None else "unrecorded"
+            if after in INVOCATION_OPEN_STATES:
+                still_open += 1
+                continue
+            moved.append(f"{entry.invocation_id} {entry.state.value}->{after}")
+            moved_not_by_stop += entry.invocation_id != stop_closed
+        from_stop = (
+            f"; {stop_closed} was closed from the run's recorded confirmed stop "
+            f"({receipt.mechanism}), as that stop would have closed it"
+            if stop_closed and receipt is not None
+            else ""
+        )
+        if closed >= moved_not_by_stop:
+            # Step 3 can close only entries of this ended run, all of them in the snapshot, so a
+            # count that covers every other entry seen closed means each of them is this call's.
+            head = (
+                f"resume closed the {made} ledger entr{'y' if made == 1 else 'ies'} left open on "
+                f"this ended run ({ended}) once {basis}: {_change_list(moved)}{from_stop}"
+            )
+        else:
+            head = (
+                f"resume closed {made} of the {len(moved)} ledger entries it saw close on this "
+                f"ended run ({ended}), once {basis}; an overlapping writer (another "
+                "`hflow resume`) closed the rest, and the ledger does not record which call "
+                f"closed which: {_change_list(moved)}{from_stop}"
+            )
+        note = (
+            f"{NOTE_DISPATCH}: {head}. Every entry with no recorded result is unknown (a launch "
+            "was recorded) or launch_unknown (no launch recorded). Nothing was re-dispatched or "
+            "refunded, and the run's state, block code, receipt and outcome are unchanged. An "
+            "unknown or launch_unknown entry keeps blocking the root until "
+            "`hflow ledger settle <invocation_id>` records an operator attestation"
+        )
+        if still_open:  # pragma: no cover - the closures are compare-and-set from the open states
+            note += f"; {still_open} could not be closed and stay open"
+        self.store.record_note(run_id, note)
+        notes.append(note)
+        return self._outcome_for(run_id, notes=notes)
 
     def reconcile(self, run_id: str) -> ReconcileOutcome:
         """Observe an interrupted attempt. Must not start new model work.
@@ -1493,8 +1749,10 @@ class Controller:
                 f"{NOTE_DISPATCH}: the confirmed stop could not record the ledger entry of "
                 f"invocation {invocation_id} ({exc}); the run is stopped and blocked "
                 f"{RefusalCode.CANCELLED_BY_OPERATOR.value}, and the entry keeps the state it "
-                "had. An open entry keeps blocking the root, and this build has no command that "
-                "closes it for such a run: `resume` reconciles only an outcome_unknown run",
+                "had. An open entry keeps blocking the root. Once this run's owner has exited, "
+                f"`hflow resume {run_id}` closes it from this recorded stop, as the stop would "
+                "have; an entry that leaves unknown or launch_unknown is then closed by "
+                "`hflow ledger settle <invocation_id>`",
             )
 
     def _stop_after_acceptance(self, run_id: str) -> CancellationReceipt:
@@ -1555,7 +1813,8 @@ class Controller:
         * a launch *was* requested and no report came back -> nobody may say whether a process
           exists, and a confirmed stop of a real child is direct evidence that one did. This is
           ``launch_unknown``: the root stays blocked (a late spawn report can still record what
-          the driver saw, see ``Store.record_invocation_spawn``; no command closes it). Recording
+          the driver saw, see ``Store.record_invocation_spawn``; only an operator's
+          ``hflow ledger settle`` closes it). Recording
           ``not_started`` here would be claiming, from an empty timestamp, that no driver was ever
           asked - which is false, and was reproduced against a real forced stop of a real pid.
         """
@@ -1572,27 +1831,56 @@ class Controller:
                 "this one already records what is known",
             )
             return
+        if (
+            not self._close_open_entry_from_stop(run_id, recorded, receipt)
+            and recorded.started_at is not None
+        ):
+            self._note_not_settled(run_id, invocation_id, InvocationOutcome.CANCELLED)
+
+    def _close_open_entry_from_stop(
+        self, run_id: str, recorded: InvocationIntent, receipt: CancellationReceipt
+    ) -> bool:
+        """Write the closure a confirmed stop implies for an entry read as open. Writes no note.
+
+        The three shapes of :meth:`_settle_cancelled_invocation`, shared with ``resume`` closing
+        an ended run's entry from its recorded stop (:meth:`_close_open_entries_of_ended_run`):
+        a recorded launch is settled ``cancelled``; no launch requested is ``not_started``; a
+        requested launch with no spawn report is ``launch_unknown``. Each write is a
+        compare-and-set from the open states, so an entry another writer closed in between keeps
+        what it records.
+
+        ``True`` when this call's write is what closed the entry: the store's compare-and-set
+        answer for the settlement and, because ``mark_invocation_not_started`` and
+        ``mark_launch_unresolved`` return no row count, the state read back for the other two (a
+        writer that closed the same entry the same way in between reads back the same). ``False``
+        when the entry had left the open states first. A ``StoreError`` - ``mark_launch_unresolved``
+        refusing an entry that has since recorded a launch or a final fact - propagates for the
+        caller to word.
+        """
+        invocation_id = recorded.invocation_id
         if recorded.started_at is not None:
-            if not self.store.settle_invocation(
+            return self.store.settle_invocation(
                 invocation_id,
                 outcome=InvocationOutcome.CANCELLED,
                 detail=f"stop confirmed ({receipt.mechanism}) for run {run_id}",
-            ):
-                self._note_not_settled(run_id, invocation_id, InvocationOutcome.CANCELLED)
-            return
+            )
         if not recorded.launch_requested:
             self.store.mark_invocation_not_started(
                 invocation_id,
                 f"a confirmed stop ({receipt.mechanism}) ended run {run_id} before any driver was "
                 "asked to launch this invocation",
             )
-            return
-        self.store.mark_launch_unresolved(
-            invocation_id,
-            f"a stop was confirmed ({receipt.mechanism}) for run {run_id} after the launch was "
-            "requested and before any spawn report arrived: no launch is recorded and no process "
-            "is known, so the ledger does not claim either",
-        )
+            closed_as = InvocationStartState.NOT_STARTED
+        else:
+            self.store.mark_launch_unresolved(
+                invocation_id,
+                f"a stop was confirmed ({receipt.mechanism}) for run {run_id} after the launch was "
+                "requested and before any spawn report arrived: no launch is recorded and no "
+                "process is known, so the ledger does not claim either",
+            )
+            closed_as = InvocationStartState.LAUNCH_UNKNOWN
+        now = self.store.invocation(invocation_id)
+        return now is not None and now.state is closed_as
 
     def _active_invocation(
         self, row: object, attempt: object
@@ -2250,7 +2538,10 @@ class Controller:
             self.store.record_note(
                 reservation.invocation.run_id,
                 f"{NOTE_DISPATCH}: invocation {invocation_id} could not be "
-                f"settled ({exc}); its consumption stands and the root keeps it open",
+                f"settled ({exc}); its consumption stands and the entry stays open, which keeps "
+                "blocking the root. Once the run has ended and its owner has exited, "
+                f"`hflow resume {reservation.invocation.run_id}` closes it as unknown or "
+                "launch_unknown, and `hflow ledger settle <invocation_id>` then settles it",
             )
             return
         if not settled:
@@ -2296,8 +2587,10 @@ class Controller:
                 f"{NOTE_DISPATCH}: the driver raised for invocation "
                 f"{reservation.invocation.invocation_id} without reporting a spawn fact "
                 f"({exc!r}); the ledger keeps it as a launch that was requested and unconfirmed, "
-                "which keeps blocking the root. This build has no command that closes it for a "
-                "run blocked by a driver failure: `resume` reconciles only an outcome_unknown run",
+                "which keeps blocking the root. Once the run has ended and its owner has exited, "
+                f"`hflow resume {reservation.invocation.run_id}` closes it as launch_unknown "
+                "(unknown if a launch was reported meanwhile) without re-dispatching or "
+                "refunding, and `hflow ledger settle <invocation_id>` then settles it",
             )
         except StoreError:
             pass  # a broken note write must not change what the caller reports

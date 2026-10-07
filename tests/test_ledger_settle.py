@@ -671,10 +671,20 @@ def test_status_report_and_doctor_say_not_observed(
 # --------------------------------------------------------------------------
 
 
+#: The last storage version without ``invocation_settlements`` (v7 added it).
+_PRE_SETTLEMENT_VERSION = 6
+
+
+def _strip_to_pre_settlement_shape(connection: sqlite3.Connection) -> None:
+    """Drop what v7 and every later version added, so the file is a genuine v6 shape."""
+    connection.execute("DROP TABLE IF EXISTS integrations")
+    connection.execute("DROP TABLE invocation_settlements")
+
+
 def test_migration_to_the_settlement_version_keeps_rows(
     tmp_path: Path, project, task_spec: TaskSpec, project_root: Path
 ) -> None:
-    """A ledger one version older (no settlement table) migrates with every row intact."""
+    """A ledger from before the settlement table (v6) migrates with every row intact."""
     path = tmp_path / "data" / "hflow.sqlite"
     store = Store(path)
     try:
@@ -686,10 +696,10 @@ def test_migration_to_the_settlement_version_keeps_rows(
     finally:
         store.close()
 
-    previous = migrate.STORAGE_VERSION - 1
+    previous = _PRE_SETTLEMENT_VERSION
     connection = sqlite3.connect(str(path))
     try:
-        connection.execute("DROP TABLE invocation_settlements")
+        _strip_to_pre_settlement_shape(connection)
         connection.execute(
             "UPDATE schema_meta SET value = ? WHERE key = 'storage_version'", (str(previous),)
         )
@@ -721,10 +731,10 @@ def test_a_failed_settlement_migration_rolls_back(
 ) -> None:
     path = tmp_path / "data" / "hflow.sqlite"
     Store(path).close()
-    previous = migrate.STORAGE_VERSION - 1
+    previous = _PRE_SETTLEMENT_VERSION
     connection = sqlite3.connect(str(path))
     try:
-        connection.execute("DROP TABLE invocation_settlements")
+        _strip_to_pre_settlement_shape(connection)
         connection.execute(
             "UPDATE schema_meta SET value = ? WHERE key = 'storage_version'", (str(previous),)
         )

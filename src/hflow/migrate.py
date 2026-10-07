@@ -43,7 +43,10 @@ run's *owner identity* (``owner_token``, ``owner_pid``, ``owner_created``, ``own
 ``claim_generation``); a row written before v6 keeps a NULL owner, which reads as "owner unknown",
 never as an owner this build observed. v7 adds ``invocation_settlements``: the append-only record
 of an operator closing an ``unknown`` or ``launch_unknown`` ledger entry by attestation
-(``hflow ledger settle``). It only adds a table; no existing row is rewritten.
+(``hflow ledger settle``). It only adds a table; no existing row is rewritten. v8 adds
+``integrations`` (batch I2): one row per attempt to integrate a run's accepted candidate into a
+local branch. It only adds a table and its indexes; a run accepted before v8 has no integration
+record, which reads as "never integrated by HFlow", and its own receipt is not touched.
 """
 
 from __future__ import annotations
@@ -57,9 +60,9 @@ from pathlib import Path
 
 #: Storage format version. Separate from the public contract version: the file layout can
 #: gain a table while every published contract keeps its own meaning.
-STORAGE_VERSION = 7
+STORAGE_VERSION = 8
 #: The highest storage version this build knows how to open.
-SUPPORTED_STORAGE_VERSION = 7
+SUPPORTED_STORAGE_VERSION = 8
 #: Suffix of the pre-migration snapshot, next to the database.
 MIGRATION_BACKUP_SUFFIX = ".pre-v{version}.bak"
 
@@ -416,6 +419,68 @@ CREATE INDEX IF NOT EXISTS ix_invocation_settlements_root
     ON invocation_settlements (root_id, settled_as);
 """
 
+# --------------------------------------------------------------------------
+# v8 (batch I2): controlled integration of an accepted candidate into a local branch
+# --------------------------------------------------------------------------
+
+#: One row per integration attempt, one column per ``IntegrationRecord`` field (lists as JSON),
+#: plus the ``IntegrationReceipt`` once the record is ``integrated``. The run's own row and receipt
+#: are never rewritten by an integration.
+#:
+#: The schema backs the rules a bug must not be able to break: at most one *active* integration per
+#: run (``preparing``/``checking``/``applying``), at most one ``applying`` per repository and target
+#: ref, and a receipt exactly when the record is ``integrated`` (with its time and basis). ``state``
+#: is checked here because the partial indexes match its literal values; the other vocabularies
+#: (mode, basis, worktree state) are validated by the contract model before every write.
+_V8_SCHEMA = """
+CREATE TABLE IF NOT EXISTS integrations (
+    integration_id      TEXT PRIMARY KEY,
+    run_id              TEXT NOT NULL REFERENCES runs(run_id),
+    task_id             TEXT NOT NULL,
+    attempt_id          TEXT NOT NULL,
+    git_common_dir      TEXT NOT NULL,
+    repo_root           TEXT NOT NULL,
+    target_ref          TEXT NOT NULL,
+    target_tip          TEXT NOT NULL,
+    base_commit         TEXT NOT NULL,
+    candidate_commit    TEXT NOT NULL,
+    mode                TEXT,
+    integration_commit  TEXT NOT NULL DEFAULT '',
+    integration_tree    TEXT NOT NULL DEFAULT '',
+    integration_ref     TEXT NOT NULL DEFAULT '',
+    state               TEXT NOT NULL,
+    checks_digest       TEXT NOT NULL,
+    fingerprint         TEXT NOT NULL DEFAULT '',
+    evidence_ids_json   TEXT NOT NULL DEFAULT '[]',
+    paths_json          TEXT NOT NULL DEFAULT '[]',
+    conflict_paths_json TEXT NOT NULL DEFAULT '[]',
+    worktree_path       TEXT NOT NULL DEFAULT '',
+    worktree_state      TEXT NOT NULL DEFAULT 'NONE',
+    owner_pid           INTEGER,
+    owner_created       INTEGER,
+    owner_host          TEXT NOT NULL DEFAULT '',
+    apply_intent_at     TEXT,
+    applied_by          TEXT NOT NULL DEFAULT '',
+    integrated_at       TEXT,
+    basis               TEXT,
+    detail              TEXT NOT NULL DEFAULT '',
+    receipt_json        TEXT,
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    CHECK (state IN ('preparing', 'checking', 'ready', 'applying', 'integrated', 'conflict',
+                     'checks_failed', 'stale', 'interrupted', 'superseded', 'failed')),
+    CHECK ((state = 'integrated') = (receipt_json IS NOT NULL)),
+    CHECK (state <> 'integrated' OR (integrated_at IS NOT NULL AND basis IS NOT NULL))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_integrations_active_run
+    ON integrations (run_id) WHERE state IN ('preparing', 'checking', 'applying');
+CREATE UNIQUE INDEX IF NOT EXISTS ux_integrations_applying_target
+    ON integrations (git_common_dir, target_ref) WHERE state = 'applying';
+CREATE INDEX IF NOT EXISTS ix_integrations_run
+    ON integrations (run_id, created_at);
+"""
+
 #: Migration targets that rebuild a table. SQLite's recommended procedure for that runs with
 #: foreign-key enforcement suspended, and ``PRAGMA foreign_keys`` is a no-op inside a transaction,
 #: so ``migrate`` has to set it before it opens one.
@@ -479,10 +544,10 @@ def _effective_version(conn: sqlite3.Connection) -> int:
         return version
     if not _has_table(conn, "runs"):
         return 0
-    if _has_table(conn, "invocation_settlements") and _columns(conn, "runs") >= {
-        "owner_token",
-        "claim_generation",
-    }:
+    v6_runs = _columns(conn, "runs") >= {"owner_token", "claim_generation"}
+    if _has_table(conn, "integrations") and _has_table(conn, "invocation_settlements") and v6_runs:
+        return 8
+    if _has_table(conn, "invocation_settlements") and v6_runs:
         return 7
     if _columns(conn, "runs") >= {"owner_token", "claim_generation"}:
         return 6
@@ -857,6 +922,18 @@ def _migrate_to_v7(conn: sqlite3.Connection, step: StepHook) -> None:
     step("v7:invocation-settlements-table")
 
 
+def _migrate_to_v8(conn: sqlite3.Connection, step: StepHook) -> None:
+    """Add the integration record (``hflow integrate``, batch I2). Adds only.
+
+    No existing row is touched. A run accepted by an earlier build keeps its ``LOCAL_CANDIDATE``
+    receipt and has no integration record: whether its candidate reached a branch some other way
+    is not something this build observed, so nothing is inferred from the repository here.
+    """
+    for statement in _statements(_V8_SCHEMA):
+        conn.execute(statement)
+    step("v8:integrations-table")
+
+
 _MIGRATIONS: dict[int, Callable[[sqlite3.Connection, StepHook], None]] = {
     1: _migrate_to_v1,
     2: _migrate_to_v2,
@@ -865,6 +942,7 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection, StepHook], None]] = {
     5: _migrate_to_v5,
     6: _migrate_to_v6,
     7: _migrate_to_v7,
+    8: _migrate_to_v8,
 }
 
 

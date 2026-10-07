@@ -7,23 +7,29 @@ fingerprint. This module owns that and nothing else:
   is never written to (and never stashed, reset or overwritten);
 * a freeze step that records the candidate as a **commit** with a canonical message and an
   explicit identity, so the receipt can name a commit and a tree object;
-* a drift check that fails closed when the worktree no longer matches what was frozen.
+* a drift check that fails closed when the worktree no longer matches what was frozen;
+* the plumbing a controlled integration is built from: ancestry, a three-way merge computed by
+  ``merge-tree`` (objects only - no index, no working tree), ``commit-tree``, a compare-and-set
+  branch update, and the question "is this branch checked out anywhere".
 
-Deliberately absent: branch management, merging, rebasing, remotes, publishing, and any
-"generic git platform" behaviour. Only what a local candidate needs.
+Deliberately absent: porcelain merging or rebasing in any working tree, creating or deleting
+branches, remotes, publishing, and any "generic git platform" behaviour.
 """
 
 from __future__ import annotations
 
 import atexit
 import hashlib
+import locale
 import os
+import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -128,6 +134,157 @@ CANDIDATE_AUTHOR_EMAIL = "hflow@localhost"
 
 class GitError(RuntimeError):
     """A git command failed. The message keeps git's own words."""
+
+
+#: The oldest Git a controlled integration runs on: ``merge-tree --write-tree`` is 2.38 and its
+#: ``--merge-base`` option is 2.40.
+MIN_INTEGRATION_GIT: tuple[int, int] = (2, 40)
+
+_GIT_VERSION = re.compile(r"git version (\d+)\.(\d+)(?:\.(\d+))?(?!\d)")
+_FULL_OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def parse_git_version(text: str) -> tuple[int, int, int]:
+    """``git version 2.56.0.windows.2`` -> ``(2, 56, 0)``.
+
+    A vendor suffix (``.windows.2``, `` (Apple Git-146)``, ``.rc1``) is ignored; a missing patch
+    number (a ``2.40.GIT`` source build) reads as ``0``. Anything else raises :class:`GitError`.
+    """
+    match = _GIT_VERSION.match(text.strip())
+    if match is None:
+        raise GitError(f"unrecognised `git version` output: {text.strip()[:80]!r}")
+    major, minor, patch = match.groups()
+    return int(major), int(minor), int(patch or 0)
+
+
+def is_full_oid(value: str) -> bool:
+    """Is ``value`` a complete lowercase hex object id (SHA-1 or SHA-256), as git prints one?"""
+    return isinstance(value, str) and _FULL_OID.fullmatch(value) is not None
+
+
+def _revision(value: str, label: str) -> str:
+    """A revision argument that git cannot read as an option or split into several arguments."""
+    if not isinstance(value, str) or not value or value.startswith("-"):
+        raise GitError(f"refusing {label} {value!r}: not a revision")
+    if any(char in value for char in "\0\n\r"):
+        raise GitError(f"refusing {label} {value!r}: it holds a NUL or a line break")
+    return value
+
+
+@dataclass(frozen=True)
+class MergeTreeResult:
+    """``git merge-tree --write-tree`` in git's own terms."""
+
+    clean: bool
+    #: The toplevel tree OID git printed. Git prints one for a conflicted merge too, with conflict
+    #: markers inside files; it is never to be committed then.
+    tree: str
+    #: Conflicted paths, unique and sorted; empty when clean. Git documents that a conflicted merge
+    #: can list no path (some directory-rename conflicts), so ``clean`` is the verdict, not this.
+    conflicts: tuple[str, ...]
+
+
+def _merge_tree_result(stdout: str, *, clean: bool, args: tuple[str, ...]) -> MergeTreeResult:
+    """Parse ``merge-tree --write-tree -z --name-only --no-messages`` output.
+
+    The layout (``Documentation/git-merge-tree.adoc``, ``builtin/merge-tree.c``): the toplevel
+    tree OID and a NUL; then, only for a conflicted merge, each conflicted path once, raw (``-z``
+    never quotes) and NUL-terminated. ``--no-messages`` drops the informational section, so
+    nothing follows. Anything else raises: a layout this cannot read is not a merge result.
+    """
+    fields = stdout.split("\0")
+    if len(fields) < 2 or fields[-1] != "":
+        raise GitError(f"git {' '.join(args)} printed an unreadable result (no NUL-terminated tree)")
+    tree, paths = fields[0], fields[1:-1]
+    if not is_full_oid(tree):
+        raise GitError(f"git {' '.join(args)} printed {tree[:80]!r} where a tree id belongs")
+    if clean and paths:
+        raise GitError(f"git {' '.join(args)} reported a clean merge and conflicted paths")
+    if any(not path for path in paths):
+        raise GitError(f"git {' '.join(args)} printed an empty conflicted path")
+    return MergeTreeResult(clean=clean, tree=tree, conflicts=tuple(sorted(set(paths))))
+
+
+def _output_encoding() -> str:
+    """The encoding ``subprocess`` text mode decodes git's output with, for every other call here."""
+    return "utf-8" if sys.flags.utf8_mode else locale.getencoding()
+
+
+def _path_key(path: str | os.PathLike[str]) -> str:
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _read_state_file(path: Path) -> str | None:
+    """A worktree state file the way git's ``get_branch`` reads it: ``None`` when absent or empty.
+
+    Trailing line ends are dropped. A file that exists but cannot be read raises: whether a branch
+    is checked out must not be answered "no" because the answer could not be read.
+    """
+    try:
+        data = path.read_bytes()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as exc:
+        raise GitError(f"cannot read {path}: {exc}") from exc
+    text = data.decode(_output_encoding(), errors="surrogateescape").rstrip("\r\n")
+    return text or None
+
+
+def _state_names_branch(name: str | None, branch: str) -> bool:
+    """Does a rebase ``head-name`` or ``BISECT_START`` value name ``branch`` (no ``refs/heads/``)?
+
+    Mirrors git's ``get_branch``: ``refs/heads/<b>`` names ``<b>``; any other ``refs/...`` value,
+    or a bare branch name (``BISECT_START`` stores one), is kept as written; ``detached HEAD``
+    names nothing. An object id is shown abbreviated by git, so it is matched as a prefix (four
+    hex digits or more) - erring towards "checked out".
+    """
+    if not name or name == "detached HEAD":
+        return False
+    if is_full_oid(name):
+        return re.fullmatch(r"[0-9a-f]{4,}", branch) is not None and name.startswith(branch)
+    return name.removeprefix("refs/heads/") == branch
+
+
+def _update_refs_state(path: Path) -> list[str]:
+    """The refs a ``rebase --update-refs`` will move, from its ``update-refs`` state file.
+
+    The file is groups of three lines: a ref name, its old and its new object id. Every ref line is
+    returned, a malformed group's included - erring towards "checked out".
+    """
+    text = _read_state_file(path)
+    if text is None:
+        return []
+    lines = text.split("\n")
+    return [lines[index].rstrip("\r") for index in range(0, len(lines), 3)]
+
+
+def _worktree_state_holds(admin: Path, ref: str) -> bool:
+    """Does the worktree whose git directory is ``admin`` hold ``ref`` through an operation?
+
+    What git's ``prepare_checked_out_branches`` (``branch.c``) adds to the ``branch`` line of
+    ``git worktree list``, read from the same files (``wt_status_check_rebase`` /
+    ``wt_status_check_bisect``): a rebase in progress (``rebase-apply`` that is not an ``am``,
+    or ``rebase-merge``) names its branch in ``head-name``; a bisect (``BISECT_LOG`` present)
+    names the branch it started from in ``BISECT_START``; a ``rebase --update-refs`` lists the
+    branches it will move in ``rebase-merge/update-refs``.
+    """
+    branch = ref.removeprefix("refs/heads/") if ref.startswith("refs/heads/") else None
+    if branch is not None:
+        rebase_apply = admin / "rebase-apply"
+        if rebase_apply.exists():
+            if not (rebase_apply / "applying").exists() and _state_names_branch(
+                _read_state_file(rebase_apply / "head-name"), branch
+            ):
+                return True
+        elif (admin / "rebase-merge").exists() and _state_names_branch(
+            _read_state_file(admin / "rebase-merge" / "head-name"), branch
+        ):
+            return True
+        if (admin / "BISECT_LOG").exists() and _state_names_branch(
+            _read_state_file(admin / "BISECT_START"), branch
+        ):
+            return True
+    return ref in _update_refs_state(admin / "rebase-merge" / "update-refs")
 
 
 #: Ignored paths a *check* may legitimately leave behind in a run worktree. Naming them is
@@ -1098,16 +1255,29 @@ class GitRepo:
 
     # -- refs -----------------------------------------------------------------
 
+    @staticmethod
+    def _ref_components(*labelled: tuple[str, str]) -> None:
+        """Refuse an identifier that is not letters, digits, ``-`` and ``_`` as a ref component."""
+        for label, value in labelled:
+            if not value or not value.replace("-", "").replace("_", "").isalnum():
+                raise GitError(f"refusing to build a ref from an invalid {label}: {value!r}")
+
     def candidate_ref(self, run_id: str, attempt_id: str) -> str:
         """The HFlow-owned ref that keeps a candidate reachable after its worktree is gone.
 
         The name is built from controller-validated identifiers, never from model text. It is
         *not* an acceptance mark: failed candidates are kept too.
         """
-        for label, value in (("run id", run_id), ("attempt id", attempt_id)):
-            if not value or not value.replace("-", "").replace("_", "").isalnum():
-                raise GitError(f"refusing to build a ref from an invalid {label}: {value!r}")
+        self._ref_components(("run id", run_id), ("attempt id", attempt_id))
         return f"refs/hflow/candidates/{run_id}/{attempt_id}"
+
+    def integration_ref(self, run_id: str, integration_id: str) -> str:
+        """The HFlow-owned ref that keeps an integration commit reachable, whatever the target does.
+
+        Built like :meth:`candidate_ref`, from controller-validated identifiers only.
+        """
+        self._ref_components(("run id", run_id), ("integration id", integration_id))
+        return f"refs/hflow/integrations/{run_id}/{integration_id}"
 
     def ref_target(self, ref: str) -> str | None:
         completed = subprocess.run(  # noqa: S603,S607 - read-only query
@@ -1121,13 +1291,35 @@ class GitRepo:
         )
         return completed.stdout.strip() or None
 
+    def ref_spelled_exactly(self, ref: str) -> bool:
+        """Does a ref with exactly this name - byte for byte, case included - exist?
+
+        ``rev-parse`` is not enough on a case-insensitive file system: ``refs/heads/MAIN`` resolves
+        through the loose file ``refs/heads/main``, so a lookup by a differently cased name finds
+        the branch while every comparison against the real name (which worktree has it checked
+        out, which ref an update locks) silently misses it. ``for-each-ref`` matches the stored
+        names, loose and packed, case-sensitively.
+        """
+        listing = self.run("for-each-ref", "--format=%(refname)", ref)
+        return ref in listing.splitlines()
+
     def ensure_candidate_ref(self, ref: str, commit: str) -> str:
-        """Create the ref only if absent; reuse it if it already points at the candidate.
+        """Create the candidate ref only if absent; reuse it if it already points at the candidate."""
+        return self.ensure_ref(ref, commit)
+
+    def ensure_ref(self, ref: str, commit: str) -> str:
+        """Create ``ref`` at ``commit`` only if absent; ``"reused"`` if it already points there.
 
         ``git update-ref`` with the empty old value is a create-if-absent operation, so an
         existing ref - including a user's - is never overwritten. A conflicting value is
-        refused instead.
+        refused instead. ``ref`` must be a full name under ``refs/`` (never ``HEAD`` or another
+        pseudo-ref) and ``commit`` a full object id, so "already points there" is a plain
+        comparison. Returns ``"created"`` or ``"reused"``.
         """
+        if not isinstance(ref, str) or not ref.startswith("refs/") or any(c in ref for c in "\0\n\r"):
+            raise GitError(f"refusing to create {ref!r}: not a full ref name under refs/")
+        if not is_full_oid(commit):
+            raise GitError(f"refusing to point {ref} at {commit!r}: not a full object id")
         existing = self.ref_target(ref)
         if existing is not None:
             if existing == commit:
@@ -1142,6 +1334,276 @@ class GitRepo:
                 return "reused"
             raise GitError(f"could not create {ref}: {exc}") from exc
         return "created"
+
+    # -- integration primitives ----------------------------------------------
+    #
+    # Plumbing only: none of these reads or writes an index or a working tree, so the user's
+    # checkout is never touched. Revisions are refused when they could read as an option.
+
+    def _git_call(
+        self, *args: str, stdin: bytes | None = None, timeout: float = 300.0
+    ) -> tuple[int, str, str]:
+        """Run ``git <args>`` in the repository root; ``(returncode, stdout, stderr)``.
+
+        For callers that read the exit code themselves (``run`` raises on any non-zero) or feed
+        stdin. The pipes are binary: input reaches git byte for byte (a text-mode stdin on Windows
+        writes ``\\r\\n`` for ``\\n``), and stdout is decoded strictly with the encoding the
+        module's text-mode calls use, without newline translation, so a path holding ``\\r``
+        arrives as git printed it. Output that is not text raises :class:`GitError` on every
+        platform - the caveat in ``run``: unreadable must never look like empty.
+        """
+        try:
+            completed = subprocess.run(  # noqa: S603,S607 - fixed argv, no shell
+                ["git", *args],
+                cwd=str(self.root),
+                input=stdin,
+                # Nothing to feed: git reads no terminal and no inherited pipe.
+                stdin=subprocess.DEVNULL if stdin is None else None,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+                env=_base_env(),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise GitError(f"git {' '.join(args)} timed out after {exc.timeout}s") from exc
+        encoding = _output_encoding()
+        try:
+            stdout = completed.stdout.decode(encoding)
+        except UnicodeDecodeError as exc:
+            raise GitError(_undecodable(args, exc.reason)) from exc
+        stderr = completed.stderr.decode(encoding, errors="replace")
+        return completed.returncode, stdout, stderr
+
+    def _git_checked(self, *args: str, stdin: bytes | None = None) -> str:
+        """:meth:`_git_call` that raises :class:`GitError`, with git's words, on a non-zero exit."""
+        returncode, stdout, stderr = self._git_call(*args, stdin=stdin)
+        if returncode != 0:
+            raise GitError(f"git {' '.join(args)} failed ({returncode}): {stderr.strip()[:300]}")
+        return stdout
+
+    @staticmethod
+    def _object_id(stdout: str, args: tuple[str, ...]) -> str:
+        oid = stdout.strip()
+        if not is_full_oid(oid):
+            raise GitError(f"git {' '.join(args)} printed {oid[:80]!r} where an object id belongs")
+        return oid
+
+    def git_version(self) -> tuple[int, int, int]:
+        """The running git's version, ``(major, minor, patch)``; see :func:`parse_git_version`."""
+        return parse_git_version(self._git_checked("version"))
+
+    def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        """``git merge-base --is-ancestor``: exit 0 is yes, 1 is no, anything else raises.
+
+        A commit is its own ancestor. A missing or non-commit object is an error, never a "no".
+        """
+        args = (
+            "merge-base",
+            "--is-ancestor",
+            "--end-of-options",
+            _revision(ancestor, "ancestor"),
+            _revision(descendant, "descendant"),
+        )
+        returncode, _, stderr = self._git_call(*args)
+        if returncode in (0, 1):
+            return returncode == 0
+        raise GitError(f"git {' '.join(args)} failed ({returncode}): {stderr.strip()[:300]}")
+
+    def branch_ref(self, branch: str) -> str:
+        """``refs/heads/<branch>`` for a plain branch name, validated by git itself.
+
+        ``git check-ref-format --branch`` must print the name back unchanged: it expands
+        ``@{-1}`` and similar shorthands, and those never name a fixed branch. Refused before git
+        is asked: empty, ``-`` prefixed (an option), ``refs/`` prefixed (a full ref, which would
+        become ``refs/heads/refs/...``), ``HEAD``, ``@`` (HEAD's shorthand) and anything holding
+        ``@{``, NUL or a line break.
+        """
+        if (
+            not isinstance(branch, str)
+            or not branch
+            or branch.startswith(("-", "refs/"))
+            or branch in {"HEAD", "@"}
+            or "@{" in branch
+            or any(char in branch for char in "\0\n\r")
+        ):
+            raise GitError(f"refusing branch name {branch!r}")
+        returncode, stdout, stderr = self._git_call("check-ref-format", "--branch", branch)
+        if returncode != 0 or stdout.removesuffix("\n") != branch:
+            raise GitError(f"refusing branch name {branch!r}: {stderr.strip()[:200] or stdout.strip()[:200]}")
+        return f"refs/heads/{branch}"
+
+    def tree_of(self, commit: str) -> str:
+        """The tree object id of ``commit`` (``rev-parse --verify <commit>^{tree}``)."""
+        args = ("rev-parse", "--verify", "--end-of-options", f"{_revision(commit, 'commit')}^{{tree}}")
+        return self._object_id(self._git_checked(*args), args)
+
+    def merge_tree(self, *, base: str, ours: str, theirs: str) -> MergeTreeResult:
+        """Three-way merge of ``ours`` and ``theirs`` over ``base``, as objects only.
+
+        ``git merge-tree --write-tree -z --name-only --no-messages --merge-base=<base>``: no index
+        and no working tree is read or written; the result tree and its blobs are written to the
+        object store. Exit 0 is a clean merge, 1 a conflicted one (git still prints a tree, which
+        holds conflict markers and must not be committed), anything else raises. Requires Git 2.40
+        (:data:`MIN_INTEGRATION_GIT`).
+        """
+        args = (
+            "merge-tree",
+            "--write-tree",
+            "-z",
+            "--name-only",
+            "--no-messages",
+            f"--merge-base={_revision(base, 'merge base')}",
+            "--end-of-options",
+            _revision(ours, "ours"),
+            _revision(theirs, "theirs"),
+        )
+        returncode, stdout, stderr = self._git_call(*args)
+        if returncode not in (0, 1):
+            raise GitError(f"git {' '.join(args)} failed ({returncode}): {stderr.strip()[:300]}")
+        return _merge_tree_result(stdout, clean=returncode == 0, args=args)
+
+    def commit_tree(self, tree: str, *, parents: Sequence[str], message: str) -> str:
+        """Write a commit of ``tree`` with ``parents`` and ``message``; return its object id.
+
+        ``git commit-tree <tree> -p <parent>... -F -``: the message travels on stdin as UTF-8,
+        never on the command line; author and committer are HFlow's fixed identity from
+        :func:`_base_env`; ``i18n.commitEncoding`` is pinned to UTF-8 so a user's setting cannot
+        add an encoding header. Refused: an empty message, one holding NUL, and a repeated
+        parent (git would drop it with only a warning). No ref moves.
+        """
+        if isinstance(parents, str):
+            raise GitError("parents must be a sequence of revisions, not one string")
+        parent_list = [_revision(parent, "parent") for parent in parents]
+        if len(set(parent_list)) != len(parent_list):
+            raise GitError(f"refusing a commit with a repeated parent: {parent_list}")
+        if not isinstance(message, str) or not message.strip():
+            raise GitError("refusing a commit with an empty message")
+        if "\0" in message:
+            raise GitError("refusing a commit message that holds a NUL")
+        try:
+            body = message.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise GitError(f"refusing a commit message that is not valid text ({exc.reason})") from exc
+        args = ["-c", "i18n.commitEncoding=UTF-8", "commit-tree", _revision(tree, "tree")]
+        for parent in parent_list:
+            args += ["-p", parent]
+        args += ["-F", "-"]
+        return self._object_id(self._git_checked(*args, stdin=body), tuple(args))
+
+    def update_ref_cas(self, ref: str, new: str, expected_old: str, *, reason: str) -> None:
+        """Move branch ``ref`` from ``expected_old`` to ``new``, atomically, or raise.
+
+        ``git update-ref --no-deref -m <reason> <ref> <new> <expected_old>``: git takes the ref's
+        lock, checks the current value is ``expected_old`` and writes ``new`` under that lock - a
+        compare-and-set. Only an existing branch (``refs/heads/``, validated as by
+        :meth:`branch_ref`) moves, and only between two full object ids: a zero id (create or
+        delete), an abbreviated id and a symbolic ref are refused, so this never creates, deletes
+        or retargets a ref. Any failure - a stale ``expected_old`` included - raises
+        :class:`GitError` and leaves the ref as it was. Git does not check whether the branch is
+        checked out anywhere; that is :meth:`checked_out_at`, the caller's question.
+        """
+        if not isinstance(ref, str) or not ref.startswith("refs/heads/"):
+            raise GitError(f"refusing to update {ref!r}: only a branch under refs/heads/ moves")
+        if self.branch_ref(ref.removeprefix("refs/heads/")) != ref:
+            raise GitError(f"refusing to update {ref!r}: not a valid branch ref")
+        for label, value in (("new", new), ("expected old", expected_old)):
+            if not is_full_oid(value) or set(value) == {"0"}:
+                raise GitError(f"refusing to update {ref}: {label} value {value!r} is not a full object id")
+        if not isinstance(reason, str) or not reason.strip() or any(c in reason for c in "\0\n\r"):
+            raise GitError(f"refusing to update {ref}: the reflog reason must be one non-empty line")
+        returncode, stdout, stderr = self._git_call("symbolic-ref", "-q", ref)
+        if returncode == 0:
+            raise GitError(f"refusing to update {ref}: it is a symbolic ref to {stdout.strip()}")
+        if returncode != 1:
+            raise GitError(f"git symbolic-ref -q {ref} failed ({returncode}): {stderr.strip()[:300]}")
+        self._git_checked("update-ref", "--no-deref", "-m", reason, ref, new, expected_old)
+
+    def _worktree_records(self) -> list[dict[str, str]]:
+        """``git worktree list --porcelain -z`` as one dict per worktree, in git's order.
+
+        ``-z`` (Git 2.36) prints every path raw and NUL-terminated, so a worktree path holding a
+        space, a non-ASCII letter or a line break is read as git holds it.
+        """
+        records: list[dict[str, str]] = []
+        current: dict[str, str] = {}
+        for line in self._git_checked("worktree", "list", "--porcelain", "-z").split("\0"):
+            if not line:
+                if current:
+                    records.append(current)
+                    current = {}
+                continue
+            key, _, value = line.partition(" ")
+            current[key] = value
+        if current:
+            records.append(current)
+        return records
+
+    def checked_out_at(self, ref: str) -> list[Path]:
+        """Every worktree that holds ``ref`` checked out, as git itself counts it.
+
+        A worktree holds a branch when its ``HEAD`` names it (the ``branch`` line of ``git
+        worktree list``) or when an operation in it will return to or move the branch: a rebase
+        (``head-name``), a bisect (``BISECT_START``) or a ``rebase --update-refs`` - git's
+        ``prepare_checked_out_branches`` in ``branch.c``, a superset of what ``worktree.c``'s
+        ``is_worktree_being_rebased`` / ``is_worktree_being_bisected`` / ``find_shared_symref``
+        check. The main worktree's state lives in the common git directory, a linked worktree's in
+        ``worktrees/<id>``, found as git finds it: by the ``gitdir`` file there. A bare main
+        worktree is skipped, as git skips it.
+
+        Returns resolved paths, deduplicated, in ``git worktree list`` order; a worktree whose
+        state names the branch but that the listing does not show comes last. Read-only.
+        """
+        records = self._worktree_records()
+        common = Path(
+            self._git_checked("rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+        )
+        # Linked worktree administrative directories, by the worktree path git derives from each
+        # ``gitdir`` file (``worktree.c`` ``get_linked_worktree``). One whose file is unreadable
+        # or empty is not a worktree to git either.
+        linked: dict[str, tuple[Path, str]] = {}
+        try:
+            entries = sorted(os.scandir(common / "worktrees"), key=lambda entry: entry.name)
+        except (FileNotFoundError, NotADirectoryError):
+            entries = []
+        except OSError as exc:
+            raise GitError(f"cannot list {common / 'worktrees'}: {exc}") from exc
+        for entry in entries:
+            if not entry.is_dir():
+                continue
+            admin_dir = Path(entry.path)
+            recorded = _read_state_file(admin_dir / "gitdir")
+            if recorded is None:
+                continue
+            path_text = recorded.rstrip().removesuffix("/.git")
+            if not os.path.isabs(path_text):
+                path_text = os.path.realpath(os.path.join(admin_dir, path_text))
+            linked.setdefault(_path_key(path_text), (admin_dir, path_text))
+
+        found: list[Path] = []
+        seen: set[str] = set()
+        listed: set[str] = set()
+
+        def add(path_text: str) -> None:
+            key = _path_key(path_text)
+            if key not in seen:
+                seen.add(key)
+                found.append(Path(path_text).resolve())
+
+        for index, record in enumerate(records):
+            path_text = record.get("worktree", "")
+            if not path_text:
+                continue
+            key = _path_key(path_text)
+            listed.add(key)
+            if "bare" in record:
+                continue
+            admin = common if index == 0 else linked.get(key, (None, ""))[0]
+            if record.get("branch") == ref or (admin is not None and _worktree_state_holds(admin, ref)):
+                add(path_text)
+        for key, (admin, path_text) in linked.items():
+            if key not in listed and _worktree_state_holds(admin, ref):
+                add(path_text)
+        return found
 
     # -- cleanup helpers ------------------------------------------------------
 

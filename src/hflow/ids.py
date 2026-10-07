@@ -44,3 +44,8 @@ def new_invocation_id() -> str:
 
 def new_reservation_id() -> str:
     return new_id("B")
+
+
+def new_integration_id() -> str:
+    # ``I-`` is taken by invocations.
+    return new_id("G")

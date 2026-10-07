@@ -932,6 +932,7 @@ def verify_candidate(
     time_budget_seconds: int | None = None,
     remove_bytecode: bool = False,
     committed_bytecode: Iterable[str] = (),
+    evidence_kind: str = "verification",
 ) -> VerificationResult:
     """Execute every required check once for this candidate; store evidence.
 
@@ -967,13 +968,17 @@ def verify_candidate(
     (a link, a junction, a file that could not be deleted) the check is not started: it is recorded
     as an error that never buys a repair. An in-place run passes ``False``: its working tree is the
     user's checkout, and nothing in it is deleted.
+
+    ``evidence_kind`` is the kind every row is recorded (and looked up for reuse) under. A run's own
+    checks are ``verification``; an integration tree's are ``integration-check``
+    (:mod:`hflow.integrate`), so neither can ever be read as the other.
     """
     check_map = project.check_map()
     required = spec.required_check_ids()
     if not required:
         return VerificationResult(status="not_run", detail="no checks required by acceptance")
 
-    existing = [dict(r) for r in store.evidence_for(run_id, kind="verification")]
+    existing = [dict(r) for r in store.evidence_for(run_id, kind=evidence_kind)]
     evidence_ids: list[str] = []
     failure_details: list[str] = []
     overall = EvidenceStatus.PASSED
@@ -1091,7 +1096,7 @@ def verify_candidate(
             evidence_id=evidence_id,
             run_id=run_id,
             attempt_id=attempt_id,
-            kind="verification",
+            kind=evidence_kind,
             status=outcome.status,
             candidate_fingerprint=candidate_fingerprint,
             checks_digest=project_checks_digest,

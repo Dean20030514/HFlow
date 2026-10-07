@@ -43,6 +43,10 @@ from .contracts import (
     EffectiveConfig,
     EvidenceRecord,
     EvidenceStatus,
+    INTEGRATION_ACTIVE_STATES,
+    IntegrationReceipt,
+    IntegrationRecord,
+    IntegrationState,
     InvocationIntent,
     InvocationOutcome,
     InvocationSettlement,
@@ -221,6 +225,75 @@ class SettlementRefused(StoreError):
 
 class InvocationNotFound(StoreError):
     """No ledger entry has this invocation id."""
+
+
+class IntegrationNotFound(StoreError):
+    """No integration record has this integration id."""
+
+
+class IntegrationConflict(StoreError):
+    """An integration write was refused by the stored state; nothing was written.
+
+    A compare-and-set whose record is not in an expected state, a second active integration of the
+    same run, a second ``applying`` integration of the same repository target, or a run that is not
+    an accepted candidate. The message names the current state or the other integration.
+    """
+
+
+#: Prefix of the run notes an integration writes (``integration: <id> ...``).
+NOTE_INTEGRATION = "integration"
+
+#: ``IntegrationRecord`` list fields and the JSON column each one is stored in. Every other field
+#: is stored in the column of the same name.
+_INTEGRATION_LIST_COLUMNS: dict[str, str] = {
+    "evidence_ids": "evidence_ids_json",
+    "paths": "paths_json",
+    "conflict_paths": "conflict_paths_json",
+}
+#: What ``update_integration`` may change besides ``state``. The identity of an integration - its
+#: run, candidate, target and the tip it was prepared against - is fixed at creation, and the
+#: ``integrated`` facts (time, basis, receipt) are written only by ``finalize_integration``.
+_INTEGRATION_MUTABLE_FIELDS: frozenset[str] = frozenset(
+    {
+        "mode",
+        "integration_commit",
+        "integration_tree",
+        "integration_ref",
+        "fingerprint",
+        "evidence_ids",
+        "paths",
+        "conflict_paths",
+        "worktree_path",
+        "worktree_state",
+        "owner_pid",
+        "owner_created",
+        "owner_host",
+        "apply_intent_at",
+        "applied_by",
+        "detail",
+    }
+)
+
+
+def _integration_states(
+    expected: IntegrationState | str | Sequence[IntegrationState | str],
+) -> tuple[IntegrationState, ...]:
+    """``expected`` as a non-empty tuple of states. A single state is a ``str``, so it is checked
+    before the sequence case: iterating it would yield its characters."""
+    items = (expected,) if isinstance(expected, str) else tuple(expected)
+    states = tuple(IntegrationState(item) for item in items)
+    if not states:
+        raise ValueError("expected names no integration state")
+    return states
+
+
+def _integration_values(record: IntegrationRecord) -> dict[str, Any]:
+    """Column name -> stored value for every ``IntegrationRecord`` field."""
+    values: dict[str, Any] = {}
+    for name, value in record.model_dump(mode="json").items():
+        column = _INTEGRATION_LIST_COLUMNS.get(name)
+        values[column or name] = canonical_json(value) if column else value
+    return values
 
 
 class Store:
@@ -2519,9 +2592,10 @@ class Store:
 
         * a process was created (``started_at`` set) -> ``UNKNOWN``: work really began and its
           result was never observed, so it blocks until an operator reconciles;
-        * a launch was only *requested* -> ``LAUNCH_UNKNOWN``: a transport call may have been made
-          and no process is known. It still blocks (the spend is unresolvable without looking),
-          but it is not counted as ``ever_started``, because no process was ever reported.
+        * no launch was recorded (``requested``, and also ``reserved`` - an entry no driver was
+          asked to launch yet) -> ``LAUNCH_UNKNOWN``: a transport call may have been made and no
+          process is known. It still blocks (the spend is unresolvable without looking), but it
+          is not counted as ``ever_started``, because no process was ever reported.
 
         A row that a driver explicitly reported as creating nothing stays ``NOT_STARTED``: nothing
         is unknown about it, and inventing an unknown would block the root for no reason.
@@ -3989,3 +4063,377 @@ class Store:
                 (run_id,),
             )
         ]
+
+    # -- controlled integration (batch I2, storage v8) ----------------------------------------
+
+    @staticmethod
+    def _integration_from_row(row: sqlite3.Row) -> IntegrationRecord:
+        """The contract view of one ``integrations`` row. An unreadable row raises, never skips."""
+        try:
+            data = {
+                name: (
+                    json.loads(str(row[_INTEGRATION_LIST_COLUMNS[name]]))
+                    if name in _INTEGRATION_LIST_COLUMNS
+                    else row[name]
+                )
+                for name in IntegrationRecord.model_fields
+            }
+            return IntegrationRecord.model_validate(data)
+        except (ValidationError, ValueError, RecursionError) as exc:
+            raise StoredRecordUnreadable(
+                f"integration {row['integration_id']} is not a readable IntegrationRecord: {exc}"
+            ) from exc
+
+    def _integration_row_locked(
+        self, conn: sqlite3.Connection, integration_id: str
+    ) -> IntegrationRecord:
+        row = conn.execute(
+            "SELECT * FROM integrations WHERE integration_id = ?", (integration_id,)
+        ).fetchone()
+        if row is None:
+            raise IntegrationNotFound(f"no integration record has id {integration_id}")
+        return self._integration_from_row(row)
+
+    @staticmethod
+    def _integrity_conflict_locked(
+        conn: sqlite3.Connection, record: IntegrationRecord, exc: sqlite3.IntegrityError
+    ) -> IntegrationConflict:
+        """Name the integration a uniqueness refusal collided with, when there is one."""
+        active = tuple(state.value for state in INTEGRATION_ACTIVE_STATES)
+        if record.state.value in active:
+            other = conn.execute(
+                f"SELECT integration_id, state FROM integrations WHERE run_id = ? "
+                f"AND state IN ({', '.join('?' for _ in active)}) AND integration_id <> ? "
+                "ORDER BY created_at, rowid LIMIT 1",
+                (record.run_id, *active, record.integration_id),
+            ).fetchone()
+            if other is not None:
+                return IntegrationConflict(
+                    f"run {record.run_id} already has an active integration "
+                    f"{other['integration_id']} ({other['state']}); a run has at most one "
+                    "preparing, checking or applying integration"
+                )
+        if record.state is IntegrationState.APPLYING:
+            other = conn.execute(
+                "SELECT integration_id, run_id FROM integrations WHERE git_common_dir = ? "
+                "AND target_ref = ? AND state = ? AND integration_id <> ? LIMIT 1",
+                (
+                    record.git_common_dir,
+                    record.target_ref,
+                    IntegrationState.APPLYING.value,
+                    record.integration_id,
+                ),
+            ).fetchone()
+            if other is not None:
+                return IntegrationConflict(
+                    f"integration {other['integration_id']} (run {other['run_id']}) is already "
+                    f"applying to {record.target_ref} in {record.git_common_dir}; a repository "
+                    "target has at most one applying integration"
+                )
+        return IntegrationConflict(f"integration {record.integration_id} was not written: {exc}")
+
+    def create_integration(self, record: IntegrationRecord) -> IntegrationRecord:
+        """Record a new ``preparing`` integration of an accepted run's candidate.
+
+        One ``BEGIN IMMEDIATE`` transaction. The run must exist, be ``ACCEPTED`` with a
+        ``LOCAL_CANDIDATE`` delivery receipt, and the record must name that receipt's attempt,
+        candidate commit and base and the run's task and checks digest. A ``ready`` integration of
+        the same run is marked ``superseded`` (a new prepare replaces it); a second *active* one is
+        refused by the schema's partial unique index and reported naming it. The store stamps
+        ``created_at``/``updated_at``; the stored record is returned.
+        """
+        record = IntegrationRecord.model_validate(record.model_dump())
+        if record.state is not IntegrationState.PREPARING:
+            raise ValueError(
+                f"a new integration is recorded as preparing, not {record.state.value}"
+            )
+        now = utc_now()
+        record = record.model_copy(update={"created_at": now, "updated_at": now})
+        with self.transaction() as conn:
+            run = conn.execute(
+                "SELECT task_id, task_state, delivery_state, checks_digest, receipt_json "
+                "FROM runs WHERE run_id = ?",
+                (record.run_id,),
+            ).fetchone()
+            if run is None:
+                raise IntegrationConflict(f"run {record.run_id} does not exist; nothing to integrate")
+            if run["task_state"] != TaskState.ACCEPTED.value:
+                raise IntegrationConflict(
+                    f"run {record.run_id} is {run['task_state']}, not ACCEPTED; only an accepted "
+                    "candidate is integrated"
+                )
+            if not run["receipt_json"]:
+                raise IntegrationConflict(
+                    f"run {record.run_id} is ACCEPTED but records no delivery receipt; there is "
+                    "no frozen candidate to integrate"
+                )
+            if run["delivery_state"] != DeliveryState.LOCAL_CANDIDATE.value:
+                raise IntegrationConflict(
+                    f"run {record.run_id} has delivery state {run['delivery_state']}, not "
+                    f"{DeliveryState.LOCAL_CANDIDATE.value}"
+                )
+            try:
+                receipt = ResultReceipt.model_validate_json(str(run["receipt_json"]))
+            except (ValidationError, ValueError) as exc:
+                raise StoredRecordUnreadable(
+                    f"run {record.run_id} has an unreadable delivery receipt: {exc}"
+                ) from exc
+            mismatches = [
+                f"{name} {given!r} != {recorded!r}"
+                for name, given, recorded in (
+                    ("task_id", record.task_id, str(run["task_id"])),
+                    ("attempt_id", record.attempt_id, receipt.attempt_id),
+                    ("checks_digest", record.checks_digest, str(run["checks_digest"])),
+                    ("candidate_commit", record.candidate_commit, receipt.candidate.git_commit),
+                    ("base_commit", record.base_commit, receipt.candidate.base_commit),
+                )
+                if given != recorded
+            ]
+            if mismatches:
+                raise ValueError(
+                    f"integration {record.integration_id} does not describe run "
+                    f"{record.run_id}'s accepted candidate: {'; '.join(mismatches)}"
+                )
+            if not record.candidate_commit:
+                raise IntegrationConflict(
+                    f"run {record.run_id}'s receipt records no Git candidate commit; only a "
+                    "candidate frozen in a Git worktree can be integrated"
+                )
+            superseded = [
+                str(row["integration_id"])
+                for row in conn.execute(
+                    "SELECT integration_id FROM integrations WHERE run_id = ? AND state = ? "
+                    "ORDER BY created_at, rowid",
+                    (record.run_id, IntegrationState.READY.value),
+                )
+            ]
+            if superseded:
+                conn.execute(
+                    "UPDATE integrations SET state = ?, detail = ?, updated_at = ? "
+                    "WHERE run_id = ? AND state = ?",
+                    (
+                        IntegrationState.SUPERSEDED.value,
+                        f"superseded by {record.integration_id}: a new prepare of the same run",
+                        now,
+                        record.run_id,
+                        IntegrationState.READY.value,
+                    ),
+                )
+            values = _integration_values(record)
+            columns = list(values)
+            try:
+                conn.execute(
+                    f"INSERT INTO integrations ({', '.join(columns)}) "
+                    f"VALUES ({', '.join('?' for _ in columns)})",
+                    [values[column] for column in columns],
+                )
+            except sqlite3.IntegrityError as exc:
+                raise self._integrity_conflict_locked(conn, record, exc) from exc
+            note = (
+                f"{NOTE_INTEGRATION}: {record.integration_id} prepared against "
+                f"{record.target_ref} at {record.target_tip}"
+            )
+            if superseded:
+                note += f"; superseded ready integration(s) {', '.join(superseded)}"
+            self._record_note_locked(conn, record.run_id, note)
+            return self._integration_row_locked(conn, record.integration_id)
+
+    def integration(self, integration_id: str) -> IntegrationRecord | None:
+        row = self._fetchone(
+            "SELECT * FROM integrations WHERE integration_id = ?", (integration_id,)
+        )
+        return self._integration_from_row(row) if row is not None else None
+
+    def integrations_for(self, run_id: str) -> list[IntegrationRecord]:
+        """This run's integration records, oldest first."""
+        return [
+            self._integration_from_row(row)
+            for row in self._fetchall(
+                "SELECT * FROM integrations WHERE run_id = ? ORDER BY created_at, rowid",
+                (run_id,),
+            )
+        ]
+
+    def update_integration(
+        self,
+        integration_id: str,
+        *,
+        expected: IntegrationState | Sequence[IntegrationState],
+        state: IntegrationState | None = None,
+        **fields: Any,
+    ) -> IntegrationRecord:
+        """Compare-and-set one integration record from one of ``expected``.
+
+        ``fields`` is limited to ``_INTEGRATION_MUTABLE_FIELDS`` (an unknown key is a
+        ``ValueError``), and the result is validated as an ``IntegrationRecord`` before it is
+        written. ``state`` can never become ``integrated`` here - :meth:`finalize_integration`
+        writes that together with its receipt - and an ``integrated`` record never changes state.
+
+        Raises ``IntegrationNotFound`` for an unknown id, and ``IntegrationConflict`` (nothing
+        written) when the record is not in an expected state or a uniqueness rule refuses the
+        write (a second ``applying`` integration of the same repository target, a second active
+        integration of the same run); the message names the current state or the other record.
+        """
+        unknown = sorted(set(fields) - _INTEGRATION_MUTABLE_FIELDS)
+        if unknown:
+            raise ValueError(
+                f"update_integration cannot set {', '.join(unknown)}; it may set state and "
+                f"{', '.join(sorted(_INTEGRATION_MUTABLE_FIELDS))}"
+            )
+        target = IntegrationState(state) if state is not None else None
+        if target is IntegrationState.INTEGRATED:
+            raise ValueError(
+                "update_integration never sets integrated; finalize_integration records it "
+                "together with the integration receipt"
+            )
+        allowed = _integration_states(expected)
+        with self.transaction() as conn:
+            current = self._integration_row_locked(conn, integration_id)
+            if current.state not in allowed:
+                raise IntegrationConflict(
+                    f"integration {integration_id} is {current.state.value}, expected "
+                    f"{' or '.join(item.value for item in allowed)}; nothing was written"
+                )
+            if (
+                current.state is IntegrationState.INTEGRATED
+                and target is not None
+                and target is not IntegrationState.INTEGRATED
+            ):
+                raise IntegrationConflict(
+                    f"integration {integration_id} is integrated; an integrated record keeps its "
+                    "state and receipt"
+                )
+            updates: dict[str, Any] = dict(fields)
+            if target is not None:
+                updates["state"] = target
+            updates["updated_at"] = utc_now()
+            merged = IntegrationRecord.model_validate({**current.model_dump(), **updates})
+            values = _integration_values(merged)
+            columns = [_INTEGRATION_LIST_COLUMNS.get(name, name) for name in updates]
+            try:
+                cur = conn.execute(
+                    f"UPDATE integrations SET {', '.join(f'{column} = ?' for column in columns)} "
+                    f"WHERE integration_id = ? AND state IN ({', '.join('?' for _ in allowed)})",
+                    [
+                        *(values[column] for column in columns),
+                        integration_id,
+                        *(item.value for item in allowed),
+                    ],
+                )
+            except sqlite3.IntegrityError as exc:
+                raise self._integrity_conflict_locked(conn, merged, exc) from exc
+            if cur.rowcount != 1:  # pragma: no cover - the transaction holds the write lock
+                raise IntegrationConflict(
+                    f"integration {integration_id} changed during the update; nothing was written"
+                )
+            return self._integration_row_locked(conn, integration_id)
+
+    def finalize_integration(
+        self,
+        integration_id: str,
+        *,
+        expected: IntegrationState | Sequence[IntegrationState],
+        receipt: IntegrationReceipt,
+    ) -> IntegrationRecord:
+        """Record that the target contains the integration commit: ``integrated`` + its receipt.
+
+        One transaction: a compare-and-set from ``expected`` to ``integrated`` that writes
+        ``integrated_at``, ``basis``, ``applied_by`` (when the receipt names one) and the receipt
+        as canonical JSON, plus a run note. The receipt must describe this record - its run, task,
+        attempt, candidate, target, the tip it was prepared against and, once recorded, its
+        integration commit, tree and mode - or nothing is written. The run's own row (its receipt,
+        task state and delivery state) is never touched: the run stays ``LOCAL_CANDIDATE``.
+        """
+        if receipt.integration_id != integration_id:
+            raise ValueError(
+                f"the receipt is for integration {receipt.integration_id}, not {integration_id}"
+            )
+        allowed = _integration_states(expected)
+        if IntegrationState.INTEGRATED in allowed:
+            raise ValueError(
+                "finalize_integration moves a record into integrated once; an integrated record "
+                "keeps the receipt it has"
+            )
+        with self.transaction() as conn:
+            current = self._integration_row_locked(conn, integration_id)
+            if current.state not in allowed:
+                raise IntegrationConflict(
+                    f"integration {integration_id} is {current.state.value}, expected "
+                    f"{' or '.join(item.value for item in allowed)}; nothing was written"
+                )
+            checks: list[tuple[str, Any, Any]] = [
+                ("run_id", receipt.run_id, current.run_id),
+                ("task_id", receipt.task_id, current.task_id),
+                ("attempt_id", receipt.attempt_id, current.attempt_id),
+                ("candidate.git_commit", receipt.candidate.git_commit, current.candidate_commit),
+                ("candidate.base_commit", receipt.candidate.base_commit, current.base_commit),
+                ("target_ref", receipt.target_ref, current.target_ref),
+                ("target_tip_before", receipt.target_tip_before, current.target_tip),
+            ]
+            if current.integration_commit:
+                checks.append(
+                    ("integration_commit", receipt.integration_commit, current.integration_commit)
+                )
+            if current.integration_tree:
+                checks.append(
+                    ("integration_tree", receipt.integration_tree, current.integration_tree)
+                )
+            if current.mode is not None:
+                checks.append(("mode", receipt.mode, current.mode))
+            mismatches = [
+                f"{name} {given!r} != {recorded!r}"
+                for name, given, recorded in checks
+                if given != recorded
+            ]
+            if mismatches:
+                raise ValueError(
+                    f"the receipt does not describe integration {integration_id}: "
+                    f"{'; '.join(mismatches)}"
+                )
+            cur = conn.execute(
+                f"""
+                UPDATE integrations
+                   SET state = ?, mode = ?, integration_commit = ?, integration_tree = ?,
+                       integrated_at = ?, basis = ?, applied_by = ?, receipt_json = ?,
+                       updated_at = ?
+                 WHERE integration_id = ? AND state IN ({', '.join('?' for _ in allowed)})
+                """,
+                (
+                    IntegrationState.INTEGRATED.value,
+                    receipt.mode,
+                    receipt.integration_commit,
+                    receipt.integration_tree,
+                    receipt.integrated_at,
+                    receipt.basis,
+                    receipt.applied_by or current.applied_by,
+                    canonical_json(receipt.model_dump(mode="json")),
+                    utc_now(),
+                    integration_id,
+                    *(item.value for item in allowed),
+                ),
+            )
+            if cur.rowcount != 1:  # pragma: no cover - the transaction holds the write lock
+                raise IntegrationConflict(
+                    f"integration {integration_id} changed during finalization; nothing was written"
+                )
+            self._record_note_locked(
+                conn,
+                current.run_id,
+                f"{NOTE_INTEGRATION}: {integration_id} integrated into {receipt.target_ref} at "
+                f"{receipt.integration_commit} ({receipt.basis})",
+            )
+            return self._integration_row_locked(conn, integration_id)
+
+    def integration_receipt(self, integration_id: str) -> IntegrationReceipt | None:
+        """The integration's receipt; ``None`` when the id is unknown or it is not integrated."""
+        row = self._fetchone(
+            "SELECT receipt_json FROM integrations WHERE integration_id = ?", (integration_id,)
+        )
+        if row is None or row["receipt_json"] is None:
+            return None
+        try:
+            return IntegrationReceipt.model_validate_json(str(row["receipt_json"]))
+        except (ValidationError, ValueError) as exc:
+            raise StoredRecordUnreadable(
+                f"integration {integration_id} has an unreadable receipt: {exc}"
+            ) from exc

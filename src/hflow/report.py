@@ -7,15 +7,19 @@ observed, it prints as ``unknown`` rather than being estimated.
 from __future__ import annotations
 
 from .contracts import (
+    IntegrationRecord,
     InvocationSettlement,
     LaunchSurfaces,
     ModelApplied,
     ModelObservation,
+    RefusalCode,
     ResultReceipt,
     RunInspection,
     StreamOrder,
     SurfaceFile,
+    TaskState,
 )
+from .store import INVOCATION_OPEN_STATES
 
 
 def _unknown(value: object) -> str:
@@ -147,6 +151,67 @@ def _dispatch_ledger_lines(inspection: RunInspection) -> list[str]:
             if settlement is not None:
                 lines.extend(_settlement_lines(settlement))
     return lines
+
+
+def _open_entry_lines(inspection: RunInspection) -> list[str]:
+    """One line when an ended run left ledger entries open, naming what can close them.
+
+    Such an entry keeps the root blocked, and ``hflow ledger settle`` refuses it while it is open.
+    What closes it follows the order ``hflow resume`` decides in, read from stored facts only (no
+    process is probed here):
+
+    * a run blocked ``outcome_unknown`` or ``owner_lost``: ``resume`` reconciles it - its existing
+      reconcile path, which waits on no owner - and records each open entry ``unknown`` or
+      ``launch_unknown``;
+    * a run with no owner token (written before storage v6, or a label-only claim) whose attempts
+      recorded a controller pid: that pid carries no host, so the owner can never be proven gone,
+      and ``resume`` takes no attestation - this build cannot close the entries;
+    * otherwise ``resume`` closes them once the run's owner is provably gone, as ``unknown`` or
+      ``launch_unknown`` (or from the run's own recorded confirmed stop).
+
+    A live run's open entry is in flight, not left behind, so it gets no line.
+    """
+    run = inspection.run
+    if run.task_state not in {TaskState.ACCEPTED, TaskState.BLOCKED, TaskState.CANCELLED}:
+        return []
+    open_ids = [
+        item.invocation_id
+        for item in inspection.invocations
+        if item.state.value in INVOCATION_OPEN_STATES
+    ]
+    if not open_ids:
+        return []
+    count = len(open_ids)
+    them = "it" if count == 1 else "them"
+    head = (
+        f"open entries  {count} ledger entr{'y' if count == 1 else 'ies'} left open on this ended "
+        f"run ({', '.join(open_ids)}) keep{'s' if count == 1 else ''} the root blocked: "
+    )
+    if run.task_state is TaskState.BLOCKED and run.block_code in {
+        RefusalCode.OUTCOME_UNKNOWN.value,
+        RefusalCode.OWNER_LOST.value,
+    }:
+        return [
+            head
+            + f"`hflow resume {run.run_id}` reconciles {them} - a run blocked {run.block_code} "
+            "is reconciled without waiting on its owner - recording each as unknown or "
+            "launch_unknown, then `hflow ledger settle <invocation_id>`"
+        ]
+    owner_token = inspection.owner.token if inspection.owner is not None else None
+    if owner_token is None and any(a.process_id is not None for a in inspection.attempts):
+        return [
+            head
+            + f"this build cannot close {them}. The run has no owner token (written before "
+            "storage v6, or a label-only claim) and its attempts recorded a controller pid with "
+            f"no host, so its owner can never be proven gone: `hflow resume {run.run_id}` "
+            "refuses (it takes no attestation) and `hflow ledger settle` refuses an open entry, "
+            f"so {'it keeps' if count == 1 else 'they keep'} blocking the root"
+        ]
+    return [
+        head
+        + f"`hflow resume {run.run_id}` closes {them} once the run's owner is gone, then "
+        "`hflow ledger settle <invocation_id>`"
+    ]
 
 
 def _settlement_lines(settlement: InvocationSettlement) -> list[str]:
@@ -483,6 +548,7 @@ def status_text(inspection: RunInspection) -> str:
     )
     lines.extend(_root_budget_lines(inspection))
     lines.extend(_dispatch_ledger_lines(inspection))
+    lines.extend(_open_entry_lines(inspection))
     lines.append(_drift_line(inspection))
     if run.block_code:
         lines.append(f"blocked       {run.block_code}: {run.block_reason}")
@@ -653,3 +719,52 @@ def report_json(inspection: RunInspection) -> dict[str, object]:
         "owner": inspection.owner.model_dump(mode="json") if inspection.owner else None,
     }
     return payload
+
+
+def integration_record_lines(record: IntegrationRecord) -> list[str]:
+    """One integration record, from its stored fields only (batch I2)."""
+    lines = [
+        f"integration   {record.integration_id} (run {record.run_id}, task {record.task_id})",
+        f"state         {record.state.value}",
+        f"target        {record.target_ref} checked against {record.target_tip}",
+        f"candidate     {record.candidate_commit} (task base {record.base_commit})",
+    ]
+    if record.integration_commit:
+        lines.append(
+            f"commit        {record.integration_commit} ({record.mode or 'unknown'}), kept by "
+            f"{record.integration_ref or 'no ref'}"
+        )
+    if record.paths:
+        lines.append(f"paths         {', '.join(record.paths[:10])}"
+                     + (f" (+{len(record.paths) - 10} more)" if len(record.paths) > 10 else ""))
+    if record.conflict_paths:
+        lines.append(f"conflicts     {', '.join(record.conflict_paths[:10])}"
+                     + (f" (+{len(record.conflict_paths) - 10} more)"
+                        if len(record.conflict_paths) > 10 else ""))
+    if record.evidence_ids:
+        lines.append(f"evidence      {', '.join(record.evidence_ids)} (phase integration-check)")
+    if record.worktree_path:
+        lines.append(f"worktree      {record.worktree_path} ({record.worktree_state})")
+    if record.state.value == "integrated":
+        lines.append(
+            f"integrated    {_unknown(record.integrated_at)} basis={_unknown(record.basis)}"
+            + (f" applied_by={record.applied_by} (OS user; recorded, not authenticated)"
+               if record.applied_by else "")
+        )
+    if record.detail:
+        lines.append(f"detail        {record.detail}")
+    return lines
+
+
+def integration_lines(records: list[IntegrationRecord]) -> list[str]:
+    """The integrations of a run, after - and apart from - the run's own delivery."""
+    if not records:
+        return []
+    lines = ["integrations  (separate deliveries; the run's receipt above is not rewritten)"]
+    for record in records:
+        lines.append(
+            f"  {record.integration_id}  state={record.state.value} target={record.target_ref} "
+            f"tip={record.target_tip[:12]} commit={record.integration_commit[:12] or '-'}"
+            + (f" basis={record.basis}" if record.basis else "")
+        )
+    return lines

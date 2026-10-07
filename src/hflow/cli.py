@@ -1,10 +1,15 @@
 """HFlow command line.
 
 Subcommands: doctor / prepare / run / status / report / cancel / resume / schema / clean /
-ledger settle.
+ledger settle / integrate (prepare, apply, reconcile, show).
 
 ``ledger settle`` closes an ``unknown`` / ``launch_unknown`` ledger entry by operator attestation;
 it never calls a model, never re-dispatches and never changes a run's state.
+
+``integrate`` takes an ``ACCEPTED`` run's candidate onto an existing local branch as a separate,
+operator-approved delivery: ``prepare`` builds and checks one commit without moving anything,
+``apply`` moves the branch by compare-and-set only (never a branch some worktree has checked out),
+``reconcile`` settles an interrupted record from what Git shows. It never calls a model.
 
 ``doctor``, ``prepare``, ``status``, ``report``, ``schema`` and ``clean`` never call a model;
 ``doctor`` never boots a DSH profile either - it reports what is *known* locally and marks the
@@ -63,6 +68,12 @@ from .controller import Controller, RunOutcome, inspect_run
 from .drivers.fake import FakeDriver, FakeScript
 from .drivers.acpx_dsh import DriverSetupError
 from .drivers.selected import FAKE_ALIASES, default_refusal_reason, local_probe
+from .integrate import (
+    IntegrationOutcome,
+    apply_integration,
+    prepare_integration,
+    reconcile_integration,
+)
 from .paths import database_path, default_data_dir
 from . import profiles
 from .profiles import ENV_PROFILE
@@ -1001,6 +1012,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         inspection = inspect_run(
             store, args.run_id, project_root=Path(args.project_root).resolve()
         )
+        integrations = store.integrations_for(inspection.run.run_id)
     except RunNotFound:
         print(f"unknown run {args.run_id}", file=sys.stderr)
         return EXIT_USAGE
@@ -1008,12 +1020,12 @@ def cmd_status(args: argparse.Namespace) -> int:
         return _unreadable_record(args.run_id, exc)
     finally:
         store.close()
-    from .report import status_text
+    from .report import integration_lines, status_text
 
     if args.json:
-        print(canonical_json(report_json(inspection)))
+        print(canonical_json(_with_integrations(report_json(inspection), integrations)))
     else:
-        print(status_text(inspection))
+        print(_join_lines(status_text(inspection), integration_lines(integrations)))
     return EXIT_OK
 
 
@@ -1023,6 +1035,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         inspection = inspect_run(
             store, args.run_id, project_root=Path(args.project_root).resolve()
         )
+        integrations = store.integrations_for(inspection.run.run_id)
     except RunNotFound:
         print(f"unknown run {args.run_id}", file=sys.stderr)
         return EXIT_USAGE
@@ -1030,10 +1043,215 @@ def cmd_report(args: argparse.Namespace) -> int:
         return _unreadable_record(args.run_id, exc)
     finally:
         store.close()
+    from .report import integration_lines
+
     if args.json:
-        print(canonical_json(report_json(inspection)))
+        print(canonical_json(_with_integrations(report_json(inspection), integrations)))
     else:
-        print(report_text(inspection))
+        print(_join_lines(report_text(inspection), integration_lines(integrations)))
+    return EXIT_OK
+
+
+def _with_integrations(payload: dict[str, object], integrations: list) -> dict[str, object]:
+    """The run's integration records, beside - never inside - its own delivery receipt."""
+    return {**payload, "integrations": [record.model_dump(mode="json") for record in integrations]}
+
+
+def _join_lines(text: str, extra: list[str]) -> str:
+    return text if not extra else text.rstrip("\n") + "\n" + "\n".join(extra)
+
+
+# --------------------------------------------------------------------------
+# integrate (batch I2) - no model calls, no dispatch, no budget
+# --------------------------------------------------------------------------
+
+#: The states in which each integrate subcommand did what it was asked. Anything else is ``3``
+#: (the operator has something to decide: a conflict, a failed check, a moved target, a hand-off
+#: because the branch is checked out, a ref update that failed), except a record another process
+#: is still working on, which is ``5``. ``apply`` succeeds only when the branch contains the commit.
+_INTEGRATION_DONE: dict[str, frozenset[str]] = {
+    "prepare": frozenset({"ready"}),
+    "apply": frozenset({"integrated"}),
+    "reconcile": frozenset({"ready", "integrated"}),
+}
+_INTEGRATION_ACTIVE = frozenset({"preparing", "checking", "applying"})
+
+
+def _integration_exit(outcome: IntegrationOutcome, command: str) -> int:
+    state = outcome.record.state.value
+    if state in _INTEGRATION_DONE[command]:
+        return EXIT_OK
+    if state in _INTEGRATION_ACTIVE:
+        return EXIT_IN_PROGRESS
+    return EXIT_BLOCKED
+
+
+def _integration_error(exc: Exception) -> int:
+    """One mapping for every integrate subcommand, so no failure escapes as a traceback."""
+    from .gitworkspace import GitError
+    from .integrate import IntegrationBusy
+    from .store import IntegrationConflict, IntegrationNotFound
+
+    if isinstance(exc, IntegrationNotFound):
+        print(f"unknown integration: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    if isinstance(exc, IntegrationBusy):
+        print(f"in progress: {exc}", file=sys.stderr)
+        return EXIT_IN_PROGRESS
+    if isinstance(exc, (IntegrationConflict, GitError)):
+        print(f"refused: {exc}", file=sys.stderr)
+        return EXIT_REFUSED
+    if isinstance(exc, (StoredRecordUnreadable, ValidationError, json.JSONDecodeError)):
+        print(f"stored integration record unreadable: {exc}", file=sys.stderr)
+        return EXIT_RECORD_UNREADABLE
+    raise exc
+
+
+def _integrate_call(call):  # noqa: ANN001, ANN202 - a thin wrapper around the three commands
+    """Run one integrate operation; map its failures. Returns (outcome or None, exit code)."""
+    from .integrate import IntegrationBusy
+
+    try:
+        return call(), None
+    except IntegrationBusy as exc:
+        return None, _integration_error(exc)
+    except RefusedError:
+        raise
+    except RunNotFound:
+        raise
+    except Exception as exc:  # noqa: BLE001 - mapped explicitly, anything else re-raised
+        return None, _integration_error(exc)
+
+
+def _print_integration(outcome: IntegrationOutcome, as_json: bool) -> None:
+    from .report import integration_record_lines
+
+    if as_json:
+        print(canonical_json(outcome.as_dict()))
+        return
+    lines = integration_record_lines(outcome.record)
+    for note in outcome.notes:
+        lines.append(f"note          {note}")
+    if outcome.receipt is not None:
+        receipt = outcome.receipt
+        lines.append(f"delivery      {receipt.delivery_state.value} ({receipt.basis})")
+        for limitation in receipt.limitations:
+            lines.append(f"limitation    {limitation}")
+    for command in outcome.handoff:
+        lines.append(f"next          {command}")
+    print("\n".join(lines))
+
+
+def cmd_integrate_prepare(args: argparse.Namespace) -> int:
+    """Build and check an integration commit for an accepted run. Never moves a branch."""
+    from .prepare import load_project_contract
+
+    project = load_project_contract(Path(args.project))
+    data_dir = Path(args.data_dir) if getattr(args, "data_dir", None) else default_data_dir()
+    store = _open_store(args)
+    try:
+        outcome, failed = _integrate_call(
+            lambda: prepare_integration(
+                store,
+                run_id=args.run_id,
+                target_branch=args.target,
+                project=project,
+                # The same check environment a run's own checks get (see cmd_run).
+                runners=CheckRunners.offline_default(
+                    extra_env={
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                        "PYTEST_ADDOPTS": "-p no:cacheprovider",
+                    }
+                ),
+                data_dir=data_dir,
+                controller_build=controller_build(),
+            )
+        )
+    except RunNotFound:
+        print(f"unknown run {args.run_id}", file=sys.stderr)
+        return EXIT_USAGE
+    finally:
+        store.close()
+    if failed is not None:
+        return failed
+    _print_integration(outcome, args.json)
+    return _integration_exit(outcome, "prepare")
+
+
+def cmd_integrate_apply(args: argparse.Namespace) -> int:
+    """The operator's approval: move the target branch by compare-and-set, or hand off."""
+    import getpass
+
+    try:
+        applied_by = getpass.getuser()
+    except Exception:  # noqa: BLE001 - getuser raises OSError/KeyError/ImportError by platform
+        applied_by = "unknown"
+    store = _open_store(args)
+    try:
+        outcome, failed = _integrate_call(
+            lambda: apply_integration(
+                store,
+                integration_id=args.integration_id,
+                expect_target=args.expect_target,
+                applied_by=applied_by,
+                controller_build=controller_build(),
+            )
+        )
+    finally:
+        store.close()
+    if failed is not None:
+        return failed
+    _print_integration(outcome, args.json)
+    return _integration_exit(outcome, "apply")
+
+
+def cmd_integrate_reconcile(args: argparse.Namespace) -> int:
+    """Settle an integration record from what Git shows; never re-runs an update or a check."""
+    import getpass
+
+    attestation = (args.attest or "").strip()
+    if args.owner_gone and not attestation:
+        print("refusing: --owner-gone needs --attest with what you know and why", file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        attested_by = getpass.getuser()
+    except Exception:  # noqa: BLE001 - getuser raises OSError/KeyError/ImportError by platform
+        attested_by = "unknown"
+    if args.owner_gone:
+        attested_by = f"{attested_by}: {attestation[:500]}"
+    store = _open_store(args)
+    try:
+        outcome, failed = _integrate_call(
+            lambda: reconcile_integration(
+                store,
+                integration_id=args.integration_id,
+                controller_build=controller_build(),
+                owner_gone_attested=args.owner_gone,
+                attested_by=attested_by,
+            )
+        )
+    finally:
+        store.close()
+    if failed is not None:
+        return failed
+    _print_integration(outcome, args.json)
+    return _integration_exit(outcome, "reconcile")
+
+
+def cmd_integrate_show(args: argparse.Namespace) -> int:
+    """Print one integration record and its receipt. Read-only."""
+    store = _open_store(args)
+    try:
+        record = store.integration(args.integration_id)
+        receipt = store.integration_receipt(args.integration_id) if record is not None else None
+    except Exception as exc:  # noqa: BLE001 - mapped explicitly, anything else re-raised
+        return _integration_error(exc)
+    finally:
+        store.close()
+    if record is None:
+        print(f"unknown integration {args.integration_id}", file=sys.stderr)
+        return EXIT_USAGE
+    _print_integration(IntegrationOutcome(record=record, receipt=receipt), args.json)
     return EXIT_OK
 
 
@@ -1320,13 +1538,16 @@ def cmd_schema(args: argparse.Namespace) -> int:
     ``MachineProfile`` is here because a profile is a document a person writes by hand
     (``<data-dir>/profiles/<id>.json``), and so are ``AuthorizationRecord``
     (``--authorization-file``), ``RootBudgetPlan`` (``--root-budget-file``) and ``RepairPolicy``
-    (``--repair-policy-file``). ``PrepareReport`` and ``CancellationReceipt`` (``hflow cancel
-    --json``) are here because their output is consumed by scripts. All are generated from the
+    (``--repair-policy-file``). ``PrepareReport``, ``CancellationReceipt`` (``hflow cancel
+    --json``) and ``IntegrationRecord`` / ``IntegrationReceipt`` (``hflow integrate ... --json``)
+    are here because their output is consumed by scripts. All are generated from the
     same models the loaders validate against.
     """
     from .authorization import AuthorizationRecord
     from .contracts import (
         EffectiveConfig,
+        IntegrationReceipt,
+        IntegrationRecord,
         MachineProfile,
         PrepareReport,
         RepairPolicy,
@@ -1345,6 +1566,8 @@ def cmd_schema(args: argparse.Namespace) -> int:
         "RootBudgetPlan": RootBudgetPlan,
         "RepairPolicy": RepairPolicy,
         "CancellationReceipt": CancellationReceipt,
+        "IntegrationRecord": IntegrationRecord,
+        "IntegrationReceipt": IntegrationReceipt,
     }
     payload = {name: json_schema(model) for name, model in models.items()}
     print(canonical_json(payload))
@@ -1622,6 +1845,78 @@ def build_parser() -> argparse.ArgumentParser:
     settle.add_argument("--json", action="store_true")
     _add_store_args(settle)
     settle.set_defaults(func=cmd_ledger_settle)
+
+    integrate = sub.add_parser(
+        "integrate",
+        help=(
+            "integrate an accepted candidate into a local branch: prepare (build + check), apply "
+            "(compare-and-set), reconcile, show. No model calls"
+        ),
+    )
+    integrate_sub = integrate.add_subparsers(dest="integrate_command", required=True)
+    integrate_prepare = integrate_sub.add_parser(
+        "prepare",
+        help=(
+            "build one integration commit on the target's current tip and run the run's approved "
+            "checks on it in a worktree of its own; never moves the branch"
+        ),
+    )
+    integrate_prepare.add_argument("run_id")
+    integrate_prepare.add_argument(
+        "--target", required=True, help="an existing local branch name, e.g. main"
+    )
+    integrate_prepare.add_argument(
+        "--project",
+        required=True,
+        help="the project contract the run was accepted under (its checks digest must match)",
+    )
+    integrate_prepare.add_argument("--json", action="store_true")
+    _add_store_args(integrate_prepare)
+    integrate_prepare.set_defaults(func=cmd_integrate_prepare)
+    integrate_apply = integrate_sub.add_parser(
+        "apply",
+        help=(
+            "move the target branch to a ready integration commit by compare-and-set; a branch "
+            "checked out in any worktree is never moved (you get the merge command instead)"
+        ),
+    )
+    integrate_apply.add_argument("integration_id")
+    integrate_apply.add_argument(
+        "--expect-target",
+        required=True,
+        help="the full target tip the integration was checked against (printed by prepare)",
+    )
+    integrate_apply.add_argument("--json", action="store_true")
+    _add_store_args(integrate_apply)
+    integrate_apply.set_defaults(func=cmd_integrate_apply)
+    integrate_reconcile = integrate_sub.add_parser(
+        "reconcile",
+        help=(
+            "settle an integration from what Git shows (an interrupted apply, a hand merge, a "
+            "moved target); never re-runs the update or a check"
+        ),
+    )
+    integrate_reconcile.add_argument("integration_id")
+    integrate_reconcile.add_argument(
+        "--owner-gone",
+        action="store_true",
+        help=(
+            "attest that the process recorded on an active integration has exited when HFlow "
+            "cannot tell (another host, no creation time); recorded as an attestation, never as "
+            "an observation. A process HFlow sees running is never overridden"
+        ),
+    )
+    integrate_reconcile.add_argument(
+        "--attest", default="", help="what you know and why (required with --owner-gone)"
+    )
+    integrate_reconcile.add_argument("--json", action="store_true")
+    _add_store_args(integrate_reconcile)
+    integrate_reconcile.set_defaults(func=cmd_integrate_reconcile)
+    integrate_show = integrate_sub.add_parser("show", help="print one integration record")
+    integrate_show.add_argument("integration_id")
+    integrate_show.add_argument("--json", action="store_true")
+    _add_store_args(integrate_show)
+    integrate_show.set_defaults(func=cmd_integrate_show)
 
     return parser
 

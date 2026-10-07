@@ -2002,6 +2002,169 @@ class ResultReceipt(BaseModel):
 
 
 # --------------------------------------------------------------------------
+# Controlled integration of an accepted candidate (batch I2, storage v8)
+# --------------------------------------------------------------------------
+
+
+class IntegrationState(StrEnum):
+    """Where one integration of an accepted candidate into a local branch stands.
+
+    ``preparing -> checking -> ready -> applying -> integrated``. ``conflict``, ``checks_failed``,
+    ``stale``, ``interrupted``, ``superseded`` and ``failed`` are terminal as well: a new
+    integration is prepared instead of reviving one.
+    """
+
+    PREPARING = "preparing"
+    CHECKING = "checking"
+    READY = "ready"
+    APPLYING = "applying"
+    INTEGRATED = "integrated"
+    CONFLICT = "conflict"
+    CHECKS_FAILED = "checks_failed"
+    STALE = "stale"
+    INTERRUPTED = "interrupted"
+    SUPERSEDED = "superseded"
+    FAILED = "failed"
+
+
+#: A process may be acting on the record. At most one per run (a partial unique index in storage
+#: v8), and a ``preparing``/``checking``/``applying`` record whose owner is gone is reconciled,
+#: never resumed.
+INTEGRATION_ACTIVE_STATES: tuple[IntegrationState, ...] = (
+    IntegrationState.PREPARING,
+    IntegrationState.CHECKING,
+    IntegrationState.APPLYING,
+)
+#: Final: ``hflow integrate reconcile`` reports these and changes nothing.
+INTEGRATION_TERMINAL_STATES: tuple[IntegrationState, ...] = (
+    IntegrationState.INTEGRATED,
+    IntegrationState.CONFLICT,
+    IntegrationState.CHECKS_FAILED,
+    IntegrationState.STALE,
+    IntegrationState.INTERRUPTED,
+    IntegrationState.SUPERSEDED,
+    IntegrationState.FAILED,
+)
+
+#: How the integration commit was built. ``squash``: the target tip still equals the task's base,
+#: so the integration commit is one new commit carrying the candidate's tree on top of the base
+#: (rejected repair rounds never enter the target's history). ``replayed``: the target moved, and
+#: the base-to-candidate change was three-way merged onto the new tip.
+IntegrationMode = Literal["squash", "replayed"]
+#: Why the target is recorded as containing the integration commit. ``hflow_ref_update``: HFlow's
+#: own compare-and-set of the target ref succeeded. ``observed_after_interruption``: an
+#: ``applying`` record whose owner was gone, and the target was then observed to contain the
+#: commit. ``operator_merge_observed``: the operator moved the target (a checked-out branch is
+#: never written by HFlow) and the target was observed to contain the commit.
+IntegrationBasis = Literal[
+    "hflow_ref_update", "observed_after_interruption", "operator_merge_observed"
+]
+#: The integration worktree's lifecycle: never created, present, removed without ``--force``, or
+#: left in place because a non-forced removal was refused (its path is recorded).
+WorkspaceLifecycle = Literal["NONE", "PRESENT", "REMOVED", "LEFT"]
+
+
+class IntegrationRecord(BaseModel):
+    """One attempt to integrate a run's frozen candidate into a local branch (``integrations``).
+
+    Written only by the store's integration methods. The run's own ``ResultReceipt`` is never
+    rewritten by an integration: it stays ``LOCAL_CANDIDATE``, and the integration facts live
+    here and in a separate :class:`IntegrationReceipt`.
+    """
+
+    model_config = Strict
+
+    integration_id: str
+    run_id: str
+    task_id: str
+    #: The accepted attempt (the run receipt's ``attempt_id``).
+    attempt_id: str
+    #: ``git rev-parse --git-common-dir`` of the repository: the identity two worktrees share.
+    git_common_dir: str
+    repo_root: str
+    #: Full ref name, e.g. ``refs/heads/main``.
+    target_ref: str
+    #: The target's commit when this integration was prepared (``T``).
+    target_tip: str
+    #: The task's base (``B``, the run receipt's ``candidate.base_commit``).
+    base_commit: str
+    #: The frozen candidate (``C``, the run receipt's ``candidate.git_commit``).
+    candidate_commit: str
+    mode: IntegrationMode | None = None
+    #: The commit the target would be moved to (``M``); empty until it exists.
+    integration_commit: str = ""
+    integration_tree: str = ""
+    #: HFlow's own ref that keeps ``M`` reachable (``refs/hflow/integrations/<run>/<id>``).
+    integration_ref: str = ""
+    state: IntegrationState
+    #: The run's ``checks_digest``: the approved checks the integration-check evidence ran.
+    checks_digest: str
+    #: Content fingerprint of the integration worktree over the task scope. Not a Git object id.
+    fingerprint: str = ""
+    evidence_ids: list[str] = Field(default_factory=list)
+    #: ``git diff --name-only T M``: the paths the integration changes on the target.
+    paths: list[str] = Field(default_factory=list)
+    conflict_paths: list[str] = Field(default_factory=list)
+    worktree_path: str = ""
+    worktree_state: WorkspaceLifecycle = "NONE"
+    #: The process acting on the record (pid, creation FILETIME, host); ``None`` = not recorded.
+    owner_pid: int | None = None
+    owner_created: int | None = None
+    owner_host: str = ""
+    #: Recorded, and committed, before the target ref is written.
+    apply_intent_at: str | None = None
+    #: The OS user name the applying process saw: recorded, never authenticated.
+    applied_by: str = ""
+    integrated_at: str | None = None
+    basis: IntegrationBasis | None = None
+    detail: str = ""
+    created_at: str
+    updated_at: str
+
+
+class IntegrationReceipt(BaseModel):
+    """The controller-derived record that a candidate was integrated into a target ref.
+
+    A separate document from the run's ``ResultReceipt``, which is never rewritten: the run keeps
+    ``LOCAL_CANDIDATE`` and this receipt carries ``INTEGRATED``.
+    """
+
+    model_config = Strict
+
+    schema_version: int = SCHEMA_VERSION
+    integration_id: str
+    run_id: str
+    task_id: str
+    attempt_id: str
+    runtime_build: str
+    #: Copied from the run's ``ResultReceipt``.
+    candidate: CandidateSnapshot
+    target_ref: str
+    target_tip_before: str
+    integration_commit: str
+    integration_tree: str
+    mode: IntegrationMode
+    paths: list[str]
+    #: The integration-check evidence (phase ``integration-check``) on the integration tree.
+    verification: VerificationResult
+    #: Always ``INTEGRATED``; a receipt with any other value is refused.
+    delivery_state: DeliveryState
+    basis: IntegrationBasis
+    integrated_at: str
+    applied_by: str = ""
+    limitations: list[str] = Field(default_factory=list)
+
+    @field_validator("delivery_state")
+    @classmethod
+    def _integrated_only(cls, value: DeliveryState) -> DeliveryState:
+        if value != DeliveryState.INTEGRATED:
+            raise ValueError(
+                f"an integration receipt records delivery_state INTEGRATED, not {value}"
+            )
+        return value
+
+
+# --------------------------------------------------------------------------
 # Admission / refusal
 # --------------------------------------------------------------------------
 
@@ -2061,6 +2224,18 @@ class RefusalCode(StrEnum):
     #: dsh launcher and its carrier entry and package.json) no longer has the bytes - or the final
     #: path - it had when the launch was resolved or approved. Refused before any process exists.
     LAUNCH_CONTENT_CHANGED = "launch_content_changed"
+    #: Batch I2. The run cannot be integrated: not ``ACCEPTED`` / ``LOCAL_CANDIDATE``, no Git
+    #: candidate, the target was rewritten (the base is not its ancestor), or the target already
+    #: contains the candidate's change.
+    NOT_INTEGRABLE = "not_integrable"
+    #: The three-way replay of the candidate onto the moved target conflicts; nothing is written
+    #: to the target, and no conflict is resolved automatically.
+    INTEGRATION_CONFLICT = "integration_conflict"
+    #: The target ref no longer points at the tip the integration was prepared and checked against.
+    TARGET_MOVED = "target_moved"
+    #: The target branch is checked out in a worktree (the user's checkout included), so HFlow does
+    #: not write the ref; the operator moves it and ``hflow integrate reconcile`` observes that.
+    TARGET_CHECKED_OUT = "target_checked_out"
 
 
 class RefusedError(RuntimeError):
@@ -2262,7 +2437,8 @@ class EvidenceRecord(BaseModel):
     evidence_id: str
     run_id: str
     attempt_id: str
-    kind: Literal["verification", "review"]
+    #: ``integration-check`` rows (batch I2) describe an integration tree, not the run's candidate.
+    kind: Literal["verification", "review", "integration-check"]
     status: EvidenceStatus
     check_id: str = ""
     candidate_fingerprint: str = ""

@@ -22,6 +22,7 @@ not restate the design; read the plan and `docs/architecture.md` when the task n
 | Scope containment and candidate fingerprints | `src/hflow/workspace.py` |
 | Git worktree isolation, candidate freezing, shared-metadata snapshot | `src/hflow/gitworkspace.py` |
 | Guarded worktree release (`hflow clean`) | `src/hflow/cleanup.py` |
+| Controlled integration of an accepted candidate (`hflow integrate`: prepare / apply / reconcile) | `src/hflow/integrate.py`; contract `docs/batch-i-integration-plan.md` |
 | `status` / `report` text from stored facts | `src/hflow/report.py` |
 | Commands and exit codes | `src/hflow/cli.py` |
 | The one production driver (acpx → DSH ACP) | `src/hflow/drivers/acpx_dsh.py` |

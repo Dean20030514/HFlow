@@ -9,6 +9,8 @@ offline delivery slice; the batch E1 root ledger and the batch E2 bounded repair
 the batch F hardening from the 2026-10-03 upstream survey (turn settlement, reviewer transcript,
 stop confirmation, shared Git metadata, launch and context records), offline-tested;
 immutable admission and workspace records, guarded cleanup and bounded wire metadata;
+batch I: controlled integration of an accepted candidate into a local branch (`hflow integrate`)
+and the close-out of ledger entries an ended run left open, offline-tested;
 three recorded live top-level M2 tasks (one stop trial, two attempts at one small change) under
 explicit one-time authorizations.**
 
@@ -34,6 +36,9 @@ m2_live_original_run     = BLOCKED / review_rejected on build 3dbfeae; no receip
 m2_live_later_decision   = ACCEPTED / LOCAL_CANDIDATE, recorded offline during a later
                            reprocessing of that run's own evidence; the original decision is
                            preserved, not overwritten or re-run
+local_integration        = implemented, offline-tested (hflow integrate: one checked commit on a
+                           local branch, compare-and-set, never a checked-out branch; no model,
+                           no push; never exercised after a live run yet)
 unattended_execution     = disabled
 new_live_budget          = 0                   (each live task needs its own explicit approval)
 ```
@@ -73,6 +78,12 @@ ProjectConfig ─────────────┘                   └�
                                                    -> independent review verdict
                                                    -> controller-generated ResultReceipt
                                                    -> status / report
+
+ACCEPTED / LOCAL_CANDIDATE ──> hflow integrate prepare   (one commit on the target's tip, checked
+                                                          again in a worktree of its own)
+                           ──> hflow integrate apply     (operator approval: compare-and-set of a
+                                                          branch nobody has checked out)
+                           ──> IntegrationReceipt        (INTEGRATED; the run's receipt is kept)
 ```
 
 Admission refuses a spec it cannot honour - an unanswered or failed reuse/adapt fit test, a
@@ -106,7 +117,8 @@ Python 3.12+ (developed on 3.14.7). Runtime dependency: `pydantic>=2.12,<3`.
 Development dependency: `pytest>=9.0,<10`. Git 2.31 or later for worktree runs (`git rev-parse
 --path-format=absolute`; `git config --show-scope` needs 2.26). The global attributes file is
 located with `git var GIT_ATTR_GLOBAL` on Git 2.42+, and on older Git from `core.attributesFile`,
-else `$XDG_CONFIG_HOME/git/attributes`, else `~/.config/git/attributes`.
+else `$XDG_CONFIG_HOME/git/attributes`, else `~/.config/git/attributes`. `hflow integrate` needs Git
+2.40 or later (`merge-tree --write-tree --merge-base`) and refuses an older one.
 
 ```sh
 python -m pytest -q            # see the recorded snapshot below
@@ -128,10 +140,15 @@ tested, so they are recorded rather than asserted:
 | batch F on top of `f2796aa` (prompt errors and unknown stop reasons, stream order and after-response text, reviewer transcript by `messageId` and session, fail-safe exit checks, shared Git metadata, launch-surface and DSH-context records) | `python -m pytest -q` | `938 passed, 1 skipped in 610.03s` (exit 0; 939 collected) |
 | 2026-10-05 working tree on `35751aa` (immutable admission binding, guarded cleanup and reconciliation, bounded raw/protocol output, unreadable-record diagnostics) | `python -m pytest -q` | `1382 passed, 1 skipped in 771.05s` (exit 0; 1383 collected) |
 | 2026-10-06 working tree on `bdb33ba` (void-aware repair admission, session-bound model observations, protocol read failures, artifact IO settlement, streaming candidate hashes; 82 added regression cases) | `python -m pytest -q` | `1464 passed, 1 skipped in 843.65s` (exit 0; 1465 collected) |
+| 2026-10-06 batch I working tree on `9d4fc3b` (controlled integration `hflow integrate`, storage v8, ledger close-out of ended runs by `resume`, and the fixes from two adversarial reviews) | `python -m pytest -q -n 8 -p no:cacheprovider` (pytest-xdist) | `1633 passed, 1 skipped in 314.30s` (exit 0) |
 
 The 2026-10-05 snapshot is offline verification, including actual Git repositories and local
 stand-in processes. It adds no live-model compatibility observation or capability upgrade;
 the production driver and acpx 0.17.1 pin are unchanged.
+
+The batch I snapshot is offline as well (real temporary Git repositories, local stand-in processes, no
+model call, no live integration) and ran the same suite in parallel workers; the baseline on
+`9d4fc3b` under that command was `1464 passed, 1 skipped in 388.43s`.
 
 The 2026-10-06 snapshot is also offline: real temporary Git repositories and local stand-in
 processes, with no model call, dependency upgrade, database-version change or capability upgrade.
@@ -182,11 +199,18 @@ hflow run      --task t.json --profile dsh-local --authorization-file auth.json 
                --repair-policy-file repair.json      # opt in to ONE bounded repair (batch E2)
 hflow status   R-xxxxxxxxxx               # pure SQLite read, zero model calls
 hflow report   R-xxxxxxxxxx --json        # receipt + evidence + the config it ran under
-hflow resume   R-xxxxxxxxxx               # reconcile an interrupted attempt; never re-dispatches
+hflow resume   R-xxxxxxxxxx               # reconcile an interrupted attempt, or close the
+                                          # open ledger entries of an ended run once its
+                                          # owner is gone; never re-dispatches
 hflow cancel   R-xxxxxxxxxx               # for a run another process is executing: records
                                           # the stop, reports unknown, blocks outcome_unknown
 hflow clean    R-xxxxxxxxxx               # preview releasing the run's worktree
 hflow clean    R-xxxxxxxxxx --apply       # remove it; candidate ref and receipt (if any) kept
+hflow integrate prepare R-xxxxxxxxxx --target main --project .hflow/project.json
+                                          # build + check one integration commit; moves nothing
+hflow integrate apply G-xxxxxxxxxx --expect-target <tip>
+                                          # your approval: compare-and-set of the branch
+hflow integrate reconcile G-xxxxxxxxxx    # settle an interrupted or hand-merged integration
 hflow schema                              # generated JSON Schema, MachineProfile included
 ```
 
@@ -222,7 +246,13 @@ undispatched run whose recorded admission binding is missing or differs from thi
 `6`: `status`/`report` found the run but a stored record it needs no longer validates
 (`StoredRecordUnreadable`); one line names the record and no replacement record is inferred.
 `cancel`/`resume` can still work from the run row without those presentation records.
-A `CANCELLED` task state, which this build never writes, would exit `3`.
+A `CANCELLED` task state, which this build never writes, would exit `3`. `hflow integrate` uses the
+same codes for its own record: `0` when the subcommand did what it was asked (`prepare` ready,
+`apply` integrated, `reconcile` ready or integrated), `2` refused (nothing written), `3` a state
+that needs your decision (conflict, failed checks, stale, interrupted, a hand-off because the
+branch is checked out, or a ref update that failed), `4` unknown id, `5` another process is or may
+still be working on it, `6` an unreadable stored record (see `docs/operations.md`, "Integrating an
+accepted candidate").
 
 Without installing, run through the module path:
 
@@ -321,6 +351,26 @@ the project contract, the machine profile, the authorization artifact, the root 
   exited. The child rule applies either way. Not covered: an entry that
   recorded a process but no pid has nothing to probe and rests on the owner rule alone, and
   the check runs just before the store transaction, not inside it.
+- **`hflow resume <run_id>` on an ended run closes the ledger entries it left open** (batch I1).
+  A run can end - `internal_error` or `review_protocol_error` after a driver raised before it
+  reported a spawn fact, `cancelled_by_operator` after a confirmed stop whose ledger write
+  failed, or any outcome (`ACCEPTED` included) after a settlement write failed - with an entry
+  still `reserved`/`requested`/`started`, which blocks its root and which `ledger settle`
+  refuses. Once the run's owner is provably gone, by the same owner rule `ledger settle` applies
+  (a pre-v6 run that recorded a controller pid is refused: `resume` takes no attestation),
+  `resume` closes such an entry from the run's own recorded confirmed stop when that stop ended
+  the run (as the stop would have), and otherwise as `unknown` (a launch was recorded) or
+  `launch_unknown` (no launch recorded), then writes a `dispatch:` note. It never dispatches, calls
+  no driver, refunds nothing and leaves the run's state, block code, receipt and outcome as they
+  were. An entry closed from the stop fact (`settled` or `not_started`) is final and no longer
+  blocks the root; an `unknown`/`launch_unknown` one blocks it until `hflow ledger settle`
+  closes it. While the owner
+  may be alive it writes nothing and says why, a second `resume` is a no-op, and every closure is
+  a compare-and-set, so two overlapping calls never close an entry twice and each describes only
+  what it closed (one that closed nothing writes no note). `status`/`report` show one
+  `open entries` line naming what closes them: `resume` once the owner is gone; `resume`'s
+  reconcile, without waiting on the owner, for a run blocked `outcome_unknown`/`owner_lost`; or
+  nothing in this build, for a pre-v6 run whose attempts recorded a controller pid.
 - **A repair is classified from a stored execution fact, never from prose.** `evidence.exit_reason`
   records *why* a check ended (`completed`, `nonzero_exit`, `timed_out`, `settlement_forced`,
   `output_capture_error`, ...), and an automatic repair needs that reason to say the check ran to
@@ -601,16 +651,15 @@ exercised has to *declare* the clean process exit it is modelling
 (`FakeCheckRunner(verdicts=..., exit_reasons={"unit": "nonzero_exit"})`). That is a deliberate
 modelling choice inside the offline facility, not evidence about a live harness.
 
-Not built: cooperative (protocol) cancellation on the selected launch path; a `hflow repair` or
-`hflow integrate` command; integration/publish delivery; reuse-research automation; teams and
+Not built: cooperative (protocol) cancellation on the selected launch path; a `hflow repair`
+command; publish delivery (no push, no pull request, no remote of any kind) and integration into
+a branch that is checked out (HFlow hands that merge to you instead of writing your checkout); a
+second review of a `replayed` integration tree (it is checked, not reviewed again); automatic
+resolution of an integration conflict; reuse-research automation; teams and
 native subagents; real billing observation; metrics against a direct-DSH baseline; an operator
-command that closes an entry left OPEN (`reserved`/`requested`/`started`) on a run that is not
-`outcome_unknown` - a confirmed stop whose ledger write failed (`cancelled_by_operator`), or a
-driver that raised without reporting a spawn fact (`internal_error`, or `review_protocol_error`
-for the reviewer) - which `resume` does not touch because it reconciles only an
-`outcome_unknown` run, and which `hflow ledger settle` refuses because it settles only `unknown`
-and `launch_unknown` entries, so that root stays blocked (the run's notes say so instead of
-promising a reconcile); the upgrade of the pinned acpx
+command that closes an entry left open on an ended pre-v6 run whose attempts recorded a
+controller pid (`resume` refuses it because that pid carries no host and `resume` takes no
+attestation, so that root stays blocked); the upgrade of the pinned acpx
 from 0.17.1 to 0.19.x (surveyed, deliberately deferred); reading a prompt answered with a
 JSON-RPC error as `failed` - it stays `outcome_unknown` with its code recorded, even for DSH's
 pre-model forms, because telling them apart means reading DSH's message text, and that

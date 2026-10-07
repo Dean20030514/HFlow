@@ -15,7 +15,7 @@ offline test, or a recorded live execution on one binding — never a neighbour'
 ## Layer map
 
 ```text
-CLI (cli.py: doctor/prepare/run/status/report/cancel/resume/clean/schema)
+CLI (cli.py: doctor/prepare/run/status/report/cancel/resume/clean/ledger/integrate/schema)
   |
 prepare.py  the one resolution `prepare` and `run` share: task overrides, project contract,
   |         per-role bindings (profiles.py), resolved launch, write permission, base commit
@@ -94,9 +94,15 @@ Task state: `DRAFT → READY → RUNNING → CHECKING → ACCEPTED`, plus `BLOCK
 `CANCELLED`, `OUTCOME_UNKNOWN`, `SUPERSEDED`. Delivery is tracked separately:
 `NONE → LOCAL_CANDIDATE`.
 
-No run reaches `INTEGRATED` or `PUBLISHED`: a TaskSpec asking for one of those delivery levels
-is refused at admission, before any run row exists, instead of being delivered as a local
-candidate and reported as the requested level.
+A run itself never reaches `INTEGRATED` or `PUBLISHED`: a TaskSpec asking for one of those delivery
+levels is still refused at admission, before any run row exists. Integration is a separate,
+operator-approved step after acceptance (`hflow integrate`, `src/hflow/integrate.py`, batch I2):
+its own `integrations` record (storage v8) and its own `IntegrationReceipt` with
+`delivery_state = INTEGRATED`, while the run's receipt stays `LOCAL_CANDIDATE` and is never
+rewritten. Integration states: `preparing → checking → ready → applying → integrated`, terminal
+`conflict` / `checks_failed` / `stale` / `interrupted` / `superseded` / `failed`. Its checks are
+evidence of kind `integration-check` over the integration commit, run in a worktree of their own.
+`PUBLISHED` is not reachable in this build.
 
 Each top-level invocation also has a ledger state (`invocations.state`, `InvocationStartState`),
 kept apart from the attempt state because a reservation, a launch request, a launch and a result
