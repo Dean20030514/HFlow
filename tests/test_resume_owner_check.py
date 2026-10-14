@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import getpass
 import json
+import shlex
 import sqlite3
 from pathlib import Path
 
@@ -40,9 +41,11 @@ from hflow.controller import (
     NOTE_DISPATCH,
     NOTE_OPERATOR_ATTESTATION,
     LegacyOwnerAttestation,
+    attestation_problem,
     inspect_run,
 )
 from hflow.drivers.fake import FakeDriver, FakeScript
+from hflow.hints import ATTEST_PLACEHOLDER, next_steps
 from hflow.report import status_text
 from hflow.store import ATTESTATION_MAX_CHARS, Store, StoreError
 
@@ -336,8 +339,9 @@ def test_legacy_owner_gone_closes_a_pre_v6_runs_entries_and_records_the_attestat
             f"the bound is {ATTESTATION_MAX_CHARS}",
         ),
         (["--legacy-owner-gone", "--attest", "a\x00b"], "NUL"),
+        (["--legacy-owner-gone", "--attest", "<what you know and why>"], "is a placeholder"),
     ],
-    ids=["no-attest", "attest-alone", "blank", "oversized", "nul"],
+    ids=["no-attest", "attest-alone", "blank", "oversized", "nul", "placeholder"],
 )
 def test_an_unusable_attestation_is_a_usage_error_and_nothing_is_read_or_written(
     store: Store, project, task_spec: TaskSpec, project_root: Path,
@@ -360,6 +364,91 @@ def test_the_attestation_type_applies_the_settle_bounds() -> None:
     with pytest.raises(ValueError, match="the bound is"):
         LegacyOwnerAttestation(attested_by="operator", attestation="x" * (ATTESTATION_MAX_CHARS + 1))
     assert LegacyOwnerAttestation(attested_by="operator", attestation=ATTEST).attestation == ATTEST
+    with pytest.raises(ValueError, match="is a placeholder"):
+        LegacyOwnerAttestation(attested_by="operator", attestation="<what you know and why>")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "<what you know and why>",
+        ATTEST_PLACEHOLDER,  # the quotes reached the program too (a shell that kept them)
+        "  <What You Know And Why>  ",
+        "<text>",  # the docs' own placeholder
+        "<what you know>",
+        "“<what you know and why>”",
+        "what you know and why",
+        "What  you know\tAND why",
+        "'what you know and why'",
+    ],
+)
+def test_a_placeholder_is_never_an_attestation(text: str) -> None:
+    """Rules 5 and 8: an unconfirmable state stays blocked until a person attests in their own
+    words - pasting the printed placeholder must not close entries or take an owner over."""
+    problem = attestation_problem(text)
+    assert problem is not None and "replace the placeholder with what you actually know" in problem
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        ATTEST,
+        "pid <4194300> exited when the machine was rebooted at 10:00",
+        "<4194300> exited: the machine was rebooted",
+        "<a> and <b> both exited",
+        "I know what you know and why it matters: the console was closed by hand",
+    ],
+)
+def test_real_words_with_angle_brackets_are_still_an_attestation(text: str) -> None:
+    assert attestation_problem(text) is None
+
+
+def _pasted(step: str) -> list[str]:
+    """The argv a shell hands ``hflow`` for a printed ``next:`` step, its comment dropped."""
+    argv = shlex.split(step, comments=True)
+    assert argv[0] == "hflow", step
+    return argv[1:]
+
+
+def test_pasting_each_printed_attestation_hint_verbatim_is_refused(
+    store: Store, project, task_spec: TaskSpec, project_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The ``next:`` lines print ``--attest "<what you know and why>"``. Pasted as printed, that
+    used to close a pre-v6 run's entries and settle them on an attestation nobody wrote."""
+    run_id = _legacy_ended_run(store, project, task_spec, project_root)
+    _record_controller_pid(store, run_id)
+    before = _recorded(store, run_id)
+
+    resume_hint, settle_hint = next_steps(store, run_id)
+    assert f"--legacy-owner-gone --attest {ATTEST_PLACEHOLDER}" in resume_hint, resume_hint
+    capsys.readouterr()
+    assert main(_pasted(resume_hint)) == EXIT_USAGE
+    err = capsys.readouterr().err
+    assert "is a placeholder" in err and "nothing was done" in err, err
+    # The settle hint printed beside it, pasted before resume: refused as well.
+    assert main(_pasted(settle_hint)) == EXIT_REFUSED
+    capsys.readouterr()
+    assert _recorded(store, run_id) == before, "nothing was closed, settled or noted"
+
+    # Real words close the entries; the settle hint printed next is refused verbatim too.
+    assert _cli_resume(
+        store, project_root, run_id, "--legacy-owner-gone", "--attest", ATTEST
+    ) == EXIT_BLOCKED
+    capsys.readouterr()
+    assert store.invocation("I-legacy").state is InvocationStartState.UNKNOWN
+    (settle_hint,) = [s for s in next_steps(store, run_id) if s.startswith("hflow ledger settle")]
+    assert f"--attest {ATTEST_PLACEHOLDER} --legacy-owner-gone" in settle_hint, settle_hint
+    argv = _pasted(settle_hint)
+    assert main(argv) == EXIT_REFUSED
+    err = capsys.readouterr().err
+    assert "is a placeholder" in err and "replace the placeholder" in err, err
+    assert store.invocation("I-legacy").state is InvocationStartState.UNKNOWN
+    assert store.settlement_for("I-legacy") is None
+
+    argv[argv.index("--attest") + 1] = ATTEST
+    assert main(argv) == EXIT_OK, capsys.readouterr().err
+    assert store.invocation("I-legacy").state is InvocationStartState.OPERATOR_SETTLED
 
 
 def test_legacy_owner_gone_never_passes_an_owner_this_build_recorded(

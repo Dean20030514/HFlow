@@ -21,11 +21,7 @@ from ..contracts import (
     AgentBinding,
     CapabilityReport,
     CapabilityState,
-    CancellationReceipt,
-    InvocationRequest,
-    InvocationResult,
     LaunchConfig,
-    ReconcileResult,
     RefusalCode,
     RefusedError,
 )
@@ -170,27 +166,3 @@ def build_driver(
         root.mkdir(parents=True, exist_ok=True)
         return FakeDriver(root)
     return AcpxDshDriver(data_dir=data_dir, dsh_home=dsh_home, launch=launch, binding=binding)
-
-
-class UnselectedDriver:
-    """Refuses to run. Kept so a misconfiguration fails loudly rather than silently."""
-
-    driver_id = "unselected"
-
-    def __init__(self, reason: str) -> None:
-        self.reason = reason
-
-    def probe(self, binding: AgentBinding) -> CapabilityReport:
-        return local_probe()
-
-    def _refuse(self) -> None:
-        raise RefusedError(RefusalCode.NOT_IMPLEMENTED, self.reason)
-
-    def start(self, request: InvocationRequest) -> InvocationResult:
-        self._refuse()
-
-    def cancel(self, invocation_id: str) -> CancellationReceipt:
-        self._refuse()
-
-    def reconcile(self, invocation_id: str) -> ReconcileResult:
-        self._refuse()

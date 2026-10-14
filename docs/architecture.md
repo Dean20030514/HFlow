@@ -38,7 +38,7 @@ Controller (controller.py)  — finite state machine, no LLM calls
   |-- report.py       status/report rendering from stored facts only
   |-- runtime.py      the controller build id recorded into every run
   |
-HarnessDriver (contracts.HarnessDriver / LifecycleDriver)
+HarnessDriver (contracts.HarnessDriver; a driver's optional cancel_handle is looked up, not declared)
   |-- drivers/selected.py   the single place a binding becomes a driver object
   |-- drivers/acpx_dsh.py   the production transport: acpx -> official DSH ACP
   |-- drivers/acp_events.py neutral projection of the client's event stream
@@ -238,7 +238,8 @@ usable finding. The rules, the triggers and everything that stops a repair are i
 No DAG engine, no distributed queue, no plugin loader, no vector memory, no web UI, no
 Task/Reviewer team topology, no second task database, no credential store, and no second
 production transport. Each omission is a scoping decision from the plan, not an oversight;
-the corresponding item is listed in the README as future work. The one production Driver
+none is promised as future work here; the README's "Not implemented" section lists what a
+reader must not assume. The one production Driver
 exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
 
 ## Known boundaries (do not overstate)

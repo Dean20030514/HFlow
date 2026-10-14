@@ -1,7 +1,8 @@
 # AGENTS.md — HFlow working notes
 
 Short navigation for an agent (or human) editing this repository. It intentionally does
-not restate the design; read the plan and `docs/architecture.md` when the task needs them.
+not restate the design; read the plan (`docs/history/Harness_Agnostic_Workflow_Greenfield_Plan_2026-09-19.md`;
+"plan N.M" in source comments cites its sections) and `docs/architecture.md` when the task needs them.
 
 ## Where things are
 
@@ -15,6 +16,7 @@ not restate the design; read the plan and `docs/architecture.md` when the task n
 | The one resolution `prepare` and `run` share (config, launch, binding) | `src/hflow/prepare.py` |
 | Machine profiles (per-role agent, driver, model selection) | `src/hflow/profiles.py` |
 | One-shot authorization artifacts and their binding digest | `src/hflow/authorization.py` |
+| Saved plans and `approve` (`prepare --plan-out` / `approve --plan` / `run --plan`, staleness) | `src/hflow/plan.py` |
 | What each role is told (input packets, 32 KiB bound) | `src/hflow/packet.py` |
 | Reviewer verdict decoding (`ReviewOutput`) | `src/hflow/review.py` |
 | Approved checks and evidence | `src/hflow/verify.py` |
@@ -24,6 +26,7 @@ not restate the design; read the plan and `docs/architecture.md` when the task n
 | Guarded worktree release (`hflow clean`) | `src/hflow/cleanup.py` |
 | Controlled integration of an accepted candidate (`hflow integrate`: prepare / apply / reconcile) | `src/hflow/integrate.py`; contract `docs/batch-i-integration-plan.md` |
 | `status` / `report` text from stored facts | `src/hflow/report.py` |
+| The operator's next command (`next:` lines) from stored facts; pasteable quoting and `--data-dir` | `src/hflow/hints.py` |
 | Commands and exit codes | `src/hflow/cli.py` |
 | The one production driver (acpx → DSH ACP) | `src/hflow/drivers/acpx_dsh.py` |
 | Windows Job Object process boundary | `src/hflow/drivers/winjob.py` |

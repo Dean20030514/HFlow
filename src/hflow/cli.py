@@ -1,7 +1,13 @@
 """HFlow command line.
 
-Subcommands: doctor / prepare / run / status / report / cancel / resume / schema / clean /
-ledger settle / integrate (prepare, apply, reconcile, show).
+Subcommands: doctor / prepare / approve / run / status / report / cancel / resume / schema /
+clean / ledger settle / integrate (prepare, apply, reconcile, show).
+
+``prepare --plan-out`` saves a task's resolution as a plan; ``approve --plan`` writes the
+authorization artifact for it only for a person at an interactive terminal, who types back the
+plan's approval code and then the approval text (never an argument, never piped stdin);
+``run --plan`` resolves from the plan instead of repeating every flag. Neither ``approve`` nor
+``prepare`` calls a model or opens the database.
 
 ``ledger settle`` closes an ``unknown`` / ``launch_unknown`` ledger entry by operator attestation;
 it never calls a model, never re-dispatches and never changes a run's state.
@@ -11,10 +17,10 @@ operator-approved delivery: ``prepare`` builds and checks one commit without mov
 ``apply`` moves the branch by compare-and-set only (never a branch some worktree has checked out),
 ``reconcile`` settles an interrupted record from what Git shows. It never calls a model.
 
-``doctor``, ``prepare``, ``status``, ``report``, ``schema`` and ``clean`` never call a model;
-``doctor`` never boots a DSH profile or runs ``dsh``: it reports what is *known* locally, marks the
-rest ``unknown``. ``resume`` reconciles and never re-dispatches; on a live run it takes over only
-from an owner process proven gone, and that takeover blocks the run ``owner_lost``.
+``doctor``, ``prepare``, ``approve``, ``status``, ``report``, ``schema`` and ``clean`` never call
+a model; ``doctor`` never boots a DSH profile or runs ``dsh``: it reports what is *known* locally,
+marks the rest ``unknown``. ``resume`` reconciles and never re-dispatches; on a live run it takes
+over only from an owner process proven gone, and that takeover blocks the run ``owner_lost``.
 
 ``--controller-id`` is a human label. A run's exclusive owner is the controller *process*
 (``hflow.ownership``): a random token, its pid, creation time and host, and an OS file lock held
@@ -63,10 +69,12 @@ from .contracts import (
     json_schema,
 )
 
+from .contracts import PlanArguments
+
 if TYPE_CHECKING:  # imported for annotations only: authorization.py is not a CLI dependency
     from .authorization import AuthorizationBinding, AuthorizationRecord
-    from .contracts import RootBudgetLimits, RootBudgetPlan
-    from .prepare import ResolvedRun
+    from .contracts import PrepareReport, RootBudgetLimits, RootBudgetPlan, RunPlan
+    from .prepare import Resolution, ResolvedRun
 
 from .controller import Controller, RunOutcome, inspect_run
 from .drivers.fake import FakeDriver, FakeScript
@@ -78,6 +86,7 @@ from .integrate import (
     prepare_integration,
     reconcile_integration,
 )
+from .integrate import _shell_word  # a printed path, quoted for the operator's shell
 from .paths import database_path, default_data_dir
 from . import profiles
 from .profiles import ENV_PROFILE
@@ -107,15 +116,6 @@ EXIT_RECORD_UNREADABLE = 6
 #: convention. Not ``EXIT_USAGE`` - the arguments were fine - and not a run outcome: whatever the
 #: command recorded before the interrupt is authoritative, and ``hflow status <run-id>`` reads it.
 EXIT_INTERRUPTED = 130
-
-
-def _load_json(path: Path) -> object:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise RefusedError(RefusalCode.INVALID_SPEC, f"file not found: {path}") from exc
-    except json.JSONDecodeError as exc:
-        raise RefusedError(RefusalCode.INVALID_SPEC, f"{path} is not valid JSON: {exc}") from exc
 
 
 def _text_value(value: object) -> str:
@@ -788,6 +788,55 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return profile_exit
 
 
+#: ``(dest, flag)`` of every input `prepare` and `run` resolve a task from
+#: (:func:`_add_resolution_args`). With ``run --plan`` they come from the plan, never the command
+#: line.
+_RESOLUTION_FLAGS = (
+    ("task", "--task"),
+    ("project", "--project"),
+    ("project_root", "--project-root"),
+    ("profile", "--profile"),
+    ("driver", "--driver"),
+    ("base_commit", "--base-commit"),
+    ("workspace", "--workspace"),
+    ("authorization_mode", "--authorization-mode"),
+    ("root_budget_file", "--root-budget-file"),
+    ("repair_policy_file", "--repair-policy-file"),
+)
+_DEFAULT_PROJECT_ROOT = "."
+_DEFAULT_AUTHORIZATION_MODE = "m2-live-change"
+
+
+def _resolution_arguments(args: argparse.Namespace) -> PlanArguments:
+    """The resolution inputs as given on the command line, with the documented defaults.
+
+    The parser leaves every resolution flag ``None`` when it is absent (so ``run --plan`` can tell
+    a flag that was given from a default); the defaults are applied here, once, for both commands.
+    """
+    data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
+    return PlanArguments.model_validate(
+        {
+            "task": args.task,
+            "project": args.project,
+            "project_root": args.project_root or _DEFAULT_PROJECT_ROOT,
+            "profile": args.profile,
+            "driver": args.driver,
+            "base_commit": args.base_commit,
+            "workspace": args.workspace,
+            "authorization_mode": args.authorization_mode or _DEFAULT_AUTHORIZATION_MODE,
+            "root_budget_file": args.root_budget_file,
+            "repair_policy_file": args.repair_policy_file,
+            "data_dir": str(data_dir),
+        }
+    )
+
+
+def _usage_error(command: str, message: str) -> int:
+    """A usage error found after parsing: argparse's shape and :data:`EXIT_USAGE`."""
+    print(f"hflow {command}: error: {message}", file=sys.stderr)
+    return EXIT_USAGE
+
+
 def cmd_prepare(args: argparse.Namespace) -> int:
     """Zero-model resolution of one task: what would run, under which config, for how much.
 
@@ -803,39 +852,31 @@ def cmd_prepare(args: argparse.Namespace) -> int:
 
     With `--root-budget-file` the preview also reports the root this run would be spent
     against. That is still zero-write: the ledger path is computed, never created or opened.
-    """
-    from .prepare import (
-        build_prepare_report,
-        load_repair_policy,
-        load_root_budget_plan,
-        render_prepare_text,
-        resolve_run,
-    )
 
-    data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
-    root_plan = (
-        load_root_budget_plan(Path(args.root_budget_file)) if args.root_budget_file else None
-    )
-    # The explicit repair opt-in, read and validated before anything is resolved. An invalid
-    # policy refuses here, with no report printed and nothing dispatched.
-    repair_policy = (
-        load_repair_policy(Path(args.repair_policy_file)) if args.repair_policy_file else None
-    )
-    resolved = resolve_run(
-        task_path=Path(args.task),
-        project_root=Path(args.project_root),
-        data_dir=data_dir,
-        project_path=Path(args.project) if args.project else None,
-        profile_id=args.profile,
-        driver=args.driver,
-        base_commit=args.base_commit,
-        workspace_mode=args.workspace,
-        repair_policy=repair_policy,
-        root_bound=root_plan is not None,
-        root_limits=root_plan.limits if root_plan is not None else None,
-    )
+    With `--plan-out` it also writes these inputs and this report as a plan file
+    (``hflow.plan``), which `approve --plan` and `run --plan` resolve again instead of repeating
+    every flag. A plan is not an approval, and it is written only for a task that would get past
+    both gates.
+    """
+    from .prepare import build_prepare_report, render_prepare_text, resolve_arguments
+
+    arguments = _resolution_arguments(args)
+    if args.plan_out:
+        from .plan import check_plan_target, frozen_arguments
+
+        # A target that exists and is not a plan (the task, an approval, the contract) is refused
+        # before anything is resolved or printed; `write_plan` checks again when it writes.
+        check_plan_target(Path(args.plan_out))
+        # Resolved from the absolute form the plan records, so the report inside the plan is
+        # exactly what `approve` and `run` compute from it.
+        arguments = frozen_arguments(arguments)
+    # The root budget file and the explicit repair opt-in are read and validated before anything
+    # else is resolved; an invalid one refuses with no report printed and nothing dispatched.
+    resolution = resolve_arguments(arguments)
     report = build_prepare_report(
-        resolved, authorization_mode=args.authorization_mode, root_budget_plan=root_plan
+        resolution.resolved,
+        authorization_mode=arguments.authorization_mode,
+        root_budget_plan=resolution.root_plan,
     )
     if args.json:
         print(canonical_json(report.model_dump(mode="json")))
@@ -844,7 +885,191 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     # "Will this run?" is the question prepare is asked, so anything the run itself would
     # refuse on has to reach the exit code: the admission gate *and* the dispatch gate. A
     # preview that reported success for a task a run refuses would be worse than no preview.
-    return EXIT_OK if resolved.ready_to_dispatch else EXIT_REFUSED
+    ready = resolution.resolved.ready_to_dispatch
+    if args.plan_out:
+        _write_prepared_plan(args, arguments, resolution, report, ready=ready)
+    return EXIT_OK if ready else EXIT_REFUSED
+
+
+def _write_prepared_plan(
+    args: argparse.Namespace,
+    arguments: PlanArguments,
+    resolution: Resolution,
+    report: PrepareReport,
+    *,
+    ready: bool,
+) -> None:
+    """``prepare --plan-out``: write the plan, or say why none was written.
+
+    The lines follow the report. In ``--json`` mode stdout carries only the report, so they go to
+    stderr there.
+    """
+    from .ids import utc_now
+    from .plan import build_plan, write_plan
+
+    stream = sys.stderr if args.json else sys.stdout
+    if not ready:
+        print(
+            f"plan          not written: `hflow run` would refuse this task (see above); "
+            f"{args.plan_out} was left as it was",
+            file=stream,
+        )
+        return
+    plan = build_plan(
+        arguments,
+        resolution,
+        report,
+        created_at=utc_now(),
+        controller_build=controller_build(),
+    )
+    path = write_plan(Path(args.plan_out), plan)
+    print(f"plan          {path}", file=stream)
+    if plan.prepare_report.authorization.required:
+        print(f"next: hflow approve --plan {_shell_word(str(path))}", file=stream)
+    else:
+        print(
+            "plan          needs no authorization (offline fake driver, no root budget)",
+            file=stream,
+        )
+        print(f"next: hflow run --plan {_shell_word(str(path))}", file=stream)
+
+
+def cmd_approve(args: argparse.Namespace) -> int:
+    """Turn a plan into an authorization artifact with the user's own words. No model, no DB.
+
+    The plan's inputs are resolved again through the function `prepare` used. A plan whose
+    binding changed since is refused as stale (exit 2); a plan that needs no authorization is
+    said to need none (exit 0, nothing written); a task `run` would refuse is refused here too.
+    Then standard input must be an interactive console - piped or redirected input is refused
+    unread (exit 2). Only then are the summary and the approval code shown and the two lines
+    read: the code typed back, then the approval in the person's own words; a wrong code or an
+    empty approval writes nothing (exit 2). Neither is ever an argument. The summary, the code and
+    both prompts go to stderr, the stream the prompts use, so redirecting stdout never hides what
+    is approved; stdout carries only the result. The artifact is created as a new file: an
+    existing file is never overwritten.
+    """
+    from .ids import new_id, utc_now
+    from .plan import (
+        approval_code,
+        approval_record,
+        ask_approval,
+        default_authorization_path,
+        load_plan,
+        plan_drift,
+        require_terminal,
+        resolution_binding,
+        same_directory,
+        stale_plan_error,
+        write_authorization,
+    )
+    from .prepare import build_prepare_report, render_prepare_text, resolve_arguments
+
+    plan_path = Path(os.path.abspath(args.plan))
+    plan = load_plan(plan_path)
+    if args.data_dir and not same_directory(args.data_dir, plan.arguments.data_dir):
+        return _usage_error(
+            "approve",
+            f"--data-dir {args.data_dir} names another directory than the plan's "
+            f"{plan.arguments.data_dir}; every resolution input comes from the plan",
+        )
+    arguments = plan.arguments
+    resolution = resolve_arguments(arguments)
+    report = build_prepare_report(
+        resolution.resolved,
+        authorization_mode=arguments.authorization_mode,
+        root_budget_plan=resolution.root_plan,
+    )
+    drift = plan_drift(
+        plan,
+        binding=resolution_binding(resolution, authorization_mode=arguments.authorization_mode),
+        root_limits=resolution.root_plan.limits if resolution.root_plan is not None else None,
+        submissions_required=report.authorization.max_top_level_submissions_required,
+    )
+    if drift:
+        raise stale_plan_error(plan_path, drift, approved=False)
+    # What is being approved and the questions about it share one stream, the one the prompts
+    # use: `approve --plan p > log.txt` must not hide the summary while still asking.
+    summary_stream = sys.stderr
+    run_command = f"hflow run --plan {_shell_word(str(plan_path))}"
+    if not report.authorization.required:
+        _print_approve_result(
+            {
+                "authorization_required": False,
+                "written": False,
+                "detail": (
+                    "this plan uses the offline fake driver, which reaches no model, and binds "
+                    "no root budget, so it needs no authorization. Nothing was written"
+                ),
+                "next": run_command,
+            },
+            args.json,
+        )
+        return EXIT_OK
+    if not resolution.resolved.ready_to_dispatch:
+        # An approval nobody can spend is not worth asking for. The issues are the run's own
+        # gates, printed the way `prepare` prints them.
+        print(render_prepare_text(report), file=summary_stream)
+        raise RefusedError(
+            RefusalCode.INVALID_SPEC,
+            "`hflow run` would refuse this plan's task (admission or dispatch gate, listed "
+            "above). Nothing was written; fix it and re-run `hflow prepare ... --plan-out`",
+        )
+    target = (
+        Path(os.path.abspath(args.out))
+        if args.out
+        else default_authorization_path(plan_path, plan.binding_digest)
+    )
+    if target.exists():
+        # Checked before asking, so nobody types an approval that cannot be stored; the write
+        # itself is still an exclusive create.
+        raise RefusedError(
+            RefusalCode.INVALID_SPEC,
+            f"{target} already exists and an authorization file is never overwritten. Nothing "
+            "was written; pass --out with a new path, or run with the existing approval",
+        )
+    # A person at a terminal, or nothing: piped input is refused before it is read and before the
+    # summary or the code is shown.
+    require_terminal(sys.stdin)
+    pending = report.authorization
+    code = approval_code(plan.binding_digest)
+    print(render_prepare_text(report), file=summary_stream)
+    print(
+        f"approving     binding {pending.binding_digest} for up to "
+        f"{pending.max_top_level_submissions_required} top-level submission(s)",
+        file=summary_stream,
+    )
+    print(f"approval code {code}", file=summary_stream)
+    summary_stream.flush()
+    user_text = ask_approval(sys.stdin, summary_stream, code=code)
+    record = approval_record(
+        plan, user_text, authorization_id=new_id("AUTH"), authorized_at=utc_now()
+    )
+    written = write_authorization(target, record)
+    _print_approve_result(
+        {
+            "authorization_required": True,
+            "written": True,
+            "authorization_file": str(written),
+            "authorization_id": record.authorization_id,
+            "binding_digest": record.binding_digest(),
+            "max_top_level_submissions": record.max_top_level_submissions,
+            "next": f"{run_command} --authorization-file {_shell_word(str(written))}",
+        },
+        args.json,
+    )
+    return EXIT_OK
+
+
+def _print_approve_result(payload: dict[str, object], as_json: bool) -> None:
+    if as_json:
+        print(canonical_json(payload))
+        return
+    if payload["written"]:
+        print(f"authorization {payload['authorization_file']}")
+        print(f"id            {payload['authorization_id']}")
+    else:
+        print(f"authorization not needed: {payload['detail']}")
+    print(f"next: {payload['next']}")
 
 
 #: Recorded on the in-memory artifact an offline root run charges its dispatches to. It is
@@ -991,7 +1216,11 @@ def _continuation_before_admission(
 
 
 def _write_run_outcome(
-    outcome: RunOutcome, args: argparse.Namespace, *, offline_root_note: str = "",
+    outcome: RunOutcome,
+    args: argparse.Namespace,
+    *,
+    offline_root_note: str = "",
+    steps: list[str] | None = None,
 ) -> int:
     payload = _outcome_payload(outcome)
     if offline_root_note:
@@ -1020,79 +1249,118 @@ def _write_run_outcome(
             print(f"note       {note}")
         if offline_root_note:
             print(f"note       {offline_root_note}")
+        if steps:
+            from .hints import next_lines
+
+            for line in next_lines(steps):
+                print(line)
     return _outcome_exit_code(outcome)
 
 
-def cmd_run(args: argparse.Namespace) -> int:
-    from .prepare import (
-        load_repair_policy,
-        load_root_budget_plan,
-        resolve_machine_bindings,
-        resolve_run,
-        role_drivers,
-    )
+def _run_plan_inputs(
+    args: argparse.Namespace,
+) -> tuple[PlanArguments, RunPlan | None, Path | None, str | None] | int:
+    """``run``'s resolution inputs - from ``--plan``, or from the flags - and its approval file.
 
-    data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
+    Returns ``(arguments, plan, plan_path, authorization_file)``, or an exit code for a usage
+    error. With ``--plan`` every resolution input comes from the plan: a resolution flag given as
+    well, or a ``--data-dir`` naming another directory, is a usage error rather than a silent
+    override. The plan's data directory becomes this command's, so the run opens the ledger the
+    plan's binding names. Without ``--authorization-file`` a plan that needs an approval uses the
+    file ``approve`` writes by default for the plan's digest, when it exists.
+    """
+    if not args.plan:  # the parser requires exactly one of --task and --plan
+        return _resolution_arguments(args), None, None, args.authorization_file
+    from .plan import default_authorization_path, load_plan, same_directory
+
+    given = [flag for dest, flag in _RESOLUTION_FLAGS if getattr(args, dest, None) is not None]
+    if given:
+        return _usage_error(
+            "run",
+            f"{', '.join(given)} cannot be combined with --plan: every resolution input comes "
+            "from the plan. Re-run `hflow prepare ... --plan-out` to change one",
+        )
+    plan_path = Path(os.path.abspath(args.plan))
+    plan = load_plan(plan_path)
+    if args.data_dir and not same_directory(args.data_dir, plan.arguments.data_dir):
+        return _usage_error(
+            "run",
+            f"--data-dir {args.data_dir} names another directory than the plan's "
+            f"{plan.arguments.data_dir}; every resolution input comes from the plan",
+        )
+    args.data_dir = plan.arguments.data_dir
+    authorization_file = args.authorization_file
+    if not authorization_file and plan.prepare_report.authorization.required:
+        candidate = default_authorization_path(plan_path, plan.binding_digest)
+        if candidate.exists():
+            authorization_file = str(candidate)
+            print(f"note: using the approval of this plan at {candidate}", file=sys.stderr)
+    return plan.arguments, plan, plan_path, authorization_file
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    from .prepare import resolve_arguments, resolve_machine_bindings, role_drivers
+
+    inputs = _run_plan_inputs(args)
+    if isinstance(inputs, int):
+        return inputs
+    arguments, plan, plan_path, authorization_file = inputs
+    data_dir = Path(arguments.data_dir)
 
     # The authorization question is settled before the task is even read: refusing here means a
     # missing approval cannot be confused with a malformed task, and no file is touched first.
     # "Is this a real run?" comes from the resolved machine bindings - the profile when one is
-    # named, the command line otherwise - which is the same resolution the run itself uses.
+    # named, the command line otherwise - and those same bindings are what the full resolution
+    # below uses (it is handed them rather than reading the profile a second time), so the
+    # configuration that answered this question is the one that runs.
     machine = resolve_machine_bindings(
-        data_dir=data_dir, profile_id=args.profile, driver=args.driver
+        data_dir=data_dir, profile_id=arguments.profile, driver=arguments.driver
     )
     is_real_driver = machine.is_real_driver
-    if is_real_driver and not args.authorization_file:
+    if is_real_driver and not authorization_file:
         message = (
             "this run resolves to a real Harness driver and needs an explicit, bound user "
             "authorization file (--authorization-file). There is no flag that substitutes for "
             "one and no fallback to the fake driver."
         )
+        if plan_path is not None:
+            message += (
+                f" Approve the plan first: hflow approve --plan {_shell_word(str(plan_path))}"
+            )
         _write_out({"refused": True, "reason": "live_authorization_missing", "detail": message}, args.json)
         print(f"refused: {message}", file=sys.stderr)
         return EXIT_REFUSED
-    root_plan = (
-        load_root_budget_plan(Path(args.root_budget_file)) if args.root_budget_file else None
-    )
-    # The task's explicit opt-in to one bounded repair. Read here, before the spec is resolved:
-    # the policy becomes part of the effective TaskSpec, so the stored spec, its digest and the
-    # authorization binding all cover the repair the task asked for. An unreadable or unsupported
-    # document refuses before a run row, a workspace or an allowance exists.
-    repair_policy = (
-        load_repair_policy(Path(args.repair_policy_file)) if args.repair_policy_file else None
-    )
-
-    resolved = resolve_run(
-        task_path=Path(args.task),
-        project_root=Path(args.project_root),
-        data_dir=data_dir,
-        project_path=Path(args.project) if args.project else None,
-        profile_id=args.profile,
-        driver=args.driver,
-        base_commit=args.base_commit,
-        workspace_mode=args.workspace,
-        repair_policy=repair_policy,
-        root_bound=root_plan is not None,
-    )
+    # The root budget file and the task's explicit repair opt-in are read before the spec is
+    # resolved: the policy becomes part of the effective TaskSpec, so the stored spec, its digest
+    # and the authorization binding all cover the repair the task asked for. An unreadable or
+    # unsupported document refuses before a run row, a workspace or an allowance exists.
+    resolution = resolve_arguments(arguments, machine=machine)
+    resolved = resolution.resolved
+    root_plan = resolution.root_plan
     spec = resolved.spec
     project = resolved.project
     project_root = resolved.project_root
-    task_path = resolved.spec_path
-
-    if resolved.is_real_driver != is_real_driver:
-        # The profile is read once to settle the authorization question and once by the full
-        # resolution. If those disagree, the file changed underneath this command, and
-        # continuing would mean dispatching under a configuration no gate has seen.
-        raise RefusedError(
-            RefusalCode.INVALID_SPEC,
-            "the machine configuration changed while this run was being resolved "
-            f"(was real_driver={is_real_driver}, now {resolved.is_real_driver}). Nothing was "
-            "dispatched and no allowance was consumed; re-run when the configuration is stable.",
-        )
 
     continuation = _continuation_before_admission(resolved, data_dir=data_dir, root_plan=root_plan)
     if continuation is not None:
         return _write_run_outcome(continuation, args)
+
+    if plan is not None:
+        # A plan runs what it planned, or nothing: inputs that now resolve to another binding (an
+        # edited task or contract, a moved branch, another configuration) refuse here. This is
+        # in addition to every check below, not instead of one.
+        from .plan import plan_drift, resolution_binding, stale_plan_error
+
+        assert plan_path is not None
+        drift = plan_drift(
+            plan,
+            binding=resolution_binding(resolution, authorization_mode=arguments.authorization_mode),
+            root_limits=root_plan.limits if root_plan is not None else None,
+        )
+        if drift:
+            raise stale_plan_error(
+                plan_path, drift, approved=plan.prepare_report.authorization.required
+            )
 
     if not resolved.admission.ok:
         _write_out(
@@ -1121,35 +1389,34 @@ def cmd_run(args: argparse.Namespace) -> int:
     root_limits = None
     offline_root_note = ""
     if is_real_driver or root_plan is not None:
-        from .authorization import (
-            current_binding,
-            load_authorization,
-            resolve_root_binding,
-            verify_authorization,
-        )
+        from .authorization import load_authorization, verify_authorization
+        from .prepare import pending_binding, root_binding_for
 
         if root_plan is not None:
             # Derived, not created: the binding names the ledger, and the store creates or
             # migrates it only when the dispatch transaction actually runs.
-            root_binding = resolve_root_binding(
-                project_id=project.project_id,
-                request=resolved.request(),
-                data_dir=data_dir,
-            )
-        authorization_binding = current_binding(
-            mode=args.authorization_mode,
-            driver=resolved.effective.role("implementer").driver,  # type: ignore[union-attr]
-            project=project,
-            request=resolved.request(),
-            spec_path=task_path,
-            effective=resolved.effective,
-            root_binding=root_binding,
+            root_binding = root_binding_for(resolved)
+        # The same call `prepare` makes for the binding it prints.
+        authorization_binding = pending_binding(
+            resolved, authorization_mode=arguments.authorization_mode, root_binding=root_binding
         )
-        if args.authorization_file:
-            authorization = load_authorization(Path(args.authorization_file))
+        if authorization_file:
+            authorization = load_authorization(Path(authorization_file))
             # Refuses with a specific mismatch list when the artifact covers a different task,
             # project, base commit, driver, execution mode, configuration or root.
-            verify_authorization(authorization, expected=authorization_binding)
+            try:
+                verify_authorization(authorization, expected=authorization_binding)
+            except RefusedError as exc:
+                if plan_path is None:
+                    raise
+                # The plan itself is current (checked above), so this approval was written for
+                # another plan, or for this one before its inputs changed and it was re-prepared.
+                raise RefusedError(
+                    exc.code,
+                    f"{exc.message} - this authorization was not issued for plan {plan_path} as "
+                    "it resolves now. Nothing was dispatched; approve this plan with `hflow "
+                    f"approve --plan {_shell_word(str(plan_path))}`",
+                ) from exc
         if root_plan is not None:
             if authorization is not None:
                 root_limits = authorization.root_limits
@@ -1195,12 +1462,14 @@ def cmd_run(args: argparse.Namespace) -> int:
             # offline agent, because there is nothing per-role to distinguish offline.
             script = FakeScript(outcome=InvocationOutcome.COMPLETED, agent_turns=1)
             if args.fake_write_plan:
-                plan = _load_json(Path(args.fake_write_plan))
-                if not isinstance(plan, dict):
+                from .prepare import load_json_file
+
+                writes = load_json_file(Path(args.fake_write_plan), what="fake write plan")
+                if not isinstance(writes, dict):
                     raise RefusedError(
                         RefusalCode.INVALID_SPEC, "--fake-write-plan must be a JSON object of path -> text"
                     )
-                script.write_plan = {str(key): str(value) for key, value in plan.items()}
+                script.write_plan = {str(key): str(value) for key, value in writes.items()}
                 script.limitations = ["fake driver: no model was invoked; change came from a plan file"]
             implementer_driver: object = FakeDriver(project_root, script)
             drivers = {"implementer": implementer_driver, "reviewer": implementer_driver}
@@ -1260,10 +1529,15 @@ def cmd_run(args: argparse.Namespace) -> int:
                 base_commit=resolved.base_commit,
             )
         )
+        steps: list[str] = []
+        if not (args.json or args.receipt_out):
+            from .hints import next_steps
+
+            steps = next_steps(store, outcome.run_id, project_file=arguments.project)
     finally:
         store.close()
 
-    return _write_run_outcome(outcome, args, offline_root_note=offline_root_note)
+    return _write_run_outcome(outcome, args, offline_root_note=offline_root_note, steps=steps)
 
 
 def _unreadable_record(run_id: str, exc: ValueError | StoredRecordUnreadable) -> int:
@@ -1283,13 +1557,39 @@ def _unreadable_record(run_id: str, exc: ValueError | StoredRecordUnreadable) ->
     return EXIT_RECORD_UNREADABLE
 
 
+def _drift_root(store: Store, args: argparse.Namespace) -> Path:
+    """The workspace ``status``/``report`` compare for drift.
+
+    ``--project-root`` when given; otherwise the project root the run recorded at admission (its
+    admission binding, else its workspace provenance) while that directory still exists; otherwise
+    the current directory, as before such records existed. An unreadable record falls back the
+    same way: choosing a default must never fail the read-only command.
+    """
+    if args.project_root is not None:
+        return Path(args.project_root).resolve()
+    recorded = ""
+    try:
+        binding = store.admission_binding_for(args.run_id)
+        if binding is not None:
+            recorded = binding.project_root
+        else:
+            provenance = store.workspace_provenance_for(args.run_id)
+            recorded = provenance.project_root if provenance is not None else ""
+    except StoredRecordUnreadable:
+        recorded = ""
+    if recorded and Path(recorded).is_dir():
+        return Path(recorded).resolve()
+    return Path(".").resolve()
+
+
 def cmd_status(args: argparse.Namespace) -> int:
+    from .hints import next_lines, next_steps
+
     store = _open_store(args)
     try:
-        inspection = inspect_run(
-            store, args.run_id, project_root=Path(args.project_root).resolve()
-        )
+        inspection = inspect_run(store, args.run_id, project_root=_drift_root(store, args))
         integrations = store.integrations_for(inspection.run.run_id)
+        steps = [] if args.json else next_steps(store, inspection.run.run_id)
     except RunNotFound:
         print(f"unknown run {args.run_id}", file=sys.stderr)
         return EXIT_USAGE
@@ -1302,17 +1602,22 @@ def cmd_status(args: argparse.Namespace) -> int:
     if args.json:
         print(canonical_json(_with_integrations(report_json(inspection), integrations)))
     else:
-        print(_join_lines(status_text(inspection), integration_lines(integrations)))
+        print(
+            _join_lines(
+                status_text(inspection), [*integration_lines(integrations), *next_lines(steps)]
+            )
+        )
     return EXIT_OK
 
 
 def cmd_report(args: argparse.Namespace) -> int:
+    from .hints import next_lines, next_steps
+
     store = _open_store(args)
     try:
-        inspection = inspect_run(
-            store, args.run_id, project_root=Path(args.project_root).resolve()
-        )
+        inspection = inspect_run(store, args.run_id, project_root=_drift_root(store, args))
         integrations = store.integrations_for(inspection.run.run_id)
+        steps = [] if args.json else next_steps(store, inspection.run.run_id)
     except RunNotFound:
         print(f"unknown run {args.run_id}", file=sys.stderr)
         return EXIT_USAGE
@@ -1325,7 +1630,11 @@ def cmd_report(args: argparse.Namespace) -> int:
     if args.json:
         print(canonical_json(_with_integrations(report_json(inspection), integrations)))
     else:
-        print(_join_lines(report_text(inspection), integration_lines(integrations)))
+        print(
+            _join_lines(
+                report_text(inspection), [*integration_lines(integrations), *next_lines(steps)]
+            )
+        )
     return EXIT_OK
 
 
@@ -1400,7 +1709,30 @@ def _integrate_call(call):  # noqa: ANN001, ANN202 - a thin wrapper around the t
         return None, _integration_error(exc)
 
 
-def _print_integration(outcome: IntegrationOutcome, as_json: bool) -> None:
+def _integration_next(
+    store: Store,
+    outcome: IntegrationOutcome | None,
+    args: argparse.Namespace,
+    project_file: str | None = None,
+) -> list[str]:
+    """What the operator runs next after an integrate command (text output only).
+
+    The command's own hand-off when it has one - it alone knows from Git whether the target is
+    checked out somewhere - else the run's next steps from stored facts (:mod:`hflow.hints`).
+    """
+    if outcome is None or args.json:
+        return []
+    from .hints import next_steps
+
+    return list(outcome.handoff) or next_steps(
+        store, outcome.record.run_id, project_file=project_file
+    )
+
+
+def _print_integration(
+    outcome: IntegrationOutcome, as_json: bool, steps: list[str] | None = None
+) -> None:
+    from .hints import next_lines
     from .report import integration_record_lines
 
     if as_json:
@@ -1414,19 +1746,33 @@ def _print_integration(outcome: IntegrationOutcome, as_json: bool) -> None:
         lines.append(f"delivery      {receipt.delivery_state.value} ({receipt.basis})")
         for limitation in receipt.limitations:
             lines.append(f"limitation    {limitation}")
-    for command in outcome.handoff:
-        lines.append(f"next          {command}")
+    lines.extend(next_lines(list(outcome.handoff) if steps is None else steps))
     print("\n".join(lines))
 
 
 def cmd_integrate_prepare(args: argparse.Namespace) -> int:
     """Build and check an integration commit for an accepted run. Never moves a branch."""
+    from .integrate import recorded_project_file
     from .prepare import load_project_contract
 
-    project = load_project_contract(Path(args.project))
     data_dir = Path(args.data_dir) if getattr(args, "data_dir", None) else default_data_dir()
     store = _open_store(args)
     try:
+        # An unknown run is named as one, never as a missing --project.
+        store.get_run(args.run_id)
+        project_file = Path(args.project) if args.project else None
+        if project_file is None:
+            project_file = recorded_project_file(store, args.run_id)
+        if project_file is None:
+            print(
+                f"refusing: pass --project for run {args.run_id}: it recorded no project "
+                "contract digest, its admission record cannot be read, or <project "
+                "root>/.hflow/project.json is missing, unreadable or no longer the contract the "
+                "run was admitted under",
+                file=sys.stderr,
+            )
+            return EXIT_USAGE
+        project = load_project_contract(project_file)
         outcome, failed = _integrate_call(
             lambda: prepare_integration(
                 store,
@@ -1444,6 +1790,7 @@ def cmd_integrate_prepare(args: argparse.Namespace) -> int:
                 controller_build=controller_build(),
             )
         )
+        steps = _integration_next(store, outcome, args, project_file=args.project)
     except RunNotFound:
         print(f"unknown run {args.run_id}", file=sys.stderr)
         return EXIT_USAGE
@@ -1451,7 +1798,7 @@ def cmd_integrate_prepare(args: argparse.Namespace) -> int:
         store.close()
     if failed is not None:
         return failed
-    _print_integration(outcome, args.json)
+    _print_integration(outcome, args.json, steps)
     return _integration_exit(outcome, "prepare")
 
 
@@ -1474,11 +1821,12 @@ def cmd_integrate_apply(args: argparse.Namespace) -> int:
                 controller_build=controller_build(),
             )
         )
+        steps = _integration_next(store, outcome, args)
     finally:
         store.close()
     if failed is not None:
         return failed
-    _print_integration(outcome, args.json)
+    _print_integration(outcome, args.json, steps)
     return _integration_exit(outcome, "apply")
 
 
@@ -1486,10 +1834,18 @@ def cmd_integrate_reconcile(args: argparse.Namespace) -> int:
     """Settle an integration record from what Git shows; never re-runs an update or a check."""
     import getpass
 
+    from .controller import attestation_problem
+
     attestation = (args.attest or "").strip()
-    if args.owner_gone and not attestation:
-        print("refusing: --owner-gone needs --attest with what you know and why", file=sys.stderr)
-        return EXIT_USAGE
+    if args.owner_gone:
+        problem = (
+            "--owner-gone needs --attest with what you know and why"
+            if not attestation
+            else attestation_problem(args.attest)
+        )
+        if problem is not None:
+            print(f"refusing: {problem}", file=sys.stderr)
+            return EXIT_USAGE
     try:
         attested_by = getpass.getuser()
     except Exception:  # noqa: BLE001 - getuser raises OSError/KeyError/ImportError by platform
@@ -1507,11 +1863,12 @@ def cmd_integrate_reconcile(args: argparse.Namespace) -> int:
                 attested_by=attested_by,
             )
         )
+        steps = _integration_next(store, outcome, args)
     finally:
         store.close()
     if failed is not None:
         return failed
-    _print_integration(outcome, args.json)
+    _print_integration(outcome, args.json, steps)
     return _integration_exit(outcome, "reconcile")
 
 
@@ -1521,14 +1878,18 @@ def cmd_integrate_show(args: argparse.Namespace) -> int:
     try:
         record = store.integration(args.integration_id)
         receipt = store.integration_receipt(args.integration_id) if record is not None else None
+        outcome = (
+            IntegrationOutcome(record=record, receipt=receipt) if record is not None else None
+        )
+        steps = _integration_next(store, outcome, args)
     except Exception as exc:  # noqa: BLE001 - mapped explicitly, anything else re-raised
         return _integration_error(exc)
     finally:
         store.close()
-    if record is None:
+    if outcome is None:
         print(f"unknown integration {args.integration_id}", file=sys.stderr)
         return EXIT_USAGE
-    _print_integration(IntegrationOutcome(record=record, receipt=receipt), args.json)
+    _print_integration(outcome, args.json, steps)
     return EXIT_OK
 
 
@@ -1687,6 +2048,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
     import sqlite3
 
     from .controller import LegacyOwnerAttestation, attestation_problem
+    from .hints import next_lines, next_steps
     from .store import StoreError
 
     legacy_owner_gone: LegacyOwnerAttestation | None = None
@@ -1724,6 +2086,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
         outcome = controller.resume(run_id, legacy_owner_gone=legacy_owner_gone)
         if config_unreadable and store.total_changes() != changes:
             _note_stored_config_unreadable(store, run_id)
+        steps = [] if args.json else next_steps(store, run_id)
     except RunNotFound:
         print(f"unknown run {args.run_id}", file=sys.stderr)
         return EXIT_USAGE
@@ -1739,6 +2102,8 @@ def cmd_resume(args: argparse.Namespace) -> int:
     finally:
         store.close()
     _write_out(_outcome_payload(outcome), args.json)
+    if steps:
+        print("\n".join(next_lines(steps)))
     if outcome.waiting_on_owner:
         return EXIT_IN_PROGRESS
     return _outcome_exit_code(outcome)
@@ -1754,7 +2119,8 @@ def cmd_ledger_settle(args: argparse.Namespace) -> int:
     """
     import getpass
 
-    from .controller import operator_settle_refusal
+    from .controller import attestation_problem, operator_settle_refusal
+    from .hints import next_lines, next_steps
     from .store import InvocationNotFound, SettlementRefused, StoreError
 
     try:
@@ -1772,6 +2138,11 @@ def cmd_ledger_settle(args: argparse.Namespace) -> int:
         )
         if alive is not None:
             raise SettlementRefused(alive)
+        # Before the flag's suffix is added: a pasted placeholder plus that suffix is still not
+        # the operator's own words.
+        problem = attestation_problem(args.attest)
+        if problem is not None:
+            raise SettlementRefused(problem)
         attestation = args.attest
         if args.legacy_owner_gone:
             attestation = (
@@ -1784,6 +2155,7 @@ def cmd_ledger_settle(args: argparse.Namespace) -> int:
             attestation=attestation,
         )
         usage = store.root_budget_view(settlement.root_id) if settlement.root_id else None
+        steps = [] if args.json else next_steps(store, settlement.run_id)
     except InvocationNotFound as exc:
         print(f"unknown invocation: {exc}", file=sys.stderr)
         return EXIT_USAGE
@@ -1829,6 +2201,8 @@ def cmd_ledger_settle(args: argparse.Namespace) -> int:
     print(f"attested_by   {settlement.attested_by} (OS user; recorded, not authenticated)")
     print(f"attested_at   {settlement.attested_at}")
     print(f"note          {statement}")
+    for line in next_lines(steps):
+        print(line)
     return EXIT_OK
 
 
@@ -1895,7 +2269,10 @@ def cmd_clean(args: argparse.Namespace) -> int:
         for keep in plan.keeps:
             print(f"  keeps       {keep}")
         if plan.allowed:
-            print("apply with:   hflow clean " + plan.run_id + " --apply")
+            from .hints import hflow_command
+
+            # The ledger this preview read, so the printed command opens the same one.
+            print("apply with:   " + hflow_command(store, "clean", plan.run_id, "--apply"))
     return EXIT_OK
 
 
@@ -1947,6 +2324,10 @@ def cmd_schema(args: argparse.Namespace) -> int:
 
 
 _DATA_DIR_HELP = "runtime data directory (default: platform data dir, outside any repo)"
+_DRIFT_ROOT_HELP = (
+    "workspace used for the drift check (default: the project root the run recorded, while it "
+    "exists; else the current directory)"
+)
 
 
 def _add_store_args(parser: argparse.ArgumentParser) -> None:
@@ -1992,6 +2373,80 @@ def _add_repair_policy_arg(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_resolution_args(
+    parser: argparse.ArgumentParser, *, plan_alternative: str | None = None
+) -> None:
+    """The inputs `prepare` and `run` resolve a task from: one definition for both commands.
+
+    Every one defaults to ``None`` so ``run --plan`` can tell a given flag from an absent one;
+    :func:`_resolution_arguments` applies the documented defaults (``--project-root .``,
+    ``--authorization-mode m2-live-change``). With ``plan_alternative`` (the help of ``--plan``)
+    exactly one of ``--task`` and ``--plan`` is required, and argparse enforces it.
+    """
+    if plan_alternative is None:
+        parser.add_argument("--task", required=True, default=None, help="path to task.json")
+    else:
+        source = parser.add_mutually_exclusive_group(required=True)
+        source.add_argument("--task", default=None, help="path to task.json")
+        source.add_argument("--plan", default=None, help=plan_alternative)
+    parser.add_argument(
+        "--project",
+        default=None,
+        help="path to the project contract (default: <project-root>/.hflow/project.json)",
+    )
+    parser.add_argument(
+        "--project-root", default=None, help="target project root (workspace; default: .)"
+    )
+    parser.add_argument(
+        "--profile",
+        default=None,
+        help=(
+            f"machine profile id, loaded from <data-dir>/profiles/<id>.json (or {ENV_PROFILE}). "
+            "Binds the implementer and the reviewer independently"
+        ),
+    )
+    parser.add_argument(
+        "--driver",
+        default=None,
+        help=(
+            "driver id override: 'fake' (offline) or 'acpx-dsh' (the M0-selected transport). "
+            "Without --profile the default is 'fake'. With --profile the profile supplies the "
+            "per-role bindings and this flag must name the same driver or the run is refused"
+        ),
+    )
+    parser.add_argument(
+        "--base-commit",
+        default=None,
+        help="fix the base commit for a Git-worktree run (overrides the TaskSpec before admission)",
+    )
+    parser.add_argument(
+        "--workspace",
+        choices=["worktree", "in_place"],
+        default=None,
+        help="override workspace.mode before admission (worktree = isolated Git worktree)",
+    )
+    parser.add_argument(
+        "--authorization-mode",
+        choices=["stop-trial", "m2-live-change"],
+        default=None,
+        help=(
+            "which authorized activity the binding is for (default: m2-live-change); modes are "
+            "not interchangeable"
+        ),
+    )
+    parser.add_argument(
+        "--root-budget-file",
+        default=None,
+        help=(
+            "JSON root budget plan ({'limits': {...}, 'note': '...'}): the run spends against a "
+            "root ledger the authorization must bind. `prepare` derives the binding and the ledger "
+            "path and creates no database; a real `run` needs an authorization with the same "
+            "root, the offline driver mints a labelled offline record instead"
+        ),
+    )
+    _add_repair_policy_arg(parser)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(prog="hflow", description=__doc__)
     parser.add_argument("--data-dir", default=None, help=_DATA_DIR_HELP)
@@ -2014,80 +2469,53 @@ def build_parser() -> argparse.ArgumentParser:
         "prepare",
         help="zero-model resolution: what a task would run, under which config, for how much",
     )
-    prepare.add_argument("--task", required=True, help="path to task.json")
-    prepare.add_argument("--project", default=None, help="path to .hflow/project.json")
-    prepare.add_argument("--project-root", default=".", help="target project root (workspace)")
-    prepare.add_argument("--profile", default=None, help=f"machine profile id (or {ENV_PROFILE})")
+    _add_resolution_args(prepare)
     prepare.add_argument(
-        "--driver",
-        default=None,
-        help="driver override; must agree with --profile when both are given",
-    )
-    prepare.add_argument(
-        "--base-commit",
-        default=None,
-        help="fix the base commit for a Git-worktree run (the same override `run` applies)",
-    )
-    prepare.add_argument(
-        "--workspace",
-        choices=["worktree", "in_place"],
-        default=None,
-        help="workspace mode override (the same override `run` applies)",
-    )
-    prepare.add_argument(
-        "--authorization-mode",
-        choices=["stop-trial", "m2-live-change"],
-        default="m2-live-change",
-        help="which authorized activity the pending binding would be for; modes are not interchangeable",
-    )
-    prepare.add_argument(
-        "--root-budget-file",
+        "--plan-out",
         default=None,
         help=(
-            "JSON root budget plan ({'limits': {...}, 'note': '...'}) for a run that spends "
-            "against a root ledger. The preview derives the root binding and the ledger path; "
-            "it creates no database"
+            "also write these inputs (paths made absolute) and this report as a plan file, for "
+            "`hflow approve --plan` and `hflow run --plan`; an existing plan file there is "
+            "replaced, any other existing file is refused and left as it was. Not written when "
+            "the run would be refused. A plan is not an approval"
         ),
     )
     prepare.add_argument("--json", action="store_true")
-    _add_repair_policy_arg(prepare)
     _add_store_args(prepare)
     prepare.set_defaults(func=cmd_prepare)
 
-    run = sub.add_parser("run", help="admit and run one task")
-    run.add_argument("--task", required=True, help="path to task.json")
-    run.add_argument("--project", default=None, help="path to .hflow/project.json")
-    run.add_argument("--project-root", default=".", help="target project root (workspace)")
-    run.add_argument(
-        "--driver",
-        default=None,
+    approve = sub.add_parser(
+        "approve",
         help=(
-            "driver id override: 'fake' (offline) or 'acpx-dsh' (the M0-selected transport). "
-            "Without --profile the default is 'fake'. With --profile the profile supplies the "
-            "per-role bindings and this flag must name the same driver or the run is refused."
+            "turn a plan into an authorization file, at an interactive terminal only: type the "
+            "approval code it shows, then your own approval text (no model calls, no database)"
         ),
     )
-    run.add_argument(
-        "--profile",
+    approve.add_argument("--plan", required=True, help="plan file written by `prepare --plan-out`")
+    approve.add_argument(
+        "--out",
         default=None,
         help=(
-            f"machine profile id, loaded from <data-dir>/profiles/<id>.json (or {ENV_PROFILE}). "
-            "Binds the implementer and the reviewer independently"
+            "authorization file to create (never overwritten); default: next to the plan, "
+            "<plan stem>.<12 hex of the binding digest>.authorization.json"
+        ),
+    )
+    approve.add_argument("--json", action="store_true")
+    _add_store_args(approve)
+    approve.set_defaults(func=cmd_approve)
+
+    run = sub.add_parser("run", help="admit and run one task")
+    _add_resolution_args(
+        run,
+        plan_alternative=(
+            "plan file written by `prepare --plan-out`, instead of --task: every resolution input "
+            "comes from it, so no other resolution flag may be given with it. Without "
+            "--authorization-file the approval `hflow approve --plan` wrote by default for this "
+            "plan is used when it exists"
         ),
     )
     run.add_argument("--controller-id", default="local-controller")
     run.add_argument("--receipt-out", default=None, help="write the result receipt to this path")
-    run.add_argument(
-        "--base-commit",
-        default=None,
-        help="fix the base commit for a Git-worktree run (overrides the TaskSpec before admission)",
-    )
-    run.add_argument(
-        "--workspace",
-        choices=["worktree", "in_place"],
-        default=None,
-        help="override workspace.mode before admission (worktree = isolated Git worktree)",
-    )
     run.add_argument(
         "--fake-write-plan",
         default=None,
@@ -2101,37 +2529,20 @@ def build_parser() -> argparse.ArgumentParser:
             "driver; there is no flag substitute"
         ),
     )
-    run.add_argument(
-        "--authorization-mode",
-        choices=["stop-trial", "m2-live-change"],
-        default="m2-live-change",
-        help="which authorized activity this run belongs to; modes are not interchangeable",
-    )
-    run.add_argument(
-        "--root-budget-file",
-        default=None,
-        help=(
-            "JSON root budget plan ({'limits': {...}, 'note': '...'}). Makes this run spend "
-            "against a root ledger the authorization must bind. A real driver also needs "
-            "--authorization-file with the same root; the offline driver mints a labelled "
-            "offline record instead"
-        ),
-    )
     run.add_argument("--json", action="store_true")
-    _add_repair_policy_arg(run)
     _add_store_args(run)
     run.set_defaults(func=cmd_run)
 
     status = sub.add_parser("status", help="show a run's state from SQLite (no model calls)")
     status.add_argument("run_id")
-    status.add_argument("--project-root", default=".", help="workspace used for the drift check")
+    status.add_argument("--project-root", default=None, help=_DRIFT_ROOT_HELP)
     status.add_argument("--json", action="store_true")
     _add_store_args(status)
     status.set_defaults(func=cmd_status)
 
     report = sub.add_parser("report", help="render a run's receipt and evidence (no model calls)")
     report.add_argument("run_id")
-    report.add_argument("--project-root", default=".", help="workspace used for the drift check")
+    report.add_argument("--project-root", default=None, help=_DRIFT_ROOT_HELP)
     report.add_argument("--json", action="store_true")
     _add_store_args(report)
     report.set_defaults(func=cmd_report)
@@ -2248,8 +2659,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     integrate_prepare.add_argument(
         "--project",
-        required=True,
-        help="the project contract the run was accepted under (its checks digest must match)",
+        default=None,
+        help=(
+            "the project contract the run was accepted under: its checks digest, and for a run "
+            "that recorded one its whole contract digest, must match. Default: <project "
+            "root>/.hflow/project.json when it still digests to the contract the run recorded"
+        ),
     )
     integrate_prepare.add_argument("--json", action="store_true")
     _add_store_args(integrate_prepare)

@@ -1,37 +1,34 @@
-# Next-session handoff — 2026-10-07 (after batch J)
+# Next-session handoff — 2026-10-14 (after batch K)
 
 ## User decision (unchanged)
 
 > 先完成“小任务从授权到集成、异常后可恢复”的真实闭环，再扩展 Team，最接近实际可用。
 
-## What batch J delivered (offline only)
+## What batch K delivered (offline only)
 
-Batch J was offline hardening for the first live small task. It followed the 2026-10-07 GitHub
-survey (ADR 0001 addendum; no transport change; acpx stays pinned at 0.17.1).
+Batch K made the operator loop shorter without relaxing a rule. It followed the 2026-10-13 GitHub
+survey (ADR 0001 addendum: acpx v0.19.5 is dependency-only, the 0.17.1 pin stays; DSH
+`dsh-v0.2.1-alpha.2` exists but this machine's Desktop still carries 0.2.0-rc.2; ACP
+schema-v1.25.0 leaves the stable v1 `StopReason` set unchanged).
 
-- **Credential refusal** (user ruling 2026-10-07, "refuse before dispatch"): a real launch is
-  refused with `no_credential_source` when `DEEPSEEK_API_KEY` is not among the child's variable
-  names and the bound `DSH_HOME` has neither `.credentials.yaml` nor `.env`. The files are checked
-  by stat only. The check runs at admission, before anything is reserved (exit 2), and again at
-  the spawn gate. It checks presence only, not validity.
-- **`resume` owner check**: an `outcome_unknown` run whose v6 owner may still be alive is not
-  reconciled. Nothing is written and the exit code is 5. `resume --legacy-owner-gone --attest` can
-  close the open entries of a pre-v6 ended run; the attestation is written atomically with the
-  closure.
-- **Process lookup**: `main()` sets `NoDefaultCurrentDirectoryInExePath=1`, so HFlow's own `git`
-  and check launches never run a program from the current directory. `doctor` finds programs on
-  absolute PATH entries only and never executes `dsh`. It also gains readiness lines:
-  integrate/Git, acpx entry, the Desktop shim hint, and credentials.
-- **Inert git**: `safe.bareRepository=explicit` is set; a graft file is neutralised; inherited
-  `GIT_CONFIG`, `GIT_ATTR_SOURCE`, `GIT_SHALLOW_FILE`, `GIT_*_PATHSPECS`, diff and discovery
-  variables are dropped. `GIT_CEILING_DIRECTORIES` is deliberately kept.
-- **Integrate**: the next-step commands it prints carry `--data-dir` and are quoted for PowerShell.
-- **Command forms**: `python -m hflow` works. Ctrl+C exits 130. Text output is `key: value`
-  lines; `--json` output is unchanged except that `doctor --json` changed shape.
-- **Tests**: one CLI-only end-to-end test of `prepare` → `run` → `integrate` (including the
-  hand-off and `reconcile`); real-process fault drills (kill before/after `update-ref`, kill
-  mid-run then `resume` + `ledger settle`); and a regression test for acpx #770, where the agent
-  dies mid-turn and the client exits 1 with no error envelope, giving `OUTCOME_UNKNOWN`.
+- **Plan flow** (`src/hflow/plan.py`): `prepare --plan-out P` saves prepare's inputs and preview;
+  `approve --plan P` re-resolves it, refuses a stale plan, and at a terminal only takes the
+  approval code (first 8 hex of the binding digest) plus the user's own words, then writes the
+  authorization exclusively; `run --plan P` takes every input from the plan (an extra resolution
+  flag is exit 4) and refuses a stale plan. The hand-written artifact still works.
+- **Approvals bind the ledger**: a real-driver binding names `ledger_path`, so an approval spent in
+  one data directory is not a second allowance in another.
+- **`next:` lines** (`src/hflow/hints.py`) after `run`, `status`, `report`, `resume`,
+  `ledger settle` and `integrate`: read from stored facts, never a re-run or a reused approval.
+  Attestation placeholders pasted verbatim are refused.
+- **Integrate**: the whole contract digest must match the run's (`project_mismatch`), and
+  `--project` may be omitted when `<root>/.hflow/project.json` still is that contract.
+- **DSH alpha.2 hardening**: the user-level agents file is recorded; an inherited
+  `DSH_AGENTS_HOME` is removed from the child; a prompt rejected by a JSON-RPC error after partial
+  work is pinned as `OUTCOME_UNKNOWN` (already the behaviour).
+- **Simplification**: ~300 lines of dead code and legacy store paths removed, duplicated helpers
+  merged, README 1218 -> ~670 lines, root planning notes moved to `docs/history/`, stale
+  `tools/m2_live` scripts deleted.
 
 ## Next step: the first live small task (needs its own explicit approval and budget)
 
@@ -48,16 +45,27 @@ task (AGENTS rule 10).
 2. `python tools/m0_probe/real_client_checks.py all`. This is model-free.
 3. `python -m hflow doctor --profile <id>`. Every readiness line must be usable, and credentials
    must not say "would be REFUSED".
-4. `prepare --json` with a small task whose checks finish in seconds. Keep the turn well under
-   DSH's reported 300 s stream timeout. Copy `authorization.binding` into the authorization file,
-   with the user's own approval text.
-5. `run` with identical flags. If it ends `ACCEPTED/LOCAL_CANDIDATE`, run `integrate prepare`,
-   then `apply` (or the hand-off plus `reconcile`), then `status`/`report`, then `clean --apply`.
-6. If anything is interrupted: press Ctrl+C in the owner's own terminal, not `cancel` from another
-   one. Then `resume` (exit 5 means the owner may still be alive; wait), then `ledger settle`.
-   Never re-run the same authorization.
-7. After the run, check the worktree root with `icacls`, because of the reported DSH Windows
+4. `python -m hflow prepare --task <t.json> --profile <id> --project-root <repo> --plan-out
+   <t.plan.json>` with a small task whose checks finish in seconds. Keep the turn well under DSH's
+   reported 300 s stream timeout (and #9515: a lost tool-call start can hang; HFlow's wall-clock
+   limit and the Job Object stop are the only bound).
+5. The user runs `python -m hflow approve --plan <t.plan.json>` in their own terminal: it shows
+   the plan and its approval code; the user types the code and their own approval text. An agent
+   never types this - a scripted approval is a hand-written artifact quoting the user verbatim.
+6. `python -m hflow run --plan <t.plan.json>`. Then follow the `next:` lines: for
+   `ACCEPTED/LOCAL_CANDIDATE`, `integrate prepare` -> `integrate apply` (or the hand-off plus
+   `reconcile`) -> `clean` preview -> `clean --apply`; `status`/`report` at any point.
+7. If anything is interrupted: press Ctrl+C in the owner's own terminal, not `cancel` from another
+   one. Then `resume` (exit 5 means the owner may still be alive; wait), then `ledger settle` with
+   an attestation in your own words (a pasted placeholder is refused). Never re-run the same
+   authorization.
+8. After the run, check the worktree root with `icacls`, because of the reported DSH Windows
    sandbox ACE/Low-label leftovers (#8312). If `clean` refuses, record the refusal; never force it.
+
+Open, not decided (ask before acting): pinning `@agentclientprotocol/sdk` for a fresh acpx 0.17.1
+install (it now resolves 1.8.0, stricter on malformed values); whether DSH's ACP/headless profile
+runs `git add` at turn start (#9382, reported for Web/Desktop) - if so, a worktree's shared hooks
+and filters could run during a turn.
 
 Only after that real evidence comes Team/DAG work. Before parallel tasks:
 

@@ -15,7 +15,6 @@ from .contracts import (
     ProjectConfig,
     ReuseStatus,
     RefusalCode,
-    RefusedError,
     TaskSpec,
     ValidationIssue,
     ValidationReport,
@@ -307,22 +306,6 @@ def _linked_scope_entries(write_allow: Sequence[str], project_root: Path) -> lis
             if not current.exists():
                 break
     return problems
-
-
-def assert_admissible(
-    spec: TaskSpec,
-    project: ProjectConfig,
-    project_root: Path,
-    *,
-    allow_fake_checks: bool = True,
-) -> None:
-    """``validate_task_spec`` as a fail-fast refusal, used before creating a run."""
-    report = validate_task_spec(
-        spec, project, project_root, allow_fake_checks=allow_fake_checks
-    )
-    if not report.ok:
-        first = report.issues[0]
-        raise RefusedError(first.code, first.detail)
 
 
 def repair_policy_problems(

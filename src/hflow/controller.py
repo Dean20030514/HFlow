@@ -21,7 +21,6 @@ import os
 import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -80,6 +79,7 @@ from .contracts import (
     digest_of,
 )
 from .ids import (
+    add_seconds,
     new_attempt_id,
     new_invocation_id,
     new_reservation_id,
@@ -472,7 +472,17 @@ LEGACY_ATTESTATION_UNUSED = (
 
 
 def attestation_problem(attestation: str | None) -> str | None:
-    """Why an operator attestation text cannot be recorded, or ``None``. The settle bounds."""
+    """Why an operator attestation text cannot be recorded, or ``None``. The settle bounds.
+
+    Also refused: a placeholder pasted as printed. The ``next:`` lines and refusal texts print
+    ``--attest "<what you know and why>"`` (:data:`hflow.hints.ATTEST_PLACEHOLDER`), and an
+    attestation is what lets an unconfirmable state stop blocking (AGENTS rules 5 and 8) - so a
+    text that is one ``<...>`` placeholder (surrounding whitespace and quotes ignored, no other
+    ``<`` or ``>`` inside), or that is the placeholder's words themselves (any case, any
+    spacing), is words nobody wrote, never an attestation.
+    """
+    from .hints import ATTEST_PLACEHOLDER_TEXT  # hints never imports the controller
+
     if not isinstance(attestation, str) or not attestation.strip():
         return (
             "the attestation is blank; an attestation records what the operator claims and why, "
@@ -485,6 +495,17 @@ def attestation_problem(attestation: str | None) -> str | None:
         )
     if "\x00" in attestation:
         return "the attestation contains a NUL character"
+    text = attestation.strip().strip("\"'“”‘’").strip()
+    inner = text[1:-1]
+    bracketed = (
+        len(text) >= 2 and text[0] == "<" and text[-1] == ">" and "<" not in inner
+        and ">" not in inner
+    )
+    if bracketed or " ".join(text.split()).casefold() == ATTEST_PLACEHOLDER_TEXT.casefold():
+        return (
+            f"the attestation {text!r} is a placeholder, not an attestation: replace the "
+            "placeholder with what you actually know and why"
+        )
     return None
 
 
@@ -2637,9 +2658,7 @@ class Controller:
         ``is_repair`` travels with the reservation so the ledger charges the root's repair counter
         for this dispatch rather than inferring it from a count taken elsewhere.
         """
-        expires_at = (
-            parse_ts(utc_now()) + timedelta(seconds=self.reservation_ttl_seconds)
-        ).isoformat().replace("+00:00", "Z")
+        expires_at = add_seconds(utc_now(), self.reservation_ttl_seconds)
         already_paid = sum(self.store.invocation_counts(run_id))
         needed = max(1, self._loop_turns_required(spec, project) - already_paid)
         try:
@@ -3008,25 +3027,6 @@ class Controller:
                 "the stop was recorded before the driver was asked to launch, and the driver "
                 "returned a cancelled invocation that produced no work and no process",
             )
-
-    def _claim_submission(self, run_id: str, purpose: str) -> int:
-        """Consume one authorized top-level submission, or refuse to dispatch.
-
-        Called immediately before a real dispatch (implementer, or the separate reviewer
-        invocation). The store's UPDATE is the gate, so a restart or a resubmission cannot
-        restore allowance.
-        """
-        assert self.authorization is not None
-        try:
-            used = self.store.claim_authorized_submission(self.authorization.authorization_id)
-        except StoreError as exc:
-            raise RefusedError(RefusalCode.BUDGET_EXHAUSTED, str(exc)) from exc
-        self.store.record_note(
-            run_id,
-            f"authorization {self.authorization.authorization_id}: consumed top-level submission "
-            f"{used}/{self.authorization.max_top_level_submissions} for {purpose}",
-        )
-        return used
 
     def _drive(
         self,

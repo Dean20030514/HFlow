@@ -644,6 +644,77 @@ def test_cli_prepare_apply_show_and_status(
     assert main(["integrate", "show", "G-missing", *data]) == 4
 
 
+def test_cli_prepare_defaults_to_the_recorded_contract_only_while_it_still_matches(
+    scene: Scene, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Without ``--project``, ``<project root>/.hflow/project.json`` is used only when it still
+    digests to the contract the run was admitted under; anything else needs ``--project``."""
+    run_id = scene.accept()
+    data = ["--data-dir", str(scene.data_dir)]
+    scene.store.close()
+    default = scene.repo / ".hflow" / "project.json"
+
+    # No file at the default path: nothing is recorded, the operator is told to name one.
+    assert main(["integrate", "prepare", run_id, "--target", "main", *data]) == 4
+    assert "pass --project" in capsys.readouterr().err
+
+    # A weaker contract at the default path is not silently picked up.
+    default.parent.mkdir()
+    weaker = scene.project.model_copy(update={"write_deny": []})
+    default.write_text(weaker.model_dump_json(), encoding="utf-8")
+    assert main(["integrate", "prepare", run_id, "--target", "main", *data]) == 4
+    assert "pass --project" in capsys.readouterr().err
+
+    # Nothing was recorded, and printed hints name --project until the default resolves the
+    # run's contract.
+    assert main(["status", run_id, *data]) == 0
+    status = capsys.readouterr().out
+    assert "integration " not in status and "target=refs/heads" not in status
+    assert "--project <project.json>" in status
+    default.write_text(scene.project.model_dump_json(), encoding="utf-8")
+    assert main(["status", run_id, *data]) == 0
+    [hint] = [line for line in capsys.readouterr().out.splitlines() if "integrate prepare" in line]
+    assert "--project" not in hint
+
+    assert main(["integrate", "prepare", run_id, "--target", "main", "--json", *data]) == 0
+    assert json.loads(capsys.readouterr().out)["integration"]["state"] == "ready"
+
+
+def test_cli_prepare_without_project_names_an_unknown_run_and_never_raises_looking_for_one(
+    scene: Scene, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """Looking for the default contract is a lookup, not a command: an unknown run is named as
+    one, and a default it cannot read or decode, or an admission record it cannot read, means
+    "pass --project" - never a traceback. With ``--project`` the run's own unreadable record
+    then surfaces through the command's error mapping (exit 6)."""
+    run_id = scene.accept()
+    data = ["--data-dir", str(scene.data_dir)]
+
+    assert main(["integrate", "prepare", "R-no-such-run", "--target", "main", *data]) == 4
+    err = capsys.readouterr().err
+    assert "unknown run R-no-such-run" in err and "pass --project" not in err, err
+
+    # A default contract that is not UTF-8: no default, no UnicodeDecodeError.
+    default = scene.repo / ".hflow" / "project.json"
+    default.parent.mkdir()
+    default.write_bytes(b"\xff\xfe{\x00not utf-8")
+    assert main(["integrate", "prepare", run_id, "--target", "main", *data]) == 4
+    assert "pass --project" in capsys.readouterr().err
+
+    # An admission record that no longer validates: no default, no StoredRecordUnreadable.
+    default.write_text(scene.project.model_dump_json(), encoding="utf-8")
+    scene.store.record_note(run_id, "admission_binding: {not a binding", limit=100)
+    scene.store.close()
+    assert main(["integrate", "prepare", run_id, "--target", "main", *data]) == 4
+    assert "pass --project" in capsys.readouterr().err
+    project_file = tmp_path / "project.json"
+    project_file.write_text(scene.project.model_dump_json(), encoding="utf-8")
+    assert main(["integrate", "prepare", run_id, "--target", "main", "--project",
+                 str(project_file), *data]) == 6
+    assert "unreadable" in capsys.readouterr().err
+    assert scene.tip() == scene.base
+
+
 # --------------------------------------------------------------------------
 # printed next commands: pasted as printed, they reach the same ledger
 # --------------------------------------------------------------------------
@@ -671,7 +742,7 @@ def test_a_printed_apply_command_names_the_data_dir_and_works_as_pasted(
     assert main(["--data-dir", str(scene.data_dir), "integrate", "prepare", run_id, "--target",
                  "main", "--project", str(project_file)]) == 0
     printed = capsys.readouterr().out.splitlines()
-    [command] = [line.removeprefix("next").strip() for line in printed if line.startswith("next ")]
+    [command] = [line.removeprefix("next:").strip() for line in printed if line.startswith("next: ")]
     assert command.endswith(f" --data-dir {_shell_word(os.path.abspath(scene.data_dir))}")
     argv = _paste(command)
 
@@ -882,7 +953,7 @@ def test_a_failed_ref_update_returns_to_ready_and_does_not_exit_zero(
     out = capsys.readouterr().out
     assert "cannot lock ref" in out
     assert (
-        f"next          hflow integrate apply {prepared.integration_id} --expect-target "
+        f"next: hflow integrate apply {prepared.integration_id} --expect-target "
         f"{scene.base} --data-dir {_shell_word(os.path.abspath(scene.data_dir))}\n"
     ) in out
     store = Store(scene.data_dir / "hflow.sqlite")
@@ -970,6 +1041,20 @@ def test_an_owner_that_cannot_be_judged_needs_an_attestation(
     assert "--owner-gone" in capsys.readouterr().err
     assert main(["integrate", "reconcile", record.integration_id, "--owner-gone", *data]) == 4
     capsys.readouterr()
+    # The documented placeholder, pasted as printed, is nobody's attestation.
+    def stored() -> object:
+        reader = Store(scene.data_dir / "hflow.sqlite")
+        try:
+            return reader.integration(record.integration_id)
+        finally:
+            reader.close()
+
+    before = stored()
+    for placeholder in ("<what you know>", "<what you know and why>", "what you know and why"):
+        assert main(["integrate", "reconcile", record.integration_id, "--owner-gone", "--attest",
+                     placeholder, *data]) == 4
+        assert "is a placeholder" in capsys.readouterr().err
+    assert stored() == before, "nothing was settled"
     assert main(["integrate", "reconcile", record.integration_id, "--owner-gone", "--attest",
                  "the machine was rebooted", *data]) == 3
     assert "interrupted" in capsys.readouterr().out

@@ -13,10 +13,9 @@ from hflow.controller import Controller
 from hflow.drivers.fake import FakeDriver, FakeScript
 from hflow.gitworkspace import GitError, GitRepo
 from hflow.ownership import lock_path_for, new_owner_token
-from hflow.store import Store
 from hflow.verify import CheckRunners, FakeCheckRunner
 
-from .test_m2_slice import FIXED_SOURCE, _git, _project, _task, sample_repo
+from .test_m2_slice import FIXED_SOURCE, _git, _project, _task, sample_repo  # noqa: F401 - pytest fixture
 from .test_owner_lease import _dead_identity, windows_only
 
 
@@ -147,7 +146,7 @@ def test_real_dead_owner_continues_only_matching_binding(store, run_request, fak
 
 
 @pytest.mark.parametrize("damage", ["base_moves", "dirty", "foreign", "empty", "unregistered", "assume_unchanged", "skip_worktree"])
-def test_reused_worktree_is_verified_before_claim(store, sample_repo, damage):
+def test_reused_worktree_is_verified_before_claim(store, sample_repo, damage):  # noqa: F811 - pytest fixture
     repo = GitRepo.discover(sample_repo)
     project, task = _project(sample_repo), _task(sample_repo, "HEAD")
     request = RunRequest(task=task, project=project, project_root=sample_repo, workspace_root=sample_repo)
@@ -200,7 +199,7 @@ def test_reused_worktree_is_verified_before_claim(store, sample_repo, damage):
 
 @windows_only
 @pytest.mark.parametrize("state", [TaskState.DRAFT, TaskState.READY])
-def test_matching_dead_owner_worktree_continues_from_recorded_base(store, sample_repo, state):
+def test_matching_dead_owner_worktree_continues_from_recorded_base(store, sample_repo, state):  # noqa: F811 - pytest fixture
     repo = GitRepo.discover(sample_repo)
     request = RunRequest(task=_task(sample_repo, "HEAD"), project=_project(sample_repo),
                          project_root=sample_repo, workspace_root=sample_repo)

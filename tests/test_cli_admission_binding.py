@@ -42,7 +42,7 @@ def admitted_cli(tmp_path, sample_repo, live_profile, acpx_client, monkeypatch):
     expected = current_binding(
         mode="m2-live-change", driver=resolved.effective.role("implementer").driver,
         project=project, request=resolved.request(), spec_path=task_file,
-        effective=resolved.effective,
+        effective=resolved.effective, data_dir=data_dir,
     )
     approval = AuthorizationRecord(
         authorization_id="AUTH-cli-original", user_text="I approve this exact bounded run.",

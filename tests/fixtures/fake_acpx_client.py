@@ -22,6 +22,14 @@ with the client's JSON-RPC error line and exit 1, without sending the prompt.
 ``STUB_CLIENT_FAIL_BEFORE_PROMPT=1`` ends any run that way after the session started, for the
 case that is *not* a model refusal.
 
+``STUB_CLIENT_PROMPT_ERROR`` adds the client's own error line when the agent ends a turn with a
+non-zero exit (as a stub that answered the prompt with an error does): ``envelope`` relays the
+agent's error answering the prompt and then writes the null-id line, ``envelope-only`` withholds
+that error and writes only the null-id line carrying its message. Either way the client exits 1.
+These are stand-in wire shapes for a rejected ``session/prompt`` (DSH from dsh-v0.2.1-alpha.2
+rejects one whose agent failed without a saved turn end; documented upstream, not observed), not
+a recording of what any acpx version prints.
+
 Usage (normally spawned by the driver):
     python fake_acpx_client.py --cwd <dir> --format json --timeout 60 exec -f -
 """
@@ -249,9 +257,26 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     pump_done = threading.Event()
+    prompt_error = os.environ.get("STUB_CLIENT_PROMPT_ERROR", "")
+    if prompt_error not in {"", "envelope", "envelope-only"}:
+        raise SystemExit(f"fake client: unknown STUB_CLIENT_PROMPT_ERROR {prompt_error!r}")
+    withheld: list[str] = []
 
     def pump_out() -> None:
         for line in process.stdout:  # type: ignore[union-attr]
+            if prompt_error == "envelope-only":
+                try:
+                    decoded = json.loads(line)
+                except ValueError:
+                    decoded = None
+                if (
+                    isinstance(decoded, dict)
+                    and "method" not in decoded
+                    and decoded.get("id") == 2
+                    and isinstance(decoded.get("error"), dict)
+                ):
+                    withheld.append(str(decoded["error"].get("message", "")))
+                    continue
             sys.stdout.write(line)
             sys.stdout.flush()
         pump_done.set()
@@ -292,7 +317,11 @@ def main(argv: list[str] | None = None) -> int:
             }
         )
         return 3
-    return process.wait()
+    code = process.wait()
+    if prompt_error and code != 0:
+        client_error(withheld[0] if withheld else f"agent exited {code} during the prompt")
+        return 1
+    return code
 
 
 if __name__ == "__main__":

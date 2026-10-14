@@ -10,9 +10,10 @@ file's test numbers were checked.
 ```sh
 hflow doctor --json                        # what is on this machine; no model calls, never runs dsh
 hflow doctor --profile <id>                # resolve the profile per role; non-zero if unusable
-hflow prepare --task task.json --profile <id> --project-root <repo>
+hflow prepare --task task.json --profile <id> --project-root <repo> --plan-out task.plan.json
+hflow approve --plan task.plan.json        # at a terminal only: shows the plan and its approval code; you type the code, then YOUR approval
+hflow run --plan task.plan.json            # every resolution input comes from the plan; a stale plan is refused
 hflow run --task task.json --project-root <repo> --driver fake --json
-hflow run --task task.json --profile <id> --authorization-file auth.json --json
 hflow status <run_id>
 hflow report <run_id>
 hflow resume <run_id>                      # never re-dispatches: reconciles a blocked run (an outcome_unknown one with an owner token only once that owner is gone), takes a live run over from a provably gone owner (blocks it owner_lost), or closes an ended run's open ledger entries once its owner is gone
@@ -41,6 +42,25 @@ the interrupt is authoritative: read it with `hflow status <run_id>` (see "Recov
 controller crash" for what an interrupted run records). Without `--json`, a refusal or a `resume`
 outcome prints `key: value` lines (lists as `- item`, a nested record as one compact JSON line);
 `--json` output is unchanged.
+
+**`next:` lines.** `run`, `status`, `report`, `resume`, `ledger settle` and every `integrate`
+subcommand end their text output with `next: <command>` lines - what to run next for that run,
+read from stored facts only (no model, no process probe, nothing written); `prepare --plan-out`
+and `approve` end with the `approve` / `run --plan` command. `--json` and `--receipt-out` output
+carry none. The order is: `resume <run>` then `ledger settle <invocation> --attest "<what you
+know and why>"` after an interruption (`--legacy-owner-gone` for a pre-v6 owner) - replace the
+placeholder with your own words: an `--attest` text that is still a `<...>` placeholder, or the
+words `what you know and why`, is refused (`resume` and `integrate reconcile` exit `4`, `ledger
+settle` exits `2`) and nothing is recorded; `integrate
+prepare <run> --target <branch>` for an accepted Git candidate (replace the placeholder);
+`integrate apply <id> --expect-target <tip>` for a ready integration; `integrate reconcile <id>`
+for an active one; then `clean <run>` (preview) and `clean <run> --apply`. A live run gets
+`status` again. A trailing `# ...` says when a command depends on something only it can observe.
+Every command carries `--data-dir` when the ledger is not the default one, and none re-runs a task
+or reuses an authorization. `integrate prepare` names `--project` only when its default (below)
+would not resolve the run's contract.
+`status` and `report` without `--project-root` check drift against the project root the run
+recorded (when that directory still exists), not against the current directory.
 
 `hflow doctor` exits `0`, or `2` when a named profile cannot be used. It finds programs on the
 absolute `PATH` entries only and runs `git --version` and `node --version` from those paths -
@@ -126,7 +146,10 @@ workspace, no SQLite database and no authorization:
 hflow prepare --task task.json --profile dsh-local --project-root <repo>
 hflow prepare --task task.json --profile dsh-local --project-root <repo> --json
 hflow prepare --task task.json --profile dsh-local --root-budget-file root-budget.json
+hflow prepare --task task.json --profile dsh-local --project-root <repo> --plan-out task.plan.json
 ```
+
+The last form is the normal start of a real task: see "From preview to run" below.
 
 It reports:
 
@@ -147,8 +170,9 @@ Two things it deliberately does not do. It does not render the **reviewer's** pa
 packet embeds the frozen candidate identity, the verification status and the evidence rows, none
 of which exists before the implementer runs, so a preview now would be an invented input. And it
 does not mint an approval: `creates_authorization` is pinned to `false`, no `user_text` and no
-`provided_by` appear anywhere in its output, and feeding its output to `load_authorization`
-fails. Approving is a user action.
+`provided_by` appear anywhere in its output (or in a plan file), and feeding either to
+`load_authorization` fails. Approving is a user action - `hflow approve`, below, or a file you
+write by hand.
 
 A third: it does not promise **remaining allowance**. With `--root-budget-file` it prints the
 root binding and the ledger path it would use, but it opens no database at all - no SQLite file
@@ -163,6 +187,75 @@ Exit code: `0` when the run would get past admission **and** its dispatch gate, 
 The full preview prints either way - that is the point of asking. What `prepare` cannot check is
 stated rather than implied: remaining authorization allowance depends on a run's history, so it
 is checked only once a run exists, and it says so in its notes.
+
+### From preview to run: `prepare --plan-out`, `approve`, `run --plan`
+
+A real task takes three commands, and approving stays a separate step that only you perform, at
+a terminal:
+
+```sh
+hflow prepare --task task.json --profile dsh-local --project-root <repo> --plan-out task.plan.json
+hflow approve --plan task.plan.json          # shows the summary and an approval code; type the code, then your approval
+hflow run --plan task.plan.json --authorization-file "<the file approve printed>"
+```
+
+- **`prepare --plan-out <file>`** writes a plan (`kind: "hflow-plan"`, generated contract
+  `RunPlan`): the resolution inputs as you gave them, with every path made absolute (the task,
+  `--project`, `--project-root`, `--root-budget-file`, `--repair-policy-file`, and the data
+  directory - the default one when you passed no `--data-dir`), the profile it selected
+  (`--profile`, else `HFLOW_PROFILE`), `--base-commit` exactly as written (a ref stays a ref, so
+  it is resolved again later), the full report, the binding and its digest, and the root
+  budget's ceilings. It is written atomically. An existing **plan** there (a JSON object with
+  `"kind": "hflow-plan"`, any schema version) is replaced; any other existing path - the task,
+  an authorization file, the project contract, a directory, a file that is not JSON - is refused
+  (exit `2`) before anything is resolved or printed, and left as it was. It is **not** written
+  when the run would be refused (exit `2`); the report says why. With `--json` stdout is still the
+  report alone - the plan lines go to stderr.
+- **`approve --plan <file>`** calls no model and opens no database. It resolves the plan's inputs
+  again through the same function `prepare` and `run` use, and refuses (exit `2`, nothing written)
+  when the binding or the root ceilings changed since the plan was written - an edited task or
+  contract, a moved branch, another profile or launch, a changed root budget file: "plan ... is
+  stale", listing each differing field; re-run `prepare --plan-out`. A plan that needs no
+  authorization (the offline fake driver without a root budget) is said to need none (exit `0`,
+  nothing written). A task the run would refuse is refused here too, its issues printed on
+  stderr. Otherwise it needs **a person at an interactive terminal**. When standard input is not
+  a console - piped, redirected from a file, absent - it refuses (exit `2`) without reading it,
+  before showing anything, and writes nothing: `echo ok | hflow approve --plan ...` approves
+  nothing. A scripted flow writes the authorization file by hand instead ("Writing the artifact by
+  hand" under "Running a real Harness task"). At a terminal it prints the same summary `prepare`
+  prints, the binding digest and an **approval code** - the first 8 hex characters of the plan's
+  binding digest - and asks two questions. First the code, compared whitespace-trimmed and
+  case-insensitively: anything else (`y`, `no`, an empty line) refuses with "the approval code did
+  not match" (exit `2`), nothing approved or written, and the second question is never asked.
+  Then your approval in your own words, one line, stored as typed apart from surrounding
+  whitespace; an empty line cancels (exit `2`, nothing written). Neither is ever an argument: a
+  command line is what the process that wants to run could type for itself. The summary, the code
+  and both questions go to **stderr**, so `approve --plan ... > log.txt` still shows what you are
+  approving; stdout carries only the result - the authorization path, its id and the `next:`
+  line, or the `--json` payload. The code makes approving a deliberate act (you have to read the
+  summary to type it); it does not identify you - a process that drives a pseudo-terminal can
+  read it and type both lines (see "What the authorization does and does not prove"). The
+  artifact gets a fresh
+  `AUTH-...` id, `provided_by: user`, `origin: user_artifact`, the current UTC time, the plan's
+  binding, its root ceilings as `root_limits`, and `max_top_level_submissions` = the count the
+  preview requires. It goes to `--out <file>`, by default next to the plan as
+  `<plan stem>.<first 12 hex of the binding digest>.authorization.json` (a trailing `.plan` is
+  dropped from the stem), so re-preparing never collides with an older approval. An existing
+  file is **never overwritten** (checked before you are asked, and the write is an exclusive
+  create). It ends with a `next:` line and the exact `run` command, quoted for PowerShell.
+- **`run --plan <file>`** takes every resolution input from the plan: `--task`, `--project`,
+  `--project-root`, `--profile`, `--driver`, `--base-commit`, `--workspace`,
+  `--authorization-mode`, `--root-budget-file` or `--repair-policy-file` given as well - even
+  with the same value - is a usage error (exit `4`), as is a `--data-dir` naming another
+  directory than the plan's. Without `--authorization-file` it uses `approve`'s default file for
+  the plan's digest when that exists (stderr says so), and otherwise behaves exactly like a run
+  with no authorization. A plan whose inputs no longer resolve to its binding is refused as stale
+  (exit `2`) before anything is claimed - an offline plan too - and every check a run with flags
+  makes still runs: the authorization's binding, `root_limits` against the root file, the
+  single-use consumption in the dispatch transaction, the credential and launch refusals.
+
+Writing the artifact by hand and repeating every flag to `run` still works; see "Running a real
+Harness task" for the complete field list.
 
 ### What stops a run before it dispatches, and what `prepare` therefore reports
 
@@ -200,8 +293,11 @@ policy problem therefore shows up under `dispatch_preconditions` while `admissio
 The authorization artifact binds the *effective configuration*, not just the task: profile id,
 per-role agents and drivers, model selections, limits, the write permission, and the **resolved
 launch** - the client entry point, the interpreter that starts it, the launcher argv, and the DSH
-home/profile. `prepare` prints exactly that binding, and `run` verifies against the same
-resolution, so a preview and a run cannot disagree.
+home/profile. `prepare` prints exactly that binding (and `--plan-out` saves it), `approve` writes
+it into the artifact after resolving the plan again, and `run` verifies against the same
+resolution, so a preview, an approval and a run cannot disagree. Wherever this section says
+"re-issue it", the short way is a fresh `prepare --plan-out` followed by `approve`: a plan whose
+inputs changed is refused as stale by both `approve` and `run --plan`, naming the fields.
 
 Consequences worth knowing:
 
@@ -230,6 +326,15 @@ Consequences worth knowing:
   because nothing in it says which one. Re-issue it.
 - The digest of an old artifact is unchanged by this build: the new fields are omitted while
   they are empty, so an already-consumed approval cannot look unused again.
+- **The ledger is bound too** (`ledger_path`, printed by `prepare` as `ledger` under the binding
+  digest). Single use is enforced per ledger (`<data-dir>/hflow.sqlite`), so a real-driver
+  approval names the resolved absolute path of the ledger it is spent in - the same string a
+  root's `ledger_path` carries, whether the data directory came from `--data-dir`, a relative or
+  absolute `HFLOW_DATA_DIR`, or the default. `run` against another data directory refuses it
+  ("issued for another ledger"): a fresh ledger has no record of the approval, and that is not a
+  second allowance. An artifact without the field cannot authorize a real run, because it could
+  be spent once per data directory; re-issue it. Offline bindings name no ledger and digest as
+  before.
 - **The project contract is bound too** (`project_contract_digest`, printed by `prepare` as
   `contract`): every check with its argv and timeout, `write_deny`, the limits, the review floor
   and `review_required`. Editing `.hflow/project.json` (or pointing `--project` at another file)
@@ -1099,7 +1204,7 @@ section calls a model, dispatches an agent or spends a budget. The contract is
 `docs/batch-i-integration-plan.md`.
 
 ```sh
-hflow integrate prepare <run-id> --target main --project .hflow/project.json
+hflow integrate prepare <run-id> --target main [--project <project.json>]
 hflow integrate apply   <integration-id> --expect-target <full tip printed by prepare>
 hflow integrate reconcile <integration-id> [--owner-gone --attest "<what you know>"]
 hflow integrate show    <integration-id> [--json]
@@ -1116,6 +1221,15 @@ holds `$`, a backtick or a quote character; a root is printed with a `.` (`C:\.`
 `\\server\share\.` - the same directory) so that no backslash stands before the closing quote,
 which Windows PowerShell 5.1 would pass on escaped for a path with a space. `apply` and
 `reconcile` take no `--project`, so none is printed.
+
+**Which contract `prepare` checks with.** The run's admission binding records its project root and
+the digest of its whole project contract. `--project` may be left out when
+`<project root>/.hflow/project.json` still digests to that contract (the default `prepare` and
+`run` read); otherwise `prepare` exits `4` and asks for `--project`. A named contract whose whole
+digest differs from the recorded one - a weaker `write_deny`, a dropped review floor, not only a
+changed check - is refused `project_mismatch` (exit `2`) and nothing is recorded: an accepted
+delivery is re-checked only under the contract it was accepted under. A run admitted before that
+digest was recorded is held to its checks digest and always needs `--project`.
 
 **prepare** fixes the target branch's current tip `T` and builds exactly one integration commit
 `M` on top of it, with Git plumbing only:
@@ -1193,7 +1307,18 @@ review of a merged tree (a `replayed` tree is checked, not reviewed again - the 
 ## Running a real Harness task (authorized only)
 
 A real driver needs an **authorization artifact**: a JSON file holding the user's own approval
-text, bound to one execution, with a hard cap on how many top-level submissions it covers.
+text, bound to one execution, with a hard cap on how many top-level submissions it covers. The
+primary way to produce one is the plan flow ("From preview to run" above):
+
+```sh
+hflow prepare --task task.json --project .hflow/project.json --project-root <repo> \
+              --profile dsh-local --data-dir <data> --plan-out task.plan.json
+hflow approve --plan task.plan.json
+hflow run --plan task.plan.json --authorization-file <the file approve printed> --json
+```
+
+**Writing the artifact by hand** is the documented alternative. Copy `authorization.binding`
+from `hflow prepare --json` whole - every field it prints - and add your own text:
 
 ```json
 {
@@ -1201,7 +1326,7 @@ text, bound to one execution, with a hard cap on how many top-level submissions 
   "authorization_id": "AUTH-m2-live-1",
   "provided_by": "user",
   "user_text": "<the user's approval, verbatim>",
-  "authorized_at": "<when the user said it>",
+  "authorized_at": "<when the user said it, UTC>",
   "max_top_level_submissions": 2,
   "binding": {
     "mode": "m2-live-change",
@@ -1210,31 +1335,42 @@ text, bound to one execution, with a hard cap on how many top-level submissions 
     "repo_path": "<abs path>",
     "base_commit": "<40-hex>",
     "spec_digest": "sha256:<the task as admitted>",
-    "spec_path": "<abs path to task.json>"
+    "spec_path": "<abs path to task.json>",
+    "roles": ["implementer", "reviewer"],
+    "effective_config_digest": "sha256:<config_hash prepare prints>",
+    "profile_id": "dsh-local",
+    "project_contract_digest": "sha256:<contract prepare prints>",
+    "launch_content_digest": "sha256:<launch_content_digest prepare prints>"
   }
 }
 ```
 
+and pass every resolution flag `prepare` was given, identically, to `run`:
+
 ```sh
 hflow run --task task.json --project .hflow/project.json --project-root <repo> \
-          --driver acpx-dsh --authorization-file auth.json \
-          --authorization-mode m2-live-change --data-dir <data> --json
+          --profile dsh-local --authorization-file auth.json --data-dir <data> --json
 ```
 
 The examples in this file are illustrations; the shapes are generated. `hflow schema` prints
 `AuthorizationRecord` (the artifact, defined in `authorization.py`), `RootBudgetPlan` (the root
 budget file) and `RepairPolicy` (the `--repair-policy-file` document) next to `TaskSpec`,
-`ProjectConfig`, `MachineProfile` and the rest. Write `base_commit` as the 40-hex SHA that
-`hflow prepare --json` prints under `authorization.binding`, never as a branch name. The example
-binding above is not complete: a real run's artifact also carries `roles`,
-`effective_config_digest` and `project_contract_digest`, copied from `hflow prepare --json`
-together with the rest of `authorization.binding`. Without the two digests it cannot authorize a
-run that resolved a configuration and a contract, and a missing `roles` reads as implementer and
-reviewer, which a run that dispatches no reviewer refuses.
+`ProjectConfig`, `MachineProfile` and the rest. `base_commit` is the 40-hex SHA that
+`hflow prepare --json` prints under `authorization.binding`, never a branch name.
+`max_top_level_submissions` is at most 4 and must cover
+`authorization.max_top_level_submissions_required`. `origin` may be omitted (it defaults to
+`user_artifact`). Leaving out a binding field `prepare` printed does not narrow the approval, it
+breaks it: without `effective_config_digest`, `project_contract_digest` or
+`launch_content_digest` the artifact cannot authorize a run that resolved a configuration, a
+contract or launch content, and a missing `roles` reads as implementer and reviewer, which a run
+that dispatches no reviewer refuses. `--authorization-mode` defaults to `m2-live-change`; pass
+it only for a `stop-trial`.
 
 For a run that spends against a **root ledger** (`--root-budget-file`, batch E1) the artifact
-carries two more members: the derived `binding.root_budget` and the approved `root_limits`. Write
-them from `hflow prepare --root-budget-file <file> --json`, which prints exactly that binding:
+carries two more members: the derived `binding.root_budget` and the approved `root_limits`.
+`approve` writes both from the plan. By hand, write them from
+`hflow prepare --root-budget-file <file> --json`, which prints exactly that binding (and the
+limits under `root_budget.limits`):
 
 ```json
 {
@@ -1481,22 +1617,30 @@ still runs with the current user's rights and can read whatever that user can re
 python tools/m2_live/prepare_m2_live.py --out .probe/m2-live
 ```
 
-Builds a synthetic Git project with two genuine input-handling defects, the project contract,
-the TaskSpec, and the authorization template (`user_text` deliberately empty). It asserts the
-base commit really fails both defect tests and that nothing fails for import or collection
-reasons - so a later live run is never the first time the package is exercised. It contains no
-fixed patch and no fake-write plan.
+Builds a synthetic Git project with two genuine input-handling defects, the project contract
+and the TaskSpec. It asserts the base commit really fails both defect tests and that nothing
+fails for import or collection reasons - so a later live run is never the first time the package
+is exercised. It contains no fixed patch and no fake-write plan. It ends by printing the
+`hflow prepare` preview for the task, project and repository it built; to approve and run it, add
+`--plan-out <plan>` to that command, then `hflow approve --plan <plan>` and `hflow run --plan
+<plan>`. It no longer writes an authorization template: the template carried a binding with no
+`roles`, `effective_config_digest`, `project_contract_digest` or `launch_content_digest`, which
+cannot authorize a run that resolves a profile.
 
 ### What the authorization does and does not prove
 
-**Trust model: trusted-local, user-attested operation.** A human creates the artifact through the
-manual procedure below; the artifact records that decision and bounds its consumption. The
-executor is trusted not to forge approvals and not to modify the controller or its database.
+**Trust model: trusted-local, user-attested operation.** A human creates the artifact - by typing
+the approval into `hflow approve`, or by writing the file by hand - and the artifact records that
+decision and bounds its consumption. The executor is trusted not to forge approvals and not to
+modify the controller or its database.
 
 What is actually enforced:
 
-- the **binding** must match the run about to happen (mode, driver, project, repository path,
-  base commit, task digest, task path), so an approval for one task cannot authorize another;
+- the **binding** must match the run about to happen - mode, driver, project, repository path,
+  base commit, task digest, task path, the roles it dispatches, the effective configuration
+  (profile, per-role agents, drivers, models, write permission and resolved launch), the project
+  contract, the launch entry files' content and, for a root run, the root binding - so an
+  approval for one task, configuration or contract cannot authorize another;
 - **consumption is bounded per authorization id** by a single guarded UPDATE plus a CHECK
   constraint, so a restart, a new run id or a resubmitted identical spec cannot restore
   allowance for that id;
@@ -1514,7 +1658,10 @@ What is **not** enforced, and must not be claimed:
 - provenance is **not authenticated**. Nothing distinguishes bytes a user typed from the same
   bytes written by the executing agent, because there is no approval issuer and no protected
   store outside the executor's reach. `tests/test_authorization.py` asserts this limit
-  explicitly, so it is a recorded fact rather than an unstated assumption;
+  explicitly, so it is a recorded fact rather than an unstated assumption. `hflow approve` does
+  not change it: it takes neither the approval code nor the text from its arguments and refuses
+  piped input, but whoever types at the terminal is not identified - a process that drives a
+  pseudo-terminal can read the code and type both lines;
 - a **fresh authorization id resets the allowance** - the cap bounds one id, not a person or a
   day. Raising this to real anti-forgery would need a separate issuer or store and is a
   deliberate design decision, not something to solve with another string field.
@@ -1613,8 +1760,9 @@ Pinned to dsh-v0.2.0-rc.2 (639ed015), documented, not observed:
   chain from the nearest `.git` marker down to the cwd, and skills under `<root>/.dsh/skills`,
   `<root>/.agents/skills` and `<home>/skills`. Nested instruction files DSH reads after a tool
   call cannot be captured by any record taken before the launch.
-- **`DSH_TELEMETRY_*` and `DSH_AGENTS_HOME` pass through** to the child; HFlow removes only
-  `DSH_PERMISSION_MODE` and `DSH_TOOLS_MODE`.
+- **`DSH_TELEMETRY_*` pass through** to the child; HFlow removes `DSH_PERMISSION_MODE`,
+  `DSH_TOOLS_MODE` and an inherited `DSH_AGENTS_HOME` (every spelling on Windows), and sets
+  `DSH_HOME` only to a bound value.
 - **`~/.agents/skills` resolves inside the per-invocation home**, because `~` is the redirected
   USERPROFILE.
 
@@ -1752,7 +1900,12 @@ enforced, refused or part of an approval.
   `.env`, the project root (the nearest `.git` marker), the AGENTS.md/CLAUDE.md(.local) files
   present from that root down to the workspace and the two project skill directories; the names
   of the DSH_* variables that reach the child; whether `DEEPSEEK_API_KEY` is among the child's
-  variable names; and the client identity - acpx and @agentclientprotocol/sdk versions from
+  variable names; the user-level agents file DSH >= 0.2.1-alpha.2 reads after the home's
+  `AGENTS.md` (`$DSH_AGENTS_HOME/AGENTS.md` when that variable reaches the child, else
+  `<child home>/.agents/AGENTS.md`; documented from upstream source, not observed; a relative or
+  unresolved path is `unknown`). HFlow removes an inherited `DSH_AGENTS_HOME` from every child,
+  so at an HFlow launch it is the per-invocation home's `.agents/AGENTS.md`, created empty - an
+  instruction file elsewhere that no approval binds is not pointed at; and the client identity - acpx and @agentclientprotocol/sdk versions from
   their package.json (the SDK found by Node's node_modules walk from the client entry), and the
   dsh carrier.
 - **How it is read:** a fixed list of paths, never a directory listing. A regular file gets its

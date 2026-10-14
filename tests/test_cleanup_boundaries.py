@@ -50,7 +50,7 @@ def managed(store, task_spec, tmp_path):
 
 @pytest.mark.parametrize("state", ["DRAFT", "READY"])
 def test_clean_refuses_during_admission_then_original_run_completes(
-    state, tmp_path, scoped_repo, monkeypatch,
+    state, tmp_path, scoped_repo, monkeypatch,  # noqa: F811 - pytest fixture
 ):
     store = Store(tmp_path / "hflow.sqlite")
     project = _project()

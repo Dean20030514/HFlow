@@ -20,7 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal, Protocol, TypeVar
@@ -40,10 +40,6 @@ SCHEMA_VERSION = 1
 # ``Strict`` forbids unknown fields everywhere: an agent that invents a field
 # gets a hard validation error instead of a silently ignored key.
 Strict = ConfigDict(extra="forbid")
-
-
-class HFlowContractError(ValueError):
-    """Raised when persisted data no longer matches the declared contract."""
 
 
 def canonical_json(payload: Any) -> str:
@@ -1029,10 +1025,6 @@ class CandidateRef(BaseModel):
 #: nothing by it (user ruling, 2026-10-03).
 FindingSeverity = Literal["P0", "P1", "P2", "P3"]
 
-#: The typed finding models: unknown keys are refused, and ``strict`` refuses coercion, so a
-#: ``"12"`` or a ``true`` is not a line number and a number is not a string.
-StrictTyped = ConfigDict(extra="forbid", strict=True)
-
 
 def _refuse_null_optional_keys(data: Any) -> Any:
     """An optional finding key is omitted, never ``null``: the schema says the value's type."""
@@ -1073,6 +1065,8 @@ def _require_non_blank(value: str) -> str:
 class FindingLocation(BaseModel):
     """Where a finding applies. Give a line only when you have read it; never invent one."""
 
+    # Both finding models refuse unknown keys, and ``strict`` refuses coercion, so a ``"12"``
+    # or a ``true`` is not a line number and a number is not a string.
     model_config = ConfigDict(
         extra="forbid", strict=True, json_schema_extra=_optional_keys_are_omitted
     )
@@ -1384,6 +1378,11 @@ class LaunchSurfaces(BaseModel):
     dsh_home_observed: bool = False
     #: The home's fixed surface paths, in a fixed order; empty when it was not looked into.
     dsh_home_files: list[SurfaceFile] = Field(default_factory=list)
+    #: DSH's user-level agents file: ``$DSH_AGENTS_HOME/AGENTS.md`` when that variable reaches the
+    #: child, else ``<home>/.agents/AGENTS.md`` in the child's home. Read by DSH >= 0.2.1-alpha.2
+    #: per upstream source (documented, not observed). ``None`` for a record made before this
+    #: field existed.
+    user_agents_file: SurfaceFile | None = None
     #: The directory DSH starts in ("" = not known before dispatch).
     workspace: str = ""
     #: The workspace's ``.env``, by presence and size only.
@@ -1892,30 +1891,6 @@ class HarnessDriver(Protocol):
     def cancel(self, invocation_id: str) -> CancellationReceipt: ...
 
     def reconcile(self, invocation_id: str) -> ReconcileResult: ...
-
-
-class LifecycleDriver(Protocol):
-    """Optional extension: a driver whose invocation can be observed and stopped while live.
-
-    A driver that only implements :class:`HarnessDriver` remains valid; the controller
-    degrades to "start returns when the invocation is over", and cancellation then reports
-    what it can honestly report. The point of this protocol is that ``start`` must not be
-    the only thing that can happen to a running invocation.
-    """
-
-    driver_id: str
-
-    def probe(self, binding: AgentBinding) -> CapabilityReport: ...
-
-    def start_handle(self, request: InvocationRequest) -> DriverHandle: ...
-
-    def observe(self, handle: DriverHandle) -> Iterator[NormalizedEvent]: ...
-
-    def collect(self, handle: DriverHandle) -> InvocationResult: ...
-
-    def cancel_handle(self, handle: DriverHandle) -> CancellationReceipt: ...
-
-    def reconcile_handle(self, handle: DriverHandle) -> ReconcileResult: ...
 
 
 # --------------------------------------------------------------------------
@@ -2436,6 +2411,77 @@ class PrepareReport(BaseModel):
     authorization: PendingAuthorization = Field(default_factory=PendingAuthorization)
     model_calls_made: Literal[0] = 0
     notes: list[str] = Field(default_factory=list)
+
+
+class PlanArguments(BaseModel):
+    """The resolution inputs ``hflow prepare --plan-out`` was given, as later commands re-use them.
+
+    ``approve --plan`` and ``run --plan`` resolve from exactly these values, through the same
+    function ``prepare`` used, so a plan is "run with identical flags" written down once. Paths are
+    absolute (resolved against the directory ``prepare`` ran in). ``base_commit`` is kept as given
+    - a ref stays a ref - so the later resolution resolves it the way ``prepare`` did, and a branch
+    that moved in between shows up as a changed binding rather than being hidden by a stored SHA.
+    ``profile`` is the profile ``prepare`` selected (``--profile``, else ``HFLOW_PROFILE``).
+    """
+
+    model_config = Strict
+
+    task: str
+    project: str | None = None
+    project_root: str
+    profile: str | None = None
+    driver: str | None = None
+    base_commit: str | None = None
+    workspace: Literal["worktree", "in_place"] | None = None
+    authorization_mode: Literal["stop-trial", "m2-live-change"] = "m2-live-change"
+    root_budget_file: str | None = None
+    repair_policy_file: str | None = None
+    data_dir: str
+
+
+class RunPlan(BaseModel):
+    """A saved ``hflow prepare``: what was resolved, from which inputs. Never an approval.
+
+    ``approve --plan`` turns a plan into an authorization artifact only after the user types their
+    own approval text, and refuses a plan whose inputs now resolve to another binding. A plan
+    carries no ``user_text`` and no ``provided_by``, and ``AuthorizationRecord`` forbids unknown
+    fields, so a plan file handed to ``--authorization-file`` is refused.
+
+    ``binding`` / ``binding_digest`` are what the plan resolves to, for every plan: for one that
+    needs an approval they are exactly ``prepare_report.authorization``'s binding and digest (the
+    digest the approval must carry); for an offline plan they are what ``run --plan`` compares the
+    fresh resolution against, so an offline plan cannot silently run an edited task either.
+    """
+
+    model_config = Strict
+
+    kind: Literal["hflow-plan"] = "hflow-plan"
+    schema_version: Literal[1] = 1
+    created_at: str
+    controller_build: str
+    arguments: PlanArguments
+    prepare_report: PrepareReport
+    binding: dict[str, Any]
+    binding_digest: str
+    #: The ceilings of the root budget file, when one was given: an approval of this plan carries
+    #: them as ``root_limits``. ``None`` exactly when the plan binds no root.
+    root_limits: RootBudgetLimits | None = None
+
+    @model_validator(mode="after")
+    def _consistent(self) -> RunPlan:
+        pending = self.prepare_report.authorization
+        if pending.required and (
+            pending.binding_digest != self.binding_digest or pending.binding != self.binding
+        ):
+            raise ValueError(
+                "the plan's binding differs from the binding its prepare report asks approval for"
+            )
+        root = self.prepare_report.root_budget
+        if (root is None) != (self.root_limits is None) or (
+            root is not None and root.limits != self.root_limits
+        ):
+            raise ValueError("the plan's root_limits differ from its prepare report's root budget")
+        return self
 
 
 class EvidenceRecord(BaseModel):

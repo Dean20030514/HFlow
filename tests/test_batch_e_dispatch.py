@@ -983,7 +983,7 @@ def test_resume_closes_a_reservation_that_never_launched_as_unknown(
         store, project=project, spec=task_spec, binding=binding, limits=limits,
         project_root=project_root,
     )
-    reservation = _reserve(
+    _reserve(
         store, run_id=run_id, binding=binding, limits=limits,
         role="implementer", invocation_id="I-crashed",
     )

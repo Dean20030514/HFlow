@@ -350,7 +350,6 @@ def check_permission(node: str, *, allow_writes: bool) -> dict:
                 decision = payload["permission_decision"]
     outcome = (decision or {}).get("outcome")
     option = outcome.get("optionId") if isinstance(outcome, dict) else outcome
-    expected_option = "allow-once" if allow_writes else None
     approved = option == "allow-once"
     rejected = isinstance(outcome, dict) and outcome.get("optionId") == "reject-once"
     ok = result.outcome.value == "completed" and (approved if allow_writes else rejected)

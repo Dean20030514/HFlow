@@ -58,7 +58,25 @@ POST_BINDING_FIELDS = (
     "root_budget",
     "project_contract_digest",
     "launch_content_digest",
+    "ledger_path",
 )
+
+
+def ledger_path_for(data_dir: Path | str) -> str:
+    """The canonical absolute path of the ledger ``data_dir`` holds, as a binding names it.
+
+    One spelling for both places a binding names a ledger - ``AuthorizationBinding.ledger_path``
+    and ``RootBudgetBinding.ledger_path`` - so ``prepare``, ``approve``, ``run`` and ``run --plan``
+    compute the identical string from one data directory, however it was given (relative,
+    through ``HFLOW_DATA_DIR``, or absolute). Only string work: the path is resolved, never
+    opened, so a preview that names a ledger does not create it.
+    """
+    from .paths import database_path
+
+    ledger = database_path(Path(data_dir))
+    if str(ledger) != ":memory:":
+        ledger = ledger.resolve()
+    return str(ledger)
 
 
 def resolve_root_binding(
@@ -72,16 +90,11 @@ def resolve_root_binding(
     ``data_dir`` is only string work here - the ledger's path is computed, never opened, so
     ``hflow prepare`` can report a binding without creating the SQLite file the binding names.
     """
-    from .paths import database_path
-
-    ledger = database_path(Path(data_dir))
-    if str(ledger) != ":memory:":
-        ledger = ledger.resolve()
     return RootBudgetBinding.derive(
         project_id=project_id,
         repo_path=str(Path(request.project_root)),
         task_id=request.task.task_id,
-        ledger_path=str(ledger),
+        ledger_path=ledger_path_for(data_dir),
     )
 
 
@@ -147,6 +160,13 @@ class AuthorizationBinding(BaseModel):
     #: later remain bound by path. Dropped from the digest while empty, like the other
     #: post-binding fields.
     launch_content_digest: str = ""
+    #: :func:`ledger_path_for` of the data directory whose ledger spends this approval. Single
+    #: use is enforced per ledger (``<data-dir>/hflow.sqlite``), so without it an artifact already
+    #: consumed in one data directory would authorize a fresh run in another. Set for every
+    #: binding that reaches a real driver, root run or not (a root run carries the same string
+    #: in ``root_budget.ledger_path``); empty for the offline fake. Dropped from the digest while
+    #: empty, like the other post-binding fields.
+    ledger_path: str = ""
 
     def digest(self) -> str:
         """Identity of what this binding covers.
@@ -271,6 +291,7 @@ def current_binding(
     spec_path: Path,
     effective: EffectiveConfig | None = None,
     root_binding: RootBudgetBinding | None = None,
+    data_dir: Path | str | None = None,
 ) -> AuthorizationBinding:
     """The binding of the run that is about to happen.
 
@@ -295,6 +316,13 @@ def current_binding(
     (``project_contract_digest``) and the roles the run will actually dispatch
     (:func:`dispatched_roles`), so editing a check's argv, ``write_deny`` or the review floor
     after approval - or a change that drops the reviewer - stops the old approval applying.
+
+    ``data_dir`` is the data directory whose ledger will spend the approval. For a run that
+    reaches a real driver the binding names that ledger (``ledger_path``), so an approval
+    consumed in one data directory does not authorize the same task again in another: single
+    use is enforced per ledger. ``prepare``, ``approve`` and ``run`` always pass it (through
+    ``prepare.pending_binding``); an offline binding, and a caller that passes none, keep the
+    shape they had.
     """
     binding = AuthorizationBinding(
         mode=mode,
@@ -314,7 +342,22 @@ def current_binding(
         binding.launch_content_digest = effective.launch_content_digest()
     if root_binding is not None:
         binding.root_budget = root_binding
+    if data_dir is not None and not is_offline(driver, effective):
+        binding.ledger_path = ledger_path_for(data_dir)
     return binding
+
+
+def is_offline(driver: str, effective: EffectiveConfig | None = None) -> bool:
+    """Does this binding reach only the offline fake?
+
+    With a resolved configuration every role counts - the same rule as
+    ``ResolvedRun.is_real_driver`` - so a run whose reviewer is real is not offline because its
+    implementer is the fake, and the fake's alias resolves to the fake's driver id. Without
+    one, the binding's own driver name decides.
+    """
+    if effective is not None and effective.roles:
+        return all(entry.driver_id == OFFLINE_DRIVER_ID for entry in effective.roles)
+    return driver == OFFLINE_DRIVER_ID
 
 
 #: The roles a binding names when no configuration was resolved: what every artifact written
@@ -382,7 +425,38 @@ def verify_authorization(
     _verify_effective_config(actual, expected)
     _verify_project_contract(actual, expected)
     _verify_launch_content(actual, expected)
+    _verify_ledger(actual, expected)
     _verify_root_budget(actual, expected)
+
+
+def _verify_ledger(actual: AuthorizationBinding, expected: AuthorizationBinding) -> None:
+    """The ledger half of the check: an approval is spent in the ledger it names, and only there.
+
+    Single use is enforced per ledger (``<data-dir>/hflow.sqlite``). A run that names its ledger
+    therefore refuses an artifact that names none - nothing in it stops it being spent once in
+    every data directory - and an artifact issued for another ledger: pointing ``--data-dir`` or
+    ``HFLOW_DATA_DIR`` elsewhere opens a ledger with no record of it, which is not a second
+    allowance.
+    """
+    if not expected.ledger_path:
+        return
+    if not actual.ledger_path:
+        raise RefusedError(
+            RefusalCode.RISK_DOWNGRADE,
+            "this authorization names no ledger, so its single use would be enforced only per "
+            "data directory: it could be spent once in each. It predates ledger binding and "
+            "cannot authorize this run; re-issue it against the binding `hflow prepare` prints "
+            f"(ledger {expected.ledger_path}).",
+        )
+    if actual.ledger_path != expected.ledger_path:
+        raise RefusedError(
+            RefusalCode.RISK_DOWNGRADE,
+            "the authorization was issued for another ledger: authorized ledger "
+            f"{actual.ledger_path!r} != actual {expected.ledger_path!r}. Single use is enforced "
+            "per ledger, so another data directory (--data-dir or HFLOW_DATA_DIR) is not a "
+            "second allowance; run against the data directory it was issued for, or prepare "
+            "and approve this one.",
+        )
 
 
 def _verify_launch_content(actual: AuthorizationBinding, expected: AuthorizationBinding) -> None:

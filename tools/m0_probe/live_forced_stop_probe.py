@@ -43,10 +43,8 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from hflow.contracts import (  # noqa: E402
     AcceptanceCriterion,
-    AgentBinding,
     BudgetRequest,
     CheckDef,
-    InvocationRequest,
     ProjectConfig,
     ProjectLimits,
     ReuseDecision,
@@ -58,7 +56,6 @@ from hflow.contracts import (  # noqa: E402
 from hflow.controller import Controller  # noqa: E402
 from hflow.drivers.acpx_dsh import AcpxDshDriver  # noqa: E402
 from hflow.drivers.winjob import parent_pid, process_gone  # noqa: E402
-from hflow.paths import default_data_dir  # noqa: E402
 from hflow.store import Store  # noqa: E402
 from hflow.verify import CheckRunners  # noqa: E402
 
@@ -279,7 +276,6 @@ def run_trial(
 ) -> TrialEvidence:
     data_dir = PROBE_ROOT / "data"
     store = Store(data_dir / "hflow.sqlite")
-    binding = AgentBinding(harness="dsh", driver="acpx-dsh")
     if offline_client:
         # Self-check wiring: the same probe logic against the test-only stand-in client, so
         # the evidence chain can be exercised without a model. It is not a live trial and

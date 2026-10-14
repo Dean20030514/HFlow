@@ -512,7 +512,14 @@ def launch_surfaces_lines(
         f"sdk={client.sdk_version or 'unknown'} dsh={dsh}; DSH_* reaching the child: "
         f"{', '.join(surfaces.dsh_env_names) or 'none'} (names only)"
     )
-    return [home, workspace, client_line]
+    lines = [home, workspace, client_line]
+    if surfaces.user_agents_file is not None:
+        # Absent on a record written before it was observed: nothing to say rather than "absent".
+        lines.append(
+            f"{indent}user agents   {role} {surface_summary(surfaces.user_agents_file)} "
+            "(read by DSH >= 0.2.1-alpha.2; recorded, never enforced)"
+        )
+    return lines
 
 
 def _owner_lines(inspection: RunInspection) -> list[str]:

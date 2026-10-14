@@ -256,7 +256,7 @@ class MockAgent:
         # acpx's *client-side* policy mapping: the mock never answers this request itself, so
         # whatever comes back was decided by the client from its configuration. It says nothing
         # about DSH's native tool enforcement, only about the client's permission mediation.
-        decision = self.ask_permission(session_id)
+        self.ask_permission(session_id)
         if self.scenario == "prompt-error":
             # DSH's failed-turn shape: RequestError.internalError answering the prompt, never a stop
             # reason.

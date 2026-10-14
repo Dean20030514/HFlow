@@ -393,3 +393,31 @@ reports above to surface as an implementer failure or as permissions left on the
 `hflow clean` may then refuse to remove - both are recorded, never retried - and do not create a
 per-run `DSH_HOME` from nothing (#7978); a bound home must hold a profile that boots. RFD #2308 is
 one more reason a stop stays the Job Object's empty boundary, never a protocol cancel (rule 8).
+
+## Addendum 2026-10-13 — sixth read of the upstreams
+
+Appended; the decision and every capability state above stand. Release metadata, compare views,
+source, discussions and npm dist-tags only; nothing was executed against DSH or a model, so every
+row is *documented*.
+
+| Fact | Label |
+|---|---|
+| acpx: new release `v0.19.5` (`95adbc56`, 2026-10-11; npm `latest` 0.19.5). Against `v0.19.4` it adds dependency updates only (#870, #871). `main` moved `b3cd8433...66599833` (5 commits, no `src/` file: workflows, CHANGELOG, package.json, lockfile; #873 locks `@agentclientprotocol/sdk` 1.8.0, range still `^1.5.0`). `src/async-control.ts` is still blob `2e318c1d`. #835, #854, #861 unchanged; #850 reproduced by a maintainer on 2026-10-10 (an overload message ending `end_turn` exits 0, a structured quota rejection exits 1) and left open pending a structured ACP error. New #867 is a named-session lookup slowdown. At `v0.17.1` the agent is spawned with `windowsHide: true` and no `detached` (`src/acp/auth-env.ts`), and a `--model` change is awaited before the prompt is sent (`model-application.ts`, `runtime.ts:241`) | documented |
+| DSH: new prerelease tag `dsh-v0.2.1-alpha.2` (`d7432673`, 2026-10-09; npm `alpha` 0.2.1-alpha.2, `latest`/`next` still 0.2.0-rc.2). `packages/acp/acp/src` moved `f6f88229` -> `5d63d1b7` (`index.ts`, `session.ts`): `session/prompt` returns only after subagents and pending output finish (`50da6f0b`, `7304af57`, `323ec4db`); an agent failure with no saved `turn/end` now rejects the prompt with a JSON-RPC error instead of returning the earlier answer or `cancelled`, and headless exits non-zero (`57226b39`, `b0237914`); the idle watchdog now ends a stalled request at its own deadline (`dbb150ff`, `99670bab`); `DEFAULT_STREAM_IDLE_TIMEOUT_MS` is still 300 000. New launch surface: after `$DSH_HOME/AGENTS.md` DSH also reads `$DSH_AGENTS_HOME/AGENTS.md`, default `~/.agents/AGENTS.md` (`21d0c2e2`; not in 0.2.0-rc.2). Windows terminals use node-pty's bundled console host (`59ba1321`). `packages/sandbox` has no code change since alpha.1; DSH still pins `@agentclientprotocol/sdk` 1.4.0 | documented |
+| DSH discussions (unconfirmed by maintainers): #9038's `0xC0000142` under the Windows sandbox now has many duplicates; #9238/#9280 tie it to a host process without a console, and #9280 also to a missing `Everyone` ACE. #9060: `reason:null` comes from a cancel with an unrecognised reason (#9646 reports the same). New: #9198 (a prompt right after a model change can run on the old model, ACP profile), #9515 (a Windows tool call can hang forever when its start message is lost), #9451 (exit 0 when a profile names an uninstalled bundle), #9653 (handle exhaustion at boot leaves an empty `.lock` that blocks later boots), #9575 (a failed atomic rename, EPERM, kills the host), #9382 (Web/Desktop run `git add` at each turn start, which runs repository-local hooks), #9173 (an agent's PowerShell `$home` misuse deleted a home directory), #9113 (a turn ending `stopReason=stop` with no tool call is recorded as completed); #9568's body is empty | documented (unconfirmed) |
+| ACP: `schema-v1.25.0` released 2026-10-09 (`4cf3dd85`) with v1.11.0 and schema-v2.0.0-alpha.8; `schema/v1/schema.json` moved `fa1242c6` -> `d6f7731b`. The stable v1 `StopReason` set is unchanged; `error` (#2281) is unstable/v2 only. v1 adds session notices (#2336) and compaction (#2334); #2333 rejects some malformed values that used to fall back to a default. Release PR #2379 (unstable client system prompt, #2361) is open. `@agentclientprotocol/sdk` `latest` is 1.8.0 (`f4ea2195`) | documented |
+
+Nothing here needs a transport change and the acpx 0.17.1 pin stays: the exec cancel/timeout
+source is unchanged and every acpx change since the last read is a dependency bump. Batch K acts
+on two DSH alpha.2 facts offline: `dsh_surfaces` records the user-level agents file (and the
+child no longer inherits `DSH_AGENTS_HOME`, so it resolves under the per-invocation home), and a
+regression test pins how a prompt rejected by a JSON-RPC error after partial work is classified.
+#9515 and #8947 are two more reasons HFlow's own wall-clock limit and the Job Object stop stay the
+only bound on a turn. Open, not acted on: acpx 0.17.1 ships no lockfile, so a fresh install now
+resolves SDK 1.8.0 (stricter on malformed values) - HFlow records the resolved SDK version rather
+than pinning it, and pinning it is a separate decision; whether the ACP/headless profile runs
+`git add` (#9382) is not established. On this machine the Desktop install's `app.asar` header
+names `@deepseek-ai/dsh-desktop` and `@deepseek-ai/dsh-desktop-runtime` 0.2.0-rc.2 (read from the
+archive header, nothing executed; file dated 2026-09-29), so the alpha.2 behaviour above does not
+apply to it until Desktop updates itself - and an update changes the launch content an approval
+binds, so it surfaces as a refused approval rather than as a silent change.

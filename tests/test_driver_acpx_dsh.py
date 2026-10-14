@@ -43,6 +43,7 @@ from hflow.drivers.acpx_dsh import (
     AcpxDshDriver,
     DriverSetupError,
     _workspace_client_config,
+    child_environment,
     resolve_launch_config,
 )
 from hflow.drivers import winjob
@@ -339,6 +340,41 @@ def test_ambient_dsh_mode_variables_never_reach_the_child(
     notes = driver.probe(AgentBinding(harness="dsh", driver=DRIVER_ID)).notes
     removed = [note for note in notes if "DSH_PERMISSION_MODE" in note]
     assert removed and "removed" in removed[0] and "DSH_TOOLS_MODE" in removed[0], notes
+
+
+@pytest.mark.parametrize("bound", ["", "C:\\bound-dsh-home" if os.name == "nt" else "/bound"])
+def test_an_inherited_dsh_agents_home_and_every_spelling_of_the_dsh_variables_are_removed(
+    bound: str,
+) -> None:
+    """DSH >= 0.2.1-alpha.2 reads ``$DSH_AGENTS_HOME/AGENTS.md`` as user-level instructions: an
+    inherited value would point it at a file outside the invocation's home that no approval
+    binds. Windows reads variable names in any case, so a removal that knew one spelling could
+    be bypassed by another; elsewhere ``dsh_home`` is not ``DSH_HOME`` and is left alone."""
+    source = {
+        "DSH_AGENTS_HOME": "C:\\shared-agents",
+        "DSH_TELEMETRY_DISABLED": "1",
+        "dsh_home": "lower-home",
+        "Dsh_Permission_Mode": "danger-full-access",
+        "PATH": "",
+    }
+    extra = {"dsh_agents_home": "from-extra-env", "dsh_tools_mode": "full"}
+
+    env = child_environment(source, extra_env=extra, dsh_home=bound)
+
+    if os.name == "nt":
+        assert not [key for key in env if key.upper() in {
+            "DSH_AGENTS_HOME", "DSH_PERMISSION_MODE", "DSH_TOOLS_MODE"
+        }], env
+        homes = [key for key in env if key.upper() == "DSH_HOME"]
+        assert homes == (["DSH_HOME"] if bound else []), env
+    else:
+        assert "DSH_AGENTS_HOME" not in env
+        assert env["dsh_agents_home"] == "from-extra-env", "another variable on POSIX"
+        assert env["dsh_home"] == "lower-home"
+        assert ("DSH_HOME" in env) is bool(bound)
+    if bound:
+        assert env["DSH_HOME"] == bound, "a profile-bound home is still set, in that spelling"
+    assert env["DSH_TELEMETRY_DISABLED"] == "1", "only the named variables are removed"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="the batch-shim wrapper exists only on Windows")

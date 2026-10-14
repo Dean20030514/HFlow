@@ -1,6 +1,6 @@
 #!/usr/bin/env python
-"""Prepare the real M2 task package: a synthetic project, a failing acceptance check, and the
-exact commands to run a real DSH implementer and a real DSH reviewer.
+"""Prepare the real M2 task package: a synthetic project, a failing acceptance check, the
+TaskSpec and project contract, and the `hflow prepare` command that previews the run.
 
 This is preparation only. It dispatches nothing, reads no credential and needs no
 authorization. It exists so that a live run never has to be debugged with a model call.
@@ -14,7 +14,6 @@ is given the requirement, the failing test and the source, and has to do the wor
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import subprocess
 import sys
@@ -23,7 +22,6 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from hflow.authorization import AuthorizationBinding, AuthorizationRecord  # noqa: E402
 from hflow.contracts import (  # noqa: E402
     AcceptanceCriterion,
     BudgetRequest,
@@ -258,31 +256,6 @@ def write_package(root: Path, repo: Path, base: str) -> dict[str, Path]:
     }
 
 
-def write_authorization_template(root: Path, repo: Path, task_path: Path, project_path: Path) -> Path:
-    """Emit the artifact skeleton with an EMPTY user_text: only the user fills that in."""
-    from hflow.contracts import ProjectConfig as PC
-    from hflow.contracts import RunRequest, TaskSpec as TS
-
-    spec = TS.model_validate_json(task_path.read_text(encoding="utf-8"))
-    project = PC.model_validate_json(project_path.read_text(encoding="utf-8"))
-    request = RunRequest(task=spec, project=project, project_root=repo, workspace_root=repo)
-    from hflow.authorization import current_binding
-
-    binding = current_binding(
-        mode="m2-live-change", driver="acpx-dsh", project=project, request=request, spec_path=task_path
-    )
-    template = AuthorizationRecord(
-        authorization_id="AUTH-m2-live-1",
-        user_text="",
-        authorized_at="<set by the user>",
-        max_top_level_submissions=2,
-        binding=AuthorizationBinding.model_validate(binding.model_dump(mode="json")),
-    )
-    path = root / "authorization.template.json"
-    path.write_text(json.dumps(template.model_dump(mode="json"), indent=2), encoding="utf-8")
-    return path
-
-
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out", default=str(REPO_ROOT / ".probe" / "m2-live"))
@@ -292,7 +265,6 @@ def main() -> int:
     repo = build_project(root)
     base = base_commit(repo)
     files = write_package(root, repo, base)
-    template = write_authorization_template(root, repo, files["task"], files["project"])
 
     argv = [sys.executable, "-m", "pytest", "-q", "tests"]
     result = run_check(repo, argv)
@@ -313,17 +285,16 @@ def main() -> int:
 
     print(f"\ntask           {files['task']}")
     print(f"project        {files['project']}")
-    print(f"authorization  {template}  (fill in user_text from the user's own words)")
-    print("\nRun a real implementer (requires a bound authorization file):")
     print(
-        "  hflow run --task {task} --project {project} --project-root {repo} \\\n"
-        "      --driver acpx-dsh --authorization-file <filled-in.json> \\\n"
-        "      --authorization-mode m2-live-change --data-dir {data} --json".format(
+        "\nPreview the run and the binding an approval must cover (no model call; approving\n"
+        "and running are user actions, see docs/operations.md):\n"
+        "  hflow prepare --task {task} --project {project} --project-root {repo} \\\n"
+        "      --profile <id> --data-dir {data}".format(
             task=files["task"], project=files["project"], repo=repo, data=root / "data"
         )
     )
     print(
-        "\nThen read the result (no model, no re-run):\n"
+        "\nAfter an approved run, read the result (no model, no re-run):\n"
         "  hflow status <run-id> --data-dir {data} --project-root {repo}\n"
         "  hflow report <run-id> --data-dir {data} --project-root {repo} --json".format(
             data=root / "data", repo=repo

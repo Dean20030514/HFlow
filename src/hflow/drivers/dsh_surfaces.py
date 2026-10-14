@@ -7,8 +7,13 @@ AGENTS.md/CLAUDE.md(.local) chain from the nearest ``.git`` marker down to the c
 ``<root>/.dsh/skills``, ``<root>/.agents/skills`` and ``<home>/skills``, and ambient ``DSH_*``
 variables.
 
+Documented upstream at dsh-v0.2.1-alpha.2 (d7432673, commit 21d0c2e2), not observed, and not read
+by 0.2.0-rc.2: after ``$DSH_HOME/AGENTS.md`` DSH also reads ``$DSH_AGENTS_HOME/AGENTS.md``, the
+environment-only ``DSH_AGENTS_HOME`` defaulting to ``~/.agents`` (:func:`user_agents_file`).
+
 This module checks a FIXED list of paths. It never lists a directory, never opens a ``.env`` or
-the home's stored-credentials file, never records a value, executes nothing, refuses nothing and
+the home's stored-credentials file, never records a value (``DSH_AGENTS_HOME`` is a directory, and
+is recorded only as the location of the file it names), executes nothing, refuses nothing and
 binds nothing. :func:`_read_regular` is the only place a file is opened. :func:`carrier_files`
 and :func:`package_manifest_for` only *name* files; the binding by content is
 ``launch_content``'s. :func:`credential_sources` reports which credential sources a launch would
@@ -30,7 +35,7 @@ from typing import Literal, NamedTuple
 from ..contracts import ClientIdentity, LaunchConfig, LaunchSurfaces, SurfaceFile
 from ..ids import utc_now
 from ..report import surface_summary
-from .acpx_dsh import _client_module_tree
+from .acpx_dsh import _client_module_tree, env_keys, path_inside
 
 #: The paths DSH reads in its home (pinned to dsh-v0.2.0-rc.2). The profile entry is formatted
 #: with the launch's profile and skipped when it has none.
@@ -40,6 +45,16 @@ DSH_HOME_SURFACE_NAMES = (
     ".env",
     "AGENTS.md",
     "skills",
+)
+#: DSH's user-level agents file: ``$DSH_AGENTS_HOME/AGENTS.md``, the environment-only
+#: ``DSH_AGENTS_HOME`` defaulting to ``<home>/.agents`` (see :data:`USER_AGENTS_SOURCE`).
+DSH_AGENTS_HOME_NAME = "DSH_AGENTS_HOME"
+USER_AGENTS_DEFAULT_DIR = ".agents"
+USER_AGENTS_FILE_NAME = "AGENTS.md"
+#: Where the user-level agents file comes from, as far as it is known.
+USER_AGENTS_SOURCE = (
+    "read by DSH >= 0.2.1-alpha.2 after $DSH_HOME/AGENTS.md, per upstream source (commit "
+    "21d0c2e2, tag dsh-v0.2.1-alpha.2): documented, not observed; dsh-v0.2.0-rc.2 does not read it"
 )
 #: Instruction files DSH's agent-instructions source reads in each directory from the project
 #: root down to the cwd (pinned to dsh-v0.2.0-rc.2). Whether DSH loads all four or only the
@@ -179,7 +194,7 @@ def surface_file(base: Path, name: str, *, digest: bool = True) -> SurfaceFile:
 def env_has_name(env: Mapping[str, str], name: str) -> bool:
     """Whether ``name`` is a variable of ``env`` (case-insensitive on Windows). Never reads it."""
     if os.name == "nt":
-        return any(key.upper() == name.upper() for key in env)
+        return bool(env_keys(env, name))
     return name in env
 
 
@@ -273,13 +288,6 @@ def dsh_project_root(workspace: Path) -> Path | None:
         if os.path.exists(directory / PROJECT_ROOT_MARKER):
             return directory
     return None
-
-
-def _inside(path: Path, root: Path) -> bool:
-    """``path`` is ``root`` or below it (the rule ``acpx_dsh._inside_any`` applies)."""
-    candidate = os.path.normcase(os.path.abspath(path))
-    base = os.path.normcase(os.path.abspath(root))
-    return candidate == base or candidate.startswith(base.rstrip(os.sep) + os.sep)
 
 
 def _version(raw: object, label: str, notes: list[str]) -> str:
@@ -603,6 +611,89 @@ def carrier_files(launch: LaunchConfig) -> CarrierFiles:
     return CarrierFiles(carrier, shim, entry, manifest, "", [interpreter_note])
 
 
+def _env_value(env: Mapping[str, str], name: str) -> str | None:
+    """The value of ``name`` in ``env``, or ``None`` (case-insensitive on Windows, an exact
+    spelling first) - the lookup :func:`env_has_name` makes, for a variable whose value is a path.
+    """
+    if name in env:
+        return env[name]
+    if os.name == "nt":
+        for key, value in env.items():
+            if key.upper() == name.upper():
+                return value
+    return None
+
+
+def child_user_home(child_env: Mapping[str, str], child_home: Path | None = None) -> Path:
+    """The directory DSH's ``os.homedir()`` returns in a child started with ``child_env``.
+
+    ``child_home`` when given: the driver points every child's USERPROFILE/HOME at its
+    invocation's own home (``acpx_dsh.child_home_for``). Otherwise Node's rule - USERPROFILE on
+    Windows, HOME elsewhere - read from ``child_env``, and failing that this process's home.
+    """
+    if child_home is not None:
+        return Path(child_home)
+    value = _env_value(child_env, "USERPROFILE" if os.name == "nt" else "HOME")
+    return Path(value) if value else Path.home()
+
+
+def user_agents_file(
+    child_env: Mapping[str, str], *, child_home: Path | None = None
+) -> SurfaceFile:
+    """DSH's user-level agents file at this launch (:data:`USER_AGENTS_SOURCE`). Records only.
+
+    ``$DSH_AGENTS_HOME/AGENTS.md`` when that variable reaches the child (looked up like
+    :func:`env_has_name`), else ``<home>/.agents/AGENTS.md`` with ``<home>`` from
+    :func:`child_user_home`. Examined like every other surface (:func:`surface_file`: presence,
+    size, and a digest within :data:`SURFACE_HASH_LIMIT_BYTES`); never enforced and never a
+    reason to refuse. An empty or relative ``DSH_AGENTS_HOME`` is not looked into - how DSH
+    resolves one is not verified - and neither is a default path in a per-invocation home that
+    does not exist yet (its path holds ``acpx_dsh.INVOCATION_ID_PLACEHOLDER``).
+    """
+    from .acpx_dsh import INVOCATION_ID_PLACEHOLDER
+
+    configured = _env_value(child_env, DSH_AGENTS_HOME_NAME)
+    if configured is not None:
+        name = f"${DSH_AGENTS_HOME_NAME}/{USER_AGENTS_FILE_NAME}"
+        base = Path(configured)
+        if not configured or not base.is_absolute():
+            return SurfaceFile(
+                name=name,
+                path=str(base / USER_AGENTS_FILE_NAME) if configured else "",
+                present=None,
+                kind="unknown",
+                detail=(
+                    f"{DSH_AGENTS_HOME_NAME} is "
+                    + ("empty" if not configured else "a relative path")
+                    + ": how DSH resolves it is not verified, so it was not looked into"
+                ),
+            )
+    else:
+        name = f"~/{USER_AGENTS_DEFAULT_DIR}/{USER_AGENTS_FILE_NAME}"
+        try:
+            base = child_user_home(child_env, child_home) / USER_AGENTS_DEFAULT_DIR
+        except (RuntimeError, OSError) as exc:  # Path.home() with no home to name
+            return SurfaceFile(
+                name=name,
+                path="",
+                present=None,
+                kind="unknown",
+                detail=f"the child's home could not be determined: {type(exc).__name__}",
+            )
+        if INVOCATION_ID_PLACEHOLDER in str(base):
+            return SurfaceFile(
+                name=name,
+                path=str(base / USER_AGENTS_FILE_NAME),
+                present=None,
+                kind="unknown",
+                detail=(
+                    "in the per-invocation home, which is created empty for each invocation and "
+                    "does not exist before dispatch: named, not looked into"
+                ),
+            )
+    return surface_file(base, USER_AGENTS_FILE_NAME).model_copy(update={"name": name})
+
+
 def observe_launch_surfaces(
     launch: LaunchConfig,
     *,
@@ -611,11 +702,14 @@ def observe_launch_surfaces(
     child_env: Mapping[str, str],
     workspace: Path | None = None,
     look_in_home: bool = True,
+    child_home: Path | None = None,
 ) -> LaunchSurfaces:
     """What DSH would read at this launch besides the packet, from a fixed list of paths.
 
     ``workspace`` is the directory DSH starts in (``None`` before dispatch, when a worktree does
-    not exist yet). Records only: it refuses nothing and changes nothing.
+    not exist yet). ``child_home`` is the home the child's USERPROFILE/HOME point at, when the
+    caller knows it (see :func:`child_user_home`). Records only: it refuses nothing and changes
+    nothing.
     """
     notes: list[str] = []
     home = Path(dsh_home)
@@ -634,7 +728,7 @@ def observe_launch_surfaces(
                 f"DSH_HOME is the relative path {home}: where DSH resolves it depends on the "
                 "workspace it starts in, so it was not looked into"
             )
-    if ws is not None and home.is_absolute() and _inside(home, ws):
+    if ws is not None and home.is_absolute() and path_inside(home, ws):
         notes.append(
             f"the DSH home {home} lies inside the workspace {ws}: the agent can write the patch "
             "files, AGENTS.md and skills DSH loads at the next launch (recorded here; a real "
@@ -683,6 +777,7 @@ def observe_launch_surfaces(
         dsh_home=str(home),
         dsh_home_observed=look_in_home,
         dsh_home_files=home_files,
+        user_agents_file=user_agents_file(child_env, child_home=child_home),
         workspace=str(ws) if ws is not None else "",
         workspace_env=workspace_env,
         deepseek_api_key_inherited=env_has_name(child_env, DEEPSEEK_API_KEY_NAME),
@@ -714,6 +809,12 @@ def probe_notes(surfaces: LaunchSurfaces) -> list[str]:
             "from upstream source, not observed); a real launch refuses a workspace .env, and "
             "refuses one without DEEPSEEK_API_KEY in its environment (no_credential_source)"
         )
+    agents = surfaces.user_agents_file
+    agents_note = f"user-level agents file ({USER_AGENTS_SOURCE}): " + (
+        surface_summary(agents) + (f" at {agents.path}" if agents.path else "")
+        if agents is not None
+        else "not recorded"
+    )
     client = surfaces.client
     carrier = client.dsh_carrier
     if client.dsh_version:
@@ -726,6 +827,7 @@ def probe_notes(surfaces: LaunchSurfaces) -> list[str]:
     )
     return [
         home_note,
+        agents_note,
         client_note,
         "DSH_* variables that reach the child (names only): "
         + (", ".join(surfaces.dsh_env_names) or "none"),

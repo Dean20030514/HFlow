@@ -30,7 +30,6 @@ from hflow.contracts import (
 )
 from hflow.controller import Controller
 from hflow.drivers.fake import FakeDriver, FakeScript
-from hflow.runtime import controller_build
 from hflow.store import Store
 from hflow.verify import CheckRunners, FakeCheckRunner
 

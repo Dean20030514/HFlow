@@ -16,7 +16,6 @@ messages) and maps it here. Three rules:
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Iterator
 
 from ..contracts import EventKind, NormalizedEvent
 
@@ -164,26 +163,3 @@ def _event_for_method(method: str, message: dict, sequence: int, at: str) -> Nor
     return NormalizedEvent(
         kind=EventKind.PROGRESS, sequence=sequence, at=at, message=f"method {method}", method=method
     )
-
-
-def iter_lines(text: str) -> Iterator[str]:
-    yield from text.splitlines()
-
-
-def summarize(events: Iterable[NormalizedEvent]) -> dict[str, object]:
-    """Small deterministic summary of a stream: event counts, dispatch, last stop reason.
-
-    ``stop_reason`` is the last one in the stream *whatever request it answered*, so it describes
-    the stream, never a turn's outcome. The driver takes a turn's outcome only from the response
-    to that turn's own ``session/prompt`` request.
-    """
-    kinds: dict[str, int] = {}
-    stop_reason: str | None = None
-    dispatched = False
-    for event in events:
-        kinds[event.kind.value] = kinds.get(event.kind.value, 0) + 1
-        if event.kind is EventKind.DISPATCHED:
-            dispatched = True
-        if event.method == "session/prompt" and "stopReason=" in event.message:
-            stop_reason = event.message.split("stopReason=", 1)[1]
-    return {"kinds": kinds, "stop_reason": stop_reason, "dispatched": dispatched}

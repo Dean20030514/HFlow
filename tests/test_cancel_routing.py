@@ -30,6 +30,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 import hflow.controller as controller_module
 import hflow.drivers.acpx_dsh as acpx_dsh_module
 from hflow.contracts import (

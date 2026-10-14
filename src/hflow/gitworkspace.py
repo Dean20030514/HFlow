@@ -723,17 +723,6 @@ class GitRepo:
         """Paths git ignores here. Ignored does not mean disposable - see the clean policy."""
         return list(self.status_report(cwd).ignored)
 
-    def ignored_artifact_fingerprint(self, cwd: Path) -> str:
-        """Content hash of ignored artifacts, so a change in them is still detectable."""
-        entries: list[dict[str, object]] = []
-        for relative in sorted(self.ignored_artifacts(cwd)):
-            target = Path(cwd) / relative.rstrip("/")
-            if target.is_file():
-                entries.append({"path": relative, "size": target.stat().st_size})
-            else:
-                entries.append({"path": relative, "size": None})
-        return digest_of(entries)
-
     def is_dirty(self) -> bool:
         """Does the user's own checkout have changes? Read-only: nothing is touched."""
         return bool(self.status_porcelain())
@@ -1155,19 +1144,6 @@ class GitRepo:
             entries[f"file:{path}"] = _file_digest(Path(path))
         return GitMetadataSnapshot(tuple(sorted(entries.items())))
 
-    def worktree_changes(self, worktree: Path, allow: list[str]) -> list[str]:
-        """Changed paths in the worktree that the TaskSpec did not authorize.
-
-        Raises :class:`GitStatusParseError` when the status cannot be interpreted safely: an
-        unreadable status must fail the run, not silently shrink the change set.
-        """
-        report = self.status_report(worktree)
-        if report.unsupported:
-            raise GitStatusParseError(
-                "unsupported git status records: " + "; ".join(report.unsupported[:3])
-            )
-        return [path for path in report.changed if not matches_pattern(path, allow)]
-
     def freeze_candidate(
         self,
         worktree: Path,
@@ -1334,9 +1310,6 @@ class GitRepo:
             serial=int(self.run("rev-list", "--count", "HEAD", cwd=worktree).strip()),
             tree_digest=digest_of({"base": base_commit, "staged": sorted(staged)}),
         )
-
-    def remove_worktree(self, worktree: Path) -> None:
-        self.run("worktree", "remove", "--force", str(worktree))
 
     def worktree_list(self) -> list[str]:
         return [line for line in self.run("worktree", "list", "--porcelain").splitlines() if line.strip()]

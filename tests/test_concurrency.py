@@ -332,8 +332,7 @@ def test_concurrent_writers_do_not_deadlock_or_lose_updates(tmp_path: Path, proj
     """Several threads hammering the same run through the real Store stay consistent."""
     store = Store(tmp_path / "hflow.sqlite")
     try:
-        run_id = _seed_checking(store, project, task_spec, run_id="R-load", turn_limit=4)
-        store.release_reservation(run_id, 1)  # drop the seeded attempt's turn: start from zero
+        run_id = _seed_ready(store, project, task_spec, run_id="R-load", turn_limit=4)
         barrier = threading.Barrier(4)
         reserve_lock = threading.Lock()
         granted = 0
@@ -439,7 +438,15 @@ def test_transaction_is_one_write_unit_in_the_file(tmp_path: Path, project, task
             not to the transaction under test, so both facts are read in one query.
             """
             while not stop.is_set():
-                seen.append(observer.reserved_turns_and_attempts(run_id))
+                # The observer handle is used by this thread only, so its connection is read
+                # directly.
+                row = observer.conn.execute(
+                    "SELECT r.turns_reserved, "
+                    "(SELECT COUNT(*) FROM attempts a WHERE a.run_id = r.run_id) "
+                    "FROM runs r WHERE r.run_id = ?",
+                    (run_id,),
+                ).fetchone()
+                seen.append((int(row[0]), int(row[1])))
                 time.sleep(0.005)
 
         thread = threading.Thread(target=observe, daemon=True)
@@ -461,12 +468,8 @@ def test_transaction_is_one_write_unit_in_the_file(tmp_path: Path, project, task
                 outcome=InvocationOutcome.FAILED,
                 result={"index": index},
             )
-            if index == 1:
-                store.start_repair_cycle(run_id, "local-controller")
-            else:
-                # The next dispatch needs the run back in READY; repair_cycle does that, so the
-                # last iteration simply leaves the run RUNNING for the next attempt to replace.
-                store.set_task_state(run_id, [TaskState.RUNNING], TaskState.READY, idempotent=True)
+            # The next dispatch needs the run back in READY.
+            store.set_task_state(run_id, [TaskState.RUNNING], TaskState.READY, idempotent=True)
         stop.set()
         thread.join(timeout=10)
 

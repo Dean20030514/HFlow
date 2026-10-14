@@ -16,12 +16,9 @@ What the tests deliberately do not claim:
 from __future__ import annotations
 
 import json
-import os
 import sys
 import time
 from pathlib import Path
-
-import pytest
 
 from hflow.artifacts import (
     BoundedTextSink,

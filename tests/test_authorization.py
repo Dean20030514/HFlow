@@ -12,7 +12,6 @@ for a different task: both must be refused.
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 
 import pytest
@@ -219,7 +218,7 @@ def test_reviewer_is_a_separate_consumed_submission(
     authorization = _record(real_request, project, tmp_path / "task.json", max_submissions=2)
     controller = _controller(store, tmp_path, driver, authorization)
     try:
-        outcome = controller.run_task(real_request)
+        controller.run_task(real_request)
         assert driver.invocations == ["implementer", "reviewer"], (
             "the reviewer must be its own invocation, not a continuation"
         )
@@ -258,6 +257,7 @@ def test_a_recorded_authorization_from_an_earlier_build_still_loads_and_digests_
     assert record.binding.root_budget is None
     assert record.binding.project_contract_digest == ""
     assert record.binding.launch_content_digest == ""
+    assert record.binding.ledger_path == ""
     assert record.root_limits is None
     assert record.binding_digest() == LEGACY_FIXTURE_DIGEST
 
@@ -268,6 +268,7 @@ def test_a_recorded_authorization_from_an_earlier_build_still_loads_and_digests_
         "root_budget",
         "project_contract_digest",
         "launch_content_digest",
+        "ledger_path",
     }
     old_recipe = digest_of({field: binding_document[field] for field in LEGACY_BINDING_FIELDS})
     assert old_recipe == LEGACY_FIXTURE_DIGEST
@@ -444,6 +445,135 @@ def test_a_root_approval_does_not_cover_another_data_dir(
             }
         )
     assert "declares no root_limits" in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------
+# the ledger an approval is spent in is part of the approval, root or not
+# --------------------------------------------------------------------------
+
+
+def _roles(*bindings: tuple[str, str]):  # noqa: ANN202
+    """An effective configuration whose roles use ``(driver name, driver id)`` in order."""
+    from hflow.contracts import EffectiveConfig, RoleConfig
+
+    return EffectiveConfig(
+        source="command_line",
+        roles=[
+            RoleConfig(role=role, agent="a", harness="dsh", driver=name, driver_id=driver_id)
+            for role, (name, driver_id) in zip(("implementer", "reviewer"), bindings)
+        ],
+    )
+
+
+def test_a_real_driver_binding_names_its_ledger_and_an_offline_one_does_not(
+    tmp_path: Path, project, real_request: RunRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hflow.authorization import resolve_root_binding
+    from hflow.paths import database_path
+
+    spec_path = tmp_path / "task.json"
+    data_dir = tmp_path / "data"
+
+    def binding(driver: str, effective=None, **extra):  # noqa: ANN001, ANN202
+        return current_binding(
+            mode="m2-live-change",
+            driver=driver,
+            project=project,
+            request=real_request,
+            spec_path=spec_path,
+            effective=effective,
+            **extra,
+        )
+
+    real = binding("acpx-dsh", data_dir=data_dir)
+    assert real.ledger_path == str(database_path(data_dir).resolve())
+    assert not data_dir.exists(), "naming the ledger must not create it"
+    # The same directory given relative (HFLOW_DATA_DIR may give it so) names the same ledger.
+    monkeypatch.chdir(tmp_path)
+    assert binding("acpx-dsh", data_dir=Path("data")).digest() == real.digest()
+
+    # Offline bindings keep the shape and the digest they always had, alias included.
+    offline = binding("fake", data_dir=data_dir)
+    assert offline.ledger_path == ""
+    assert offline.digest() == binding("fake").digest()
+    aliased = binding(
+        "fake-offline", _roles(("fake-offline", "fake"), ("fake-offline", "fake")), data_dir=data_dir
+    )
+    assert aliased.ledger_path == ""
+    # A run any of whose roles reaches a real driver is not offline.
+    mixed = binding("fake", _roles(("fake", "fake"), ("acpx-dsh", "acpx-dsh-acp")), data_dir=data_dir)
+    assert mixed.ledger_path == real.ledger_path
+
+    # A root run names its ledger twice, spelled the same way both times.
+    root = resolve_root_binding(project_id=project.project_id, request=real_request, data_dir=data_dir)
+    rooted = binding("acpx-dsh", root_binding=root, data_dir=data_dir)
+    assert rooted.root_budget is not None
+    assert rooted.ledger_path == rooted.root_budget.ledger_path == real.ledger_path
+
+
+def test_a_binding_without_a_ledger_digests_exactly_as_before(
+    tmp_path: Path, project, real_request: RunRequest
+) -> None:
+    """``ledger_path`` is dropped from the digest while empty: an artifact written before it
+    existed keeps the digest its consumed ledger row is keyed by."""
+    real = current_binding(
+        mode="m2-live-change",
+        driver="acpx-dsh",
+        project=project,
+        request=real_request,
+        spec_path=tmp_path / "task.json",
+        data_dir=tmp_path / "data",
+    )
+    without = real.model_copy(update={"ledger_path": ""})
+    document = without.model_dump(mode="json")
+    assert document["ledger_path"] == ""
+    assert without.digest() == digest_of({field: document[field] for field in LEGACY_BINDING_FIELDS})
+    assert real.digest() != without.digest()
+
+
+def test_a_real_run_refuses_an_approval_for_another_ledger_or_for_none(
+    tmp_path: Path, project, real_request: RunRequest
+) -> None:
+    def binding(driver: str, data_dir: Path):  # noqa: ANN202
+        return current_binding(
+            mode="m2-live-change",
+            driver=driver,
+            project=project,
+            request=real_request,
+            spec_path=tmp_path / "task.json",
+            data_dir=data_dir,
+        )
+
+    def approval(bound) -> AuthorizationRecord:  # noqa: ANN001
+        return AuthorizationRecord(
+            authorization_id="AUTH-ledger-1",
+            user_text=USER_TEXT,
+            authorized_at="2026-10-14T00:00:00Z",
+            max_top_level_submissions=2,
+            binding=bound,
+        )
+
+    first = binding("acpx-dsh", tmp_path / "data-one")
+    second = binding("acpx-dsh", tmp_path / "data-two")
+    verify_authorization(approval(first), expected=first)
+
+    with pytest.raises(RefusedError) as excinfo:
+        verify_authorization(approval(first), expected=second)
+    assert excinfo.value.code is RefusalCode.RISK_DOWNGRADE
+    assert "issued for another ledger" in excinfo.value.message
+    assert repr(first.ledger_path) in excinfo.value.message
+    assert repr(second.ledger_path) in excinfo.value.message
+
+    # An artifact that names no ledger could be spent once per data directory.
+    with pytest.raises(RefusedError) as excinfo:
+        verify_authorization(approval(first.model_copy(update={"ledger_path": ""})), expected=first)
+    assert excinfo.value.code is RefusalCode.RISK_DOWNGRADE
+    assert "names no ledger" in excinfo.value.message
+    assert "predates ledger binding" in excinfo.value.message
+
+    # The offline fake names no ledger, so nothing about one is asked of its artifact.
+    offline = binding("fake", tmp_path / "data-one")
+    verify_authorization(approval(offline), expected=offline)
 
 
 def test_an_unchanged_legacy_record_keeps_one_ledger_row(

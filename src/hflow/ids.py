@@ -7,7 +7,7 @@ ID prefixes are part of the readable contract (`R-...` runs, `A-...` attempts,
 from __future__ import annotations
 
 import secrets
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 _ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
 
@@ -19,6 +19,11 @@ def utc_now() -> str:
 
 def parse_ts(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def add_seconds(timestamp: str, seconds: int) -> str:
+    """``timestamp`` (a stored UTC string) plus ``seconds``, in the same textual form."""
+    return (parse_ts(timestamp) + timedelta(seconds=seconds)).isoformat().replace("+00:00", "Z")
 
 
 def new_id(prefix: str, length: int = 10) -> str:

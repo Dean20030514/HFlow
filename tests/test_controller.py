@@ -592,8 +592,6 @@ def test_budget_ceiling_is_enforced_by_the_database_itself(
     store.reserve_turn(run_id, "local-controller", turns=1)
     with pytest.raises(StoreError):
         store.reserve_turn(run_id, "local-controller", turns=1)
-    with pytest.raises(StoreError):
-        store.release_reservation(run_id, 5)
 
 
 # --------------------------------------------------------------------------
@@ -818,14 +816,14 @@ def test_phase_field_tracks_the_checking_stage(
 
 
 def test_scope_denied_path_is_refused_at_admission(
-    run_request: RunRequest, task_spec, project_root: Path
+    controller: Controller, driver, store: Store, run_request: RunRequest, task_spec
 ) -> None:
     """A denied path inside the allow list is refused up front, not silently dropped."""
-    from hflow.admission import assert_admissible
-
     spec = task_spec.model_copy(
         update={"scope": Scope(write_allow=["src/parser.py", ".github/x.yml"])}
     )
     with pytest.raises(RefusedError) as excinfo:
-        assert_admissible(spec, run_request.project, project_root)
+        controller.run_task(run_request.model_copy(update={"task": spec}))
     assert excinfo.value.code is RefusalCode.SCOPE_VIOLATION
+    assert store.list_runs() == [], "a refused admission creates no run"
+    assert driver.started == [], "a refused admission dispatches nothing"

@@ -277,20 +277,32 @@ def system_command_processor(env: Mapping[str, str]) -> Path | None:
     worktree root could run as the launcher. The variable is looked up case-insensitively, as
     Windows does.
     """
-    system_root = next(
-        (value for key, value in env.items() if key.upper() == "SYSTEMROOT" and value), ""
-    )
+    system_root = next((env[key] for key in env_keys(env, "SYSTEMROOT") if env[key]), "")
     if not system_root:
         return None
     candidate = Path(system_root) / "System32" / "cmd.exe"
     return candidate if candidate.is_absolute() and candidate.is_file() else None
 
 
+def env_keys(env: Mapping[str, str], name: str) -> list[str]:
+    """Every key of ``env`` that spells ``name``, in any case.
+
+    Windows reads variable names case-insensitively, so a lookup or a removal that knew only one
+    spelling could be bypassed by another. OS-following callers apply it on Windows only and match
+    the exact name elsewhere, where ``dsh_home`` is not ``DSH_HOME``: :func:`_env_lookup`,
+    ``dsh_surfaces.env_has_name`` and :func:`child_environment`'s removal of the DSH variables.
+    :func:`system_command_processor` and :func:`child_environment`'s handling of
+    ``NoDefaultCurrentDirectoryInExePath`` and ``PATH`` apply it everywhere.
+    """
+    wanted = name.upper()
+    return [key for key in env if key.upper() == wanted]
+
+
 def _env_lookup(env: Mapping[str, str], name: str) -> str:
     """``env[name]``, matched case-insensitively on Windows as the OS does; ``""`` when unset."""
     if os.name != "nt":
         return env.get(name, "")
-    return next((value for key, value in env.items() if key.upper() == name.upper()), "")
+    return next((env[key] for key in env_keys(env, name)), "")
 
 
 def find_on_path(name: str, env: Mapping[str, str]) -> str:
@@ -325,20 +337,8 @@ def find_on_path(name: str, env: Mapping[str, str]) -> str:
 
 
 def _inside_any(program: str, roots: Sequence[Path]) -> Path | None:
-    """The first of ``roots`` that contains ``program`` (as written or with links resolved)."""
-    forms = {
-        os.path.normcase(os.path.abspath(program)),
-        os.path.normcase(os.path.realpath(program)),
-    }
-    for root in roots:
-        for root_form in {
-            os.path.normcase(os.path.abspath(root)),
-            os.path.normcase(os.path.realpath(root)),
-        }:
-            prefix = root_form.rstrip("\\/") + os.sep
-            if any(form == root_form or form.startswith(prefix) for form in forms):
-                return Path(root)
-    return None
+    """The first of ``roots`` that contains ``program`` (:func:`path_inside`)."""
+    return next((Path(root) for root in roots if path_inside(program, root)), None)
 
 
 def build_agent_argv(
@@ -620,6 +620,12 @@ def effective_dsh_home(
     return "per_invocation", Path(child_home) / ".dsh"
 
 
+#: DSH >= 0.2.1-alpha.2 reads ``$DSH_AGENTS_HOME/AGENTS.md`` as user-level instructions (else
+#: ``~/.agents/AGENTS.md``; documented from upstream source, not observed). Removed from every
+#: child environment and never set (:func:`child_environment`).
+DSH_AGENTS_HOME_ENV = "DSH_AGENTS_HOME"
+
+
 def child_environment(
     source: Mapping[str, str], *, extra_env: Mapping[str, str], dsh_home: str
 ) -> dict[str, str]:
@@ -638,6 +644,15 @@ def child_environment(
     ``danger-full-access`` would silently unconfine every role. Choosing a value per role is
     not this driver's decision; inheriting one by accident is ruled out here.
 
+    ``DSH_AGENTS_HOME`` is removed and never set (:data:`DSH_AGENTS_HOME_ENV`): an inherited one
+    would point DSH at an instruction file outside the invocation's own home that no approval
+    binds. Without it DSH falls back to ``~/.agents/AGENTS.md`` under the child's home - the
+    per-invocation home the driver points USERPROFILE/HOME at, created empty.
+
+    These DSH variables are removed in every spelling on Windows, which reads variable names
+    case-insensitively (:func:`env_keys`), and by their exact name elsewhere; a bound
+    ``DSH_HOME`` is then set in exactly that spelling.
+
     ``NoDefaultCurrentDirectoryInExePath=1`` is always set, in exactly that spelling, after
     removing every other spelling: acpx starts the agent with the workspace as its cwd, and
     without it both cmd.exe (the npm DSH batch shim runs a bare ``node`` unless a node.exe sits
@@ -648,16 +663,15 @@ def child_environment(
     """
     env = dict(source)
     env.update(extra_env)
+    for name in ("DSH_HOME", *STRIPPED_DSH_ENV, DSH_AGENTS_HOME_ENV):
+        for key in env_keys(env, name) if os.name == "nt" else [name]:
+            env.pop(key, None)
     if dsh_home:
         env["DSH_HOME"] = dsh_home
-    else:
-        env.pop("DSH_HOME", None)
-    for name in STRIPPED_DSH_ENV:
-        env.pop(name, None)
-    for key in [key for key in env if key.upper() == NO_CWD_EXE_SEARCH_ENV.upper()]:
+    for key in env_keys(env, NO_CWD_EXE_SEARCH_ENV):
         del env[key]
     env[NO_CWD_EXE_SEARCH_ENV] = "1"
-    for key in [key for key in env if key.upper() == "PATH"]:
+    for key in env_keys(env, "PATH"):
         env[key] = os.pathsep.join(
             entry
             for entry in env[key].split(os.pathsep)
@@ -977,6 +991,20 @@ def _path_forms(path: str | Path) -> set[str]:
 
 def _same_or_inside(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip("\\/") + os.sep)
+
+
+def path_inside(path: str | Path, root: str | Path) -> bool:
+    """``path`` is ``root`` or lies below it, as written or with links resolved.
+
+    The one containment rule of the launch checks. Both forms of both paths are compared
+    case-folded (:func:`_path_forms`), so a refusal built on it cannot be bypassed by spelling
+    a path in another case. Raises like :func:`_path_forms`.
+    """
+    return any(
+        _same_or_inside(form, root_form)
+        for form in _path_forms(path)
+        for root_form in _path_forms(root)
+    )
 
 
 def dsh_home_workspace_problem(dsh_home: str, workspaces: Sequence[Path]) -> str:
@@ -1357,10 +1385,8 @@ class AcpxDshDriver:
         try:
             from .dsh_surfaces import observe_launch_surfaces, probe_notes
 
-            kind, home = effective_dsh_home(
-                self.launch,
-                child_home=child_home_for(self.data_dir.resolve(), INVOCATION_ID_PLACEHOLDER),
-            )
+            probe_home = child_home_for(self.data_dir.resolve(), INVOCATION_ID_PLACEHOLDER)
+            kind, home = effective_dsh_home(self.launch, child_home=probe_home)
             notes.extend(
                 probe_notes(
                     observe_launch_surfaces(
@@ -1370,6 +1396,7 @@ class AcpxDshDriver:
                         child_env=self._child_env(self.data_dir),
                         workspace=None,
                         look_in_home=kind == "bound",
+                        child_home=probe_home,
                     )
                 )
             )
@@ -1567,7 +1594,12 @@ class AcpxDshDriver:
 
             kind, home = effective_dsh_home(self.launch, child_home=child_home)
             self._launch_surfaces[invocation_id] = observe_launch_surfaces(
-                self.launch, dsh_home=home, dsh_home_kind=kind, child_env=env, workspace=workspace
+                self.launch,
+                dsh_home=home,
+                dsh_home_kind=kind,
+                child_env=env,
+                workspace=workspace,
+                child_home=child_home,
             )
         except Exception as exc:  # noqa: BLE001 - an observation must never stop a launch
             self._launch_surfaces[invocation_id] = None

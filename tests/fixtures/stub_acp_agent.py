@@ -37,7 +37,9 @@ Each mode models one behaviour the driver must handle honestly:
                   updates *after* it, see ``emit_trailing_updates``; ``STUB_REPORTED_USAGE=1``
                   adds agent-reported usage and cost, see ``emit_usage_update``;
                   ``STUB_DIE_MID_TURN`` (and ``STUB_REVIEWER_DIE_MID_TURN``) ends the agent
-                  process mid-turn with no response at all, see ``die_mid_turn``.
+                  process mid-turn with no response at all, see ``die_mid_turn``;
+                  ``STUB_PENDING_OUTPUT`` streams a subagent's work after the final message
+                  and before the terminal response, see ``emit_pending_output``.
 
 Invoked as: ``python stub_acp_agent.py <mode> --task-file -`` with the prompt on stdin.
 """
@@ -386,6 +388,72 @@ def die_mid_turn(stage: str, *, reviewer: bool) -> None:
     os._exit(int(code or "1"))
 
 
+def emit_pending_output(session_id: str) -> None:
+    """A subagent's work that the turn waits for before it answers the prompt.
+
+    ``STUB_PENDING_OUTPUT`` is ``<updates>:<seconds>``: a ``tool_call`` that starts a subagent,
+    then ``<updates>`` in-progress ``tool_call_update`` notifications carrying its output, each
+    after ``<seconds>`` of silence, then the completed ``tool_call_update``. DSH from
+    dsh-v0.2.1-alpha.2 answers ``session/prompt`` only after subagents and pending output finish
+    (upstream 50da6f0b / 7304af57 / 323ec4db; documented, not observed), so a turn's last updates
+    can arrive well after its final message. Tool updates are never answer text, so a reviewer's
+    final message stays its answer. Unset or empty: nothing is sent.
+    """
+    spec = os.environ.get("STUB_PENDING_OUTPUT", "")
+    if not spec:
+        return
+    count, _, seconds = spec.partition(":")
+    call = {"toolCallId": "call-subagent-1"}
+    emit(
+        {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    **call,
+                    "title": "subagent",
+                    "kind": "other",
+                    "status": "in_progress",
+                },
+            },
+        }
+    )
+    for index in range(int(count)):
+        time.sleep(float(seconds or "0"))
+        emit(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        **call,
+                        "status": "in_progress",
+                        "content": [
+                            {
+                                "type": "content",
+                                "content": {"type": "text", "text": f"subagent output {index + 1}"},
+                            }
+                        ],
+                    },
+                },
+            }
+        )
+    emit(
+        {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {"sessionUpdate": "tool_call_update", **call, "status": "completed"},
+            },
+        }
+    )
+
+
 def verdict_document(verdict: str, detail: str) -> str:
     """The reviewer's answer, in the form the recorded reviewer actually produced."""
     payload = json.dumps(
@@ -468,6 +536,7 @@ def structured_turn(session_id: str, task: str, scratch: Path) -> int:
             session_id, "The change is inside src/parser.py.", "m-2", with_id=with_ids
         )
         die_mid_turn("answer", reviewer=False)
+        emit_pending_output(session_id)
         if os.environ.get("STUB_REPORTED_USAGE") == "1":
             emit_usage_update(session_id)
         errored = emit_terminal_responses(session_id, reviewer=False)
@@ -521,6 +590,7 @@ def structured_turn(session_id: str, task: str, scratch: Path) -> int:
                 if index == 0:
                     die_mid_turn("partial", reviewer=True)
     die_mid_turn("answer", reviewer=True)
+    emit_pending_output(session_id)
     if os.environ.get("STUB_REPORTED_USAGE") == "1":
         emit_usage_update(session_id)
     errored = emit_terminal_responses(session_id, reviewer=True)

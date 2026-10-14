@@ -19,7 +19,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
@@ -28,9 +27,6 @@ from typing import IO
 #: are read, counted and digested but not written: a true bound needs a bounded amount of memory
 #: as well as a bounded file, which is why the reader never accumulates the whole stream.
 DEFAULT_STREAM_LIMIT_BYTES = 8 * 1024 * 1024
-#: Bytes kept for the run's whole invocation budget. Reserved for the driver's own logs, which
-#: are kept separately; it exists here so the two limits are declared in one place.
-DEFAULT_INVOCATION_LIMIT_BYTES = 32 * 1024 * 1024
 #: How much of a stream's head is quoted into an evidence row's detail text.
 DEFAULT_EXCERPT_BYTES = 2000
 
@@ -370,8 +366,3 @@ def write_artifact_manifest(directory: Path, payload: dict[str, object]) -> Path
     path = directory / "artifact.json"
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     return path
-
-
-def python_interpreter() -> str:
-    """The interpreter running this code, used only to describe the runtime in a manifest."""
-    return sys.executable

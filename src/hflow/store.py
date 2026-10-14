@@ -26,7 +26,6 @@ import sqlite3
 import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -69,7 +68,7 @@ from .contracts import (
     digest_of,
     json_schema,
 )
-from .ids import new_attempt_id, new_evidence_id, new_id, parse_ts, utc_now
+from .ids import add_seconds, new_attempt_id, new_evidence_id, new_id, parse_ts, utc_now
 from .migrate import (
     MIGRATION_BACKUP_SUFFIX as MIGRATION_BACKUP_SUFFIX,
     STORAGE_VERSION as STORAGE_VERSION,
@@ -164,13 +163,6 @@ _TERMINAL_STATES: tuple[str, ...] = (
 #: state, or a delivery receipt - is never relabelled. Its three placeholders take
 #: ``_TERMINAL_STATES``.
 _LIVE_RUN_GUARD = "task_state NOT IN (?, ?, ?) AND receipt_json IS NULL"
-
-
-def _add_seconds(timestamp: str, seconds: int) -> str:
-    """``timestamp`` (a stored UTC string) plus ``seconds``, in the same textual form."""
-    return (
-        (parse_ts(timestamp) + timedelta(seconds=seconds)).isoformat().replace("+00:00", "Z")
-    )
 
 
 def _invocation_from_row(row: sqlite3.Row) -> InvocationIntent:
@@ -925,18 +917,6 @@ class Store:
             )
             return cur.rowcount == 1
 
-    def save_receipt(self, run_id: str, receipt: ResultReceipt) -> None:
-        """Persist a receipt without touching state.
-
-        Prefer :meth:`finalize_acceptance`; this exists for the rare case of repairing a
-        receipt on an already terminal run, and callers must still go through admission.
-        """
-        with self.transaction() as conn:
-            conn.execute(
-                "UPDATE runs SET receipt_json = ?, updated_at = ? WHERE run_id = ?",
-                (canonical_json(receipt.model_dump(mode="json")), utc_now(), run_id),
-            )
-
     def add_turns_observed(self, run_id: str, turns: int) -> None:
         """Add one applied implementer result's self-reported turns to the run's total.
 
@@ -1199,20 +1179,6 @@ class Store:
         raise StoreError(
             f"budget exhausted for {run_id}: {row['turns_reserved']}/{row['turn_limit']} turns reserved"
         )
-
-    def release_reservation(self, run_id: str, turns: int) -> None:
-        """Give budget back only when a dispatch provably never reached a model."""
-        with self.transaction() as conn:
-            cur = conn.execute(
-                """
-                UPDATE runs
-                   SET turns_reserved = turns_reserved - ?, updated_at = ?
-                 WHERE run_id = ? AND turns_reserved >= ?
-                """,
-                (turns, utc_now(), run_id, turns),
-            )
-            if cur.rowcount != 1:
-                raise StoreError(f"cannot release {turns} turn(s) for {run_id}: underflow")
 
     def turns_remaining(self, run_id: str) -> int:
         row = self.get_run(run_id)
@@ -2100,7 +2066,7 @@ class Store:
                 canonical_json(authorization_ids),
                 first_dispatch_at,
                 row["deadline_at"]
-                or _add_seconds(first_dispatch_at, int(row["deadline_seconds"])),
+                or add_seconds(first_dispatch_at, int(row["deadline_seconds"])),
                 now,
                 root_binding.root_id,
             ),
@@ -2401,10 +2367,11 @@ class Store:
     ) -> bool:
         """Record a launch that happened, without a driver-reported spawn fact.
 
-        Kept for store-level callers and for a driver that does not implement the spawn report.
-        The controller does **not** use it on the launch path: it records a launch *request*
-        before asking a driver and takes the launch and process facts from the driver's report,
-        because assuming that asking means launching is the error this split exists to prevent.
+        Kept for store-level tests; nothing in ``src`` calls it. The controller records a launch
+        *request* before asking a driver and takes the launch and process facts from the driver's
+        report (:meth:`record_invocation_spawn`, also the path for the controller's own bounded
+        inference when a driver reports nothing), because assuming that asking means launching is
+        the error this split exists to prevent.
 
         ``process_created`` is what decides the process fact: a caller that knows no child exists
         (the offline path) must pass ``process_created=False``, which records the launch without
@@ -2732,11 +2699,6 @@ class Store:
             (run_id,),
         )
 
-    def attempt_by_invocation(self, invocation_id: str) -> sqlite3.Row | None:
-        return self._fetchone(
-            "SELECT * FROM attempts WHERE invocation_id = ?", (invocation_id,)
-        )
-
     def dispatch_attempt(
         self,
         *,
@@ -2748,11 +2710,13 @@ class Store:
         reserved_turns: int,
         reservation_expires_at: str,
     ) -> sqlite3.Row:
-        """Reserve budget **and** record dispatch intent in one transaction.
+        """Legacy: reserve run budget **and** create the attempt row in one transaction.
 
-        This is the only sanctioned way to start an attempt. If anything inside the
-        transaction fails, both the reservation and the attempt disappear: there is
-        no state where budget was spent on a dispatch that never happened.
+        Not the production path. Live dispatch goes through :meth:`reserve_dispatch`, which also
+        checks the stop, the root ledger and the authorization and writes the invocation row. This
+        run-and-attempt-only form is kept for the offline replay tool
+        (``tools/m2_live/replay_review.py``) and store-level tests. It still keeps rule 1: if
+        anything inside the transaction fails, both the reservation and the attempt disappear.
         """
         with self.transaction():
             self._reserve_turn_locked(run_id, controller_id, turns=reserved_turns)
@@ -2898,15 +2862,6 @@ class Store:
                 "UPDATE attempts SET review_invocation_id = ? WHERE attempt_id = ?",
                 (invocation_id, attempt_id),
             )
-
-    def reserve_review_turn(self, run_id: str, controller_id: str) -> None:
-        """Reserve the review turn. Refuses when the ceiling cannot cover it (plan 10.3).
-
-        Kept separate from dispatch so a run that can afford implementation but not
-        review stops *before* the review is bought, instead of discovering it after.
-        """
-        with self.transaction():
-            self._reserve_turn_locked(run_id, controller_id, turns=1)
 
     def attach_review_result(self, attempt_id: str, payload: dict[str, Any]) -> None:
         """Record that a review invocation happened for this attempt."""
@@ -3389,33 +3344,14 @@ class Store:
     def claim_authorized_submission(self, authorization_id: str) -> int:
         """Consume one top-level submission from an authorization, atomically.
 
-        The UPDATE is the gate and the CHECK constraint is the backstop, mirroring budget
-        reservation: a restart, a new run id or a resubmitted identical spec cannot restore
-        allowance. A refusal means "do not dispatch", not "dispatch and hope".
+        Not the production path: :meth:`reserve_dispatch` charges the authorization in the same
+        transaction as the dispatch. This standalone form, with the same gate, is kept for tests
+        that spend or exhaust an authorization directly: a restart, a new run id or a resubmitted
+        identical spec cannot restore allowance.
         """
         with self.transaction() as conn:
-            cur = conn.execute(
-                """
-                UPDATE authorizations
-                   SET used_top_level_submissions = used_top_level_submissions + 1
-                 WHERE authorization_id = ?
-                   AND used_top_level_submissions + 1 <= max_top_level_submissions
-                """,
-                (authorization_id,),
-            )
-            if cur.rowcount != 1:
-                row = conn.execute(
-                    "SELECT used_top_level_submissions, max_top_level_submissions FROM authorizations "
-                    "WHERE authorization_id = ?",
-                    (authorization_id,),
-                ).fetchone()
-                if row is None:
-                    raise StoreError(f"unknown authorization {authorization_id}")
-                raise StoreError(
-                    f"authorization {authorization_id} is exhausted: "
-                    f"{row['used_top_level_submissions']}/{row['max_top_level_submissions']} "
-                    "top-level submissions used"
-                )
+            self._check_authorization_locked(conn, authorization_id, None)
+            self._claim_authorization_locked(conn, authorization_id)
             row = conn.execute(
                 "SELECT used_top_level_submissions FROM authorizations WHERE authorization_id = ?",
                 (authorization_id,),
@@ -3539,32 +3475,6 @@ class Store:
             if cur.rowcount != 1:
                 raise StoreError(f"run {run_id} is not RUNNING; cannot enter CHECKING")
             return conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
-
-    def start_repair_cycle(self, run_id: str, controller_id: str) -> int:
-        """Bounded repair cycle (plan 10.4); refuses when the cycle budget is spent."""
-        with self.transaction() as conn:
-            row = conn.execute(
-                "SELECT repairs_used, repair_limit, claimed_by FROM runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-            if row is None:
-                raise RunNotFound(run_id)
-            if row["claimed_by"] != controller_id:
-                raise StoreError(f"run {run_id} is owned by {row['claimed_by']!r}")
-            if row["repairs_used"] + 1 > row["repair_limit"]:
-                raise StoreError(
-                    f"repair budget exhausted for {run_id}: "
-                    f"{row['repairs_used']}/{row['repair_limit']} cycles used"
-                )
-            conn.execute(
-                """
-                UPDATE runs
-                   SET repairs_used = repairs_used + 1, current_attempt_id = NULL,
-                       task_state = ?, phase = NULL, updated_at = ?
-                 WHERE run_id = ?
-                """,
-                (TaskState.READY.value, utc_now(), run_id),
-            )
-            return int(row["repairs_used"]) + 1
 
     def reopen_for_repair(
         self, run_id: str, controller_id: str, *, fence: OwnerFence | None = None
@@ -3842,28 +3752,6 @@ class Store:
         )
         assert row is not None
         return int(row["implementer"]), int(row["reviewer"])
-
-    def reserved_turns_and_attempts(self, run_id: str) -> tuple[int, int]:
-        """``(turns_reserved, attempt_count)`` read in **one statement**.
-
-        Two separate reads are two snapshots: a dispatch can commit between them, and an
-        observer would then see a budget that looks smaller than the attempts it covers. That
-        skew is an artifact of the observation, not of the transaction, so a consistency check
-        has to observe both facts at once - a single SQL statement is a single snapshot.
-        """
-        row = self._fetchone(
-            """
-            SELECT
-                r.turns_reserved AS reserved,
-                (SELECT COUNT(*) FROM attempts a WHERE a.run_id = r.run_id) AS attempts
-              FROM runs r
-             WHERE r.run_id = ?
-            """,
-            (run_id,),
-        )
-        if row is None:
-            raise RunNotFound(run_id)
-        return int(row["reserved"]), int(row["attempts"])
 
     # -- operator settlement of an unresolved ledger entry (ruling 2026-10-03) --------------
 

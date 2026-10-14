@@ -6,7 +6,6 @@ Run directly: `python tools/m0_probe/check_process_boundary.py`
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path

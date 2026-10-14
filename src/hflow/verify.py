@@ -1163,26 +1163,6 @@ def _detail_with_references(outcome: CheckOutcome) -> str:
     return " ".join(references)
 
 
-def evidence_is_current(
-    rows: Iterable[dict[str, object]],
-    *,
-    status: str,
-    candidate_fingerprint: str,
-    checks_digest: str,
-) -> bool:
-    """True only if a stored row matches every freshness key.
-
-    Kept as a standalone predicate so ``controller._accept`` and the tests agree on
-    what "current evidence" means instead of each re-implementing the comparison.
-    """
-    return any(
-        row.get("status") == status
-        and row.get("candidate_fingerprint") == candidate_fingerprint
-        and row.get("checks_digest") == checks_digest
-        for row in rows
-    )
-
-
 # --------------------------------------------------------------------------
 # The facts a repair decision reads (batch E2)
 # --------------------------------------------------------------------------

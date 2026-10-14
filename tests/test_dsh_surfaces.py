@@ -275,15 +275,22 @@ def test_only_names_of_dsh_variables_that_reach_the_child_are_recorded(tmp_path:
         extra_env={},
         dsh_home="",
     )
+    child_home = tmp_path / "child-home"
     surfaces = observe_launch_surfaces(
         _launch(),
-        dsh_home=tmp_path / "home",
+        dsh_home=child_home / ".dsh",
         dsh_home_kind="per_invocation",
         child_env=child_env,
         look_in_home=False,
+        child_home=child_home,
     )
-    assert surfaces.dsh_env_names == ["DSH_AGENTS_HOME", "DSH_TELEMETRY_DISABLED"]
+    # An inherited DSH_AGENTS_HOME is removed like the mode variables and DSH_HOME, so the
+    # user-level agents file DSH would read is the default in the child's own home.
+    assert surfaces.dsh_env_names == ["DSH_TELEMETRY_DISABLED"]
     assert "tele-sentinel" not in surfaces.model_dump_json()
+    entry = surfaces.user_agents_file
+    assert entry is not None and entry.name == "~/.agents/AGENTS.md"
+    assert entry.path == str(child_home / ".agents" / "AGENTS.md")
 
 
 def _package(directory: Path, name: str, version: str) -> Path:
@@ -456,3 +463,179 @@ def test_a_per_invocation_home_before_dispatch_is_named_but_not_looked_into(
         bound,
     )
     assert list(tmp_path.iterdir()) == [], "naming a home creates nothing"
+
+
+# --------------------------------------------------------------------------
+# the user-level agents file (DSH >= 0.2.1-alpha.2, documented upstream, not observed)
+# --------------------------------------------------------------------------
+
+
+def _agents_file(directory: Path, text: str) -> bytes:
+    directory.mkdir(parents=True, exist_ok=True)
+    data = text.encode("utf-8")
+    (directory / "AGENTS.md").write_bytes(data)
+    return data
+
+
+def test_the_user_agents_file_follows_dsh_agents_home_when_it_reaches_the_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agents_home = tmp_path / "agents-home"
+    data = _agents_file(agents_home, "# user-level rules\n")
+    child_home = tmp_path / "child-home"
+    _agents_file(child_home / ".agents", "# the default, not read while the variable is set\n")
+    reads = _record_reads(monkeypatch)
+
+    surfaces = observe_launch_surfaces(
+        _launch(),
+        dsh_home=child_home / ".dsh",
+        dsh_home_kind="per_invocation",
+        child_env={"DSH_AGENTS_HOME": str(agents_home)},
+        look_in_home=False,
+        child_home=child_home,
+    )
+
+    entry = surfaces.user_agents_file
+    assert entry is not None
+    assert entry.name == "$DSH_AGENTS_HOME/AGENTS.md"
+    assert entry.path == str(agents_home / "AGENTS.md")
+    assert entry.present is True and entry.kind == "file"
+    assert entry.size == len(data) and entry.sha256 == _sha(data)
+    assert reads == [agents_home / "AGENTS.md"], "one bounded read, of that file only"
+    note = next(
+        note for note in dsh_surfaces.probe_notes(surfaces) if note.startswith("user-level agents")
+    )
+    assert "DSH >= 0.2.1-alpha.2" in note and "documented, not observed" in note
+    assert _sha(data) in note and str(agents_home / "AGENTS.md") in note
+
+    if os.name == "nt":
+        lower = dsh_surfaces.user_agents_file(
+            {"dsh_agents_home": str(agents_home)}, child_home=child_home
+        )
+        assert lower.sha256 == _sha(data), "Windows variable names are case-insensitive"
+
+    # A file over the hash cap is recorded by size, without a digest - the same bounded read.
+    monkeypatch.setattr(dsh_surfaces, "SURFACE_HASH_LIMIT_BYTES", 4)
+    capped = dsh_surfaces.user_agents_file({"DSH_AGENTS_HOME": str(agents_home)})
+    assert capped.present is True and capped.size == len(data) and capped.sha256 == ""
+    assert "not read" in capped.detail
+
+
+def test_without_dsh_agents_home_the_user_agents_file_is_in_the_childs_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child_home = tmp_path / "child-home"
+    data = _agents_file(child_home / ".agents", "# in the child's home\n")
+
+    given = dsh_surfaces.user_agents_file({}, child_home=child_home)
+    assert given.name == "~/.agents/AGENTS.md"
+    assert given.path == str(child_home / ".agents" / "AGENTS.md")
+    assert given.sha256 == _sha(data)
+
+    # Without a known child home: the variable os.homedir() reads in the child (USERPROFILE on
+    # Windows, HOME elsewhere), then this process's home.
+    variable = "USERPROFILE" if os.name == "nt" else "HOME"
+    from_env = dsh_surfaces.user_agents_file({variable: str(child_home)})
+    assert from_env.path == given.path and from_env.sha256 == _sha(data)
+    fallback = tmp_path / "process-home"
+    fallback_data = _agents_file(fallback / ".agents", "# this process's home\n")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fallback))
+    from_process = dsh_surfaces.user_agents_file({})
+    assert from_process.path == str(fallback / ".agents" / "AGENTS.md")
+    assert from_process.sha256 == _sha(fallback_data)
+
+
+def test_an_absent_or_unresolvable_user_agents_file_is_recorded_and_nothing_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child_home = tmp_path / "child-home"
+    child_home.mkdir()
+    absent = dsh_surfaces.user_agents_file({}, child_home=child_home)
+    assert absent.present is False and absent.kind == "absent"
+    assert absent.path == str(child_home / ".agents" / "AGENTS.md")
+    set_but_absent = dsh_surfaces.user_agents_file({"DSH_AGENTS_HOME": str(tmp_path / "none")})
+    assert set_but_absent.name == "$DSH_AGENTS_HOME/AGENTS.md"
+    assert set_but_absent.present is False and set_but_absent.kind == "absent"
+
+    reads = _record_reads(monkeypatch)
+    for value, why in (("", "empty"), ("rel-agents", "a relative path")):
+        unresolved = dsh_surfaces.user_agents_file(
+            {"DSH_AGENTS_HOME": value}, child_home=child_home
+        )
+        assert unresolved.present is None and unresolved.kind == "unknown"
+        assert f"DSH_AGENTS_HOME is {why}" in unresolved.detail
+        assert "not looked into" in unresolved.detail
+
+    # Before dispatch the per-invocation home is a name: it is not looked into or created.
+    placeholder = child_home_for(tmp_path / "data", INVOCATION_ID_PLACEHOLDER)
+    named = dsh_surfaces.user_agents_file({}, child_home=placeholder)
+    assert named.present is None and named.kind == "unknown"
+    assert named.path == str(placeholder / ".agents" / "AGENTS.md")
+    assert "named, not looked into" in named.detail
+    assert reads == []
+    assert not (tmp_path / "data").exists()
+
+    # A record made before the field existed still loads, and the probe says so.
+    legacy = observe_launch_surfaces(
+        _launch(),
+        dsh_home=placeholder / ".dsh",
+        dsh_home_kind="per_invocation",
+        child_env={},
+        look_in_home=False,
+        child_home=placeholder,
+    ).model_dump(mode="json")
+    legacy.pop("user_agents_file")
+    restored = LaunchSurfaces.model_validate(legacy)
+    assert restored.user_agents_file is None
+    assert any(
+        note.endswith("not recorded")
+        for note in dsh_surfaces.probe_notes(restored)
+        if note.startswith("user-level agents")
+    )
+
+
+def test_the_driver_records_the_user_agents_file_at_spawn_and_in_its_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hflow.contracts import AgentBinding, InvocationOutcome
+
+    from .test_driver_acpx_dsh import DriverHarness
+
+    monkeypatch.delenv("DSH_HOME", raising=False)
+    monkeypatch.delenv("DSH_AGENTS_HOME", raising=False)
+    harness = DriverHarness(tmp_path / "default", "cooperative")
+    probe = harness.driver.probe(AgentBinding(harness="dsh", driver=DRIVER_ID))
+    (note,) = [note for note in probe.notes if note.startswith("user-level agents file")]
+    assert "<invocation-id>" in note and "named, not looked into" in note
+    handle, _ = harness.start()
+    result = harness.driver.collect(handle)
+    harness.driver.release(handle.invocation_id)
+    assert result.outcome is InvocationOutcome.COMPLETED
+    assert result.launch_surfaces is not None
+    entry = result.launch_surfaces.user_agents_file
+    assert entry is not None and entry.name == "~/.agents/AGENTS.md"
+    child_home = (harness.data_dir / "invocations" / "I-1" / "home").resolve()
+    assert entry.path == str(child_home / ".agents" / "AGENTS.md")
+    assert entry.present is False, "the invocation's own home is created empty"
+
+    # An inherited DSH_AGENTS_HOME never reaches the child: DSH would read an instruction file
+    # outside the invocation's home that no approval binds. The record is the child-home default.
+    agents_home = tmp_path / "user-agents"
+    data = _agents_file(agents_home, "# rules every DSH session on this machine reads\n")
+    monkeypatch.setenv("DSH_AGENTS_HOME", str(agents_home))
+    configured = DriverHarness(tmp_path / "set", "cooperative")
+    probe = configured.driver.probe(AgentBinding(harness="dsh", driver=DRIVER_ID))
+    (note,) = [note for note in probe.notes if note.startswith("user-level agents file")]
+    assert _sha(data) not in note and str(agents_home) not in note, note
+    assert "<invocation-id>" in note, note
+    handle, _ = configured.start()
+    result = configured.driver.collect(handle)
+    configured.driver.release(handle.invocation_id)
+    assert result.outcome is InvocationOutcome.COMPLETED
+    entry = result.launch_surfaces.user_agents_file if result.launch_surfaces else None
+    assert entry is not None and entry.name == "~/.agents/AGENTS.md"
+    child_home = (configured.data_dir / "invocations" / "I-1" / "home").resolve()
+    assert entry.path == str(child_home / ".agents" / "AGENTS.md")
+    assert entry.present is False, "the invocation's own home is created empty"
+    assert "DSH_AGENTS_HOME" not in result.launch_surfaces.dsh_env_names
+    assert _sha(data) not in result.model_dump_json()

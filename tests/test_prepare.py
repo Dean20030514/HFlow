@@ -407,6 +407,7 @@ def test_prepare_and_run_resolve_one_configuration(
         request=resolve().request(),
         spec_path=task_file,
         effective=resolve().effective,
+        data_dir=data_dir,
     )
     assert shown.authorization.binding_digest == expected.digest()
     assert shown.authorization.binding == expected.model_dump(mode="json")
@@ -1484,3 +1485,16 @@ def test_the_dispatch_preconditions_are_the_ones_the_run_gate_raises(
         implementer_writes=resolved.effective.implementer_writes,
         launches=[],
     )[0].detail == report.dispatch_preconditions[0].detail
+
+
+def test_a_contract_file_that_is_not_utf8_is_refused_not_a_traceback(tmp_path: Path) -> None:
+    from hflow.prepare import load_project_contract
+
+    contract = tmp_path / "project.json"
+    contract.write_bytes(b'{"project_id": "\xff"}')
+
+    with pytest.raises(RefusedError) as excinfo:
+        load_project_contract(contract)
+
+    assert excinfo.value.code.value == "invalid_spec"
+    assert "not valid UTF-8 JSON" in excinfo.value.message

@@ -29,12 +29,11 @@ No step here calls a model, dispatches an agent or spends any budget.
 from __future__ import annotations
 
 import json
-import os
-import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .authorization import project_contract_digest
 from .contracts import (
     DeliveryState,
     IntegrationReceipt,
@@ -49,9 +48,9 @@ from .contracts import (
     VerificationResult,
 )
 from .gitworkspace import MIN_INTEGRATION_GIT, GitError, GitRepo
+from .hints import hflow_command, named_data_dir, shell_word
 from .ids import new_integration_id, utc_now
 from .ownership import ProcessIdentity, current_identity, probe
-from .paths import database_path, default_data_dir
 from .store import IntegrationConflict, IntegrationNotFound, Store
 from .verify import CheckRunners, verify_candidate
 from .workspace import candidate_fingerprint, paths_outside_scope
@@ -218,6 +217,7 @@ def prepare_integration(
             f"{project.checks_digest()} vs the run's {row['checks_digest']}); an integration is "
             "checked with the checks the run was accepted under, so use that contract",
         )
+    _refuse_another_contract(store, run_id, project)
     check_map = project.check_map()
     for check_id in spec.required_check_ids():
         check = check_map.get(check_id)
@@ -322,6 +322,62 @@ def prepare_integration(
         )
     except (GitError, OSError) as exc:
         return _fail(store, repo, record.integration_id, f"integration could not be prepared: {exc}")
+
+
+def recorded_project_file(store: Store, run_id: str) -> Path | None:
+    """``<project root>/.hflow/project.json`` when it is the contract ``run_id`` was admitted under.
+
+    The default ``prepare`` and ``run`` read when no ``--project`` is given, at the project root
+    the run's admission binding recorded - returned only when that binding also recorded the
+    whole contract digest and the file there still digests to it. ``None`` otherwise (a run
+    admitted before the digest was bound, a contract kept elsewhere, an edited, unreadable or
+    undecodable file, an admission record that cannot be read): the operator then names the
+    contract with ``--project``, and a run record that cannot be read surfaces there, through the
+    command's own error mapping - never as a traceback from looking for a default. Reads one file;
+    no model.
+    """
+    from pydantic import ValidationError
+
+    from .prepare import load_project_contract
+    from .store import StoredRecordUnreadable
+
+    try:
+        binding = store.admission_binding_for(run_id)
+        if binding is None or not binding.project_contract_digest or not binding.project_root:
+            return None
+        candidate = Path(binding.project_root) / ".hflow" / "project.json"
+        project = load_project_contract(candidate)
+    # ValueError covers UnicodeDecodeError (a file that is not UTF-8) and an unusable path.
+    except (StoredRecordUnreadable, ValidationError, ValueError, OSError, RefusedError):
+        return None
+    if project_contract_digest(project) != binding.project_contract_digest:
+        return None
+    return candidate
+
+
+def _refuse_another_contract(store: Store, run_id: str, project: ProjectConfig) -> None:
+    """Refuse a contract other than the one the run was admitted under (AGENTS rule 11).
+
+    The checks digest pins the checks' argv and timeouts, not the rest of what the run was judged
+    by: ``write_deny``, the limits, the review floor. The run's admission binding records the
+    digest of the whole contract (``project_contract_digest``), so a contract that differs in any
+    of it - a weaker ``write_deny``, a dropped review floor - is refused before anything is
+    recorded. A run admitted before that binding existed records no digest and is held to its
+    checks digest alone.
+    """
+    binding = store.admission_binding_for(run_id)
+    recorded = binding.project_contract_digest if binding is not None else ""
+    if not recorded:
+        return
+    actual = project_contract_digest(project)
+    if actual != recorded:
+        raise _refuse(
+            RefusalCode.PROJECT_MISMATCH,
+            f"the project contract differs from the one run {run_id} was admitted under "
+            f"(contract digest {actual} vs the run's {recorded}): an accepted delivery is "
+            "re-checked only under the contract it was accepted under, never a changed one. "
+            "Pass that project.json; nothing was written",
+        )
 
 
 def _refuse_if_already_integrated(
@@ -621,67 +677,19 @@ def _release_worktree(repo: GitRepo, record: IntegrationRecord) -> tuple[str, st
     return "REMOVED", ""
 
 
-#: Characters PowerShell reads inside a double-quoted string: ``$`` and the backtick expand, and
-#: the typographic double quotes end the string as ``"`` does.
-_POWERSHELL_DOUBLE_QUOTED_SPECIAL = frozenset('"`$\u201c\u201d\u201e')
-#: The characters PowerShell takes for a single quote; doubling one keeps it literal.
-_POWERSHELL_SINGLE_QUOTES = frozenset("'\u2018\u2019\u201a\u201b")
-
-
-def _shell_word(text: str, *, windows: bool = os.name == "nt") -> str:
-    """The path ``text`` as one word of a command an operator pastes into their shell.
-
-    A printed command is for PowerShell on Windows (PowerShell 7 or Windows PowerShell 5.1) and
-    for ``sh`` elsewhere - not for cmd.exe, which expands ``%VAR%`` inside double quotes and hands
-    PowerShell's single quotes to the program as part of the argument. On Windows a path goes in
-    double quotes unless it holds a character PowerShell would expand there or end the string at;
-    then it goes in PowerShell's literal single quotes, each single quote doubled. A path ending
-    in a backslash - a root, ``C:\\`` or ``\\\\server\\share\\``, is the only directory printed
-    with one - gets a ``.`` appended first: the same directory, with no backslash before the
-    closing quote. Windows PowerShell 5.1 re-quotes an argument that holds a space for the program,
-    and a backslash there escapes that quote (observed: ``"C:\\my dir\\" next`` reached the program
-    as the one argument ``C:\\my dir" next``). Elsewhere :func:`shlex.quote`.
-    """
-    if not windows:
-        return shlex.quote(text)
-    if text.endswith("\\"):
-        text += "."
-    if not any(char in _POWERSHELL_DOUBLE_QUOTED_SPECIAL for char in text):
-        return f'"{text}"'
-    doubled = (char * 2 if char in _POWERSHELL_SINGLE_QUOTES else char for char in text)
-    return "'" + "".join(doubled) + "'"
-
-
-def _named_data_dir(store: Store) -> str | None:
-    """The data directory a printed command must name, or ``None`` when the default reaches it.
-
-    ``--data-dir`` selects the ledger (``<data-dir>/hflow.sqlite``) an ``hflow`` command opens,
-    and an integration exists only in the ledger it was prepared in. A command printed without
-    it opens the default ledger (``HFLOW_DATA_DIR``, else the platform directory) and exits 4
-    (unknown integration) for anyone who passed another one. Absolute, so the command works from
-    any working directory.
-    """
-    path = getattr(store, "path", None)
-    if path is None or str(path) == ":memory:":
-        return None
-    ledger = os.path.normcase(os.path.abspath(path))
-    if ledger == os.path.normcase(os.path.abspath(database_path(default_data_dir()))):
-        return None
-    return os.path.dirname(os.path.abspath(path))
+#: Moved to :mod:`hflow.hints`, which every command's printed next steps share; kept under their
+#: old names because other modules and tests import them from here.
+_shell_word = shell_word
+_named_data_dir = named_data_dir
 
 
 def _hflow_command(store: Store, *words: str) -> str:
-    """A follow-up ``hflow`` command that can be pasted as printed.
+    """A follow-up ``hflow`` command that can be pasted as printed (:func:`hints.hflow_command`).
 
     ``words`` are fixed subcommand names, validated ids and full object ids, which need no
-    quoting. The data directory is appended when the ledger is not the default one
-    (:func:`_named_data_dir`), quoted by :func:`_shell_word`.
+    quoting. The data directory is appended when the ledger is not the default one.
     """
-    command = ["hflow", *words]
-    data_dir = _named_data_dir(store)
-    if data_dir is not None:
-        command += ["--data-dir", _shell_word(data_dir)]
-    return " ".join(command)
+    return hflow_command(store, *words)
 
 
 def _apply_command(store: Store, record: IntegrationRecord) -> str:

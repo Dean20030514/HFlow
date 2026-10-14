@@ -409,7 +409,7 @@ def test_hflow_run_with_a_real_profile_and_no_key_exits_refused_and_records_noth
         binding=current_binding(
             mode="m2-live-change", driver=resolved.effective.role("implementer").driver,
             project=project, request=resolved.request(), spec_path=task_file,
-            effective=resolved.effective,
+            effective=resolved.effective, data_dir=data_dir,
         ),
     )
     approval_file = tmp_path / "approval.json"

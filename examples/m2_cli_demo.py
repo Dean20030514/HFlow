@@ -177,7 +177,6 @@ def main() -> int:
     run_cli(["clean", run_id, "--data-dir", str(data)])
     print("\n--- clean --apply ---")
     apply_code, apply_payload = run_cli(["clean", run_id, "--apply", "--data-dir", str(data)])
-    ref = f"refs/hflow/candidates/{run_id}/"
     refs = git(repo, "for-each-ref", "--format=%(refname) %(objectname)", "refs/hflow/")
     print("\n--- after cleanup ---")
     status = apply_payload.get("status", "") if apply_payload else ""

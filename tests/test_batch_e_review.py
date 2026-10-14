@@ -51,7 +51,6 @@ from hflow.contracts import (
     InvocationOutcome,
     InvocationStartState,
     ProjectConfig,
-    RefusalCode,
     RunRequest,
     SpawnFact,
     SpawnKind,

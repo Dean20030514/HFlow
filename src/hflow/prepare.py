@@ -18,7 +18,7 @@ import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
@@ -32,6 +32,7 @@ from .contracts import (
     LaunchSurfaces,
     MachineProfile,
     PendingAuthorization,
+    PlanArguments,
     PlannedCheck,
     PrepareReport,
     ProjectConfig,
@@ -64,6 +65,9 @@ from .profiles import (
     resolve_role_bindings,
     summarize_validation_error,
 )
+
+if TYPE_CHECKING:  # annotations only: authorization.py is imported where it is used
+    from .authorization import AuthorizationBinding
 
 #: The write opt-in is a local, explicit decision; anything else is "no".
 _WRITE_OPT_IN = {"1", "true", "yes"}
@@ -174,9 +178,9 @@ def load_json_file(path: Path, *, what: str) -> object:
         return json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         raise RefusedError(RefusalCode.INVALID_SPEC, f"{what} not found: {path}") from exc
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise RefusedError(
-            RefusalCode.INVALID_SPEC, f"{what} {path} is not valid JSON: {exc}"
+            RefusalCode.INVALID_SPEC, f"{what} {path} is not valid UTF-8 JSON: {exc}"
         ) from exc
 
 
@@ -742,6 +746,8 @@ def launch_surface_preview(
                 ),
                 workspace=workspace,
                 look_in_home=kind == "bound",
+                # The home the child gets, as the driver gives it - not this process's home.
+                child_home=child_home,
             )
         except Exception as exc:  # noqa: BLE001 - a record never stops the preview
             if notes is not None:
@@ -830,6 +836,7 @@ def resolve_run(
     env: Mapping[str, str] | None = None,
     root_bound: bool = False,
     root_limits: RootBudgetLimits | None = None,
+    machine: MachineBindings | None = None,
 ) -> ResolvedRun:
     """Resolve one task, project and machine configuration into what would be executed.
 
@@ -838,6 +845,11 @@ def resolve_run(
     ``root_limits`` are that file's ceilings, when the caller has them: a root that cannot pay for
     an armed repair is refused by the run before anything is recorded, so it is reported here too
     (``root_repair_problems``).
+
+    ``machine`` is the machine half when the caller already resolved it (``run`` does, to settle
+    the authorization question before the task is read) from the same ``data_dir``,
+    ``profile_id``, ``driver`` and ``env``. It is then used as it is rather than read a second
+    time, so the configuration that answered "is this a real run?" is the one that runs.
     """
     root = Path(project_root).resolve()
     spec_path = Path(task_path)
@@ -854,9 +866,10 @@ def resolve_run(
     )
     project = load_project_contract(resolved_project_path)
 
-    machine = resolve_machine_bindings(
-        data_dir=data_dir, profile_id=profile_id, driver=driver, env=env
-    )
+    if machine is None:
+        machine = resolve_machine_bindings(
+            data_dir=data_dir, profile_id=profile_id, driver=driver, env=env
+        )
     implementer_writes, reviewer_writes = resolve_permissions(spec, env)
     workspaces = launch_workspaces(spec, root)
     if machine.profile is not None:
@@ -922,6 +935,87 @@ def resolve_run(
         admission=admission,
         dispatch_preconditions=preconditions,
         base_commit=base,
+    )
+
+
+@dataclass(frozen=True)
+class Resolution:
+    """One resolution of a command's inputs: the run, and the root budget file it was given."""
+
+    resolved: ResolvedRun
+    root_plan: RootBudgetPlan | None
+
+
+def resolve_arguments(
+    arguments: PlanArguments,
+    *,
+    machine: MachineBindings | None = None,
+    env: Mapping[str, str] | None = None,
+) -> Resolution:
+    """Resolve ``prepare`` / ``approve`` / ``run`` inputs. The one path all three take.
+
+    The root budget file and the repair policy are read and validated first - an invalid one
+    refuses before the task is opened, with nothing printed and nothing dispatched - and then the
+    task, the contract and the machine are resolved by :func:`resolve_run`, with the root's
+    ceilings, so a root that cannot pay for an armed repair is a dispatch precondition here for
+    every caller. ``machine`` is passed through to :func:`resolve_run`.
+    """
+    root_plan = (
+        load_root_budget_plan(Path(arguments.root_budget_file))
+        if arguments.root_budget_file
+        else None
+    )
+    # The task's explicit opt-in to one bounded repair. It becomes part of the effective TaskSpec,
+    # so the stored spec, its digest and the authorization binding all cover the repair the task
+    # asked for.
+    repair_policy = (
+        load_repair_policy(Path(arguments.repair_policy_file))
+        if arguments.repair_policy_file
+        else None
+    )
+    resolved = resolve_run(
+        task_path=Path(arguments.task),
+        project_root=Path(arguments.project_root),
+        data_dir=Path(arguments.data_dir),
+        project_path=Path(arguments.project) if arguments.project else None,
+        profile_id=arguments.profile,
+        driver=arguments.driver,
+        base_commit=arguments.base_commit,
+        workspace_mode=arguments.workspace,
+        repair_policy=repair_policy,
+        env=env,
+        root_bound=root_plan is not None,
+        root_limits=root_plan.limits if root_plan is not None else None,
+        machine=machine,
+    )
+    return Resolution(resolved=resolved, root_plan=root_plan)
+
+
+def pending_binding(
+    resolved: ResolvedRun,
+    *,
+    authorization_mode: str,
+    root_binding: RootBudgetBinding | None,
+) -> AuthorizationBinding:
+    """The binding an approval of ``resolved`` has to carry.
+
+    ``prepare`` prints it, ``approve`` writes it and ``run`` verifies against it - one call, so
+    the three cannot drift apart. For a real driver it names the ledger of ``resolved.data_dir``,
+    the database ``run`` opens to spend it.
+    """
+    from .authorization import current_binding
+
+    implementer = resolved.effective.role("implementer")
+    assert implementer is not None
+    return current_binding(
+        mode=authorization_mode,  # type: ignore[arg-type]
+        driver=implementer.driver,
+        project=resolved.project,
+        request=resolved.request(),
+        spec_path=resolved.spec_path,
+        effective=resolved.effective,
+        root_binding=root_binding,
+        data_dir=resolved.data_dir,
     )
 
 
@@ -1198,7 +1292,6 @@ def build_prepare_report(
     resolved: ResolvedRun,
     *,
     authorization_mode: str = "m2-live-change",
-    max_top_level_submissions_required: int | None = None,
     root_budget_plan: RootBudgetPlan | None = None,
     env: Mapping[str, str] | None = None,
 ) -> PrepareReport:
@@ -1209,8 +1302,6 @@ def build_prepare_report(
     authorization carries the same root, so the digest the preview prints is the digest an
     artifact must have for this run to accept it. Neither step touches the ledger.
     """
-    from .authorization import current_binding
-
     roles = resolved.roles
     execution_root, execution_root_is_final = resolved.execution_root()
     repair = _repair_plan_preview(resolved)
@@ -1223,11 +1314,7 @@ def build_prepare_report(
     # What an approval has to cover. ``budget.required_turns`` is already the worst case when a
     # repair policy is armed, so the artifact the preview describes covers the loop the run's own
     # gate prices before I1 - not just its first half.
-    submissions = (
-        max_top_level_submissions_required
-        if max_top_level_submissions_required is not None
-        else budget.required_turns
-    )
+    submissions = budget.required_turns
     # A root budget file makes the artifact necessary even for the offline driver: every charge
     # against a root is recorded with the artifact that bought it, and the store refuses to spend
     # a root under an empty authorization id. For the offline driver `run` mints a labelled
@@ -1235,15 +1322,9 @@ def build_prepare_report(
     needs_authorization = resolved.is_real_driver or root_preview is not None
     pending = PendingAuthorization(required=needs_authorization)
     if needs_authorization:
-        implementer = resolved.effective.role("implementer")
-        assert implementer is not None
-        binding = current_binding(
-            mode=authorization_mode,  # type: ignore[arg-type]
-            driver=implementer.driver,
-            project=resolved.project,
-            request=resolved.request(),
-            spec_path=resolved.spec_path,
-            effective=resolved.effective,
+        binding = pending_binding(
+            resolved,
+            authorization_mode=authorization_mode,
             # The same root ``run`` will bind when handed the same file: the two must agree or
             # the preview would print an artifact digest that the run then refuses.
             root_binding=root_preview.binding if root_preview is not None else None,
@@ -1279,9 +1360,10 @@ def build_prepare_report(
     surfaces = launch_surface_preview(resolved, env, notes) if resolved.is_real_driver else {}
     if resolved.is_real_driver:
         notes.append(
-            "a live run needs an authorization artifact the user writes from their own "
-            "approval; prepare cannot produce one and the binding above is only what the "
-            "approval would have to cover"
+            "a live run needs an authorization artifact made from the user's own approval "
+            "(`hflow approve --plan`, at the user's own terminal; or write the file by hand); prepare "
+            "cannot produce one and the binding above is only what the approval would have to "
+            "cover"
         )
         notes.append(
             "the profile selects which agent, transport, write permission and model each role "
@@ -1615,6 +1697,13 @@ def render_prepare_text(report: PrepareReport) -> str:
             f"top-level submission(s), mode={report.authorization.mode}"
         )
         lines.append(f"  binding     {report.authorization.binding_digest}")
+        ledger = report.authorization.binding.get("ledger_path")
+        if ledger:
+            # Single use is enforced per ledger: the approval is spent here and only here.
+            lines.append(
+                f"  ledger      {ledger}  (spent here only; another data dir is not a second "
+                "allowance)"
+            )
         contract = report.authorization.binding.get("project_contract_digest")
         if contract:
             # The approval covers this contract (checks with argv, write_deny, limits, review
@@ -1625,7 +1714,7 @@ def render_prepare_text(report: PrepareReport) -> str:
             lines.append(f"  roles       {', '.join(approved_roles)}")
         lines.append(
             "  pending     prepare did not create an authorization; only your own approval "
-            "produces one"
+            "produces one (`hflow approve --plan` on a plan from --plan-out, or a file you write)"
         )
     for note in report.notes:
         lines.append(f"note          {note}")
