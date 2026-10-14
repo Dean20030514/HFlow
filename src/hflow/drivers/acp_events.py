@@ -19,17 +19,14 @@ import json
 
 from ..contracts import EventKind, NormalizedEvent
 
-#: Update kinds this build understands well enough to name.
-_UPDATE_EVENT = {
-    "agent_message_chunk": EventKind.PROGRESS,
-    "agent_thought_chunk": EventKind.PROGRESS,
-    "tool_call": EventKind.PROGRESS,
-    "tool_call_update": EventKind.PROGRESS,
-    "plan": EventKind.PROGRESS,
-    "available_commands_update": EventKind.PROGRESS,
-    "current_mode_update": EventKind.PROGRESS,
-    "config_option_update": EventKind.PROGRESS,
-    "usage_update": EventKind.USAGE,
+#: Client requests with an event of their own: the kind and message each projects to.
+#: ``session/prompt`` is the moment the task actually reaches the Harness - the dispatch marker
+#: the controller uses to know model work provably began.
+_REQUEST_EVENT: dict[str, tuple[EventKind, str]] = {
+    "initialize": (EventKind.STARTED, "initialize sent"),
+    "session/new": (EventKind.STARTED, "session/new sent"),
+    "session/prompt": (EventKind.DISPATCHED, "session/prompt sent to the harness"),
+    "session/cancel": (EventKind.PROGRESS, "session/cancel sent"),
 }
 
 _STOP_REASON_EVENT = {
@@ -111,35 +108,12 @@ def project_line(line: str, sequence: int, at: str) -> ObservedLine:
 
 
 def _event_for_method(method: str, message: dict, sequence: int, at: str) -> NormalizedEvent:
-    params = message.get("params") if isinstance(message.get("params"), dict) else {}
-
-    if method == "initialize":
-        return NormalizedEvent(
-            kind=EventKind.STARTED, sequence=sequence, at=at, message="initialize sent", method=method
-        )
-    if method == "session/new":
-        return NormalizedEvent(
-            kind=EventKind.STARTED, sequence=sequence, at=at, message="session/new sent", method=method
-        )
-    if method == "session/prompt":
-        # The moment the task actually reaches the Harness. This is the dispatch marker the
-        # controller uses to know model work provably began.
-        return NormalizedEvent(
-            kind=EventKind.DISPATCHED,
-            sequence=sequence,
-            at=at,
-            message="session/prompt sent to the harness",
-            method=method,
-        )
-    if method == "session/cancel":
-        return NormalizedEvent(
-            kind=EventKind.PROGRESS,
-            sequence=sequence,
-            at=at,
-            message="session/cancel sent",
-            method=method,
-        )
+    known = _REQUEST_EVENT.get(method)
+    if known is not None:
+        kind, text = known
+        return NormalizedEvent(kind=kind, sequence=sequence, at=at, message=text, method=method)
     if method == "session/update":
+        params = message.get("params") if isinstance(message.get("params"), dict) else {}
         update = params.get("update") if isinstance(params.get("update"), dict) else {}
         kind = str(update.get("sessionUpdate", "unknown"))
         if kind == "usage_update":
@@ -153,8 +127,10 @@ def _event_for_method(method: str, message: dict, sequence: int, at: str) -> Nor
                 ),
                 method=kind,
             )
+        # Every other update kind, named or not, is progress: only semantics the controller can
+        # act on get an event of their own.
         return NormalizedEvent(
-            kind=_UPDATE_EVENT.get(kind, EventKind.PROGRESS),
+            kind=EventKind.PROGRESS,
             sequence=sequence,
             at=at,
             message=f"session update: {kind}",

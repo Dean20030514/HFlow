@@ -55,7 +55,7 @@ import contextlib
 import os
 import sqlite3
 import urllib.parse
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from pathlib import Path
 
 #: Storage format version. Separate from the public contract version: the file layout can
@@ -497,6 +497,30 @@ def _statements(script: str) -> list[str]:
     return [statement.strip() for statement in script.split(";") if statement.strip()]
 
 
+def _apply_schema(conn: sqlite3.Connection, script: str) -> None:
+    """Execute a DDL script one statement at a time, inside the caller's transaction."""
+    for statement in _statements(script):
+        conn.execute(statement)
+
+
+def _add_columns(
+    conn: sqlite3.Connection,
+    step: StepHook,
+    tag: str,
+    columns: tuple[tuple[str, str, str], ...],
+) -> None:
+    """Add each ``(table, column, definition)`` the table does not have yet.
+
+    ``ALTER TABLE ADD COLUMN`` has no ``IF NOT EXISTS``, so a column already present is skipped
+    rather than added twice.
+    """
+    for table, column, definition in columns:
+        if column in _columns(conn, table):
+            continue
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        step(f"{tag}:alter:{table}.{column}")
+
+
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
 
@@ -528,8 +552,11 @@ def recorded_version(conn: sqlite3.Connection) -> int | None:
     return None
 
 
-def _effective_version(conn: sqlite3.Connection) -> int:
-    """The version to *read* this file as.
+def effective_version(conn: sqlite3.Connection) -> int:
+    """The version to *read* this file as, inferring v1 for a pre-versioning database.
+
+    Public because two callers need the same answer: the migration itself, and the store, which
+    reports what a file was migrated from.
 
     A recorded version is authoritative. Without one the shape decides, which matters for a file
     whose bootstrap never stamped a version: it could be v1 *or* v2, and treating a v2 file as v1
@@ -549,7 +576,7 @@ def _effective_version(conn: sqlite3.Connection) -> int:
         return 8
     if _has_table(conn, "invocation_settlements") and v6_runs:
         return 7
-    if _columns(conn, "runs") >= {"owner_token", "claim_generation"}:
+    if v6_runs:
         return 6
     if (
         _has_table(conn, "run_repair_records")
@@ -625,7 +652,7 @@ def _snapshot_defect(path: Path, from_version: int) -> str | None:
             rows = conn.execute("PRAGMA integrity_check").fetchall()
             if [tuple(row) for row in rows] != [("ok",)]:
                 return f"PRAGMA integrity_check reported {rows[0][0] if rows else 'nothing'!r}"
-            version = _effective_version(conn)
+            version = effective_version(conn)
         finally:
             conn.close()
     except (OSError, sqlite3.Error, MigrationError) as exc:
@@ -712,20 +739,14 @@ def _backup(conn: sqlite3.Connection, database: Path, from_version: int) -> Path
 
 
 def _migrate_to_v1(conn: sqlite3.Connection, step: StepHook) -> None:
-    for statement in _statements(_V1_SCHEMA):
-        conn.execute(statement)
+    _apply_schema(conn, _V1_SCHEMA)
     step("v1:base-schema")
 
 
 def _migrate_to_v2(conn: sqlite3.Connection, step: StepHook) -> None:
-    for statement in _statements(_V2_SCHEMA):
-        conn.execute(statement)
+    _apply_schema(conn, _V2_SCHEMA)
     step("v2:root-and-invocation-tables")
-    for table, column, definition in _V2_COLUMNS:
-        if column in _columns(conn, table):
-            continue
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-        step(f"v2:alter:{table}.{column}")
+    _add_columns(conn, step, "v2", _V2_COLUMNS)
 
 
 def _migrate_to_v3(conn: sqlite3.Connection, step: StepHook) -> None:
@@ -739,11 +760,7 @@ def _migrate_to_v3(conn: sqlite3.Connection, step: StepHook) -> None:
     ``started_at`` would promote it to a process fact. The row keeps its state and its outcome -
     v3 does not decide what happened, it only stops claiming a time it never observed.
     """
-    for table, column, definition in _V3_COLUMNS:
-        if column in _columns(conn, table):
-            continue
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-        step(f"v3:alter:{table}.{column}")
+    _add_columns(conn, step, "v3", _V3_COLUMNS)
     conn.execute(
         """
         UPDATE invocations
@@ -786,11 +803,7 @@ def _migrate_to_v4(conn: sqlite3.Connection, step: StepHook) -> None:
     ever written together with ``launch_requested_at``, so a correctly migrated row is never
     rewritten and a genuinely recorded launch keeps its timestamp.
     """
-    for table, column, definition in _V4_COLUMNS:
-        if column in _columns(conn, table):
-            continue
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-        step(f"v4:alter:{table}.{column}")
+    _add_columns(conn, step, "v4", _V4_COLUMNS)
     conn.execute(
         """
         UPDATE invocations
@@ -833,14 +846,9 @@ def _migrate_to_v5(conn: sqlite3.Connection, step: StepHook) -> None:
     ``run_repair_records`` is the run's own record of what it decided about repairing, refusals
     included. One row per decision, stored as the ``RepairRecord`` document itself.
     """
-    for statement in _statements(_V5_SCHEMA):
-        conn.execute(statement)
+    _apply_schema(conn, _V5_SCHEMA)
     step("v5:repair-record-table")
-    for table, column, definition in _V5_COLUMNS:
-        if column in _columns(conn, table):
-            continue
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-        step(f"v5:alter:{table}.{column}")
+    _add_columns(conn, step, "v5", _V5_COLUMNS)
     _rebuild_attempts_for_v5(conn, step)
 
 
@@ -876,8 +884,7 @@ def _rebuild_attempts_for_v5(conn: sqlite3.Connection, step: StepHook) -> None:
             f"({', '.join(present)}), and this step rebuilds the table from the columns it knows. "
             "Refusing rather than copying a column set it did not expect - no data was changed."
         )
-    for statement in _statements(_V5_ATTEMPTS_DDL):
-        conn.execute(statement)
+    _apply_schema(conn, _V5_ATTEMPTS_DDL)
     step("v5:attempts-rebuild:create")
     columns = ", ".join(_V5_ATTEMPTS_COLUMNS)
     conn.execute(
@@ -902,11 +909,7 @@ def _migrate_to_v6(conn: sqlite3.Connection, step: StepHook) -> None:
     present a guess as an observation; :func:`hflow.ownership.assess_owner` states the rule a
     NULL owner is judged by instead.
     """
-    for table, column, definition in _V6_COLUMNS:
-        if column in _columns(conn, table):
-            continue
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-        step(f"v6:alter:{table}.{column}")
+    _add_columns(conn, step, "v6", _V6_COLUMNS)
 
 
 def _migrate_to_v7(conn: sqlite3.Connection, step: StepHook) -> None:
@@ -917,8 +920,7 @@ def _migrate_to_v7(conn: sqlite3.Connection, step: StepHook) -> None:
     with this build. Inferring a settlement from anything already stored would be the very
     "attested figure presented as observed" the ruling forbids.
     """
-    for statement in _statements(_V7_SCHEMA):
-        conn.execute(statement)
+    _apply_schema(conn, _V7_SCHEMA)
     step("v7:invocation-settlements-table")
 
 
@@ -929,8 +931,7 @@ def _migrate_to_v8(conn: sqlite3.Connection, step: StepHook) -> None:
     receipt and has no integration record: whether its candidate reached a branch some other way
     is not something this build observed, so nothing is inferred from the repository here.
     """
-    for statement in _statements(_V8_SCHEMA):
-        conn.execute(statement)
+    _apply_schema(conn, _V8_SCHEMA)
     step("v8:integrations-table")
 
 
@@ -974,7 +975,7 @@ def migrate(
     the whole migration back instead of committing a ledger whose rows no longer resolve.
     """
     step: StepHook = on_step or (lambda _name: None)
-    version = _effective_version(conn)
+    version = effective_version(conn)
     if version > supported:
         raise MigrationError(
             f"{database} records storage version {version}, but this build understands at most "
@@ -1032,21 +1033,3 @@ def migrate(
         if suspended_foreign_keys:
             conn.execute("PRAGMA foreign_keys = ON")
     return version, supported, backup
-
-
-def effective_version(conn: sqlite3.Connection) -> int:
-    """The version a file is *read as*, inferring v1 for a pre-versioning database.
-
-    Public because two callers need the same answer: the migration itself, and the store, which
-    reports what a file was migrated from.
-    """
-    return _effective_version(conn)
-
-
-def migration_steps() -> Iterable[str]:
-    """The version pairs this build can migrate between. Used by tests and diagnostics."""
-    return tuple(
-        f"{source}->{source + 1}"
-        for source in sorted(_MIGRATIONS)
-        if source + 1 <= SUPPORTED_STORAGE_VERSION
-    )

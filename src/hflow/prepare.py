@@ -15,12 +15,12 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from .admission import predictable_dispatch_problems, validate_task_spec
 from .contracts import (
@@ -73,6 +73,16 @@ if TYPE_CHECKING:  # annotations only: authorization.py is imported where it is 
 _WRITE_OPT_IN = {"1", "true", "yes"}
 
 
+def _uses_real_driver(driver_ids: Iterable[str]) -> bool:
+    """Is any of these driver ids something other than the offline fake?
+
+    The one definition of a real run: it gets the stricter gates (real checks, an isolated
+    worktree, effective write permission, a budget that covers the review) and needs the user's
+    authorization.
+    """
+    return any(driver_id != FAKE_DRIVER_ID for driver_id in driver_ids)
+
+
 @dataclass(frozen=True)
 class MachineBindings:
     """The machine half of a run: which agent and driver each role uses.
@@ -90,9 +100,8 @@ class MachineBindings:
     def is_real_driver(self) -> bool:
         from .drivers.selected import resolve_driver_id
 
-        return any(
-            resolve_driver_id(binding) != FAKE_DRIVER_ID
-            for _, binding in self.bindings.values()
+        return _uses_real_driver(
+            resolve_driver_id(binding) for _, binding in self.bindings.values()
         )
 
 
@@ -134,9 +143,7 @@ class ResolvedRun:
     @property
     def is_real_driver(self) -> bool:
         """Is any role dispatched to something other than the offline fake?"""
-        return any(
-            entry.driver_id != "fake" for entry in self.effective.roles
-        )
+        return _uses_real_driver(entry.driver_id for entry in self.effective.roles)
 
     @property
     def roles(self) -> list[str]:
@@ -172,16 +179,53 @@ class ResolvedRun:
 # --------------------------------------------------------------------------
 
 
-def load_json_file(path: Path, *, what: str) -> object:
-    """Read one JSON document, refusing rather than defaulting."""
+def load_json_file(path: Path, *, what: str, missing_hint: str = "") -> object:
+    """Read one JSON document, refusing rather than defaulting.
+
+    ``missing_hint`` follows the "not found" refusal: how to supply the file.
+    """
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
-        raise RefusedError(RefusalCode.INVALID_SPEC, f"{what} not found: {path}") from exc
+        raise RefusedError(
+            RefusalCode.INVALID_SPEC,
+            f"{what} not found: {path}" + (f". {missing_hint}" if missing_hint else ""),
+        ) from exc
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise RefusedError(
             RefusalCode.INVALID_SPEC, f"{what} {path} is not valid UTF-8 JSON: {exc}"
         ) from exc
+
+
+_Model = TypeVar("_Model", bound=BaseModel)
+
+
+def _load_model(
+    path: Path,
+    model: type[_Model],
+    *,
+    what: str,
+    invalid: str,
+    summarize: bool = True,
+    not_object: str = "",
+    missing_hint: str = "",
+) -> _Model:
+    """Read one input file as ``model``; every failure is an ``invalid_spec`` refusal.
+
+    ``invalid`` starts the refusal for a document that does not match, followed by the rejected
+    fields (:func:`summarize_validation_error`) or, with ``summarize=False``, pydantic's own text.
+    ``not_object``, when given, refuses a document that is not a JSON object before validation.
+    """
+    raw = load_json_file(Path(path), what=what, missing_hint=missing_hint)
+    if not_object and not isinstance(raw, dict):
+        raise RefusedError(
+            RefusalCode.INVALID_SPEC, f"{not_object}, not a JSON {type(raw).__name__}"
+        )
+    try:
+        return model.model_validate(raw)
+    except ValidationError as exc:
+        reason = summarize_validation_error(exc) if summarize else str(exc)
+        raise RefusedError(RefusalCode.INVALID_SPEC, f"{invalid}: {reason}") from exc
 
 
 def load_task_spec(path: Path) -> TaskSpec:
@@ -190,26 +234,23 @@ def load_task_spec(path: Path) -> TaskSpec:
     A malformed task is an admission refusal (exit 2) naming the rejected fields, not a pydantic
     traceback: scripts branch on the documented exit codes.
     """
-    raw = load_json_file(Path(path), what="task spec")
-    try:
-        return TaskSpec.model_validate(raw)
-    except ValidationError as exc:
-        raise RefusedError(
-            RefusalCode.INVALID_SPEC,
-            f"{path} is not a valid task spec: {summarize_validation_error(exc)}",
-        ) from exc
+    return _load_model(
+        path, TaskSpec, what="task spec", invalid=f"{path} is not a valid task spec"
+    )
 
 
 def load_project_contract(path: Path) -> ProjectConfig:
     """Read one project contract, refusing a document that does not match ``ProjectConfig``."""
-    raw = load_json_file(Path(path), what="project contract")
-    try:
-        return ProjectConfig.model_validate(raw)
-    except ValidationError as exc:
-        raise RefusedError(
-            RefusalCode.INVALID_SPEC,
-            f"{path} is not a valid project contract: {summarize_validation_error(exc)}",
-        ) from exc
+    return _load_model(
+        path,
+        ProjectConfig,
+        what="project contract",
+        invalid=f"{path} is not a valid project contract",
+        missing_hint=(
+            "Pass --project <file>, or create <project-root>/.hflow/project.json "
+            "(`hflow schema` prints the ProjectConfig shape)"
+        ),
+    )
 
 
 def load_root_budget_plan(path: Path) -> RootBudgetPlan:
@@ -223,20 +264,17 @@ def load_root_budget_plan(path: Path) -> RootBudgetPlan:
     """
     from .authorization import root_budget_from_plan
 
-    raw = load_json_file(Path(path), what="root budget file")
-    if not isinstance(raw, dict):
-        raise RefusedError(
-            RefusalCode.INVALID_SPEC,
+    plan = _load_model(
+        path,
+        RootBudgetPlan,
+        what="root budget file",
+        invalid=f"root budget file {path} is not a valid root budget plan",
+        summarize=False,
+        not_object=(
             f"root budget file {path} must be a JSON object with a 'limits' member (see "
-            f"docs/operations.md), not a JSON {type(raw).__name__}",
-        )
-    try:
-        plan = RootBudgetPlan.model_validate(raw)
-    except ValidationError as exc:
-        raise RefusedError(
-            RefusalCode.INVALID_SPEC,
-            f"root budget file {path} is not a valid root budget plan: {exc}",
-        ) from exc
+            "docs/operations.md)"
+        ),
+    )
     return root_budget_from_plan(plan)
 
 
@@ -250,21 +288,17 @@ def load_repair_policy(path: Path) -> RepairPolicy:
     case) is refused by ``admission`` before a dispatch exists, because that depends on the rest
     of the task and not on this file.
     """
-    raw = load_json_file(Path(path), what="repair policy file")
-    if not isinstance(raw, dict):
-        raise RefusedError(
-            RefusalCode.INVALID_SPEC,
+    return _load_model(
+        path,
+        RepairPolicy,
+        what="repair policy file",
+        invalid=f"repair policy file {path} is not a valid RepairPolicy",
+        summarize=False,
+        not_object=(
             f"repair policy file {path} must be a JSON object with the RepairPolicy fields "
-            f"(max_attempts, check_exit_codes, allow_reviewer_changes), not a JSON "
-            f"{type(raw).__name__}",
-        )
-    try:
-        return RepairPolicy.model_validate(raw)
-    except ValidationError as exc:
-        raise RefusedError(
-            RefusalCode.INVALID_SPEC,
-            f"repair policy file {path} is not a valid RepairPolicy: {exc}",
-        ) from exc
+            "(max_attempts, check_exit_codes, allow_reviewer_changes)"
+        ),
+    )
 
 
 def root_binding_for(resolved: ResolvedRun) -> RootBudgetBinding:
@@ -484,7 +518,9 @@ def _base_root_entry(project_root: Path, base: str, file_name: str) -> str:
     try:
         # No pathspec: a pathspec matches case-sensitively even with core.ignorecase. Without
         # -r only the root's entries are listed; -z keeps names unquoted.
-        listed = GitRepo.discover(project_root).run("ls-tree", "-z", "--name-only", base)
+        listed = GitRepo.discover(project_root).run(
+            "ls-tree", "-z", "--name-only", "--end-of-options", base
+        )
     except (GitError, RefusedError):
         return ""
     wanted = file_name.casefold()
@@ -796,7 +832,7 @@ def resolve_machine_bindings(
     from .drivers.selected import driver_id_for_name, resolve_driver_id
 
     ids = {role: resolve_driver_id(binding) for role, (_, binding) in bindings.items()}
-    if len({id_ == "fake" for id_ in ids.values()}) > 1:
+    if len({id_ == FAKE_DRIVER_ID for id_ in ids.values()}) > 1:
         # An offline stand-in for one role and a real transport for the other is not a
         # configuration anyone can reason about: half the run would be a script and half a
         # model, and the receipt could not say which half produced the candidate.
@@ -893,7 +929,8 @@ def resolve_run(
             workspaces=workspaces,
         )
 
-    is_real = any(entry.driver_id != FAKE_DRIVER_ID for entry in effective.roles)
+    is_real = _uses_real_driver(entry.driver_id for entry in effective.roles)
+    launches = resolved_launches(effective)
     base = resolve_base_commit(spec, root)
     admission = validate_task_spec(spec, project, root, allow_fake_checks=not is_real)
     preconditions = predictable_dispatch_problems(
@@ -901,22 +938,18 @@ def resolve_run(
         project,
         production=is_real,
         implementer_writes=implementer_writes,
-        launches=resolved_launches(effective),
+        launches=launches,
         real_transport=is_real,
         root_bound=root_bound,
         workspace_client_config=(
-            start_workspace_client_config(spec, root, base)
-            if is_real
-            else ""
+            start_workspace_client_config(spec, root, base) if is_real else ""
         ),
         workspace_env_file=start_workspace_env_file(spec, root, base) if is_real else "",
         dsh_home_in_workspace=(
-            launch_dsh_home_problem(resolved_launches(effective), workspaces) if is_real else ""
+            launch_dsh_home_problem(launches, workspaces) if is_real else ""
         ),
         no_credential_source=(
-            launch_credential_problem(
-                resolved_launches(effective), data_dir=Path(data_dir), env=env
-            )
+            launch_credential_problem(launches, data_dir=Path(data_dir), env=env)
             if is_real
             else ""
         ),
@@ -1453,8 +1486,7 @@ def build_prepare_report(
                 "user_text says it is not an approval, and it binds the fake driver) unless you "
                 "pass your own --authorization-file"
             )
-    for issue in resolved.dispatch_preconditions:
-        notes.append(f"dispatch precondition: {issue.code.value}: {issue.detail}")
+    notes.extend(_precondition_note(issue) for issue in resolved.dispatch_preconditions)
 
     return PrepareReport(
         task_id=resolved.spec.task_id,
@@ -1483,6 +1515,12 @@ def build_prepare_report(
         authorization=pending,
         notes=notes,
     )
+
+
+def _precondition_note(issue: ValidationIssue) -> str:
+    """A dispatch precondition as a report note. The text form lists the issue under "dispatch
+    gate" instead, so it prints each precondition once."""
+    return f"dispatch precondition: {issue.code.value}: {issue.detail}"
 
 
 def _repair_plan_lines(repair: RepairPlanPreview) -> list[str]:
@@ -1664,18 +1702,22 @@ def render_prepare_text(report: PrepareReport) -> str:
             "any is left"
         )
         lines.append(f"  detail      {root.detail}")
-    lines.append("admission")
-    if report.admission.ok:
-        lines.append("  ok          no admission problem found")
-    else:
-        for issue in report.admission.issues:
+    gates = (
+        ("admission", report.admission.ok, report.admission.issues, "no admission problem found"),
+        (
+            "dispatch gate",
+            not report.dispatch_preconditions,
+            report.dispatch_preconditions,
+            "nothing knowable now would stop a dispatch",
+        ),
+    )
+    for title, ok, issues, ok_text in gates:
+        lines.append(title)
+        if ok:
+            lines.append(f"  ok          {ok_text}")
+        for issue in issues:
             lines.append(f"  refuse      {issue.code.value} at {issue.location}: {issue.detail}")
-    lines.append("dispatch gate")
-    if not report.dispatch_preconditions:
-        lines.append("  ok          nothing knowable now would stop a dispatch")
-    else:
-        for issue in report.dispatch_preconditions:
-            lines.append(f"  refuse      {issue.code.value} at {issue.location}: {issue.detail}")
+    if report.dispatch_preconditions:
         lines.append(
             "  note        a real run would refuse before dispatching; remaining authorization "
             "allowance is checked only once a run exists"
@@ -1716,6 +1758,6 @@ def render_prepare_text(report: PrepareReport) -> str:
             "  pending     prepare did not create an authorization; only your own approval "
             "produces one (`hflow approve --plan` on a plan from --plan-out, or a file you write)"
         )
-    for note in report.notes:
-        lines.append(f"note          {note}")
+    listed = {_precondition_note(issue) for issue in report.dispatch_preconditions}
+    lines.extend(f"note          {note}" for note in report.notes if note not in listed)
     return "\n".join(lines)

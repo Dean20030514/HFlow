@@ -72,6 +72,7 @@ from hflow.review import (  # noqa: E402
     review_input_error,
 )
 from hflow.ids import new_evidence_id  # noqa: E402
+from hflow.ownership import current_identity, new_owner_token  # noqa: E402
 from hflow.packet import TYPED_FINDINGS_MARKER  # noqa: E402
 from hflow.runtime import PACKAGE_VERSION as _PACKAGE_VERSION  # noqa: E402
 from hflow.store import (  # noqa: E402
@@ -394,25 +395,35 @@ def evaluate_acceptance(
                 checks_digest=run_row["checks_digest"],
                 turn_limit=int(run_row["turn_limit"]),
                 repair_limit=int(run_row["repair_limit"]),
+                controller_id="offline-replay",
+                owner_token=new_owner_token(),
+                owner_identity=current_identity(),
             )
-            assert store.claim_run(row["run_id"], "offline-replay")
             attempt_id = verification_evidence["attempt_id"]
+            invocation_id = attempt_row.get("invocation_id") or "I-replay"
             # The recorded attempt is re-created with the same identity so the copied evidence
             # still references something real: replacing a foreign key with an invented id
-            # would be exactly the kind of quiet rewrite this tool must not do.
-            store.dispatch_attempt(
+            # would be exactly the kind of quiet rewrite this tool must not do. It goes through
+            # the production reservation (its rootless path: no root, no authorization), which
+            # creates the implementer's attempt - the row that carries the candidate.
+            store.reserve_dispatch(
                 run_id=row["run_id"],
                 controller_id="offline-replay",
-                attempt_id=attempt_id,
-                role=attempt_row.get("role") or "implementer",
+                invocation_id=invocation_id,
+                role="implementer",
                 reservation_id=attempt_row.get("reservation_id") or "B-replay",
                 reserved_turns=int(attempt_row.get("reserved_agent_turns") or 1),
                 reservation_expires_at=run_row.get("updated_at") or "2999-01-01T00:00:00Z",
+                attempt_id=attempt_id,
             )
-            store.record_invocation(attempt_id, attempt_row.get("invocation_id") or "I-replay")
-            store.record_review_invocation(
-                attempt_id, attempt_row.get("review_invocation_id") or "I-replay-review"
-            )
+            review_invocation_id = attempt_row.get("review_invocation_id") or "I-replay-review"
+            for column, recorded in (
+                ("invocation_id", invocation_id),
+                ("review_invocation_id", review_invocation_id),
+            ):
+                store.register_attempt_invocation_unless_stopped(
+                    row["run_id"], attempt_id, column=column, invocation_id=recorded
+                )
             store.record_evidence(
                 evidence_id=verification_evidence["evidence_id"],
                 run_id=row["run_id"],

@@ -25,7 +25,7 @@ from hflow.authorization import (
 from hflow.cli import EXIT_OK, EXIT_REFUSED, main
 from hflow.contracts import RefusedError, WorkspaceSpec
 from hflow.drivers.fake import FakeDriver, FakeScript
-from hflow.prepare import build_prepare_report, resolve_run, role_drivers
+from hflow.prepare import build_prepare_report, render_prepare_text, resolve_run, role_drivers
 
 from .conftest import write_profile, write_project, write_task
 
@@ -947,11 +947,8 @@ def test_the_driver_consumes_the_resolved_launch_instead_of_re_resolving_it(
     from hflow.drivers.acpx_dsh import AcpxDshDriver
 
     instance = AcpxDshDriver(data_dir=resolved.data_dir, launch=launch)
+    assert instance.launch == launch
     assert instance.acpx_cli == Path(launch.client_entry)
-    assert instance.node_executable == launch.node
-    assert instance.python_executable == launch.python
-    assert instance.dsh_executable == launch.dsh_executable
-    assert instance.profile == launch.profile
     assert instance._agent_argv() == launch.agent_argv
     assert instance._client_prefix() == launch.client_argv_prefix
 
@@ -959,7 +956,7 @@ def test_the_driver_consumes_the_resolved_launch_instead_of_re_resolving_it(
     # one, so what was approved is still what runs.
     monkeypatch.setenv("HFLOW_ACPX_NODE", "some-other-node")
     monkeypatch.setenv("HFLOW_ACPX_CLI", "some-other-client")
-    assert instance.node_executable == launch.node
+    assert instance._client_prefix() == launch.client_argv_prefix
     assert instance.acpx_cli == Path(launch.client_entry)
 
 
@@ -988,6 +985,70 @@ def test_an_unresolvable_launch_is_reported_rather_than_hidden(
     assert resolved.ready_to_dispatch is False
     assert report.model_calls_made == 0
     assert any("dispatch precondition" in note for note in report.notes)
+
+    # The text form prints the precondition once, under the dispatch gate; the note that repeats
+    # it is for --json.
+    text = render_prepare_text(report)
+    detail = report.dispatch_preconditions[0].detail
+    assert text.count(detail) == 1, text
+    assert "  refuse      not_implemented at " in text
+    assert "note          dispatch precondition: " not in text
+
+
+def test_a_missing_project_contract_says_how_to_supply_one(
+    tmp_path: Path, task_spec, capsys: pytest.CaptureFixture[str]
+) -> None:
+    task_file = write_task(tmp_path / "task.json", task_spec)
+
+    code = main(
+        [
+            "prepare",
+            "--task", str(task_file),
+            "--project-root", str(tmp_path),
+            "--driver", "fake",
+            "--data-dir", str(tmp_path / "data"),
+        ]
+    )
+
+    assert code == EXIT_REFUSED
+    err = capsys.readouterr().err
+    expected = tmp_path.resolve() / ".hflow" / "project.json"
+    assert f"project contract not found: {expected}. Pass --project <file>, or create " in err
+    assert "<project-root>/.hflow/project.json (`hflow schema` prints the ProjectConfig" in err
+
+
+def test_a_plan_that_is_not_written_names_the_refusal_codes_on_its_own_line(
+    tmp_path: Path, project, task_spec, project_root: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With --json the report is on stdout and this line on stderr, apart from it."""
+    task_file = write_task(
+        tmp_path / "task.json", task_spec.model_copy(update={"dependencies": ["T-000"]})
+    )
+    project_file = write_project(tmp_path / "hflow" / "project.json", project)
+    plan = tmp_path / "plan.json"
+
+    code = main(
+        [
+            "prepare",
+            "--task", str(task_file),
+            "--project", str(project_file),
+            "--project-root", str(project_root),
+            "--driver", "fake",
+            "--json",
+            "--plan-out", str(plan),
+            "--data-dir", str(tmp_path / "data"),
+        ]
+    )
+
+    assert code == EXIT_REFUSED
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    issues = payload["admission"]["issues"] + payload["dispatch_preconditions"]
+    codes = ", ".join(dict.fromkeys(issue["code"] for issue in issues))
+    assert codes, payload
+    (line,) = [item for item in captured.err.splitlines() if "not written" in item]
+    assert f"`hflow run` would refuse this task ({codes}; see above); {plan} was left" in line
+    assert not plan.exists()
 
 
 def test_each_roles_model_selection_is_bound_into_its_launch(
@@ -1498,3 +1559,19 @@ def test_a_contract_file_that_is_not_utf8_is_refused_not_a_traceback(tmp_path: P
 
     assert excinfo.value.code.value == "invalid_spec"
     assert "not valid UTF-8 JSON" in excinfo.value.message
+
+
+def test_a_base_spelled_like_an_option_finds_nothing(tmp_path: Path) -> None:
+    """``ls-tree`` of the base's root ends its options first (``--end-of-options``), so an
+    option-like base is a revision that does not exist. Defensive: without it git would also
+    fail, for want of a tree-ish, but by parsing the text as an option."""
+    from hflow.prepare import _base_root_entry
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / ".acpxrc.json").write_text("{}", encoding="utf-8")
+    _git(repo, "add", ".acpxrc.json")
+    _git(repo, "commit", "-q", "-m", "seed")
+    assert _base_root_entry(repo, "HEAD", ".acpxrc.json") == ".acpxrc.json"
+    assert _base_root_entry(repo, "--full-tree", ".acpxrc.json") == ""

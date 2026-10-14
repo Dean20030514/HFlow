@@ -12,7 +12,8 @@ to ``run``. A plan writes the resolution inputs and the preview down once:
   code back, then reads the approval in the person's own words, and only then writes an
   authorization artifact;
 * ``run --plan PLAN`` takes every resolution input from the plan and checks the approval exactly
-  as a run with flags does.
+  as a run with flags does. ``approve --plan PLAN --run`` goes on to exactly that, in the same
+  process, once the approval is written - and only then.
 
 Approving stays a separate human step. Nothing is taken from an argument, and a standard input
 that is not a terminal (a pipe, a file) is refused without being read, so ``echo ok | hflow
@@ -37,6 +38,8 @@ from typing import TYPE_CHECKING, TextIO
 from pydantic import ValidationError
 
 from .contracts import (
+    LAUNCH_CONTENT_FIELDS,
+    EffectiveConfig,
     PlanArguments,
     PrepareReport,
     RefusalCode,
@@ -44,8 +47,9 @@ from .contracts import (
     RootBudgetLimits,
     RunPlan,
 )
+from .paths import ENV_ALLOW_WRITES
 from .prepare import Resolution, load_json_file, pending_binding, root_binding_for
-from .profiles import requested_profile_id, summarize_validation_error
+from .profiles import ENV_PROFILE, requested_profile_id, summarize_validation_error
 
 if TYPE_CHECKING:  # annotations only
     from .authorization import AuthorizationBinding, AuthorizationRecord
@@ -206,14 +210,117 @@ def load_plan(path: Path) -> RunPlan:
         ) from exc
 
 
+#: The binding key whose change :func:`plan_drift` explains field by field.
+_EFFECTIVE_CONFIG_KEY = "effective_config_digest"
+
+
+def _environment_sources(plan: RunPlan) -> dict[str, str]:
+    """Effective-configuration fields read from the resolving process's environment, by name.
+
+    ``prepare``, ``approve`` and ``run --plan`` each resolve the plan in their own process, so a
+    shell with another value of one of these variables resolves another configuration - and the
+    plan turns stale with only a digest to show for it. Leaf field name -> the variables it is
+    read from: ``prepare.resolve_permissions`` (the write opt-in) and
+    ``acpx_dsh.resolve_launch_config`` (a real role's launch: ``dsh``/``python``/``node`` are
+    looked up on ``PATH``, ``cmd.exe`` under ``SystemRoot``). The profile is read from
+    ``HFLOW_PROFILE`` only while the plan names none (:func:`frozen_arguments`).
+    """
+    from .drivers.acpx_dsh import ENV_ACPX_CLI, ENV_ACPX_NODE
+
+    sources = {
+        "implementer_writes": ENV_ALLOW_WRITES,
+        "dsh_home": "DSH_HOME",
+        "client_entry": ENV_ACPX_CLI,
+        "node": f"{ENV_ACPX_NODE}, PATH",
+        "client_argv_prefix": f"{ENV_ACPX_NODE}, PATH",
+        "python": "PATH",
+        "dsh_executable": "PATH",
+        "agent_argv": "PATH, SystemRoot",
+    }
+    if plan.arguments.profile is None:
+        sources.update(source=ENV_PROFILE, profile_id=ENV_PROFILE, profile_digest=ENV_PROFILE)
+    return sources
+
+
+def _config_view(config: Mapping[str, object]) -> dict[str, object]:
+    """``config`` (an ``EffectiveConfig`` dump) as its digest sees it: launch content left out.
+
+    The content digests are bound by ``launch_content_digest``, a binding key of their own, so
+    they never explain a change of ``effective_config_digest``.
+    """
+    view = json.loads(json.dumps(config))  # a deep copy; the dump is JSON already
+    for role in view.get("roles") or []:
+        launch = role.get("launch") if isinstance(role, dict) else None
+        if isinstance(launch, dict):
+            for field in LAUNCH_CONTENT_FIELDS:
+                launch.pop(field, None)
+    return view
+
+
+def _changed_fields(planned: object, now: object, path: str) -> list[tuple[str, object, object]]:
+    """``(field path, planned, now)`` for every leaf that differs; roles are matched by name."""
+    if planned == now:
+        return []
+    if isinstance(planned, dict) and isinstance(now, dict):
+        changed: list[tuple[str, object, object]] = []
+        for key in [*planned, *(key for key in now if key not in planned)]:
+            changed += _changed_fields(planned.get(key), now.get(key), f"{path}.{key}")
+        return changed
+
+    def by_role(value: object) -> dict[str, object] | None:
+        if not isinstance(value, list):
+            return None
+        named = {item.get("role"): item for item in value if isinstance(item, dict)}
+        if len(named) != len(value) or not all(isinstance(name, str) for name in named):
+            return None
+        return named  # type: ignore[return-value]
+
+    planned_roles, now_roles = by_role(planned), by_role(now)
+    if planned_roles is not None and now_roles is not None:
+        changed = []
+        for role in [*planned_roles, *(role for role in now_roles if role not in planned_roles)]:
+            changed += _changed_fields(
+                planned_roles.get(role), now_roles.get(role), f"{path}[{role}]"
+            )
+        return changed
+    return [(path, planned, now)]
+
+
+def effective_config_changes(plan: RunPlan, now: EffectiveConfig) -> list[str]:
+    """Which fields of the planned effective configuration differ from ``now``, in words.
+
+    One line per changed field, naming the environment variable it is read from when it is one
+    of :func:`_environment_sources` - the usual reason a plan turns stale without any file having
+    changed. Wording only: whether a plan is stale is decided by the binding digest.
+    """
+    sources = _environment_sources(plan)
+    lines: list[str] = []
+    for path, planned, current in _changed_fields(
+        _config_view(plan.prepare_report.effective_config.model_dump(mode="json")),
+        _config_view(now.model_dump(mode="json")),
+        "effective_config",
+    ):
+        line = f"{path}: planned {planned!r} != now {current!r}"
+        variables = sources.get(path.rsplit(".", 1)[-1])
+        if variables:
+            line += f" (read from the environment: {variables})"
+        lines.append(line)
+    return lines
+
+
 def plan_drift(
     plan: RunPlan,
     *,
     binding: AuthorizationBinding,
     root_limits: RootBudgetLimits | None,
     submissions_required: int | None = None,
+    effective: EffectiveConfig | None = None,
 ) -> list[str]:
-    """What differs between ``plan`` and a fresh resolution of its arguments; empty when current."""
+    """What differs between ``plan`` and a fresh resolution of its arguments; empty when current.
+
+    With ``effective`` (the fresh resolution's effective configuration), a changed
+    ``effective_config_digest`` is followed by the configuration fields that changed.
+    """
     differences: list[str] = []
     current = binding.model_dump(mode="json")
     if binding.digest() != plan.binding_digest:
@@ -221,6 +328,8 @@ def plan_drift(
             planned, now = plan.binding.get(key), current.get(key)
             if planned != now:
                 differences.append(f"{key}: planned {planned!r} != now {now!r}")
+                if key == _EFFECTIVE_CONFIG_KEY and effective is not None:
+                    differences.extend(effective_config_changes(plan, effective))
         if not differences:
             differences.append(
                 f"binding digest: planned {plan.binding_digest} != now {binding.digest()}"
@@ -235,6 +344,34 @@ def plan_drift(
             f"required top-level submissions: planned {planned_count} != now {submissions_required}"
         )
     return differences
+
+
+def require_current(
+    plan: RunPlan,
+    plan_path: Path,
+    resolution: Resolution,
+    *,
+    approved: bool,
+    submissions_required: int | None = None,
+) -> None:
+    """Refuse ``plan`` as stale unless ``resolution`` - its arguments resolved again - is what it
+    planned: the same binding, the same root ceilings and, when given, the same submission count.
+
+    ``approve`` and ``run --plan`` both call it, after resolving and before anything is asked,
+    written or dispatched. ``approved`` picks the remedy the refusal names (re-approve, or only
+    re-prepare an offline plan).
+    """
+    differences = plan_drift(
+        plan,
+        binding=resolution_binding(
+            resolution, authorization_mode=plan.arguments.authorization_mode
+        ),
+        root_limits=resolution.root_plan.limits if resolution.root_plan is not None else None,
+        submissions_required=submissions_required,
+        effective=resolution.resolved.effective,
+    )
+    if differences:
+        raise stale_plan_error(plan_path, differences, approved=approved)
 
 
 def stale_plan_error(plan_path: Path, differences: list[str], *, approved: bool) -> RefusedError:
@@ -268,6 +405,10 @@ def default_authorization_path(plan_path: Path, binding_digest: str) -> Path:
 
 
 def same_directory(left: str | Path, right: str | Path) -> bool:
+    """Whether two paths name the same place: absolute, case-folded where the OS folds case.
+
+    Used for a data directory and for an authorization file alike; nothing is resolved on disk.
+    """
     return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
 
 

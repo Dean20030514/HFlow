@@ -44,6 +44,7 @@ from hflow.store import (
     StoreError,
 )
 from tests import test_batch_e_migration as migration_helpers
+from tests.store_helpers import claim_run, dispatch_attempt
 
 BASE = "b" * 40
 CANDIDATE = "c" * 40
@@ -76,7 +77,7 @@ def _ready_run(store: Store, project, spec: TaskSpec, run_id: str) -> str:
         turn_limit=4,
         repair_limit=0,
     )
-    store.claim_run(run_id, "local-controller")
+    claim_run(store, run_id, "local-controller")
     store.set_task_state(run_id, [TaskState.DRAFT], TaskState.READY)
     return run_id
 
@@ -87,16 +88,14 @@ def _accepted_run(
     """An ACCEPTED / LOCAL_CANDIDATE run with a receipt, through the store's own transitions."""
     _ready_run(store, project, spec, run_id)
     attempt_id = f"A-{run_id}"
-    store.dispatch_attempt(
+    dispatch_attempt(
+        store,
         run_id=run_id,
         controller_id="local-controller",
         attempt_id=attempt_id,
-        role="implementer",
+        invocation_id=f"I-{run_id}",
         reservation_id=f"B-{run_id}",
-        reserved_turns=1,
-        reservation_expires_at="2999-01-01T00:00:00Z",
     )
-    store.record_invocation(attempt_id, f"I-{run_id}")
     store.advance_to_checking(run_id=run_id, attempt_id=attempt_id, phase=CheckPhase.VERIFICATION)
     store.record_evidence(
         evidence_id=f"E-{run_id}",
@@ -831,8 +830,8 @@ def test_a_fresh_ledger_is_storage_v8_with_the_integrations_table(tmp_path: Path
         assert migrate.SUPPORTED_STORAGE_VERSION == 8
         assert store.migrated_from is None and store.migration_backup is None
         assert migrate.recorded_version(store.conn) == 8
-        assert "8->9" not in migrate.migration_steps()
-        assert migrate.migration_steps()[-1] == "7->8"
+        # One step per target version, 1 through 8, and none past 8.
+        assert sorted(migrate._MIGRATIONS) == list(range(1, 9))  # noqa: SLF001
     finally:
         store.close()
     assert "integrations" in migration_helpers._tables(path)  # noqa: SLF001

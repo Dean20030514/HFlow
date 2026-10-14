@@ -20,13 +20,13 @@ from pathlib import Path
 from ..contracts import (
     AgentBinding,
     CapabilityReport,
-    CapabilityState,
     LaunchConfig,
     RefusalCode,
     RefusedError,
 )
 from .acpx_dsh import DRIVER_ID as ACPX_DSH_DRIVER_ID
-from .acpx_dsh import AcpxDshDriver
+from .acpx_dsh import DRIVER_VERSION as ACPX_DSH_DRIVER_VERSION
+from .acpx_dsh import PROBED_CAPABILITIES, AcpxDshDriver
 
 SELECTED_DRIVER_ID = ACPX_DSH_DRIVER_ID
 #: Names a machine profile may use for the selected transport.
@@ -110,31 +110,16 @@ def local_probe(
     if driver is not None and binding is not None:
         return driver.probe(binding)
 
-    capabilities = {
-        "fresh_session": CapabilityState.PROBED,
-        "session_open_close": CapabilityState.PROBED,
-        "prompt_turn": CapabilityState.PROBED,
-        "streamed_updates": CapabilityState.PROBED,
-        "structured_output": CapabilityState.PROBED,
-        "cancel": CapabilityState.UNSUPPORTED,
-        "process_boundary_teardown": CapabilityState.PROBED,
-        "session_list": CapabilityState.DOCUMENTED,
-        "session_resume": CapabilityState.DOCUMENTED,
-        "model_selection": CapabilityState.DOCUMENTED,
-        "billing_usage": CapabilityState.UNKNOWN,
-        "readonly_enforcement": CapabilityState.UNSUPPORTED,
-        "native_subagents": CapabilityState.UNSUPPORTED,
-    }
     return CapabilityReport(
         driver_id=SELECTED_DRIVER_ID,
-        driver_version="0.1.0",
+        driver_version=ACPX_DSH_DRIVER_VERSION,
         harness="dsh",
         harness_version=None,
         os=f"{platform.system()}-{platform.release()}",
         arch=platform.machine(),
         probe_only=True,
         live_tested=False,
-        capabilities=capabilities,
+        capabilities=dict(PROBED_CAPABILITIES),
         notes=[
             "probe is static: no prompt, no session, no model request",
             "transport selected by M0: acpx 0.17.1 -> official DSH ACP",

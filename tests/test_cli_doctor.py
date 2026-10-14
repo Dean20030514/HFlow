@@ -36,6 +36,7 @@ from hflow.cli import (
 )
 from hflow.contracts import MachineProfile, canonical_json
 from hflow.drivers.acpx_dsh import NO_CWD_EXE_SEARCH_ENV, find_on_path
+from hflow.hints import shell_word
 
 from .conftest import write_profile, write_project, write_task
 
@@ -348,9 +349,18 @@ def test_doctor_says_plainly_that_acpx_is_not_found_and_where_it_is_looked_for(
                   "A machine profile does not name the acpx entry"):
         assert words in acpx["detail"], words
     assert not (tmp_path / "acpx-ran.txt").exists()
+    # How to put one where HFlow looks, and the model-free check of it: printed, never run.
+    data_dir = tmp_path / "data"
+    install = f"npm install --prefix {shell_word(str(data_dir / 'm0' / 'acpx'))} acpx@0.17.1"
+    entry = data_dir / "m0" / "acpx" / "node_modules" / "acpx" / "dist" / "cli.js"
+    check = f"python tools/m0_probe/real_client_checks.py all --acpx-cli {shell_word(str(entry))}"
+    assert (acpx["install_command"], acpx["check_command"]) == (install, check)
+    assert f"`{install}`" in acpx["detail"] and f"`{check}`" in acpx["detail"], acpx["detail"]
+    assert not (tmp_path / "data" / "m0").exists(), "doctor installs nothing"
 
     assert main(["doctor", "--data-dir", str(tmp_path / "data")]) == EXIT_OK
-    assert "acpx client   NOT FOUND" in capsys.readouterr().out
+    text = capsys.readouterr().out
+    assert "acpx client   NOT FOUND" in text and install in text, text
 
 
 def test_doctor_shows_the_acpx_entry_and_version_a_profile_would_use(

@@ -19,7 +19,7 @@ import glob
 import json
 import os
 import weakref
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -81,6 +81,7 @@ from .contracts import (
 from .ids import (
     add_seconds,
     new_attempt_id,
+    new_evidence_id,
     new_invocation_id,
     new_reservation_id,
     new_run_id,
@@ -110,13 +111,13 @@ from .gitworkspace import (
     GitStatusParseError,
 )
 from .store import (
-    ATTESTATION_MAX_CHARS,
     INVOCATION_OPEN_STATES,
     INVOCATION_UNRESOLVED_STATES,
     RunNotFound,
     Store,
     StoreError,
     StoredRecordUnreadable,
+    attestation_bounds_problem,
 )
 from .ownership import (
     OwnerAssessment,
@@ -187,9 +188,11 @@ def _packet_workspace(packet: RenderedPacket) -> str:
 from .verify import _reference_field, _stream_reference  # noqa: E402
 
 
-def _change_list(items: list[str]) -> str:
-    """At most five changed labels, then a count: what a block reason or a note names."""
-    return ", ".join(items[:5]) + (f" (+{len(items) - 5} more)" if len(items) > 5 else "")
+def _change_list(items: Sequence[str], limit: int = 5) -> str:
+    """At most ``limit`` labels, then a count of the rest: what a block reason or a note names."""
+    return ", ".join(items[:limit]) + (
+        f" (+{len(items) - limit} more)" if len(items) > limit else ""
+    )
 
 
 #: Note prefixes written by the controller. They are read back mechanically (by tests and by
@@ -483,19 +486,10 @@ def attestation_problem(attestation: str | None) -> str | None:
     """
     from .hints import ATTEST_PLACEHOLDER_TEXT  # hints never imports the controller
 
-    if not isinstance(attestation, str) or not attestation.strip():
-        return (
-            "the attestation is blank; an attestation records what the operator claims and why, "
-            "and an empty claim records nothing"
-        )
-    if len(attestation) > ATTESTATION_MAX_CHARS:
-        return (
-            f"the attestation is {len(attestation)} characters; the bound is "
-            f"{ATTESTATION_MAX_CHARS}. Shorten it (it is a statement, not a log)"
-        )
-    if "\x00" in attestation:
-        return "the attestation contains a NUL character"
-    text = attestation.strip().strip("\"'“”‘’").strip()
+    problem = attestation_bounds_problem(attestation)
+    if problem is not None:
+        return problem
+    text = str(attestation).strip().strip("\"'“”‘’").strip()
     inner = text[1:-1]
     bracketed = (
         len(text) >= 2 and text[0] == "<" and text[-1] == ">" and "<" not in inner
@@ -553,17 +547,13 @@ def operator_settle_refusal(
     )
     if blocker == OWNER_LEGACY_UNPROVEN:
         return (
-            f"run {run_id} was written before owner identity existed ({_owner_words(row)}; "
-            f"{assessment.summary}). Its recorded controller process carries no host, so HFlow "
-            "cannot tell whether it still runs - on this machine or another. If you know it has "
-            "exited, settle again with --legacy-owner-gone, which records that you attest it; "
-            "nothing was written"
+            f"run {run_id} {_owner_blocker_why(blocker, row, assessment)}, settle again with "
+            "--legacy-owner-gone, which records that you attest it; nothing was written"
         )
     if blocker == OWNER_MAY_BE_ALIVE:
         return (
-            f"the owner of run {run_id} may still be alive ({_owner_words(row)}; "
-            f"{assessment.summary}), so the agent it launched may still be running. Wait for that "
-            "controller to exit, or stop its process tree yourself, then run "
+            f"the owner of run {run_id} {_owner_blocker_why(blocker, row, assessment)}. Wait for "
+            "that controller to exit, or stop its process tree yourself, then run "
             f"`hflow resume {run_id}` and settle again; nothing was written"
         )
     if invocation.process_pid is not None:
@@ -597,6 +587,47 @@ def _owner_words(row: Any) -> str:
         f"owner pid={row['owner_pid']} host={row['owner_host']} label={row['claimed_by']!r} "
         f"created={filetime_iso(row['owner_created'])} generation={row['claim_generation']}"
     )
+
+
+def _owner_blocker_why(blocker: str, row: Any, assessment: OwnerAssessment) -> str:
+    """The middle of an owner refusal (:func:`ended_run_owner_blocker`), shared by its commands.
+
+    The caller puts its subject in front and its own remedy after: :data:`OWNER_LEGACY_UNPROVEN`
+    ends "If you know it has exited", :data:`OWNER_MAY_BE_ALIVE` ends "may still be running".
+    """
+    if blocker == OWNER_LEGACY_UNPROVEN:
+        return (
+            f"was written before owner identity existed ({_owner_words(row)}; "
+            f"{assessment.summary}). Its recorded controller process carries no host, so HFlow "
+            "cannot tell whether it still runs - on this machine or another. If you know it has "
+            "exited"
+        )
+    return (
+        f"may still be alive ({_owner_words(row)}; {assessment.summary}), so the agent it "
+        "launched may still be running"
+    )
+
+
+def _own_run_why(run_id: str) -> str:
+    """Why ``resume`` waits on a run this very controller owns."""
+    return (
+        "this controller owns the run and is still running, so the agent it launched may still "
+        f"be running too. Run `hflow resume {run_id}` from another process once this controller "
+        "has exited"
+    )
+
+
+def _gone_basis(assessment: OwnerAssessment) -> str:
+    """The basis ``resume`` names when it acts on an ended run whose owner was proven gone."""
+    return (
+        f"its owner was proven gone (lock {assessment.lock}, identity "
+        f"{assessment.probe.verdict})"
+    )
+
+
+def _nothing_dispatched(store: Store, run_id: str) -> bool:
+    """No attempt and no invocation: nothing of this run was ever in flight."""
+    return not store.attempts_for(run_id) and not store.invocations_for(run_id)
 
 
 class Controller:
@@ -667,7 +698,9 @@ class Controller:
         #: Without an explicit one it is the directory of this run's own ledger, so check
         #: artifacts stay next to the database that references them. The platform default is
         #: only for a ledger that has no directory (an in-memory store).
-        self.data_dir = Path(data_dir) if data_dir else self._ledger_data_dir(store)
+        self.data_dir = Path(data_dir) if data_dir else (
+            owner_ledger_dir(store) or default_data_dir()
+        )
         #: Recorded isolation for reviews. The driver cannot raise it by claiming so.
         self.review_isolation = review_isolation
         #: The configuration this run was resolved with, recorded against the run so `status`
@@ -697,14 +730,6 @@ class Controller:
         self._claims: dict[str, int] = {}
         assert_driver_shape(driver)
         assert_driver_shape(self.reviewer_driver)
-
-    @staticmethod
-    def _ledger_data_dir(store: Store) -> Path:
-        """The data dir a ledger file implies (``<data_dir>/hflow.sqlite``), else the default."""
-        path = getattr(store, "path", None)
-        if path is None or str(path) == ":memory:":
-            return default_data_dir()
-        return Path(path).parent
 
     # -- owner lease (user ruling 2026-10-03) ----------------------------------
 
@@ -764,10 +789,6 @@ class Controller:
         token = row["owner_token"]
         return token == self.owner_token or (token is None and row["claimed_by"] is None)
 
-    def _nothing_dispatched(self, run_id: str) -> bool:
-        """No attempt and no invocation: nothing of this run was ever in flight."""
-        return not self.store.attempts_for(run_id) and not self.store.invocations_for(run_id)
-
     def _adopt(self, run_id: str, row: Any, assessment: OwnerAssessment) -> bool:
         """Adopt a never-dispatched run whose owner is provably gone; keep its state.
 
@@ -800,7 +821,7 @@ class Controller:
     def _foreign_owner_note(self, row: Any) -> str:
         """Why this controller does not drive a run another owner holds, naming that owner."""
         assessment = assess_run_owner(self.store, row)
-        dispatched = not self._nothing_dispatched(str(row["run_id"]))
+        dispatched = not _nothing_dispatched(self.store, str(row["run_id"]))
         if assessment.gone and dispatched:
             tail = (
                 "that owner is provably gone, but the run has dispatched work, so it is not "
@@ -854,7 +875,7 @@ class Controller:
             )
         assessment = assess_run_owner(self.store, row)
         not_recorded = assessment.probe.verdict == "not_recorded"
-        if not_recorded and not self._nothing_dispatched(run_id):
+        if not_recorded and not _nothing_dispatched(self.store, run_id):
             return self._outcome_for(
                 run_id,
                 notes=[
@@ -917,7 +938,6 @@ class Controller:
             identity=me,
             reason=reason,
             detail=detail,
-            note=reason,
             require_nothing_dispatched=not_recorded,
         )
         if result is None:
@@ -1063,10 +1083,10 @@ class Controller:
         self.project_root = project_root
         spec_digest = spec.spec_digest()
         existing = self.store.find_run_by_spec_digest(project.project_id, spec_digest)
-        continuation = existing is not None and TaskState(existing["task_state"]) not in {
-            TaskState.ACCEPTED, TaskState.BLOCKED, TaskState.CANCELLED
-        } and self._nothing_dispatched(existing["run_id"])
-        if not continuation:
+        # Admission gates a *new* run only. An existing run answers below from what it recorded
+        # (a continuation re-validates there, before it claims anything), so a contract that
+        # changed after a run ended never turns its history query into a refusal.
+        if existing is None:
             report = validate_task_spec(
                 spec, project, project_root, allow_fake_checks=self.allow_fake_checks
             )
@@ -1121,10 +1141,10 @@ class Controller:
             adopt = False
             if not self._claimable(existing):
                 assessment = assess_run_owner(self.store, existing)
-                if not (assessment.gone and self._nothing_dispatched(run_id)):
+                if not (assessment.gone and _nothing_dispatched(self.store, run_id)):
                     return self._outcome_for(run_id, notes=[self._foreign_owner_note(existing)])
                 adopt = True
-            if not self._nothing_dispatched(run_id):
+            if not _nothing_dispatched(self.store, run_id):
                 return self._outcome_for(run_id, notes=["this run already dispatched work; use resume to reconcile, never re-dispatch"])
             problem, binding = self._continuation_problem(run_id, request)
             if problem:
@@ -1164,7 +1184,7 @@ class Controller:
                 # admitted run DRAFT forever, every resubmission exiting 2 although run state
                 # exists; the run instead ends through the conditional block path, as it did
                 # when the dispatch transaction refused it.
-                return self._refuse(
+                return self._blocked(
                     run_id,
                     exc.code,
                     f"{exc.message} (this run was admitted earlier but never dispatched; it ends "
@@ -1208,7 +1228,7 @@ class Controller:
         if self.root_binding is not None:
             # A root recorded with other ceilings (or another root for this task) is reported as
             # that, before the repair gate reads the recorded ceilings.
-            self._check_root_registration()
+            self._root_registration(register=False)
         else:
             self._assert_no_root_for_task(spec, project)
         self._assert_root_repair_allowance(run_id, spec)
@@ -1220,7 +1240,7 @@ class Controller:
         # pointing at a root nothing agreed to. Registration repeats the read-only check inside
         # its own transaction, so a concurrent registration is still refused here.
         if self.root_binding is not None:
-            self._register_root_budget()
+            self._root_registration(register=True)
 
         # --- real-run gate: the artifact is recorded first, then the zero-model preflight.
         # Nothing expensive happens for an unauthorized real run - no credential read, no
@@ -1404,24 +1424,17 @@ class Controller:
         if row["owner_token"] is None:
             return None, ""
         if row["owner_token"] == self.owner_token:
-            why = (
-                "this controller owns the run and is still running, so the agent it launched may "
-                f"still be running too. Run `hflow resume {run_id}` from another process once this "
-                "controller has exited"
-            )
+            why = _own_run_why(run_id)
         else:
             blocker, assessment = ended_run_owner_blocker(self.store, row)
             if blocker is None:
-                return None, (
-                    f"its owner was proven gone (lock {assessment.lock}, identity "
-                    f"{assessment.probe.verdict})"
-                )
+                return None, _gone_basis(assessment)
+            # A run with an owner token is never ``legacy_unproven``: its owner may be alive.
             why = (
-                f"the run's owner may still be alive ({_owner_words(row)}; {assessment.summary}), "
-                "so the agent it launched may still be running: an outcome_unknown block - from "
-                "an `hflow cancel` in another process, which cannot stop that agent, for one - "
-                "does not end them. Wait for that controller to exit, or stop its process tree "
-                f"yourself, then run `hflow resume {run_id}` again"
+                f"the run's owner {_owner_blocker_why(OWNER_MAY_BE_ALIVE, row, assessment)}: an "
+                "outcome_unknown block - from an `hflow cancel` in another process, which cannot "
+                "stop that agent, for one - does not end them. Wait for that controller to exit, "
+                f"or stop its process tree yourself, then run `hflow resume {run_id}` again"
             )
         outcome = self._outcome_for(
             run_id,
@@ -1514,24 +1527,16 @@ class Controller:
         if blocker is not None:
             if blocker == OWNER_LEGACY_UNPROVEN:
                 why = (
-                    f"the run was written before owner identity existed ({_owner_words(row)}; "
-                    f"{assessment.summary}). Its recorded controller process carries no host, so "
-                    "HFlow cannot tell whether it still runs - on this machine or another. If you "
-                    f"know it has exited, run `hflow resume {run_id} --legacy-owner-gone --attest "
-                    '"<what you know and why>"`, which records that you attest it (an attestation, '
-                    "never an observation)"
+                    f"the run {_owner_blocker_why(blocker, row, assessment)}, run `hflow resume "
+                    f'{run_id} --legacy-owner-gone --attest "<what you know and why>"`, which '
+                    "records that you attest it (an attestation, never an observation)"
                 )
             elif row["owner_token"] == self.owner_token:
-                why = (
-                    "this controller owns the run and is still running, so the agent it launched "
-                    f"may still be running too. Run `hflow resume {run_id}` from another process "
-                    "once this controller has exited"
-                )
+                why = _own_run_why(run_id)
             else:
                 why = (
-                    f"the run's owner may still be alive ({_owner_words(row)}; "
-                    f"{assessment.summary}), so the agent it launched may still be running. Wait "
-                    "for that controller to exit, or stop its process tree yourself, then run "
+                    f"the run's owner {_owner_blocker_why(blocker, row, assessment)}. Wait for "
+                    "that controller to exit, or stop its process tree yourself, then run "
                     f"`hflow resume {run_id}` again"
                 )
             refused = self._outcome_for(
@@ -1555,10 +1560,7 @@ class Controller:
                 "observation - a controller pid recorded with no host cannot be checked)"
             )
         elif assessment.gone:
-            basis = (
-                f"its owner was proven gone (lock {assessment.lock}, identity "
-                f"{assessment.probe.verdict})"
-            )
+            basis = _gone_basis(assessment)
         else:
             basis = (
                 "no owner and no controller process were recorded for it, so nothing recorded "
@@ -1805,10 +1807,7 @@ class Controller:
                     run_already_ended=ended,
                 )
                 if ended:
-                    # The run keeps the outcome it ended with; only the stop is recorded.
-                    self.store.record_cancel_receipt(run_id, receipt)
-                    self._note_stop_of_ended_run(run_id, row)
-                    return receipt
+                    return self._record_stop_of_ended_run(run_id, row, receipt)
                 ended_meanwhile = self._end_live_run_for_stop(
                     run_id,
                     receipt,
@@ -1842,9 +1841,7 @@ class Controller:
                 run_already_ended=ended,
             )
             if ended:
-                self.store.record_cancel_receipt(run_id, receipt)
-                self._note_stop_of_ended_run(run_id, row)
-                return receipt
+                return self._record_stop_of_ended_run(run_id, row, receipt)
             ended_meanwhile = self._end_live_run_for_stop(
                 run_id,
                 receipt,
@@ -1862,34 +1859,56 @@ class Controller:
             f"reported={receipt.status} mechanism={receipt.mechanism}"
         )
         if ended:
-            receipt = receipt.model_copy(update={"run_already_ended": True})
-            self.store.record_cancel_receipt(run_id, receipt)
-            self.store.record_note(run_id, target_note)
-            self._note_stop_of_ended_run(run_id, row)
-            return receipt
-        if receipt.status != "confirmed_stopped":
-            ended_meanwhile = self._end_live_run_for_stop(
+            return self._record_stop_of_ended_run(
                 run_id,
-                receipt,
-                RefusalCode.OUTCOME_UNKNOWN,
-                f"stop could not be confirmed for the {role} invocation {active_invocation} "
-                f"({self._driver_label(driver, role)}): {receipt.status}; work may still be running",
+                row,
+                receipt.model_copy(update={"run_already_ended": True}),
+                target_note=target_note,
             )
-            self.store.record_note(run_id, target_note)
-            return ended_meanwhile or receipt
         ended_meanwhile = self._end_live_run_for_stop(
-            run_id,
-            receipt,
-            RefusalCode.CANCELLED_BY_OPERATOR,
-            f"stop confirmed ({receipt.mechanism}) for the {role} invocation "
-            f"{active_invocation} ({self._driver_label(driver, role)}); local execution "
-            "stopped, business result unknown",
+            run_id, receipt, *self._stop_block(receipt, role, driver, active_invocation)
         )
         self.store.record_note(run_id, target_note)
         if ended_meanwhile is not None:
             return ended_meanwhile
-        self._finish_confirmed_stop(run_id, attempt, active_invocation, receipt)
+        if receipt.status == "confirmed_stopped":
+            self._finish_confirmed_stop(run_id, attempt, active_invocation, receipt)
         return receipt
+
+    def _record_stop_of_ended_run(
+        self,
+        run_id: str,
+        row: object,
+        receipt: CancellationReceipt,
+        *,
+        target_note: str | None = None,
+    ) -> CancellationReceipt:
+        """Record a stop that reached a run which had already ended; the run keeps its outcome."""
+        self.store.record_cancel_receipt(run_id, receipt)
+        if target_note is not None:
+            self.store.record_note(run_id, target_note)
+        self._note_stop_of_ended_run(run_id, row)
+        return receipt
+
+    def _stop_block(
+        self, receipt: CancellationReceipt, role: str, driver: HarnessDriver, invocation_id: str
+    ) -> tuple[RefusalCode, str]:
+        """The block a stop puts on a live run, and its reason, from the stop's own receipt.
+
+        ``cancelled_by_operator`` only for a stop the managed process boundary confirmed; any
+        other answer is ``outcome_unknown``, because work may still be running (rule 8).
+        """
+        label = self._driver_label(driver, role)
+        if receipt.status == "confirmed_stopped":
+            return RefusalCode.CANCELLED_BY_OPERATOR, (
+                f"stop confirmed ({receipt.mechanism}) for the {role} invocation "
+                f"{invocation_id or '(none registered)'} ({label}); local execution stopped, "
+                "business result unknown"
+            )
+        return RefusalCode.OUTCOME_UNKNOWN, (
+            f"stop could not be confirmed for the {role} invocation {invocation_id} ({label}): "
+            f"{receipt.status}; work may still be running"
+        )
 
     def _end_live_run_for_stop(
         self, run_id: str, receipt: CancellationReceipt, code: RefusalCode, reason: str
@@ -1932,34 +1951,17 @@ class Controller:
         attempt = self.store.open_attempt(run_id)
         role, driver, active_invocation = self._active_invocation(row, attempt)
         invocation_id = receipt.invocation_id or active_invocation
-        confirmed = receipt.status == "confirmed_stopped"
-        if confirmed:
-            self.store.set_blocked(
-                run_id,
-                RefusalCode.CANCELLED_BY_OPERATOR,
-                f"stop confirmed ({receipt.mechanism}) for the {role} invocation "
-                f"{invocation_id or '(none registered)'} ({self._driver_label(driver, role)}); "
-                "local execution stopped, business result unknown",
-            )
-        else:
-            self.store.set_blocked(
-                run_id,
-                RefusalCode.OUTCOME_UNKNOWN,
-                f"stop could not be confirmed for the {role} invocation {invocation_id} "
-                f"({self._driver_label(driver, role)}): {receipt.status}; work may still be "
-                "running",
-            )
+        self.store.set_blocked(run_id, *self._stop_block(receipt, role, driver, invocation_id))
         self.store.record_note(
             run_id,
             f"{NOTE_CANCEL_TARGET}: the block was re-applied from the recorded receipt "
             f"(reported={receipt.status} mechanism={receipt.mechanism}), which had been recorded "
             "without it; the driver was not asked again",
         )
-        if confirmed:
-            if invocation_id:
-                self._finish_confirmed_stop(run_id, attempt, invocation_id, receipt)
-            else:
-                self._finish_live_attempt(run_id, attempt, receipt)
+        if receipt.status == "confirmed_stopped":
+            # No open attempt, or no invocation id: that half of the bookkeeping has nothing to
+            # act on and is skipped; the receipt and the block above stand.
+            self._finish_confirmed_stop(run_id, attempt, invocation_id, receipt)
         return receipt
 
     def _finish_live_attempt(
@@ -1995,17 +1997,7 @@ class Controller:
         receipt: CancellationReceipt,
     ) -> None:
         """The attempt and ledger bookkeeping of a confirmed stop, after the run is blocked."""
-        try:
-            self.store.finish_attempt(
-                run_id=run_id,
-                attempt_id=attempt["attempt_id"],  # type: ignore[index]
-                state=AttemptState.CANCELLED,
-                outcome=InvocationOutcome.CANCELLED,
-                result=receipt.model_dump(mode="json"),
-                block_code=RefusalCode.CANCELLED_BY_OPERATOR,
-            )
-        except StoreError:
-            pass  # the attempt may already be terminal; the receipt is still recorded
+        self._finish_live_attempt(run_id, attempt, receipt)
         # The ledger records the same fact: the allowance this dispatch consumed stays consumed,
         # and the entry is closed if it is still open, so it does not keep the root blocked for
         # nothing. A stopped invocation is not an unknown one.
@@ -2191,19 +2183,11 @@ class Controller:
         """
         handles = getattr(driver, "_handles", None)
         cancel_handle = getattr(driver, "cancel_handle", None)
-        if isinstance(handles, dict) and callable(cancel_handle) and invocation_id in handles:
-            try:
-                return cancel_handle(handles[invocation_id])  # type: ignore[no-any-return]
-            except Exception as exc:  # noqa: BLE001 - a broken stop must not look like success
-                return CancellationReceipt(
-                    invocation_id=invocation_id,
-                    status="unknown",
-                    mechanism="none",
-                    detail=f"driver raised while stopping: {exc!r}",
-                )
         try:
+            if isinstance(handles, dict) and callable(cancel_handle) and invocation_id in handles:
+                return cancel_handle(handles[invocation_id])  # type: ignore[no-any-return]
             return driver.cancel(invocation_id)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 - a broken stop must not look like success
             return CancellationReceipt(
                 invocation_id=invocation_id,
                 status="unknown",
@@ -2392,14 +2376,14 @@ class Controller:
             limit = int(state["max_top_level_submissions"])
             remaining = limit - int(state["used_top_level_submissions"])
 
-        already_paid = self.store.invocation_counts(run_id)[0] + self.store.invocation_counts(run_id)[1]
-        needed = max(0, self._loop_turns_required(spec, project) - already_paid)
+        required = self._loop_turns_required(spec, project)
+        needed = max(0, required - sum(self.store.invocation_counts(run_id)))
         if needed > remaining:
             raise RefusedError(
                 RefusalCode.BUDGET_EXHAUSTED,
                 f"authorization {self.authorization.authorization_id} has {remaining}/{limit} "
                 f"top-level submission(s) left, but this task's fixed loop needs {needed} more "
-                f"({self._loop_turns_required(spec, project)} for implementer + reviewer). "
+                f"({required} for implementer + reviewer). "
                 "Nothing was dispatched and no allowance was consumed; obtain a new "
                 "authorization for this task or reduce it to a single invocation.",
             )
@@ -2580,28 +2564,20 @@ class Controller:
             for driver in (self.driver, self.reviewer_driver)
         )
 
-    def _register_root_budget(self) -> None:
-        """Record this root's binding and ceilings before any run row or dispatch exists.
+    def _root_registration(self, *, register: bool) -> None:
+        """Record this root's binding and ceilings, or (``register=False``) only check them.
 
-        ``StoreError`` here is an admission refusal, not a crash: it means this run presents a
-        different ceiling, or a second root id, for a task that already has one. Either way the
+        The check writes nothing and is asked before the repair gate, which reads the recorded
+        ceilings: a run presenting other ceilings than the recorded ones is told that, not that the
+        recorded root has no repair. The registration happens before any run row or dispatch
+        exists. ``StoreError`` from either is an admission refusal, not a crash: this run presents
+        a different ceiling, or a second root id, for a task that already has one. Either way the
         allowance belongs to the recorded root and nothing is dispatched.
         """
         assert self.root_binding is not None and self.root_limits is not None
+        write = self.store.register_root_budget if register else self.store.check_root_registration
         try:
-            self.store.register_root_budget(self.root_binding, self.root_limits)
-        except StoreError as exc:
-            raise RefusedError(RefusalCode.BUDGET_EXHAUSTED, str(exc)) from exc
-
-    def _check_root_registration(self) -> None:
-        """Refuse, without writing, a root ``_register_root_budget`` would refuse.
-
-        Asked before the repair gate, which reads the recorded ceilings: a run presenting other
-        ceilings than the recorded ones is told that, not that the recorded root has no repair.
-        """
-        assert self.root_binding is not None and self.root_limits is not None
-        try:
-            self.store.check_root_registration(self.root_binding, self.root_limits)
+            write(self.root_binding, self.root_limits)
         except StoreError as exc:
             raise RefusedError(RefusalCode.BUDGET_EXHAUSTED, str(exc)) from exc
 
@@ -3047,9 +3023,10 @@ class Controller:
         exception path.
         """
         spec = request.task
-        project = request.project
         project_root = Path(request.project_root)
-        policy = self._repair_policy(spec, project)
+        # Only the spec's explicit policy: ``budget.max_repair_cycles`` kept its historical default
+        # of 1 for every task that predates E2, and is never read as consent to repair.
+        policy = spec.repair_policy
 
         # --- workspace preparation (M2): an isolated worktree, or the project in place
         # Created once for the run, before the first dispatch: a repair reuses this worktree
@@ -3073,7 +3050,7 @@ class Controller:
                 # HFlow's own data directory may sit inside the checkout; its writes are not the
                 # user's state changing.
                 user_tree_before = repo.user_change_fingerprint(
-                    exclude=(self.data_dir, self._ledger_data_dir(self.store))
+                    exclude=(self.data_dir, owner_ledger_dir(self.store) or default_data_dir())
                 )
                 resolved_base = repo.resolve_commit(request.base_commit or base_name)
                 worktree = repo.create_worktree(run_id, resolved_base)
@@ -3222,21 +3199,6 @@ class Controller:
                 f"{policy.digest() if policy is not None else '(none)'})",
             )
 
-
-    def _repair_policy(self, spec: TaskSpec, project: ProjectConfig) -> RepairPolicy | None:
-        """This task's explicit repair policy, or ``None`` for the ordinary single loop.
-
-        Deliberately reads only the spec. ``budget.max_repair_cycles`` is *not* consulted: it kept
-        its historical default of 1 for every task that predates E2, and treating that number as
-        consent would repair on behalf of users who never asked for one.
-
-        ``project`` is unused today and stays in the signature because the support rules that will
-        use it (worktree mode, required review) live in ``admission.predictable_dispatch_problems``
-        and are checked before a run row exists; this method answers the narrower question "did
-        this task ask for a repair at all?".
-        """
-        return spec.repair_policy
-
     def _repairable_failure(
         self,
         *,
@@ -3278,19 +3240,15 @@ class Controller:
         """
 
         def refuse(decision: RepairDecision, reason: str) -> _CycleResult:
-            record = RepairRecord(
-                decision=decision,
+            self._record_repair(
+                run_id,
+                decision,
                 trigger=trigger_candidate,
                 reason=reason,
-                policy_digest=policy.digest() if policy is not None else "",
-                failed_checks=[str(fact.get("check_id", "")) for fact in failure_facts],
-                exit_codes={
-                    str(fact.get("check_id", "")): fact.get("exit_code") for fact in failure_facts
-                },
-                round=round_number,
-                decided_at=utc_now(),
+                policy=policy,
+                round_number=round_number,
+                failure_facts=failure_facts,
             )
-            self._record_repair_decision(run_id, record)
             # The block reason leads with what the failure *was*, then says why no repair was
             # bought. An operator reading it needs both: the check's own message ("cannot
             # execute", "acceptance is not met") is the diagnosis, and the decision is the policy
@@ -3355,19 +3313,15 @@ class Controller:
         if exhausted is not None:
             return refuse(RepairDecision.BUDGET_EXHAUSTED, exhausted)
 
-        record = RepairRecord(
-            decision=RepairDecision.ALLOWED,
+        self._record_repair(
+            run_id,
+            RepairDecision.ALLOWED,
             trigger=trigger_candidate,
             reason=f"one repair allowed: {detail}",
-            policy_digest=policy.digest(),
-            failed_checks=[str(fact.get("check_id", "")) for fact in failure_facts],
-            exit_codes={
-                str(fact.get("check_id", "")): fact.get("exit_code") for fact in failure_facts
-            },
-            round=round_number,
-            decided_at=utc_now(),
+            policy=policy,
+            round_number=round_number,
+            failure_facts=failure_facts,
         )
-        self._record_repair_decision(run_id, record)
         context = RepairContext(
             original_base_commit=original_base_commit,
             # The task's own base reference, threaded through so the reference a repair round is
@@ -3516,14 +3470,37 @@ class Controller:
         row = self.store.get_run(run_id)
         return max(0, int(row["turn_limit"]) - int(row["turns_reserved"]))
 
-    def _record_repair_decision(self, run_id: str, record: RepairRecord) -> None:
-        """Persist one repair decision and echo it into the run's notes.
+    def _record_repair(
+        self,
+        run_id: str,
+        decision: RepairDecision,
+        *,
+        trigger: RepairTrigger | None,
+        reason: str,
+        policy: RepairPolicy | None,
+        round_number: int,
+        failure_facts: Sequence[Mapping[str, Any]] = (),
+    ) -> None:
+        """Persist one repair decision of this round and echo it into the run's notes.
 
         Both, on purpose: the structured row is what `status`/`report` renders and what a later
         reader can act on, and the note is what an operator grepping a run finds in place. A
         failure to store the structured row is reported rather than swallowed, because a decision
-        nobody recorded is the state this method exists to prevent.
+        nobody recorded is the state this method exists to prevent. ``failure_facts`` are the
+        failed checks the decision was taken on (their ids and exit codes are recorded).
         """
+        record = RepairRecord(
+            decision=decision,
+            trigger=trigger,
+            reason=reason,
+            policy_digest=policy.digest() if policy is not None else "",
+            failed_checks=[str(fact.get("check_id", "")) for fact in failure_facts],
+            exit_codes={
+                str(fact.get("check_id", "")): fact.get("exit_code") for fact in failure_facts
+            },
+            round=round_number,
+            decided_at=utc_now(),
+        )
         try:
             self.store.record_repair_record(run_id, record)
         except StoreError as exc:  # pragma: no cover - a store failure must not hide the decision
@@ -3648,17 +3625,15 @@ class Controller:
         if flagged:
             return (
                 "index entries are flagged assume-unchanged or skip-worktree ("
-                + ", ".join(flagged[:5])
-                + (f" (+{len(flagged) - 5} more)" if len(flagged) > 5 else "")
+                + _change_list(flagged)
                 + "), so git's status cannot show whether the worktree is still the checked "
                 "candidate; a repair is refused rather than clearing them, and nothing was bought"
             ), ()
-        blocking = report.blocking_changes
+        blocking = report.changed
         if blocking:
             return (
                 "the worktree changed after the candidate was frozen ("
-                + ", ".join(blocking[:5])
-                + (f" (+{len(blocking) - 5} more)" if len(blocking) > 5 else "")
+                + _change_list(blocking)
                 + "), for example a file an approved check wrote that git does not ignore; a "
                 "repair is refused rather than resetting or overwriting it, and nothing was bought"
             ), ()
@@ -3673,8 +3648,7 @@ class Controller:
         if covered:
             return (
                 "a previous check left ignored file(s) inside write_allow ("
-                + ", ".join(covered[:5])
-                + (f" (+{len(covered) - 5} more)" if len(covered) > 5 else "")
+                + _change_list(covered)
                 + "); the scoped fingerprint would cover bytes no candidate commit holds, so a "
                 "repair is refused rather than deleting them, and nothing was bought"
             ), ()
@@ -3781,9 +3755,6 @@ class Controller:
 
     # -- steps ---------------------------------------------------------------
 
-
-
-
     def _attempt_cycle(
         self,
         run_id: str,
@@ -3856,32 +3827,26 @@ class Controller:
                     consequence="no repair was bought and nothing was dispatched",
                 )
                 if metadata is not None:
-                    self._record_repair_decision(
+                    self._record_repair(
                         run_id,
-                        RepairRecord(
-                            decision=RepairDecision.WORKSPACE_DRIFT,
-                            trigger=trigger,
-                            reason=metadata[1],
-                            policy_digest=policy.digest() if policy is not None else "",
-                            round=round_number,
-                            decided_at=utc_now(),
-                        ),
+                        RepairDecision.WORKSPACE_DRIFT,
+                        trigger=trigger,
+                        reason=metadata[1],
+                        policy=policy,
+                        round_number=round_number,
                     )
                     return _CycleResult(outcome=self._blocked(run_id, *metadata))
                 refusal, carried_ignored = self._reconcile_repair_workspace(
                     repo=repo, worktree=worktree, previous=previous, scope=spec.scope
                 )
                 if refusal is not None:
-                    self._record_repair_decision(
+                    self._record_repair(
                         run_id,
-                        RepairRecord(
-                            decision=RepairDecision.WORKSPACE_DRIFT,
-                            trigger=trigger,
-                            reason=refusal,
-                            policy_digest=policy.digest() if policy is not None else "",
-                            round=round_number,
-                            decided_at=utc_now(),
-                        ),
+                        RepairDecision.WORKSPACE_DRIFT,
+                        trigger=trigger,
+                        reason=refusal,
+                        policy=policy,
+                        round_number=round_number,
                     )
                     return _CycleResult(
                         outcome=self._blocked(run_id, RefusalCode.SCOPE_VIOLATION, refusal)
@@ -3896,16 +3861,13 @@ class Controller:
                     run_id, self.controller_id, fence=self._fence(run_id)
                 )
             except StoreError as exc:
-                self._record_repair_decision(
+                self._record_repair(
                     run_id,
-                    RepairRecord(
-                        decision=RepairDecision.STOP_REQUESTED,
-                        trigger=trigger,
-                        reason=str(exc),
-                        policy_digest=policy.digest() if policy is not None else "",
-                        round=round_number,
-                        decided_at=utc_now(),
-                    ),
+                    RepairDecision.STOP_REQUESTED,
+                    trigger=trigger,
+                    reason=str(exc),
+                    policy=policy,
+                    round_number=round_number,
                 )
                 return _CycleResult(outcome=self._blocked(run_id, RefusalCode.BUDGET_EXHAUSTED, str(exc)))
 
@@ -3966,7 +3928,7 @@ class Controller:
                     repair=repair,
                 )
             except RefusedError as exc:
-                return _CycleResult(outcome=self._refuse(run_id, exc.code, str(exc)))
+                return _CycleResult(outcome=self._blocked(run_id, exc.code, str(exc)))
 
         # --- the one dispatch transaction: the authorization's submission, the run's turn,
         # the root's consumption and the invocation record all commit together. Every
@@ -4001,7 +3963,7 @@ class Controller:
                         ],
                     )
                 )
-            return _CycleResult(outcome=self._refuse(run_id, exc.code, str(exc)))
+            return _CycleResult(outcome=self._blocked(run_id, exc.code, str(exc)))
         attempt_id = dispatch.attempt_id
         invocation_id = (
             dispatch.invocation.invocation_id if dispatch.invocation else invocation_id
@@ -4069,11 +4031,7 @@ class Controller:
         # Recorded before the worker runs: what the workspace looked like, so a change outside
         # the declared scope is detected afterwards from two manifests rather than assumed.
         pre_manifest = manifest(execution_root)
-        self.store.record_note(
-            run_id,
-            f"{NOTE_PACKET}: role=implementer bytes={prepared.packet.byte_length} "
-            f"digest={prepared.packet.digest}",
-        )
+        self._note_packet(run_id, "implementer", prepared.packet)
         invocation = InvocationRequest(
             invocation_id=invocation_id,
             attempt_id=attempt_id,
@@ -4265,9 +4223,7 @@ class Controller:
                     run_id,
                     RefusalCode.SCOPE_VIOLATION,
                     "the worker changed files its TaskSpec did not authorize (outside write_allow "
-                    "or under a write_deny rule): "
-                    + ", ".join(outside[:5])
-                    + (f" (+{len(outside) - 5} more)" if len(outside) > 5 else ""),
+                    f"or under a write_deny rule): {_change_list(outside)}",
                 )
             )
 
@@ -4333,12 +4289,7 @@ class Controller:
                             RefusalCode.SCOPE_VIOLATION,
                             "the candidate commit changes paths its TaskSpec did not authorize "
                             "(outside write_allow or under a write_deny rule): "
-                            + ", ".join(cumulative_outside[:5])
-                            + (
-                                f" (+{len(cumulative_outside) - 5} more)"
-                                if len(cumulative_outside) > 5
-                                else ""
-                            ),
+                            + _change_list(cumulative_outside),
                         )
                     )
                 # The next role (the reviewer, or a repair round) starts a DSH agent in this
@@ -4364,8 +4315,7 @@ class Controller:
                         problems.append(
                             "it changes files DSH loads as instructions or skills that no "
                             "write_allow entry names explicitly: "
-                            + ", ".join(undeclared[:5])
-                            + (f" (+{len(undeclared) - 5} more)" if len(undeclared) > 5 else "")
+                            + _change_list(undeclared)
                             + " (declare each file by its path, or a skill directory by an entry "
                             "under .dsh/skills or .agents/skills)"
                         )
@@ -4463,15 +4413,14 @@ class Controller:
                     "the repair attempt left the candidate unchanged; nothing was reviewed and "
                     "nothing was accepted"
                 )
-            decision = RepairRecord(
-                decision=RepairDecision.NO_CONTENT_CHANGE,
+            self._record_repair(
+                run_id,
+                RepairDecision.NO_CONTENT_CHANGE,
                 trigger=trigger,
                 reason=reason,
-                policy_digest=policy.digest() if policy is not None else "",
-                round=round_number,
-                decided_at=utc_now(),
+                policy=policy,
+                round_number=round_number,
             )
-            self._record_repair_decision(run_id, decision)
             return _CycleResult(outcome=self._blocked(run_id, block_code, block_reason))
 
         try:
@@ -4542,19 +4491,16 @@ class Controller:
             # The clock ran out while the implementer was working. Checks were recorded as
             # not-started errors rather than executed, so the run stops here instead of buying a
             # reviewer for work it can no longer accept.
-            self._record_repair_decision(
+            self._record_repair(
                 run_id,
-                RepairRecord(
-                    decision=RepairDecision.DEADLINE_REACHED,
-                    trigger=trigger,
-                    reason=(
-                        "the root's deadline passed before this candidate could be checked, so no "
-                        "check was started, no reviewer was bought and nothing was accepted"
-                    ),
-                    policy_digest=policy.digest() if policy is not None else "",
-                    round=round_number,
-                    decided_at=utc_now(),
+                RepairDecision.DEADLINE_REACHED,
+                trigger=trigger,
+                reason=(
+                    "the root's deadline passed before this candidate could be checked, so no "
+                    "check was started, no reviewer was bought and nothing was accepted"
                 ),
+                policy=policy,
+                round_number=round_number,
             )
             return _CycleResult(
                 outcome=self._blocked(
@@ -4564,22 +4510,37 @@ class Controller:
                     "was not checked and nothing was accepted",
                 )
             )
-        failure_facts = [
-            fact
-            for fact in failed_check_facts(
-                self.store,
-                run_id=run_id,
-                attempt_id=attempt_id,
-                candidate_fingerprint=post_fingerprint,
-                checks_digest=project.checks_digest(),
-            )
-            if fact.get("status") != EvidenceStatus.PASSED.value
-        ]
-
-        review = ReviewResult(status="not_run")
         if verification.status != "passed":
-            review = ReviewResult(status="not_run", isolation=self.review_isolation)
-        elif spec.needs_review(project):
+            # The only two shapes that may buy a repair are decided from recorded facts: a
+            # business assertion failing under the policy (here), or a substantive reviewer
+            # rejection (below).
+            return self._repairable_failure(
+                run_id=run_id,
+                policy=policy,
+                round_number=round_number,
+                original_base_commit=original_base_commit,
+                original_base_ref=original_base_ref,
+                previous=previous,
+                identity=identity,
+                trigger_candidate=RepairTrigger.BUSINESS_CHECK_FAILED,
+                failure_facts=[
+                    fact
+                    for fact in failed_check_facts(
+                        self.store,
+                        run_id=run_id,
+                        attempt_id=attempt_id,
+                        candidate_fingerprint=post_fingerprint,
+                        checks_digest=project.checks_digest(),
+                    )
+                    if fact.get("status") != EvidenceStatus.PASSED.value
+                ],
+                findings=[],
+                detail=verification.detail,
+                configured_deadline_seconds=request.deadline_seconds,
+                context_files=context_files,
+            )
+
+        if spec.needs_review(project):
             # A stop recorded while the implementer or its checks were running is read here,
             # before any state transition or handoff to the reviewer. The transition itself is
             # stop-aware, because the cancel can land between reading this and asking for it.
@@ -4605,25 +4566,6 @@ class Controller:
                 return _CycleResult(outcome=self._blocked(run_id, exc.code, exc.message))
         else:
             review = ReviewResult(status="not_required", isolation=IsolationLevel.NONE)
-
-        if verification.status != "passed":
-            # The only two shapes that may buy a repair are decided here, from recorded facts:
-            # a business assertion failing under the policy, or a substantive reviewer rejection.
-            return self._repairable_failure(
-                run_id=run_id,
-                policy=policy,
-                round_number=round_number,
-                original_base_commit=original_base_commit,
-                original_base_ref=original_base_ref,
-                previous=previous,
-                identity=identity,
-                trigger_candidate=RepairTrigger.BUSINESS_CHECK_FAILED,
-                failure_facts=failure_facts,
-                findings=[],
-                detail=verification.detail,
-                configured_deadline_seconds=request.deadline_seconds,
-                context_files=context_files,
-            )
 
         if review.status == "changes_requested":
             findings = self._review_findings(run_id, attempt_id, post_fingerprint)
@@ -4678,11 +4620,14 @@ class Controller:
         )
         return _CycleResult(outcome=accepted, identity=identity, review=review, accepted=True)
 
-    # -- repair (batch E2) ---------------------------------------------------
+    # -- review ----------------------------------------------------------------
 
-
-
-
+    def _note_packet(self, run_id: str, role: str, packet: RenderedPacket) -> None:
+        """Record the size and digest of a role's rendered input packet (``NOTE_PACKET``)."""
+        self.store.record_note(
+            run_id,
+            f"{NOTE_PACKET}: role={role} bytes={packet.byte_length} digest={packet.digest}",
+        )
 
     @staticmethod
     def _context_file_changes(
@@ -4770,12 +4715,12 @@ class Controller:
         """
         attempt = self.store.open_attempt(run_id)
         attempt_id = attempt["attempt_id"] if attempt else ""
-        row = self.store.get_run(run_id)
         invocation_id = new_invocation_id()
 
         # Read as late as possible - after the checks, after the worktree - so a stop recorded
         # while the implementer or its checks were running is seen here.
-        if self.store.get_run(run_id)["cancel_intent_at"]:
+        row = self.store.get_run(run_id)
+        if row["cancel_intent_at"]:
             raise RefusedError(
                 RefusalCode.CANCELLED_BY_OPERATOR,
                 "a cancellation intent is recorded, so no review turn was bought and no reviewer "
@@ -4790,6 +4735,11 @@ class Controller:
         # no-content-change before any reviewer is bought, so today the fingerprint alone already
         # separates the rounds. Keeping the attempt filter makes this reader agree with `_accept`,
         # and means a future fingerprint covering fewer files cannot start mixing rounds.
+        verification_rows = [
+            r
+            for r in self.store.evidence_for(run_id, kind="verification")
+            if r["attempt_id"] == attempt_id and r["candidate_fingerprint"] == candidate_fp
+        ]
         check_summaries = [
             {
                 "check_id": r["check_id"],
@@ -4805,10 +4755,8 @@ class Controller:
                 "stdout": _stream_reference(r["detail"], "stdout"),
                 "stderr": _stream_reference(r["detail"], "stderr"),
             }
-            for r in self.store.evidence_for(run_id, kind="verification")
-            if r["attempt_id"] == attempt_id
-            and r["candidate_fingerprint"] == candidate_fp
-            and r["checks_digest"] == checks_digest
+            for r in verification_rows
+            if r["checks_digest"] == checks_digest
         ]
         evidence_rows = [
             {
@@ -4820,8 +4768,7 @@ class Controller:
                 "stdout_digest": r["stdout_digest"],
                 "candidate_fingerprint": r["candidate_fingerprint"],
             }
-            for r in self.store.evidence_for(run_id, kind="verification")
-            if r["attempt_id"] == attempt_id and r["candidate_fingerprint"] == candidate_fp
+            for r in verification_rows
         ]
         candidate_identity: dict[str, object] = {
             "fingerprint": candidate_fp,
@@ -4858,37 +4805,42 @@ class Controller:
                     "round_parent_commit": freeze.base_commit,
                     "round_paths": list(freeze.paths),
                 }
-        try:
-            reviewer_packet = self.render(render_reviewer_packet)(
-                task_id=spec.task_id,
-                task_revision=int(row["task_revision"]),
-                goal=spec.goal,
-                acceptance=spec.acceptance,
-                scope=spec.scope,
-                workspace=str(project_root),
-                spec_digest=row["spec_digest"],
-                candidate_fingerprint=candidate_fp,
-                deadline_seconds=self._capped_deadline(900),
-                candidate=candidate_identity,
-                verification_status=verification.status if verification else "not_run",
-                verification_detail=verification.detail if verification else "",
-                check_summaries=check_summaries,
-                evidence_rows=evidence_rows,
-                context_changes=self._context_file_changes(
-                    repo, freeze, candidate_identity, list(context_files or []), project_root
-                ),
-            )
-        except PacketTooLargeError as exc:
-            raise RefusedError(
-                RefusalCode.INVALID_SPEC,
-                f"the reviewer input packet could not be built, so no review was bought: {exc}",
-            ) from exc
-
-        self.store.record_note(
-            run_id,
-            f"{NOTE_PACKET}: role=reviewer bytes={reviewer_packet.byte_length} "
-            f"digest={reviewer_packet.digest}",
+        # The deadline the packet states is the one the invocation is given: the reviewer's 900
+        # seconds capped by what is left of the root's clock, read now and again after the
+        # dispatch transaction below (which re-renders the packet if the clock moved).
+        stated_deadline = self._capped_deadline(900)
+        context_changes = self._context_file_changes(
+            repo, freeze, candidate_identity, list(context_files or []), project_root
         )
+
+        def render_packet(deadline_seconds: int) -> RenderedPacket:
+            try:
+                packet = self.render(render_reviewer_packet)(
+                    task_id=spec.task_id,
+                    task_revision=int(row["task_revision"]),
+                    goal=spec.goal,
+                    acceptance=spec.acceptance,
+                    scope=spec.scope,
+                    workspace=str(project_root),
+                    spec_digest=row["spec_digest"],
+                    candidate_fingerprint=candidate_fp,
+                    deadline_seconds=deadline_seconds,
+                    candidate=candidate_identity,
+                    verification_status=verification.status if verification else "not_run",
+                    verification_detail=verification.detail if verification else "",
+                    check_summaries=check_summaries,
+                    evidence_rows=evidence_rows,
+                    context_changes=context_changes,
+                )
+            except PacketTooLargeError as exc:
+                raise RefusedError(
+                    RefusalCode.INVALID_SPEC,
+                    f"the reviewer input packet could not be built, so no review was bought: {exc}",
+                ) from exc
+            self._note_packet(run_id, "reviewer", packet)
+            return packet
+
+        reviewer_packet = render_packet(stated_deadline)
 
         # A stop can be recorded while the packet is being built or the checks are running. It is
         # re-read here, after the rendering and before anything is bought: buying an allowance or
@@ -4929,6 +4881,17 @@ class Controller:
             # handle - so either the stop is seen and no process is created, or the process
             # exists and the stop finds a published handle to act on.
             self._register_reviewer(run_id, attempt_id, invocation_id)
+        # As for the implementer: the root's clock moved on while the packet was built and the
+        # turn was bought, so the invocation gets what is left now and the packet is brought into
+        # agreement with it - never sent stating more time than the invocation is given. The value
+        # can only shrink, so the re-rendered packet is never larger than the one already checked.
+        deadline_seconds = min(stated_deadline, self._capped_deadline(900))
+        if deadline_seconds != stated_deadline:
+            try:
+                reviewer_packet = render_packet(deadline_seconds)
+            except RefusedError as exc:
+                self._mark_invocation_not_started(dispatch, f"refused before launch: {exc}")
+                raise
         review_request = InvocationRequest(
             invocation_id=invocation_id,
             attempt_id=attempt_id,
@@ -4944,7 +4907,7 @@ class Controller:
             write_allow=[],
             write_deny=list(spec.scope.write_allow),
             workspace=str(project_root),
-            deadline_seconds=self._capped_deadline(900),
+            deadline_seconds=deadline_seconds,
             spec_digest=row["spec_digest"],
             packet=reviewer_packet.text,
             # A reviewer is read-only, always: it checks what the implementer produced, and an
@@ -5082,7 +5045,7 @@ class Controller:
                 )
 
             evidence = self.store.record_evidence(
-                evidence_id=self._new_evidence_id(),
+                evidence_id=new_evidence_id(),
                 run_id=run_id,
                 attempt_id=attempt_id,
                 kind="review",
@@ -5188,7 +5151,7 @@ class Controller:
                 "no verdict can be trusted and nothing is re-dispatched",
             )
         self.store.record_evidence(
-            evidence_id=self._new_evidence_id(),
+            evidence_id=new_evidence_id(),
             run_id=run_id,
             attempt_id=attempt_id,
             kind="review",
@@ -5363,8 +5326,7 @@ class Controller:
                 RefusalCode.SCOPE_VIOLATION,
                 "the delivery changes paths its TaskSpec did not authorize (outside write_allow "
                 "or under a write_deny rule); no receipt was written: "
-                + ", ".join(undelivered[:5])
-                + (f" (+{len(undelivered) - 5} more)" if len(undelivered) > 5 else ""),
+                + _change_list(undelivered),
             )
         # In-tree attribute files travel with the candidate and show in the delivery, so they are
         # recorded rather than refused; ``freeze`` is set only when HFlow's own git staged them.
@@ -5434,12 +5396,12 @@ class Controller:
                     [
                         "the candidate changes files that upstream DSH source (dsh-v0.2.0-rc.2) "
                         "says a DSH agent started in this worktree loads as instructions, skills "
-                        f"or environment ({_first_paths(dsh_changed)}); every role started there "
-                        "after the freeze - the reviewer when one ran, a repair implementer when "
-                        "there was one - would have them in its context. Each is named in the "
-                        "task's write_allow, and the reviewer packet, when a reviewer ran, listed "
-                        "them as untrusted data; recorded from the Git diff, not observed in an "
-                        "agent"
+                        f"or environment ({_change_list(dsh_changed, 20)}); every role started "
+                        "there after the freeze - the reviewer when one ran, a repair implementer "
+                        "when there was one - would have them in its context. Each is named in "
+                        "the task's write_allow, and the reviewer packet, when a reviewer ran, "
+                        "listed them as untrusted data; recorded from the Git diff, not observed "
+                        "in an agent"
                     ]
                     if dsh_changed
                     else []
@@ -5476,7 +5438,7 @@ class Controller:
         if repo is not None:
             user_tree_changed = bool(user_tree_before) and (
                 repo.user_change_fingerprint(
-                    exclude=(self.data_dir, self._ledger_data_dir(self.store))
+                    exclude=(self.data_dir, owner_ledger_dir(self.store) or default_data_dir())
                 )
                 != user_tree_before
             )
@@ -5497,11 +5459,6 @@ class Controller:
         return self._outcome_for(run_id)
 
     # -- helpers -------------------------------------------------------------
-
-    def _new_evidence_id(self) -> str:
-        from .ids import new_evidence_id
-
-        return new_evidence_id()
 
     def _block_attempt(
         self, run_id: str, attempt_id: str, code: RefusalCode, reason: str
@@ -5593,6 +5550,7 @@ class Controller:
         if block_code is not None:
             self._blocked(run_id, block_code, reason)
         return True
+
     def _stopped_before_freeze(
         self, run_id: str, attempt_id: str, *, frozen_commit: str = ""
     ) -> RunOutcome:
@@ -5742,9 +5700,6 @@ class Controller:
             )
         return None
 
-    def _refuse(self, run_id: str, code: RefusalCode, reason: str) -> RunOutcome:
-        return self._blocked(run_id, code, reason)
-
     def _outcome_for(self, run_id: str, notes: list[str] | None = None) -> RunOutcome:
         try:
             row = self.store.get_run(run_id)
@@ -5779,7 +5734,6 @@ class Controller:
         return workspace_drift(self.store, run_id, self.project_root)
 
 
-
 class _CycleResult:
     """What one implementer attempt ended as, in terms the driver loop can act on.
 
@@ -5807,83 +5761,44 @@ class _CycleResult:
         self.accepted = accepted
 
 
-def _first_paths(paths: list[str], limit: int = 20) -> str:
-    """The first ``limit`` paths joined for a receipt line, with a count of the rest."""
-    shown = ", ".join(paths[:limit])
-    return shown + (f" (+{len(paths) - limit} more)" if len(paths) > limit else "")
+def _stored_result_facts(row: Any, column: str, prefix: str) -> dict[str, Any]:
+    """The facts an attempt's stored invocation result carries, read as recorded.
 
-
-def _stored_model_facts(row: Any, column: str, prefix: str) -> dict[str, Any]:
-    """The model facts an attempt's stored invocation result carries, read as recorded.
-
-    A result without them - written before they existed, by the offline driver, or not a driver
-    result at all - yields nothing, which ``status`` reports as "not recorded" rather than as an
-    absent model.
+    Three groups, each read on its own: the model facts, the stream order and the launch-surface
+    record. A group the result does not carry - written before it existed, by the offline driver,
+    an unbound turn, a stream not read to its end, a failed observation - or that this build
+    cannot read is left out, so its fields stay ``None``: ``status`` reports "not recorded", never
+    an absent model, "0 updates" or "nothing was there".
     """
-    from .contracts import ModelApplied, ModelObservation
+    from .contracts import LaunchSurfaces, ModelApplied, ModelObservation, StreamOrder
 
-    raw = row[column] if column in row.keys() else None
+    def typed(model: Any) -> Callable[[Any], Any]:
+        return lambda value: model.model_validate(value) if isinstance(value, dict) else None
+
+    groups: tuple[dict[str, Callable[[Any], Any]], ...] = (
+        {
+            "model_observation": typed(ModelObservation),
+            "model_applied": lambda value: ModelApplied(value) if value else None,
+        },
+        {"stream_order": typed(StreamOrder)},
+        {"launch_surfaces": typed(LaunchSurfaces)},
+    )
     try:
-        payload = json.loads(raw) if raw else {}
-        observation = payload.get("model_observation")
-        applied = payload.get("model_applied")
-        return {
-            f"{prefix}model_observation": ModelObservation.model_validate(observation)
-            if isinstance(observation, dict)
-            else None,
-            f"{prefix}model_applied": ModelApplied(applied) if applied else None,
-        }
-    except (ValueError, TypeError, AttributeError):
+        payload = json.loads(row[column]) if row[column] else {}
+    except (ValueError, TypeError):
         return {}
-
-
-def _stored_stream_order(row: Any, column: str, prefix: str) -> dict[str, Any]:
-    """The stream order an attempt's stored invocation result carries, read as recorded.
-
-    Built like ``_stored_model_facts``: a result without it (an unbound turn, a stream not read to
-    its end, the offline driver, an older run) yields ``None``, which ``status`` reports as
-    unknown, never as "0 updates".
-    """
-    from .contracts import StreamOrder
-
-    raw = row[column] if column in row.keys() else None
-    try:
-        payload = json.loads(raw) if raw else {}
-        order = payload.get("stream_order")
-        return {
-            f"{prefix}stream_order": StreamOrder.model_validate(order)
-            if isinstance(order, dict)
-            else None
-        }
-    except (ValueError, TypeError, AttributeError):
-        return {}
-
-
-def _stored_launch_surfaces(row: Any, column: str, prefix: str) -> dict[str, Any]:
-    """The launch-surface record an attempt's stored invocation result carries, as recorded.
-
-    A result without one - written before it existed, by the offline driver, after a failed
-    observation - or with one this build cannot read yields ``None``: "not recorded", never
-    "nothing was there".
-    """
-    from .contracts import LaunchSurfaces
-
-    raw = row[column] if column in row.keys() else None
-    try:
-        payload = json.loads(raw) if raw else {}
-        surfaces = payload.get("launch_surfaces")
-        return {
-            f"{prefix}launch_surfaces": LaunchSurfaces.model_validate(surfaces)
-            if isinstance(surfaces, dict)
-            else None
-        }
-    except (ValueError, TypeError, AttributeError):
-        return {f"{prefix}launch_surfaces": None}
+    facts: dict[str, Any] = {}
+    for readers in groups:
+        try:
+            facts |= {f"{prefix}{key}": read(payload.get(key)) for key, read in readers.items()}
+        except (ValueError, TypeError, AttributeError):
+            continue  # this group stays "not recorded"
+    return facts
 
 
 def inspect_run(store: Store, run_id: str, *, project_root: Path | None = None) -> RunInspection:
     """Read-only projection for ``status``/``report``. Zero model calls, by design."""
-    from .contracts import AttemptRecord, EvidenceRecord
+    from .contracts import AttemptRecord
 
     row = store.get_run(run_id)
     drift = workspace_drift(store, run_id, project_root) if project_root is not None else None
@@ -5908,37 +5823,13 @@ def inspect_run(store: Store, run_id: str, *, project_root: Path | None = None) 
             block_code=a["block_code"],
             # Batch E2: read from the attempt's own row, so a reader can tell the first attempt
             # from the repair attempt without counting rows or inferring it from a later round.
-            is_repair=bool(a["is_repair"]) if "is_repair" in a.keys() else False,
+            is_repair=bool(a["is_repair"]),
             created_at=a["created_at"],
             finished_at=a["finished_at"],
-            **_stored_model_facts(a, "result_json", ""),
-            **_stored_model_facts(a, "review_json", "review_"),
-            **_stored_stream_order(a, "result_json", ""),
-            **_stored_stream_order(a, "review_json", "review_"),
-            **_stored_launch_surfaces(a, "result_json", ""),
-            **_stored_launch_surfaces(a, "review_json", "review_"),
+            **_stored_result_facts(a, "result_json", ""),
+            **_stored_result_facts(a, "review_json", "review_"),
         )
         for a in store.attempts_for(run_id)
-    ]
-    evidence = [
-        EvidenceRecord(
-            evidence_id=e["evidence_id"],
-            run_id=e["run_id"],
-            attempt_id=e["attempt_id"],
-            kind=e["kind"],
-            status=EvidenceStatus(e["status"]),
-            check_id=e["check_id"] or "",
-            candidate_fingerprint=e["candidate_fingerprint"],
-            checks_digest=e["checks_digest"],
-            command=json.loads(e["command_json"]),
-            exit_code=e["exit_code"],
-            exit_reason=str(e["exit_reason"]) if "exit_reason" in e.keys() else "",
-            stdout_digest=e["stdout_digest"],
-            stderr_digest=e["stderr_digest"],
-            detail=e["detail"],
-            created_at=e["created_at"],
-        )
-        for e in store.evidence_for(run_id)
     ]
     recorded_config = store.effective_config_for(run_id)
     # Batch E1 ledger facts. A run with no root reports ``None`` and no invocations, which the
@@ -5946,22 +5837,18 @@ def inspect_run(store: Store, run_id: str, *, project_root: Path | None = None) 
     # reader could mistake for a real ledger that has not been spent yet.
     root_row = store.root_budget_for_run(run_id)
     root_usage = store.root_budget_view(str(root_row["root_id"])) if root_row is not None else None
-    # Batch E2 repair decisions: every one the run recorded, refusals included. A run that never
-    # decided anything reports an empty list, which the text projection renders as "no decision
-    # recorded" rather than as an empty table.
-    try:
-        repair_records = store.repair_records_for(run_id)
-    except AttributeError:  # pragma: no cover - the store method lands with the same batch
-        repair_records = []
     return RunInspection(
         run=_summary_from_row(row, workspace_matches_receipt=drift),
         task_spec=TaskSpec.model_validate(json.loads(row["task_spec_json"])),
         attempts=attempts,
-        evidence=evidence,
+        evidence=store.evidence_records_for(run_id),
         receipt=ResultReceipt.model_validate(json.loads(row["receipt_json"]))
         if row["receipt_json"]
         else None,
-        repair_records=repair_records,
+        # Batch E2 repair decisions: every one the run recorded, refusals included. A run that
+        # never decided anything reports an empty list, which the text projection renders as "no
+        # decision recorded" rather than as an empty table.
+        repair_records=store.repair_records_for(run_id),
         dsh_context=store.dsh_context_for(run_id),
         # Read-only: the warnings a metadata comparison recorded, including the ones no block
         # reason carries (a run that ended without a receipt, or a stop that already decided it).
@@ -5983,10 +5870,8 @@ def inspect_run(store: Store, run_id: str, *, project_root: Path | None = None) 
 
 def _owner_takeover_words(store: Store, row: Any, assessment: OwnerAssessment) -> str:
     """What ``hflow resume`` would do with this live run's owner, from the same rule it applies."""
-    run_id = str(row["run_id"])
-    nothing = not store.attempts_for(run_id) and not store.invocations_for(run_id)
     if assessment.probe.verdict == "not_recorded":
-        if nothing:
+        if _nothing_dispatched(store, str(row["run_id"])):
             return (
                 "; not proven gone - `hflow resume` would take it over only because nothing was "
                 "dispatched"
@@ -6004,9 +5889,6 @@ def _run_owner(store: Store, row: Any) -> RunOwner:
     pid; it writes nothing to the ledger and never calls a model. A terminal run is not probed:
     nothing about its owner can change what it recorded.
     """
-    keys = row.keys()
-    if "owner_token" not in keys:  # pragma: no cover - every v6 ledger has the column
-        return RunOwner(label=row["claimed_by"], liveness="not_recorded", lock="not_applicable")
     owner = RunOwner(
         label=row["claimed_by"],
         token=row["owner_token"],

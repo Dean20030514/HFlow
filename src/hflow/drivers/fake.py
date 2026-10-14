@@ -55,17 +55,11 @@ class FakeScript:
     review: ReviewOutput | None = field(
         default_factory=lambda: ReviewOutput(verdict="accepted", findings=[])
     )
-    #: Reviewer-side isolation claim from the (fake) model, used to prove that a
-    #: self-claimed isolation level never upgrades the recorded one (acceptance A08).
-    claimed_isolation: str | None = None
     error_code: str | None = None
     error_message: str | None = None
     limitations: list[str] = field(default_factory=lambda: ["fake driver: no model was invoked"])
     #: Invocations that model an interrupted run: no result is produced.
     unknown_invocations: int = 0
-    #: Test hook: change a scoped file *after* verification, to prove stale evidence
-    #: is rejected instead of being reused (acceptance A09).
-    mutate_after_verify: bool = False
 
 
 class FakeDriver:

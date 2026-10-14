@@ -35,6 +35,8 @@ from typing import Any
 
 from .authorization import project_contract_digest
 from .contracts import (
+    INTEGRATION_ACTIVE_STATES,
+    INTEGRATION_TERMINAL_STATES,
     DeliveryState,
     IntegrationReceipt,
     IntegrationRecord,
@@ -48,7 +50,7 @@ from .contracts import (
     VerificationResult,
 )
 from .gitworkspace import MIN_INTEGRATION_GIT, GitError, GitRepo
-from .hints import hflow_command, named_data_dir, shell_word
+from .hints import hflow_command, shell_word
 from .ids import new_integration_id, utc_now
 from .ownership import ProcessIdentity, current_identity, probe
 from .store import IntegrationConflict, IntegrationNotFound, Store
@@ -58,17 +60,6 @@ from .workspace import candidate_fingerprint, paths_outside_scope
 #: The evidence kind of a check executed on an integration tree. Kept apart from the run's own
 #: ``verification`` rows so the acceptance path can never read an integration result as its own.
 EVIDENCE_KIND = "integration-check"
-
-#: States whose record is settled: nothing further happens to it without a new ``prepare``.
-_SETTLED = {
-    IntegrationState.INTEGRATED,
-    IntegrationState.CONFLICT,
-    IntegrationState.CHECKS_FAILED,
-    IntegrationState.STALE,
-    IntegrationState.INTERRUPTED,
-    IntegrationState.SUPERSEDED,
-    IntegrationState.FAILED,
-}
 
 
 @dataclass
@@ -96,14 +87,6 @@ class IntegrationBusy(RefusedError):
     """The process recorded on an active integration may still be running; nothing was written."""
 
 
-def _refuse(code: RefusalCode, message: str) -> RefusedError:
-    return RefusedError(code, message)
-
-
-def _absolute_common_dir(repo: GitRepo) -> str:
-    return str((repo.root / repo.common_dir).resolve())
-
-
 def _contains(repo: GitRepo, tip: str | None, commit: str) -> bool:
     """Does the branch tip ``tip`` contain ``commit``? ``None`` (no branch) contains nothing."""
     if not tip:
@@ -114,7 +97,7 @@ def _contains(repo: GitRepo, tip: str | None, commit: str) -> bool:
 def _run_receipt(store: Store, run_id: str) -> tuple[Any, ResultReceipt, TaskSpec]:
     row = store.get_run(run_id)
     if row["task_state"] != TaskState.ACCEPTED.value or not row["receipt_json"]:
-        raise _refuse(
+        raise RefusedError(
             RefusalCode.NOT_INTEGRABLE,
             f"run {run_id} is {row['task_state']} with no delivery receipt; only an ACCEPTED run's "
             "candidate can be integrated",
@@ -132,7 +115,7 @@ def _open_repo(store: Store, run_id: str) -> tuple[GitRepo, str]:
     else:
         binding = store.admission_binding_for(run_id)
         if binding is None or not binding.git_common_dir:
-            raise _refuse(
+            raise RefusedError(
                 RefusalCode.NOT_INTEGRABLE,
                 f"run {run_id} recorded no repository identity (no workspace provenance and no "
                 "admission binding naming a Git common directory), so the repository its candidate "
@@ -146,13 +129,13 @@ def _repo_at(root: str, common: str, *, owner: str) -> tuple[GitRepo, str]:
     try:
         repo = GitRepo(Path(root))
     except GitError as exc:
-        raise _refuse(
+        raise RefusedError(
             RefusalCode.NOT_INTEGRABLE,
             f"the repository {owner} recorded ({root}) cannot be opened: {exc}",
         ) from exc
-    actual = _absolute_common_dir(repo)
+    actual = repo.absolute_common_dir
     if common and str(Path(common).resolve()) != actual:
-        raise _refuse(
+        raise RefusedError(
             RefusalCode.PROJECT_MISMATCH,
             f"{root} now resolves to the Git common directory {actual}, not the {common} "
             f"{owner} recorded; refusing to integrate into a different repository",
@@ -160,7 +143,7 @@ def _repo_at(root: str, common: str, *, owner: str) -> tuple[GitRepo, str]:
     version = repo.git_version()
     if version[:2] < MIN_INTEGRATION_GIT:
         needed = ".".join(str(part) for part in MIN_INTEGRATION_GIT)
-        raise _refuse(
+        raise RefusedError(
             RefusalCode.NOT_IMPLEMENTED,
             f"integration needs Git {needed} or later (`merge-tree --write-tree --merge-base`); "
             f"this Git is {'.'.join(str(part) for part in version)}",
@@ -192,26 +175,26 @@ def prepare_integration(
     """
     row, receipt, spec = _run_receipt(store, run_id)
     if receipt.delivery_state is not DeliveryState.LOCAL_CANDIDATE:
-        raise _refuse(
+        raise RefusedError(
             RefusalCode.NOT_INTEGRABLE,
             f"run {run_id}'s receipt is {receipt.delivery_state.value}, not LOCAL_CANDIDATE",
         )
     candidate = receipt.candidate.git_commit
     base = receipt.candidate.base_commit
     if not candidate or not receipt.candidate.git_tree:
-        raise _refuse(
+        raise RefusedError(
             RefusalCode.NOT_INTEGRABLE,
             f"run {run_id} delivered no Git candidate (it did not run in a Git worktree), so there "
             "is no commit to integrate",
         )
     if project.project_id != row["project_id"]:
-        raise _refuse(
+        raise RefusedError(
             RefusalCode.PROJECT_MISMATCH,
             f"the project contract is for {project.project_id!r}; run {run_id} belongs to "
             f"{row['project_id']!r}",
         )
     if project.checks_digest() != row["checks_digest"]:
-        raise _refuse(
+        raise RefusedError(
             RefusalCode.NOT_INTEGRABLE,
             f"the project's approved checks changed since run {run_id} (checks digest "
             f"{project.checks_digest()} vs the run's {row['checks_digest']}); an integration is "
@@ -222,9 +205,11 @@ def prepare_integration(
     for check_id in spec.required_check_ids():
         check = check_map.get(check_id)
         if check is None:  # pragma: no cover - the digest above already pins the checks
-            raise _refuse(RefusalCode.UNKNOWN_CHECK, f"check {check_id!r} is not in the contract")
+            raise RefusedError(
+                RefusalCode.UNKNOWN_CHECK, f"check {check_id!r} is not in the contract"
+            )
         if check.kind == "fake" and not allow_fake_checks:
-            raise _refuse(
+            raise RefusedError(
                 RefusalCode.NOT_INTEGRABLE,
                 f"check {check_id!r} is kind=fake: it runs no program, so it cannot verify an "
                 "integration tree that is about to land on a real branch",
@@ -234,10 +219,10 @@ def prepare_integration(
     try:
         target_ref = repo.branch_ref(target_branch)
     except GitError as exc:
-        raise _refuse(RefusalCode.INVALID_SPEC, f"--target {target_branch!r}: {exc}") from exc
+        raise RefusedError(RefusalCode.INVALID_SPEC, f"--target {target_branch!r}: {exc}") from exc
     tip = repo.ref_target(target_ref)
     if tip is None:
-        raise _refuse(
+        raise RefusedError(
             RefusalCode.NOT_INTEGRABLE,
             f"there is no branch {target_ref} in {repo.root}; HFlow integrates into an existing "
             "local branch and never creates one",
@@ -246,7 +231,7 @@ def prepare_integration(
         # A case-insensitive file system resolves `MAIN` through the loose file of `main`; every
         # later comparison (which worktree has it checked out, which ref an apply locks) would then
         # miss the real branch, so the name must be the branch's exact spelling.
-        raise _refuse(
+        raise RefusedError(
             RefusalCode.INVALID_SPEC,
             f"--target {target_branch!r} resolves to {tip} only through a case-insensitive file "
             f"system: no ref is named exactly {target_ref}. Use the branch's exact spelling "
@@ -254,19 +239,19 @@ def prepare_integration(
         )
     for label, commit in (("candidate", candidate), ("task base", base)):
         if not commit or not repo.commit_exists(commit):
-            raise _refuse(
+            raise RefusedError(
                 RefusalCode.NOT_INTEGRABLE,
                 f"the {label} commit {commit or '(none recorded)'} is not in {repo.root}",
             )
     if not repo.is_ancestor(base, tip):
-        raise _refuse(
+        raise RefusedError(
             RefusalCode.TARGET_MOVED,
             f"{target_ref} is at {tip}, which does not contain the task's base {base}: the branch "
             "was rewritten or is a different line of history. HFlow does not guess how the "
             "candidate relates to it; start a new task revision on the branch's current tip",
         )
     if _contains(repo, tip, candidate):
-        raise _refuse(
+        raise RefusedError(
             RefusalCode.NOT_INTEGRABLE,
             f"{target_ref} at {tip} already contains the candidate commit {candidate}; there is "
             "nothing to integrate",
@@ -299,16 +284,17 @@ def prepare_integration(
     try:
         record = store.create_integration(record)
     except IntegrationConflict as exc:
-        raise _refuse(RefusalCode.NOT_INTEGRABLE, str(exc)) from exc
+        raise RefusedError(RefusalCode.NOT_INTEGRABLE, str(exc)) from exc
 
     notes: list[str] = []
-    candidate_ref = repo.candidate_ref(run_id, receipt.attempt_id)
-    if repo.ref_target(candidate_ref) != candidate:
-        notes.append(
-            f"the run's candidate ref {candidate_ref} no longer points at {candidate}; the "
-            "integration ref keeps the integrated change reachable instead"
-        )
     try:
+        # Inside the ``try``: the record exists now, so a failing read is a recorded failure.
+        candidate_ref = repo.candidate_ref(run_id, receipt.attempt_id)
+        if repo.ref_target(candidate_ref) != candidate:
+            notes.append(
+                f"the run's candidate ref {candidate_ref} no longer points at {candidate}; the "
+                "integration ref keeps the integrated change reachable instead"
+            )
         return _build_and_check(
             store,
             record,
@@ -371,7 +357,7 @@ def _refuse_another_contract(store: Store, run_id: str, project: ProjectConfig) 
         return
     actual = project_contract_digest(project)
     if actual != recorded:
-        raise _refuse(
+        raise RefusedError(
             RefusalCode.PROJECT_MISMATCH,
             f"the project contract differs from the one run {run_id} was admitted under "
             f"(contract digest {actual} vs the run's {recorded}): an accepted delivery is "
@@ -417,7 +403,7 @@ def _refuse_if_already_integrated(
         if earlier.state is IntegrationState.INTEGRATED or _contains(
             repo, tip, earlier.integration_commit
         ):
-            raise _refuse(
+            raise RefusedError(
                 RefusalCode.NOT_INTEGRABLE,
                 f"run {run_id} was already integrated into {target_ref}: integration "
                 f"{earlier.integration_id} ({earlier.state.value}) commit "
@@ -677,23 +663,10 @@ def _release_worktree(repo: GitRepo, record: IntegrationRecord) -> tuple[str, st
     return "REMOVED", ""
 
 
-#: Moved to :mod:`hflow.hints`, which every command's printed next steps share; kept under their
-#: old names because other modules and tests import them from here.
-_shell_word = shell_word
-_named_data_dir = named_data_dir
-
-
-def _hflow_command(store: Store, *words: str) -> str:
-    """A follow-up ``hflow`` command that can be pasted as printed (:func:`hints.hflow_command`).
-
-    ``words`` are fixed subcommand names, validated ids and full object ids, which need no
-    quoting. The data directory is appended when the ledger is not the default one.
-    """
-    return hflow_command(store, *words)
-
-
 def _apply_command(store: Store, record: IntegrationRecord) -> str:
-    return _hflow_command(
+    """``integrate apply`` for ``record``, pasteable as printed: full ids need no quoting, and
+    :func:`hints.hflow_command` appends ``--data-dir`` when the ledger is not the default one."""
+    return hflow_command(
         store, "integrate", "apply", record.integration_id, "--expect-target", record.target_tip
     )
 
@@ -703,9 +676,9 @@ def _ready_handoff(store: Store, repo: GitRepo, record: IntegrationRecord) -> li
     checked_out = repo.checked_out_at(record.target_ref)
     if checked_out:
         commands = [
-            f"git -C {_shell_word(str(checked_out[0]))} merge --ff-only "
+            f"git -C {shell_word(str(checked_out[0]))} merge --ff-only "
             f"{record.integration_commit}",
-            _hflow_command(store, "integrate", "reconcile", record.integration_id),
+            hflow_command(store, "integrate", "reconcile", record.integration_id),
         ]
     return commands
 
@@ -739,13 +712,13 @@ def apply_integration(
             return reconciled
         record = reconciled.record
     if record.state is not IntegrationState.READY:
-        raise _refuse(
+        raise RefusedError(
             RefusalCode.NOT_INTEGRABLE,
             f"integration {integration_id} is {record.state.value}; only a ready integration can be "
             "applied (prepare a new one)",
         )
     if expect_target != record.target_tip:
-        raise _refuse(
+        raise RefusedError(
             RefusalCode.TARGET_MOVED,
             f"--expect-target {expect_target!r} is not the tip {record.target_tip} this integration "
             f"was built and checked against; nothing was written",
@@ -756,7 +729,7 @@ def apply_integration(
     )
     commit = record.integration_commit
     if repo.ref_target(record.integration_ref) != commit:
-        raise _refuse(
+        raise RefusedError(
             RefusalCode.EVIDENCE_STALE,
             f"{record.integration_ref} no longer points at the integration commit {commit}; "
             "prepare a new integration",
@@ -770,7 +743,7 @@ def apply_integration(
         )
     lock = Path(record.git_common_dir) / (record.target_ref + ".lock")
     if lock.exists():
-        raise _refuse(
+        raise RefusedError(
             RefusalCode.TARGET_CHECKED_OUT,
             f"{lock} exists: another Git process may be updating {record.target_ref}, or one "
             "crashed and left its lock. HFlow never deletes a Git lock file; nothing was written",
@@ -801,7 +774,7 @@ def apply_integration(
             owner_host=identity.host,
         )
     except IntegrationConflict as exc:
-        raise _refuse(RefusalCode.NOT_INTEGRABLE, str(exc)) from exc
+        raise RefusedError(RefusalCode.NOT_INTEGRABLE, str(exc)) from exc
     try:
         repo.update_ref_cas(
             record.target_ref,
@@ -869,7 +842,7 @@ def _require_current_evidence(store: Store, record: IntegrationRecord) -> None:
             or str(row["candidate_fingerprint"]) != record.fingerprint
             or str(row["checks_digest"]) != record.checks_digest
         ):
-            raise _refuse(
+            raise RefusedError(
                 RefusalCode.EVIDENCE_STALE,
                 f"integration evidence {evidence_id} is missing or no longer describes the "
                 "integration tree; prepare a new integration",
@@ -1062,17 +1035,13 @@ def _reconcile(
     attested_by: str,
 ) -> IntegrationOutcome:
     record = _record(store, integration_id)
-    if record.state in _SETTLED:
+    if record.state in INTEGRATION_TERMINAL_STATES:
         return IntegrationOutcome(
             record=record,
             receipt=store.integration_receipt(integration_id),
             notes=[f"integration {integration_id} is {record.state.value}; nothing to reconcile"],
         )
-    if record.state in {
-        IntegrationState.PREPARING,
-        IntegrationState.CHECKING,
-        IntegrationState.APPLYING,
-    }:
+    if record.state in INTEGRATION_ACTIVE_STATES:
         alive, basis, attested = _owner_check(record, owner_gone_attested=owner_gone_attested)
         if alive is not None:
             raise IntegrationBusy(RefusalCode.RUN_CLAIMED_BY_OTHER, alive)

@@ -42,6 +42,7 @@ from hflow.integrate import prepare_integration
 from hflow.store import Store
 from hflow.verify import CheckRunners
 
+from tests.store_helpers import mark_invocation_started
 from tests.test_batch_e_ledger import _binding, _register_authorization, _reserve, _seed_ready_run
 from tests.test_integrate import Scene
 
@@ -375,7 +376,7 @@ def _interrupted_ledger(tmp_path: Path, project, task_spec: TaskSpec, project_ro
         assert _reserve(
             store, run_id=run_id, invocation_id="I-hint", binding=binding, limits=limits
         ).is_new
-        assert store.mark_invocation_started("I-hint") is True
+        assert mark_invocation_started(store, "I-hint") is True
         store.set_blocked(run_id, RefusalCode.OUTCOME_UNKNOWN, "seeded: the controller died")
         ledger = shell_word(os.path.abspath(data_dir))
         steps = next_steps(store, run_id)

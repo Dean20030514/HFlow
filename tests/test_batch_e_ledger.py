@@ -44,6 +44,8 @@ from hflow.contracts import (
 )
 from hflow.store import Store, StoreError
 
+from .store_helpers import claim_run, mark_invocation_started
+
 CONTROLLER_ID = "ledger-test-controller"
 CONTROLLER_BUILD = "ledger-test"
 AUTHORIZATION_ID = "AUTH-ledger-test"
@@ -108,7 +110,7 @@ def _seed_ready_run(
         turn_limit=turn_limit,
         repair_limit=repair_limit,
     )
-    store.claim_run(run_id, CONTROLLER_ID)
+    claim_run(store, run_id, CONTROLLER_ID)
     store.set_task_state(run_id, [TaskState.DRAFT], TaskState.READY)
     return run_id
 
@@ -332,7 +334,7 @@ def test_two_connections_racing_for_the_last_unit_commit_at_most_one_dispatch(
 
         # The race consumed the root's only unit. Settling the winner does not give it back, so
         # the next dispatch is refused by the ceiling itself, not by the pending-invocation rule.
-        assert registry.mark_invocation_started(intent.invocation_id) is True
+        assert mark_invocation_started(registry, intent.invocation_id) is True
         registry.settle_invocation(
             intent.invocation_id, outcome=InvocationOutcome.COMPLETED, detail="race winner settled"
         )
@@ -506,6 +508,51 @@ def test_a_failure_at_any_write_rolls_the_whole_dispatch_back(
         store.close()
 
 
+@pytest.mark.parametrize("column", ["run_ids_json", "authorization_ids_json"])
+def test_an_unreadable_root_id_list_refuses_the_dispatch_and_keeps_the_recorded_text(
+    tmp_path: Path, project, task_spec: TaskSpec, project_root: Path, column: str
+) -> None:
+    """The root's run and authorization lists are facts: never reset to empty and overwritten.
+
+    An unreadable list refuses the dispatch inside its transaction, so nothing is charged and the
+    stored text is left exactly as it was for an operator to look at.
+    """
+    path = tmp_path / "data" / "hflow.sqlite"
+    store = Store(path)
+    try:
+        limits = RootBudgetLimits(max_top_level_submissions=2, max_repairs=1)
+        binding = _binding(
+            store, project_id=project.project_id, repo_path=project_root, task_id=task_spec.task_id
+        )
+        store.register_root_budget(binding, limits)
+        _register_authorization(store, max_submissions=2)
+        run_id = _seed_ready_run(
+            store, run_id="R-unreadable", project_id=project.project_id, spec=task_spec
+        )
+        with store.transaction() as conn:
+            conn.execute(
+                f"UPDATE root_budgets SET {column} = '[\"R-earlier\", ' WHERE root_id = ?",
+                (binding.root_id,),
+            )
+
+        with pytest.raises(StoreError, match="unreadable run or authorization list"):
+            _reserve(
+                store, run_id=run_id, invocation_id="I-unreadable", binding=binding, limits=limits
+            )
+
+        after = _snapshot(
+            path, root_id=binding.root_id, authorization_id=AUTHORIZATION_ID, run_ids=[run_id]
+        )
+        assert after["root_used"] == 0 and after["auth_used"] == 0
+        assert after["invocation_rows_total"] == 0 and after["attempt_rows_total"] == 0
+        assert after["run0_turns"] == 0
+        assert store.root_budget_row(binding.root_id)[column] == '["R-earlier", ', (
+            "the recorded list must not be replaced"
+        )
+    finally:
+        store.close()
+
+
 # --------------------------------------------------------------------------
 # 3. cross-revision consumption
 # --------------------------------------------------------------------------
@@ -561,7 +608,7 @@ def test_a_second_revision_shares_the_root_and_pays_for_a_repair(
         )
         assert after_first["root_used"] == 1
         assert after_first["root_repairs"] == 0
-        store.mark_invocation_started("I-root-1")
+        mark_invocation_started(store, "I-root-1")
         store.settle_invocation(
             "I-root-1", outcome=InvocationOutcome.COMPLETED, detail="first revision delivered"
         )
@@ -694,7 +741,7 @@ def test_a_forged_second_root_id_cannot_open_a_fresh_allowance(
             ).is_new
             is True
         )
-        store.mark_invocation_started("I-forge-1")
+        mark_invocation_started(store, "I-forge-1")
         store.settle_invocation(
             "I-forge-1", outcome=InvocationOutcome.COMPLETED, detail="the recorded root's dispatch"
         )
@@ -783,7 +830,7 @@ def test_an_unknown_outcome_keeps_the_consumption_and_blocks_the_root(
             store, run_id=run_one, invocation_id="I-unknown-1", binding=binding, limits=limits
         )
         assert reservation.is_new is True
-        assert store.mark_invocation_started("I-unknown-1") is True
+        assert mark_invocation_started(store, "I-unknown-1") is True
         store.settle_invocation(
             "I-unknown-1", outcome=outcome, detail="the process left no observable result"
         )

@@ -441,3 +441,45 @@ binds, so it surfaces as a refused approval rather than as a silent change.
   own config, with no hooks or fsmonitor override, so a bound home whose acp profile adds
   `dsh-web-app` or the plugin would run the workspace repository's hooks and filters at every
   turn; `dsh_surfaces` now notes such a home. #9382 has no maintainer reply.
+
+## Addendum 2026-10-14 — seventh read of the upstreams
+
+Appended; the decision and every capability state above stand. Release metadata, compare views,
+source, discussions and npm dist-tags only; nothing was executed against DSH or a model, so every
+row is *documented*.
+
+| Fact | Label |
+|---|---|
+| acpx: no release after `v0.19.5` (`95adbc56`); npm `latest` 0.19.5. `main` is still `66599833` (#873 SDK lock bump, #874 dev deps; `compare 95adbc56...66599833` touches only `pnpm-lock.yaml`); `src/async-control.ts` is still blob `2e318c1d`. #835, #850 (overload message ending `end_turn` exits 0), #854, #861 and #867 are open with no new maintainer activity. `acpx@0.17.1` still declares `@agentclientprotocol/sdk ^1.4.0`, so a fresh install resolves 1.8.0, which is in `CHECKED_SDK_VERSIONS` | documented |
+| ACP: no release after `schema-v1.25.0` / v1.11.0 (`4cf3dd85`); `main` is `24f3b07f` and `schema/v1/schema.json` is still blob `d6f7731b`. Everything since touches `schema.unstable.json` (#2361 client system prompt) or adds Rust `Eq` derives (#2352). Release PR #2379 (head `dc58f072`) proposes json-schema-v1 1.26.0 with unstable-only changes. #2281 and #554 are closed as v2/unstable-only. `@agentclientprotocol/sdk` `latest` is still 1.8.0 (`f4ea2195`); typescript-sdk `main` `afa002b0` adds only dependency/CI commits | documented |
+| DSH: `master` is still `d7432673` (`compare d7432673...master` identical); no tag after `dsh-v0.2.1-alpha.2`; `packages/acp/acp/src` tree `5d63d1b7`, `packages/boot/app-boot/src/profile.ts` blob `cbece01b`, SDK pin 1.4.0, `DEFAULT_STREAM_IDLE_TIMEOUT_MS` 300 000 - all unchanged. npm: `@deepseek-ai/dsh` `latest`/`next` 0.2.0-rc.2, `alpha` 0.2.1-alpha.2; `@deepseek-ai/dsh-acp` and `dsh-headless` still have `latest` = 0.0.1-rc.1, so an install without a tag gets a very old build. External PRs are not accepted (CONTRIBUTING, quoted in #9532); fixes arrive only with releases | documented |
+| DSH discussions since 2026-10-12 (community reports, no maintainer reply on any of them): **#9626** - in the Desktop build the Windows ACL sandbox runner is spawned as `[process.execPath, runner]`, which under Electron is `DeepSeek Harness.exe`, so under `workspace-write` every restricted child exits `0xC0000142` with empty output; node.exe as the runner works, and `read-only`/`danger-full-access` are unaffected (`packages/sandbox/sandbox-local/src/index.ts:571-580`, blob `45028746`, identical at rc.2 and alpha.2; duplicates #9467, #9507, #9548, #9621, #9493). #9463/#9471/#9510 - other `workspace-write` failure shapes on Windows 11 (a shell call that hangs before spawn; `LoadLibraryExW` denied under the restricted token; missing `WRITE_OWNER`). #9558 - a Windows local terminal is built with `pid=0`, so DSH's own `stopDescendants` is a no-op and a stop kills only the shell. #9612/#9609/#9653 - `DSH_HOME` is the only isolation knob, sessions are never pruned, and ~13 000 automated sessions cause EMFILE and an empty credentials lock at boot. #9615 - a workspace mutation prunes `sessionIds` whose cwd no longer resolves, permanently. #9564 (and #9508, #9502, #9589, #9636) - transient upstream errors (`upstream_http2_stream_error`, `server_error`) are classified non-retryable and end the turn with an error, which since alpha.2 surfaces over ACP as a JSON-RPC error on `session/prompt` | documented (unconfirmed) |
+
+Nothing here needs a transport change and the acpx 0.17.1 pin stays. What it changes for the
+first live task: through the Desktop shim, a `workspace-write` home (reported to be DSH's default)
+is reported to make every shell tool call fail (#9626), so batch L records the sandbox mode a
+launch will run under and notes that combination in the preview (records only, never a refusal;
+see `dsh_surfaces`). #9558 is one more reason a stop is only the Job Object's empty boundary
+(rule 8). #9612/#9615/#9609 confirm, for later parallel work, that each invocation needs its own
+home and that HFlow, not DSH, must keep and prune those homes. A transient upstream error that
+ends a turn with a JSON-RPC error is a failed attempt under the existing budget rules; it is never
+retried outside them.
+
+### How DSH picks a session's sandbox mode (read for batch L, documented)
+
+From source at `dsh-v0.2.0-rc.2` (`639ed015`) and `dsh-v0.2.1-alpha.2` (`d7432673`), nothing
+executed: the base bundle's `sandbox-policy` row sets `mode` to `DSH_PERMISSION_MODE ?? 'workspace-write'`
+(`packages/bundle/base/cordis.patch.yml`, rc.2 L229-233), and a `DSH_` name cannot come from any
+`.env` (`packages/boot/app-boot/src/index.ts`). A new session's mode follows the `permission` row's
+`defaultPreset` when set, else the preset matching the `sandbox-policy` mode
+(`packages/interaction/permission-presets/src/index.ts` L182-227, L428-456). Layers apply as the
+profile's bundles, then `$DSH_HOME/profiles/<p>/cordis.patch.yml`, then `$DSH_HOME/cordis.patch.yml`,
+each replacing a row's whole `config` (`apps/cli/src/profile-boot.ts` L185-195). The `acp` template
+`[dsh-base, dsh-acp-app]` touches neither row, and ACP has no per-session mode: `session/set_config_option`
+accepts only `model` and `reasoning_effort`. HFlow removes `DSH_PERMISSION_MODE` from the child, so
+the mode is the bound home's patch layers or, for a per-invocation home, `workspace-write`.
+`dsh_surfaces` now reads those two layers (bounded, as text, a plain token only - anything else is
+"unknown") and notes the mode on every launch record, plus #9626 under the Desktop shim when the
+mode is or may be `workspace-write`. Per the source `read-only` also runs through the same runner
+(`sandbox-local/src/index.ts` L369-377); only `danger-full-access` skips it, so "read-only works"
+in #9626 is the reporters' observation, not something the code explains.

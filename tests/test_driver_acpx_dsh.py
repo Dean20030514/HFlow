@@ -52,6 +52,7 @@ from hflow.drivers.winjob import process_gone
 from hflow.store import Store
 from hflow.verify import CheckRunners, FakeCheckRunner
 from tests.conftest import STAND_IN_API_KEY
+from tests.store_helpers import claim_run, dispatch_attempt, reserve_turn
 from tests.test_winjob import ERROR_ACCESS_DENIED, kernel32_stand_in
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -222,13 +223,13 @@ def test_client_argv_uses_the_right_interpreter_for_the_entry_point(tmp_path: Pa
     (node_cli.parent.parent / "package.json").write_text('{"name": "acpx"}', encoding="utf-8")
     node_entry = AcpxDshDriver(data_dir=tmp_path, acpx_cli=node_cli)
     argv = node_entry._client_argv(tmp_path, tmp_path, 60)
-    assert argv[0] == node_entry.node_executable
+    assert argv[0] == node_entry.launch.node
     assert argv[1].endswith("cli.js")
     assert "exec" in argv and argv[-2:] == ["-f", "-"]
 
     python_entry = AcpxDshDriver(data_dir=tmp_path, acpx_cli=FAKE_CLIENT)
     argv = python_entry._client_argv(tmp_path, tmp_path, 60)
-    assert argv[0] == python_entry.python_executable
+    assert argv[0] == python_entry.launch.python
     assert argv[1] == "-u"
     assert argv[2].endswith("fake_acpx_client.py")
 
@@ -1023,7 +1024,7 @@ def test_exhausted_budget_never_reaches_the_cli(
             token=controller.owner_token,
             identity=controller.owner_identity,
         )
-        store.reserve_turn(run["run_id"], "local-controller", turns=1)
+        reserve_turn(store, run["run_id"], "local-controller", turns=1)
         store.set_task_state(run["run_id"], [TaskState.DRAFT], TaskState.READY)
 
         outcome = controller.run_task(
@@ -1056,15 +1057,15 @@ def test_budget_ledger_survives_a_restart(tmp_path: Path, project, task_spec, pr
         turn_limit=2,
         repair_limit=0,
     )
-    first.claim_run(run["run_id"], "local-controller")
-    first.reserve_turn(run["run_id"], "local-controller", turns=2)
+    claim_run(first, run["run_id"], "local-controller")
+    reserve_turn(first, run["run_id"], "local-controller", turns=2)
     first.close()
 
     reopened = Store(tmp_path / "hflow.sqlite")
     try:
         assert reopened.turns_remaining("R-persist") == 0
         with pytest.raises(Exception):
-            reopened.reserve_turn("R-persist", "local-controller", turns=1)
+            reserve_turn(reopened, "R-persist", "local-controller", turns=1)
     finally:
         reopened.close()
     assert data_dir  # keep the fixture honest about where state lives
@@ -1872,20 +1873,18 @@ def test_controller_cancel_records_intent_and_blocks_late_acceptance(
             repair_limit=0,
         )
         run_id = run["run_id"]
-        store.claim_run(run_id, "local-controller")
+        claim_run(store, run_id, "local-controller")
         store.set_task_state(run_id, [TaskState.DRAFT], TaskState.READY)
 
-        attempt = store.dispatch_attempt(
+        attempt = dispatch_attempt(
+            store,
             run_id=run_id,
             controller_id="local-controller",
             attempt_id="A-cancel",
-            role="implementer",
+            invocation_id="I-cancel",
             reservation_id="B-cancel",
-            reserved_turns=1,
-            reservation_expires_at="2999-01-01T00:00:00Z",
         )
         assert attempt["state"] == AttemptState.ACTIVE.value
-        store.record_invocation("A-cancel", "I-cancel")
         handle, _ = harness.start("I-cancel", attempt_id="A-cancel")
         harness.wait_for_stub_marker("helper")
 

@@ -29,6 +29,8 @@ BUILTIN_WRITE_DENY: tuple[str, ...] = (".git", ".hflow", ".acpxrc.json", "**/.ac
 # The DSH context list below is read from upstream DSH dsh-v0.2.0-rc.2 (639ed015; master da00f7f
 # is identical for these packages). It is not checked against earlier tags and not observed in a
 # DSH run: it classifies a candidate's changed paths, it neither watches DSH nor enforces anything.
+# These names are defined only here: the launch-surface record (``drivers.dsh_surfaces``) and the
+# driver's spawn gate (``drivers.acpx_dsh``) import them, so the three cannot drift apart.
 
 #: DSH's agent-instructions loads every one of these present in each directory from its project
 #: root (the nearest ``.git``, which a worktree's ``.git`` file is) down to its cwd, and in a deeper
@@ -315,13 +317,30 @@ def expand_scope(root: Path, scope: Scope) -> list[Path]:
 
 
 def _file_content_facts(path: Path) -> tuple[int, str]:
-    """Hash bytes in bounded chunks and count what was actually read, not a prior stat."""
-    digest = hashlib.sha256()
-    size = 0
-    with path.open("rb") as source:
-        while chunk := source.read(64 * 1024):
+    """Hash a regular file in bounded chunks and count what was actually read, not a prior stat.
+
+    The trees this reads are written by a worker, so anything that is not a regular file - a FIFO,
+    a device, a link to either - raises :class:`OSError` (recorded as ``unreadable``) instead of
+    being opened: a blocking open or read of one could hang the controller or never end. The type
+    is checked before the open and again on the opened handle (something swapped in between), and
+    the open is non-blocking, as in ``launch_content.hash_file``. A link to a regular file is
+    still followed, so a regular file's facts are what they always were.
+    """
+    import stat
+
+    if not stat.S_ISREG(os.stat(path).st_mode):
+        raise OSError(f"{path} is not a regular file")
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"{path} is not a regular file")
+        digest = hashlib.sha256()
+        size = 0
+        while chunk := os.read(fd, 64 * 1024):
             size += len(chunk)
             digest.update(chunk)
+    finally:
+        os.close(fd)
     return size, "sha256:" + digest.hexdigest()
 
 

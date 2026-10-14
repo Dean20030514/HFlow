@@ -35,6 +35,7 @@ from hflow.store import Store
 from hflow.verify import CheckRunners, FakeCheckRunner
 
 from .conftest import unit_only, write_project, write_task
+from .store_helpers import claim_authorized_submission
 
 
 class RecordingDriver:
@@ -429,7 +430,7 @@ def test_a_reviewed_task_is_refused_when_one_submission_was_already_used(
     )
     store = Store(tmp_path / "hflow.sqlite")
     store.register_authorization(_authorization(tmp_path, spec, max_submissions=2).as_store_record())
-    store.claim_authorized_submission("AUTH-gate-test")  # one submission already spent
+    claim_authorized_submission(store, "AUTH-gate-test")  # one submission already spent
     driver = RecordingDriver()
     controller = _authorized_controller(
         store, driver, tmp_path, _authorization(tmp_path, spec, max_submissions=2)
@@ -513,7 +514,7 @@ def test_an_identical_finished_task_returns_history_even_with_a_spent_authorizat
         # The spec itself must be byte-identical, or it would be a different run.)
         spent = _authorization(tmp_path, task_spec, max_submissions=1)
         store.register_authorization(spent.as_store_record())
-        store.claim_authorized_submission("AUTH-gate-test")
+        claim_authorized_submission(store, "AUTH-gate-test")
         again = _authorized_controller(
             store,
             driver,

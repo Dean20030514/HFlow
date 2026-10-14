@@ -40,6 +40,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hflow.contracts import (  # noqa: E402
     AcceptanceCriterion,
@@ -55,9 +56,10 @@ from hflow.contracts import (  # noqa: E402
 )
 from hflow.controller import Controller  # noqa: E402
 from hflow.drivers.acpx_dsh import AcpxDshDriver  # noqa: E402
-from hflow.drivers.winjob import parent_pid, process_gone  # noqa: E402
+from hflow.drivers.winjob import process_gone  # noqa: E402
 from hflow.store import Store  # noqa: E402
 from hflow.verify import CheckRunners  # noqa: E402
+from probe_processes import parent_pid  # noqa: E402
 
 PROBE_ROOT = REPO_ROOT / ".probe" / "live-forced-stop"
 ATTEMPT_RECORD = PROBE_ROOT / "attempts.json"
@@ -296,7 +298,6 @@ def run_trial(
                 "30",
             ],
         )
-        driver._agent_argv = lambda: list(driver.agent_argv_override or [])  # type: ignore[method-assign]
         driver.extra_env["STUB_SCRATCH_DIR"] = str(work / "stub-scratch")
     else:
         driver = AcpxDshDriver(data_dir=data_dir, dsh_home=home, completion_timeout_seconds=300)

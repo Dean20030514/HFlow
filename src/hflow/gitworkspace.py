@@ -52,18 +52,11 @@ class StatusReport:
 
     #: Paths tracked-and-changed, or untracked (rename/copy contributes BOTH paths).
     changed: tuple[str, ...]
-    #: Paths git ignores. Ignored is not the same as disposable.
+    #: Paths git ignores, untracked ones included (``!!``). Ignored is not the same as
+    #: disposable.
     ignored: tuple[str, ...]
-    #: Untracked paths that git also ignores (a check's leftover cache, for example).
-    #: Kept apart from ``changed`` so a caller can apply an artifact policy to them.
-    untracked_ignored: tuple[str, ...]
     #: Records that could not be interpreted (unmerged conflicts, submodule changes, ...).
     unsupported: tuple[str, ...]
-
-    @property
-    def blocking_changes(self) -> tuple[str, ...]:
-        """Changed paths that are *not* explainable by the ignored-artifact policy."""
-        return self.changed
 
 
 def parse_status_z(raw: str) -> StatusReport:
@@ -88,7 +81,6 @@ def parse_status_z(raw: str) -> StatusReport:
     """
     changed: list[str] = []
     ignored: list[str] = []
-    untracked_ignored: list[str] = []
     unsupported: list[str] = []
 
     records = [record for record in raw.split("\0") if record]
@@ -123,7 +115,7 @@ def parse_status_z(raw: str) -> StatusReport:
             continue
         changed.append(path)
 
-    return StatusReport(tuple(changed), tuple(ignored), tuple(untracked_ignored), tuple(unsupported))
+    return StatusReport(tuple(changed), tuple(ignored), tuple(unsupported))
 
 
 #: Identity used for controller-created candidate commits. Fixed on purpose: the commit
@@ -629,77 +621,166 @@ def _base_env() -> dict[str, str]:
     return env
 
 
+def exit_status(returncode: int) -> str:
+    """A process exit status as an operator can look it up.
+
+    A Windows status that did not come from the program itself (``0xC0000142``: the process could
+    not initialise, seen under load) reads as a huge decimal number; it is shown in hex. A negative
+    POSIX status is the signal that ended the process.
+    """
+    if returncode < 0:
+        return f"signal {-returncode}"
+    if returncode > 255:
+        return f"0x{returncode & 0xFFFFFFFF:08X}"
+    return str(returncode)
+
+
+def _run_git(
+    args: Sequence[str],
+    *,
+    cwd: str | os.PathLike[str] | None,
+    timeout: float,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """``git <args>`` in text mode; the caller interprets the exit code.
+
+    Every text-mode git call in HFlow goes through here, so each reader gets the same guards: a
+    timeout raises :class:`GitError`, and so does standard output that cannot be decoded - on
+    POSIX ``subprocess`` raises the ``UnicodeDecodeError`` in this thread, on Windows it decodes in
+    a reader thread whose failure comes back as ``None``. Reading either as empty would make
+    "unreadable" look like "nothing there" (a configuration value is raw bytes, so a worker can
+    write any). Standard error is only ever quoted in a message, so an undecodable one reads as
+    empty instead of failing a call that succeeded. ``env`` defaults to :func:`_base_env`.
+    """
+    try:
+        completed = subprocess.run(  # noqa: S603,S607 - fixed argv, no shell
+            ["git", *args],
+            cwd=None if cwd is None else str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env=_base_env() if env is None else env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise GitError(f"git {' '.join(args)} timed out after {exc.timeout}s") from exc
+    except UnicodeDecodeError as exc:
+        raise GitError(_undecodable(tuple(args), exc.reason)) from exc
+    if completed.stdout is None:
+        raise GitError(_undecodable(tuple(args), "decoding failed"))
+    if completed.stderr is None:
+        completed.stderr = ""
+    return completed
+
+
+def _git_failure(args: Sequence[str], completed: subprocess.CompletedProcess[str]) -> GitError:
+    """The error for a git call that exited non-zero: the exit status and git's own words."""
+    detail = completed.stderr.strip()[:300] or "no message"
+    status = exit_status(completed.returncode)
+    return GitError(f"git {' '.join(args)} failed (exit {status}): {detail}")
+
+
+#: How git says "there is no repository here" (``setup.c``), read with git's messages untranslated.
+_NOT_A_REPOSITORY = "not a git repository"
+
+
 class GitRepo:
     """Read-mostly handle on a repository. Never mutates the user's checkout."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, _identity: tuple[str, str] | None = None) -> None:
+        """Open the repository whose work tree is ``root``: one git call.
+
+        ``common_dir`` is the common git directory as git printed it, relative to ``root`` or
+        absolute (:attr:`absolute_common_dir` resolves it), and ``head`` is HEAD's commit when the
+        handle was made. Any failure, an unborn HEAD included, raises :class:`GitError`.
+        ``_identity`` is ``(common_dir, head)`` as :meth:`discover` already read them.
+        """
         self.root = Path(root).resolve()
-        self.git_dir = self._rev_parse("--git-dir")
-        self.common_dir = self._rev_parse("--git-common-dir")
-        self.head = self._rev_parse("HEAD")
+        if _identity is None:
+            _toplevel, common_dir, head = self._read_identity(self.root, discovering=False)
+        else:
+            common_dir, head = _identity
+        self.common_dir = common_dir
+        self.head = head
 
     # -- construction --------------------------------------------------------
 
-    @classmethod
-    def discover(cls, candidate: Path) -> GitRepo:
-        probe = subprocess.run(  # noqa: S603,S607 - fixed read-only query
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=str(candidate),
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-            env=_base_env(),
+    @staticmethod
+    def _read_identity(cwd: Path, *, discovering: bool) -> tuple[str, str, str]:
+        """``(top level or "", common git directory, HEAD commit)``: one ``rev-parse`` in ``cwd``.
+
+        ``--verify`` makes HEAD exactly one full object id (an unborn HEAD fails) and
+        ``--end-of-options`` keeps it a revision. When ``discovering``, git's own "not a git
+        repository" answer (exit 128) is a ``SCOPE_VIOLATION`` refusal - read with git's messages
+        in the C locale, so a translation cannot hide it. Anything else that is not a clean answer
+        (git could not start, was killed, timed out, or printed something unexpected) is a
+        :class:`GitError` with the exit status, never "not a repository".
+        """
+        args = (
+            "rev-parse",
+            *(("--show-toplevel",) if discovering else ()),
+            "--git-common-dir",
+            "--verify",
+            "--end-of-options",
+            "HEAD",
         )
-        if probe.returncode != 0:
+        env = {**_base_env(), "LC_ALL": "C"} if discovering else None
+        completed = _run_git(args, cwd=cwd, timeout=30, env=env)
+        if (
+            discovering
+            and completed.returncode == 128
+            and _NOT_A_REPOSITORY in completed.stderr.casefold()
+        ):
             raise RefusedError(
                 RefusalCode.SCOPE_VIOLATION,
-                f"{candidate} is not inside a git repository: {probe.stderr.strip()[:200]}",
+                f"{cwd} is not inside a git repository: {completed.stderr.strip()[:200]}",
             )
-        return cls(Path(probe.stdout.strip()))
+        if completed.returncode != 0:
+            raise _git_failure(args, completed)
+        values = completed.stdout.splitlines()
+        expected = 3 if discovering else 2
+        if len(values) != expected or not all(values) or not is_full_oid(values[-1]):
+            raise GitError(
+                f"git {' '.join(args)} printed an unexpected answer: {completed.stdout[:200]!r}"
+            )
+        return (values[0] if discovering else "", values[-2], values[-1])
+
+    @classmethod
+    def discover(cls, candidate: Path) -> GitRepo:
+        """The repository ``candidate`` is inside, by git's own discovery: one git call.
+
+        Refuses (``SCOPE_VIOLATION``) only when git answers that there is no repository; any other
+        failure raises :class:`GitError`.
+        """
+        toplevel, common_dir, head = cls._read_identity(Path(candidate), discovering=True)
+        # Git prints a relative common directory relative to where it ran, not to the top level.
+        common = os.path.join(os.path.abspath(candidate), common_dir)
+        return cls(Path(toplevel), _identity=(common, head))
+
+    @property
+    def absolute_common_dir(self) -> str:
+        """The common git directory, absolute and resolved: what two worktrees of it share."""
+        return str((self.root / self.common_dir).resolve())
 
     # -- queries -------------------------------------------------------------
 
-    def _rev_parse(self, *args: str) -> str:
-        completed = subprocess.run(  # noqa: S603,S607
-            ["git", "rev-parse", *args],
-            cwd=str(self.root),
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-            env=_base_env(),
-        )
-        if completed.returncode != 0:
-            raise GitError(f"git rev-parse {' '.join(args)} failed: {completed.stderr.strip()[:200]}")
-        return completed.stdout.strip()
+    def _verified_revision(self, revision: str, *, cwd: Path | None = None) -> str:
+        """``git rev-parse --verify --end-of-options <revision>``: one object id, or GitError.
+
+        ``--verify`` refuses anything but exactly one object (a range such as ``a..b`` prints two
+        lines otherwise); ``--end-of-options`` keeps a value spelled like an option a revision
+        (``rev-parse`` echoes an unknown option and exits 0).
+        """
+        return self.run("rev-parse", "--verify", "--end-of-options", revision, cwd=cwd).strip()
 
     def run(self, *args: str, cwd: Path | None = None, literal_pathspecs: bool = False) -> str:
         env = _base_env()
         if literal_pathspecs:
             # A scope entry is a path, never a pattern: '*', '?', '[' and ':(magic)' mean themselves.
             env["GIT_LITERAL_PATHSPECS"] = "1"
-        try:
-            completed = subprocess.run(  # noqa: S603,S607
-                ["git", *args],
-                cwd=str(cwd or self.root),
-                capture_output=True,
-                text=True,
-                timeout=300,
-                check=False,
-                env=env,
-            )
-        except UnicodeDecodeError as exc:
-            # POSIX decodes in this thread: git printed bytes that are not text in this encoding
-            # (a configuration value is raw bytes, so a worker can write any).
-            raise GitError(_undecodable(args, exc.reason)) from exc
+        completed = _run_git(args, cwd=cwd or self.root, timeout=300, env=env)
         if completed.returncode != 0:
-            raise GitError(f"git {' '.join(args)} failed: {(completed.stderr or '').strip()[:300]}")
-        if completed.stdout is None:
-            # Windows decodes in a reader thread; the decode error ends that thread and the
-            # output comes back as None. Reading it as empty would make "unreadable" look like
-            # "nothing there".
-            raise GitError(_undecodable(args, "decoding failed"))
+            raise _git_failure(args, completed)
         return completed.stdout
 
     def status_report(self, cwd: Path | None = None) -> StatusReport:
@@ -791,7 +872,7 @@ class GitRepo:
                 entries.append([path, code, info.st_size, info.st_mtime_ns])
         return digest_of(
             {
-                "head": self._rev_parse("HEAD"),
+                "head": self._verified_revision("HEAD"),
                 "head_name": head_name.stdout.strip() if head_name.returncode == 0 else "",
                 "stash": stash.stdout.strip() if stash.returncode == 0 else "",
                 "index": "sha256:"
@@ -801,7 +882,7 @@ class GitRepo:
         )
 
     def resolve_commit(self, ref: str = "HEAD") -> str:
-        return self._rev_parse(f"{ref}^{{commit}}")
+        return self._verified_revision(f"{ref}^{{commit}}")
 
     # -- worktrees -----------------------------------------------------------
 
@@ -817,7 +898,10 @@ class GitRepo:
         if not target.is_dir() or not (target / ".git").is_file():
             raise GitError(f"worktree reuse refused: {target} is not a linked Git worktree")
         actual = GitRepo.discover(target)
-        if actual.root != target.resolve() or (actual.root / actual.common_dir).resolve() != (self.root / self.common_dir).resolve():
+        if (
+            actual.root != target.resolve()
+            or actual.absolute_common_dir != self.absolute_common_dir
+        ):
             raise GitError("worktree reuse refused: repository identity differs")
         if self.worktree_registration(target) is None or self.is_main_worktree(target):
             raise GitError("worktree reuse refused: missing registration or source checkout")
@@ -851,17 +935,17 @@ class GitRepo:
         staging = parent / f"{run_id}.staging-{os.getpid()}"
         if staging.exists():
             raise GitError(f"worktree creation refused: staging path already exists: {staging}")
-        self.run("worktree", "add", "--detach", str(staging), base_commit)
+        # ``--`` ends the options, so neither the path nor the commit can read as one.
+        self.run("worktree", "add", "--detach", "--", str(staging), _revision(base_commit, "base"))
         staging.replace(target)
         self.run("worktree", "repair", str(target))
         return target
 
     def worktree_commit(self, worktree: Path) -> str:
-        out = self.run("rev-parse", "HEAD", cwd=worktree)
-        return out.strip()
+        return self._verified_revision("HEAD", cwd=worktree)
 
     def worktree_tree(self, worktree: Path) -> str:
-        return self.run("rev-parse", "HEAD^{tree}", cwd=worktree).strip()
+        return self._verified_revision("HEAD^{tree}", cwd=worktree)
 
     def commit_exists(self, commit: str) -> bool:
         """Is this commit an object in this repository?
@@ -872,15 +956,7 @@ class GitRepo:
         """
         if not commit:
             return False
-        completed = subprocess.run(  # noqa: S603,S607 - fixed argv, no shell
-            ["git", "cat-file", "-e", f"{commit}^{{commit}}"],
-            cwd=str(self.root),
-            capture_output=True,
-            text=True,
-            timeout=300,
-            check=False,
-            env=_base_env(),
-        )
+        completed = _run_git(("cat-file", "-e", f"{commit}^{{commit}}"), cwd=self.root, timeout=300)
         return completed.returncode == 0
 
     def diff_paths(self, base: str, candidate: str, *, cwd: Path | None = None) -> list[str]:
@@ -897,9 +973,13 @@ class GitRepo:
         # ``--no-renames``: with rename detection (git's default, or whatever ``diff.renames`` the
         # user configured) ``--name-only`` prints only the new name of a moved file, and the
         # deleted source path would silently drop out of the change.
-        out = self.run(
-            "diff", "--no-renames", "--name-only", "-z", f"{base}..{candidate}", cwd=cwd
-        )
+        #
+        # ``--``: without it git also checks that the range does not name a file, by stat()ing it
+        # in the work tree. A file spelled like the range makes the range "ambiguous", and on
+        # Windows a deep work tree makes the stat itself fail ("Filename too long"); either way
+        # the diff died after the implementer was paid.
+        rev_range = f"{_revision(base, 'base')}..{_revision(candidate, 'candidate')}"
+        out = self.run("diff", "--no-renames", "--name-only", "-z", rev_range, "--", cwd=cwd)
         return [path for path in out.split("\0") if path.strip()]
 
     def committed_bytecode_paths(self, commit: str) -> list[str]:
@@ -909,7 +989,9 @@ class GitRepo:
         so no filter, hook or fsmonitor configured in a worktree runs. These are committed bytes:
         the bytecode removal before a worktree run's checks keeps them.
         """
-        out = self.run("ls-tree", "-r", "-z", "--name-only", commit)
+        out = self.run(
+            "ls-tree", "-r", "-z", "--name-only", "--end-of-options", _revision(commit, "commit")
+        )
         return [
             path
             for path in out.split("\0")
@@ -1017,25 +1099,9 @@ class GitRepo:
     def _git_query(self, cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
         """A read-only git query whose exit code the caller interprets (``run`` raises on any).
 
-        Output that cannot be decoded raises :class:`GitError`, as in ``run``, on either platform.
+        A timeout and output that cannot be decoded raise :class:`GitError` (:func:`_run_git`).
         """
-        try:
-            completed = subprocess.run(  # noqa: S603,S607 - fixed read-only query
-                ["git", *args],
-                cwd=str(cwd),
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-                env=_base_env(),
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise GitError(f"git {' '.join(args)} timed out after {exc.timeout}s") from exc
-        except UnicodeDecodeError as exc:
-            raise GitError(_undecodable(args, exc.reason)) from exc
-        if completed.stdout is None or completed.stderr is None:
-            raise GitError(_undecodable(args, "decoding failed"))
-        return completed
+        return _run_git(args, cwd=cwd, timeout=30)
 
     def _global_attributes_file(self, cwd: Path) -> str:
         """The global attributes file git reads in ``cwd``, or ``""`` when it reads none."""
@@ -1307,7 +1373,8 @@ class GitRepo:
             candidate_commit=candidate_commit,
             tree=tree,
             paths=tuple(sorted(staged)),
-            serial=int(self.run("rev-list", "--count", "HEAD", cwd=worktree).strip()),
+            # ``--``: a worker's file named ``HEAD`` would otherwise make the revision ambiguous.
+            serial=int(self.run("rev-list", "--count", "HEAD", "--", cwd=worktree).strip()),
             tree_digest=digest_of({"base": base_commit, "staged": sorted(staged)}),
         )
 
@@ -1341,16 +1408,25 @@ class GitRepo:
         return f"refs/hflow/integrations/{run_id}/{integration_id}"
 
     def ref_target(self, ref: str) -> str | None:
-        completed = subprocess.run(  # noqa: S603,S607 - read-only query
-            ["git", "rev-parse", "--verify", "--quiet", ref],
-            cwd=str(self.root),
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-            env=_base_env(),
-        )
-        return completed.stdout.strip() or None
+        """The object id ``ref`` resolves to, or ``None`` when it resolves to nothing.
+
+        ``None`` is only git's documented "no such object" answer: ``rev-parse --verify --quiet``
+        exits 1 and prints nothing. Anything else - git that could not start or was killed, a
+        timeout, output that is not an object id - raises :class:`GitError`: a failed read must
+        never pass for a deleted branch (an integration would be recorded stale on it).
+        """
+        args = ("rev-parse", "--verify", "--quiet", "--end-of-options", ref)
+        completed = _run_git(args, cwd=self.root, timeout=30)
+        target = completed.stdout.strip()
+        if completed.returncode == 1 and not target:
+            return None
+        if completed.returncode != 0:
+            raise _git_failure(args, completed)
+        if not is_full_oid(target):
+            raise GitError(
+                f"git {' '.join(args)} printed {target[:80]!r} where an object id belongs"
+            )
+        return target
 
     def ref_spelled_exactly(self, ref: str) -> bool:
         """Does a ref with exactly this name - byte for byte, case included - exist?
@@ -1363,10 +1439,6 @@ class GitRepo:
         """
         listing = self.run("for-each-ref", "--format=%(refname)", ref)
         return ref in listing.splitlines()
-
-    def ensure_candidate_ref(self, ref: str, commit: str) -> str:
-        """Create the candidate ref only if absent; reuse it if it already points at the candidate."""
-        return self.ensure_ref(ref, commit)
 
     def ensure_ref(self, ref: str, commit: str) -> str:
         """Create ``ref`` at ``commit`` only if absent; ``"reused"`` if it already points there.
@@ -1395,6 +1467,9 @@ class GitRepo:
                 return "reused"
             raise GitError(f"could not create {ref}: {exc}") from exc
         return "created"
+
+    #: The candidate ref is created exactly like any other HFlow-owned ref.
+    ensure_candidate_ref = ensure_ref
 
     # -- integration primitives ----------------------------------------------
     #

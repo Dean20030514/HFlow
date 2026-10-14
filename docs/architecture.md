@@ -160,8 +160,8 @@ the report come first.
    back. Replaying the same invocation id returns the recorded intent and charges nothing.
    Database `CHECK` constraints (`turns_reserved <= turn_limit`,
    `used_top_level_submissions <= max_top_level_submissions`, `used_repairs <= max_repairs`)
-   back up the logic. No reservation, no process. (`store.dispatch_attempt`, the older
-   run-and-attempt-only transaction, is no longer on the production path.)
+   back up the logic. No reservation, no process. A run without a root takes the same
+   transaction with no root counter and no invocation row.
 3. **A worker cannot accept its own work.** The driver protocol returns an invocation
    outcome, an optional candidate description and an optional review verdict. It has no
    field for task state or verification. `ResultReceipt` is constructed only by

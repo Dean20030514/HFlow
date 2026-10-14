@@ -24,6 +24,7 @@ from hflow.prepare import pending_binding, resolve_arguments
 from hflow.store import Store
 
 from .conftest import write_profile, write_project, write_task
+from .store_helpers import claim_authorized_submission
 from .test_m2_slice import _git, _project, _task, sample_repo  # noqa: F401 - registers the shared fixture
 
 APPROVAL_TEXT = "I approve one bounded run of T-m2-none-input, spent in this data directory."
@@ -86,7 +87,7 @@ def test_an_approval_consumed_in_one_data_dir_does_not_authorize_the_task_in_ano
     try:
         store.register_authorization(record.as_store_record())
         for _ in range(record.max_top_level_submissions):
-            store.claim_authorized_submission(record.authorization_id)
+            claim_authorized_submission(store, record.authorization_id)
         spent = store.authorization_state(record.authorization_id)
     finally:
         store.close()

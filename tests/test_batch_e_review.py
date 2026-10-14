@@ -64,6 +64,7 @@ from hflow.store import Store, StoreError
 from hflow.verify import CheckRunners, FakeCheckRunner
 from tests import test_batch_e_dispatch as helpers
 from tests import test_batch_e_migration as migration_helpers
+from tests.store_helpers import mark_invocation_started
 from tests.test_driver_acpx_dsh import FAKE_CLIENT, STUB_AGENT
 
 
@@ -202,7 +203,7 @@ def test_a_settled_reviewer_cannot_be_reserved_again_with_a_new_id(
         store, run_id="R-dispatch", binding=binding, limits=limits,
         role="reviewer", invocation_id="I-review-first",
     )
-    store.mark_invocation_started("I-review-first")
+    mark_invocation_started(store, "I-review-first")
     store.settle_invocation("I-review-first", outcome=InvocationOutcome.COMPLETED)
 
     with pytest.raises(StoreError) as refused:

@@ -31,6 +31,10 @@ _RISK_ORDER = {"low": 0, "standard": 1, "strict": 2}
 _IMPLEMENTED_DELIVERY = "local_candidate"
 
 
+def _issue(code: RefusalCode, location: str, detail: str) -> ValidationIssue:
+    return ValidationIssue(code=code, detail=detail, location=location)
+
+
 def validate_task_spec(
     spec: TaskSpec,
     project: ProjectConfig,
@@ -47,26 +51,23 @@ def validate_task_spec(
     verification that never ran. The caller passes ``False`` for a real Harness run.
     """
     issues: list[ValidationIssue] = []
-    warnings: list[str] = []
 
     if spec.schema_version != STORE_SCHEMA_VERSION:
         issues.append(
-            ValidationIssue(
-                code=RefusalCode.INVALID_SPEC,
-                detail=(
-                    f"schema_version {spec.schema_version} is not supported by this runtime "
-                    f"(expected {STORE_SCHEMA_VERSION})"
-                ),
-                location="schema_version",
+            _issue(
+                RefusalCode.INVALID_SPEC,
+                "schema_version",
+                f"schema_version {spec.schema_version} is not supported by this runtime "
+                f"(expected {STORE_SCHEMA_VERSION})",
             )
         )
 
     if spec.task_id.strip() != spec.task_id or not spec.task_id.strip():
         issues.append(
-            ValidationIssue(
-                code=RefusalCode.INVALID_SPEC,
-                detail="task_id must be a non-empty identifier without surrounding whitespace",
-                location="task_id",
+            _issue(
+                RefusalCode.INVALID_SPEC,
+                "task_id",
+                "task_id must be a non-empty identifier without surrounding whitespace",
             )
         )
 
@@ -75,13 +76,11 @@ def validate_task_spec(
         for check_id in criterion.check_ids:
             if check_id not in known_checks:
                 issues.append(
-                    ValidationIssue(
-                        code=RefusalCode.UNKNOWN_CHECK,
-                        detail=(
-                            f"acceptance {criterion.id!r} references check {check_id!r}, "
-                            "which is not an approved check in the project contract"
-                        ),
-                        location=f"acceptance.{criterion.id}",
+                    _issue(
+                        RefusalCode.UNKNOWN_CHECK,
+                        f"acceptance.{criterion.id}",
+                        f"acceptance {criterion.id!r} references check {check_id!r}, "
+                        "which is not an approved check in the project contract",
                     )
                 )
 
@@ -92,16 +91,14 @@ def validate_task_spec(
     # refused as unimplemented rather than silently ignored (plan 6.7).
     if spec.dependencies:
         issues.append(
-            ValidationIssue(
-                code=RefusalCode.NOT_IMPLEMENTED,
-                detail=(
-                    "dependencies="
-                    + ", ".join(repr(dep) for dep in spec.dependencies)
-                    + " is not implemented: this build runs one task at a time with no "
-                    "dependency scheduling, so a prerequisite would be ignored rather than "
-                    "enforced. Nothing was dispatched."
-                ),
-                location="dependencies",
+            _issue(
+                RefusalCode.NOT_IMPLEMENTED,
+                "dependencies",
+                "dependencies="
+                + ", ".join(repr(dep) for dep in spec.dependencies)
+                + " is not implemented: this build runs one task at a time with no "
+                "dependency scheduling, so a prerequisite would be ignored rather than "
+                "enforced. Nothing was dispatched.",
             )
         )
 
@@ -115,43 +112,37 @@ def validate_task_spec(
             check = known_checks.get(check_id)
             if check is not None and check.kind == "fake":
                 issues.append(
-                    ValidationIssue(
-                        code=RefusalCode.NOT_IMPLEMENTED,
-                        detail=(
-                            f"check {check_id!r} is declared kind='fake', which executes nothing "
-                            "and returns a caller-chosen verdict. A real Harness run must be "
-                            "verified by approved command checks; nothing was dispatched."
-                        ),
-                        location=f"checks.{check_id}",
+                    _issue(
+                        RefusalCode.NOT_IMPLEMENTED,
+                        f"checks.{check_id}",
+                        f"check {check_id!r} is declared kind='fake', which executes nothing "
+                        "and returns a caller-chosen verdict. A real Harness run must be "
+                        "verified by approved command checks; nothing was dispatched.",
                     )
                 )
 
     for problem in check_scope(spec.scope, project_root, project.write_deny):
-        issues.append(
-            ValidationIssue(code=RefusalCode.SCOPE_VIOLATION, detail=problem, location="scope")
-        )
+        issues.append(_issue(RefusalCode.SCOPE_VIOLATION, "scope", problem))
     for problem in _linked_scope_entries(spec.scope.write_allow, project_root):
-        issues.append(
-            ValidationIssue(code=RefusalCode.SCOPE_VIOLATION, detail=problem, location="scope")
-        )
+        issues.append(_issue(RefusalCode.SCOPE_VIOLATION, "scope", problem))
 
     # --- reuse admission (plan 11.1/11.3) ---------------------------------
     reuse = spec.reuse
     if reuse.status == ReuseStatus.DECIDED:
         if reuse.choice == "none":
             issues.append(
-                ValidationIssue(
-                    code=RefusalCode.REUSE_NOT_APPROVED,
-                    detail="reuse.status=decided requires an explicit choice",
-                    location="reuse.choice",
+                _issue(
+                    RefusalCode.REUSE_NOT_APPROVED,
+                    "reuse.choice",
+                    "reuse.status=decided requires an explicit choice",
                 )
             )
         if not reuse.need.strip():
             issues.append(
-                ValidationIssue(
-                    code=RefusalCode.REUSE_NOT_APPROVED,
-                    detail="new-component tasks must state what capability is needed",
-                    location="reuse.need",
+                _issue(
+                    RefusalCode.REUSE_NOT_APPROVED,
+                    "reuse.need",
+                    "new-component tasks must state what capability is needed",
                 )
             )
         # Reusing or adapting a component is only decided once its compatibility question is
@@ -160,14 +151,12 @@ def validate_task_spec(
         # would be a false statement about an experiment that already ran.
         if reuse.choice in {"reuse", "adapt"} and reuse.fit_test_status in {"pending", "failed"}:
             issues.append(
-                ValidationIssue(
-                    code=RefusalCode.REUSE_NOT_APPROVED,
-                    detail=(
-                        f"reuse.choice={reuse.choice} with required_fit_test "
-                        f"{reuse.fit_test_status!r} cannot dispatch: the compatibility question "
-                        "must be answered by a recorded result before the component is adopted"
-                    ),
-                    location="reuse.fit_test_status",
+                _issue(
+                    RefusalCode.REUSE_NOT_APPROVED,
+                    "reuse.fit_test_status",
+                    f"reuse.choice={reuse.choice} with required_fit_test "
+                    f"{reuse.fit_test_status!r} cannot dispatch: the compatibility question "
+                    "must be answered by a recorded result before the component is adopted",
                 )
             )
         # Claiming no fit test is needed is a claim, so it carries its own short argument
@@ -178,66 +167,58 @@ def validate_task_spec(
             and not reuse.reason.strip()
         ):
             issues.append(
-                ValidationIssue(
-                    code=RefusalCode.REUSE_NOT_APPROVED,
-                    detail=(
-                        f"reuse.choice={reuse.choice} without a required_fit_test must state, in "
-                        "reuse.reason, why the component is already proven to fit this use"
-                    ),
-                    location="reuse.reason",
+                _issue(
+                    RefusalCode.REUSE_NOT_APPROVED,
+                    "reuse.reason",
+                    f"reuse.choice={reuse.choice} without a required_fit_test must state, in "
+                    "reuse.reason, why the component is already proven to fit this use",
                 )
             )
     elif reuse.status == ReuseStatus.EXISTING_DECISION and not reuse.reference.strip():
         issues.append(
-            ValidationIssue(
-                code=RefusalCode.REUSE_NOT_APPROVED,
-                detail="existing_decision requires a reference to the recorded decision",
-                location="reuse.reference",
+            _issue(
+                RefusalCode.REUSE_NOT_APPROVED,
+                "reuse.reference",
+                "existing_decision requires a reference to the recorded decision",
             )
         )
 
     # --- budget authorization --------------------------------------------
     if spec.budget.max_agent_turns > project.limits.max_agent_turns:
         issues.append(
-            ValidationIssue(
-                code=RefusalCode.BUDGET_EXCEEDED,
-                detail=(
-                    f"task requests {spec.budget.max_agent_turns} agent turns but the project "
-                    f"pre-authorizes at most {project.limits.max_agent_turns}"
-                ),
-                location="budget.max_agent_turns",
+            _issue(
+                RefusalCode.BUDGET_EXCEEDED,
+                "budget.max_agent_turns",
+                f"task requests {spec.budget.max_agent_turns} agent turns but the project "
+                f"pre-authorizes at most {project.limits.max_agent_turns}",
             )
         )
     if spec.budget.max_repair_cycles > project.limits.max_repair_cycles:
         issues.append(
-            ValidationIssue(
-                code=RefusalCode.BUDGET_EXCEEDED,
-                detail=(
-                    f"task requests {spec.budget.max_repair_cycles} repair cycles but the project "
-                    f"pre-authorizes at most {project.limits.max_repair_cycles}"
-                ),
-                location="budget.max_repair_cycles",
+            _issue(
+                RefusalCode.BUDGET_EXCEEDED,
+                "budget.max_repair_cycles",
+                f"task requests {spec.budget.max_repair_cycles} repair cycles but the project "
+                f"pre-authorizes at most {project.limits.max_repair_cycles}",
             )
         )
 
     # --- risk floor -------------------------------------------------------
     if _RISK_ORDER[spec.risk] < _RISK_ORDER[project.min_risk_for_review]:
         issues.append(
-            ValidationIssue(
-                code=RefusalCode.RISK_DOWNGRADE,
-                detail=(
-                    f"task risk {spec.risk!r} is below the project minimum "
-                    f"{project.min_risk_for_review!r}"
-                ),
-                location="risk",
+            _issue(
+                RefusalCode.RISK_DOWNGRADE,
+                "risk",
+                f"task risk {spec.risk!r} is below the project minimum "
+                f"{project.min_risk_for_review!r}",
             )
         )
     if project.review_required and not spec.review.required:
         issues.append(
-            ValidationIssue(
-                code=RefusalCode.RISK_DOWNGRADE,
-                detail="this project requires independent review; a task cannot waive it",
-                location="review.required",
+            _issue(
+                RefusalCode.RISK_DOWNGRADE,
+                "review.required",
+                "this project requires independent review; a task cannot waive it",
             )
         )
 
@@ -250,20 +231,16 @@ def validate_task_spec(
     # can still be recorded against what was actually asked for).
     if spec.delivery.mode != _IMPLEMENTED_DELIVERY:
         issues.append(
-            ValidationIssue(
-                code=RefusalCode.NOT_IMPLEMENTED,
-                detail=(
-                    f"delivery.mode={spec.delivery.mode!r} is not implemented by this build; only "
-                    f"{_IMPLEMENTED_DELIVERY!r} is. Nothing was dispatched, so no lower delivery "
-                    "level will be presented as the requested one."
-                ),
-                location="delivery.mode",
+            _issue(
+                RefusalCode.NOT_IMPLEMENTED,
+                "delivery.mode",
+                f"delivery.mode={spec.delivery.mode!r} is not implemented by this build; only "
+                f"{_IMPLEMENTED_DELIVERY!r} is. Nothing was dispatched, so no lower delivery "
+                "level will be presented as the requested one.",
             )
         )
 
-    return ValidationReport(
-        ok=not issues, issues=issues, spec_digest=spec.spec_digest(), warnings=warnings
-    )
+    return ValidationReport(ok=not issues, issues=issues, spec_digest=spec.spec_digest())
 
 
 def _linked_scope_entries(write_allow: Sequence[str], project_root: Path) -> list[str]:
@@ -341,34 +318,30 @@ def repair_policy_problems(
     # the user's own checkout.
     if spec.workspace.mode != "worktree":
         issues.append(
-            ValidationIssue(
-                code=RefusalCode.SCOPE_VIOLATION,
-                detail=(
-                    "this task carries a repair_policy but workspace.mode="
-                    f"{spec.workspace.mode!r}. A repair starts from the frozen candidate of "
-                    "the previous round, which only an isolated Git worktree keeps: set "
-                    "workspace.mode='worktree' with a base commit, or drop repair_policy. "
-                    "Nothing was dispatched."
-                ),
-                location="workspace.mode",
+            _issue(
+                RefusalCode.SCOPE_VIOLATION,
+                "workspace.mode",
+                "this task carries a repair_policy but workspace.mode="
+                f"{spec.workspace.mode!r}. A repair starts from the frozen candidate of "
+                "the previous round, which only an isolated Git worktree keeps: set "
+                "workspace.mode='worktree' with a base commit, or drop repair_policy. "
+                "Nothing was dispatched.",
             )
         )
     # A repaired candidate must be verified and independently reviewed again, so a policy without
     # a review has nothing that could accept the repair it buys.
     if review_turns == 0:
         issues.append(
-            ValidationIssue(
-                code=RefusalCode.NOT_IMPLEMENTED,
-                detail=(
-                    "this task carries a repair_policy but it will not be reviewed "
-                    f"(project.review_required={project.review_required}, task "
-                    f"review.required={spec.review.required}). A repaired candidate is "
-                    "verified and reviewed again from scratch before it can be accepted, so "
-                    "this build cannot support a repair policy without a review: require a "
-                    "review (project floor or review.required=true) or drop repair_policy. "
-                    "Nothing was dispatched."
-                ),
-                location="review.required",
+            _issue(
+                RefusalCode.NOT_IMPLEMENTED,
+                "review.required",
+                "this task carries a repair_policy but it will not be reviewed "
+                f"(project.review_required={project.review_required}, task "
+                f"review.required={spec.review.required}). A repaired candidate is "
+                "verified and reviewed again from scratch before it can be accepted, so "
+                "this build cannot support a repair policy without a review: require a "
+                "review (project floor or review.required=true) or drop repair_policy. "
+                "Nothing was dispatched.",
             )
         )
     # The run's own ceiling has to cover the whole worst-case loop: I1 (+R1) + I2 (+R2).
@@ -377,17 +350,15 @@ def repair_policy_problems(
     if spec.budget.max_agent_turns < worst_case:
         loop = "I1 + R1 + I2 + R2" if review_turns else "I1 + I2"
         issues.append(
-            ValidationIssue(
-                code=RefusalCode.BUDGET_EXCEEDED,
-                detail=(
-                    f"this task carries a repair_policy but budget.max_agent_turns="
-                    f"{spec.budget.max_agent_turns} does not cover the worst-case repair loop "
-                    f"of {worst_case} top-level dispatch(es) ({loop}): the repair attempt and "
-                    "the review that must follow it are dispatches the first attempt cannot "
-                    f"know about. Raise budget.max_agent_turns to at least {worst_case}, or "
-                    "drop repair_policy. Nothing was dispatched."
-                ),
-                location="budget.max_agent_turns",
+            _issue(
+                RefusalCode.BUDGET_EXCEEDED,
+                "budget.max_agent_turns",
+                f"this task carries a repair_policy but budget.max_agent_turns="
+                f"{spec.budget.max_agent_turns} does not cover the worst-case repair loop "
+                f"of {worst_case} top-level dispatch(es) ({loop}): the repair attempt and "
+                "the review that must follow it are dispatches the first attempt cannot "
+                f"know about. Raise budget.max_agent_turns to at least {worst_case}, or "
+                "drop repair_policy. Nothing was dispatched.",
             )
         )
     # A real transport's repair is spent against a root: its repair counter and its clock are what
@@ -395,17 +366,15 @@ def repair_policy_problems(
     # offline repair stays allowed (and is charged to no root counter, see the store's legacy path).
     if real_transport and not root_bound:
         issues.append(
-            ValidationIssue(
-                code=RefusalCode.BUDGET_EXCEEDED,
-                detail=(
-                    "this task carries a repair_policy and a role is dispatched to a real "
-                    "transport, but no root budget is bound. A repair is charged to the root's "
-                    "repair counter and clock, which bound the task across revisions; without "
-                    "one each new revision could buy another. Pass --root-budget-file (with an "
-                    "authorization that covers that root), or drop repair_policy. Nothing was "
-                    "dispatched."
-                ),
-                location="root_budget",
+            _issue(
+                RefusalCode.BUDGET_EXCEEDED,
+                "root_budget",
+                "this task carries a repair_policy and a role is dispatched to a real "
+                "transport, but no root budget is bound. A repair is charged to the root's "
+                "repair counter and clock, which bound the task across revisions; without "
+                "one each new revision could buy another. Pass --root-budget-file (with an "
+                "authorization that covers that root), or drop repair_policy. Nothing was "
+                "dispatched.",
             )
         )
     return issues
@@ -480,15 +449,13 @@ def predictable_dispatch_problems(
     #    it is refused here instead, while nothing has been spent.
     if workspace_client_config:
         issues.append(
-            ValidationIssue(
-                code=RefusalCode.WORKSPACE_CLIENT_CONFIG,
-                detail=(
-                    f"{workspace_client_config}. acpx always loads that file from the agent's "
-                    "workspace and lets it override HFlow's launch, including the agent command, "
-                    "so no agent may be started there. Refused before anything was dispatched or "
-                    "charged: submit again once the file is gone"
-                ),
-                location="workspace",
+            _issue(
+                RefusalCode.WORKSPACE_CLIENT_CONFIG,
+                "workspace",
+                f"{workspace_client_config}. acpx always loads that file from the agent's "
+                "workspace and lets it override HFlow's launch, including the agent command, "
+                "so no agent may be started there. Refused before anything was dispatched or "
+                "charged: submit again once the file is gone",
             )
         )
     #    DSH loads ``<cwd>/.env`` at launch, and the driver refuses to launch on a workspace whose
@@ -496,32 +463,28 @@ def predictable_dispatch_problems(
     #    in the starting workspace, for the same reason as the client config above.
     if workspace_env_file:
         issues.append(
-            ValidationIssue(
-                code=RefusalCode.WORKSPACE_ENV_FILE,
-                detail=(
-                    f"{workspace_env_file}. DSH loads <cwd>/.env at launch into its own "
-                    "environment and its tool processes (documented upstream, not observed); "
-                    "HFlow never opens it and cannot tell what it sets, so no real agent may be "
-                    "started there. Refused before anything was dispatched or charged: submit "
-                    "again once the file is gone"
-                ),
-                location="workspace",
+            _issue(
+                RefusalCode.WORKSPACE_ENV_FILE,
+                "workspace",
+                f"{workspace_env_file}. DSH loads <cwd>/.env at launch into its own "
+                "environment and its tool processes (documented upstream, not observed); "
+                "HFlow never opens it and cannot tell what it sets, so no real agent may be "
+                "started there. Refused before anything was dispatched or charged: submit "
+                "again once the file is gone",
             )
         )
     #    A bound DSH home the agent can write (or whose AGENTS.md and .env sit above the project)
     #    is refused at the spawn gate too; knowable now from the resolved launch.
     if dsh_home_in_workspace:
         issues.append(
-            ValidationIssue(
-                code=RefusalCode.DSH_HOME_IN_WORKSPACE,
-                detail=(
-                    f"{dsh_home_in_workspace}. Refused before anything was dispatched or "
-                    "charged: point DSH_HOME at an absolute directory outside the project and "
-                    "its worktree directory (or unset it, so each invocation gets its own home), "
-                    "then prepare again - DSH_HOME is part of the launch, so a real run needs an "
-                    "authorization for the new binding"
-                ),
-                location="launch.dsh_home",
+            _issue(
+                RefusalCode.DSH_HOME_IN_WORKSPACE,
+                "launch.dsh_home",
+                f"{dsh_home_in_workspace}. Refused before anything was dispatched or "
+                "charged: point DSH_HOME at an absolute directory outside the project and "
+                "its worktree directory (or unset it, so each invocation gets its own home), "
+                "then prepare again - DSH_HOME is part of the launch, so a real run needs an "
+                "authorization for the new binding",
             )
         )
     #    Without a credential DSH fails before any model work, but only after the dispatch was
@@ -530,21 +493,19 @@ def predictable_dispatch_problems(
     #    knowable now from the resolved launch and this environment, so it is refused here first.
     if no_credential_source:
         issues.append(
-            ValidationIssue(
-                code=RefusalCode.NO_CREDENTIAL_SOURCE,
-                detail=(
-                    f"{no_credential_source}. Without a credential DSH fails with a no-API-key "
-                    "error before any model work (observed in M0), and HFlow would record that "
-                    "invocation outcome_unknown, spend the approved submission and leave a "
-                    "ledger entry for `hflow ledger settle`. Refused before anything was "
-                    "dispatched or charged: set DEEPSEEK_API_KEY in the environment hflow runs "
-                    "in (the child inherits it; HFlow never reads its value), or bind DSH_HOME "
-                    "to an absolute directory outside the project that holds .credentials.yaml "
-                    "or .env (DSH_HOME is part of the launch, so a real run then needs an "
-                    "authorization for the new binding), then prepare again. A presence check "
-                    "only: it does not prove the credential is valid"
-                ),
-                location="launch.credentials",
+            _issue(
+                RefusalCode.NO_CREDENTIAL_SOURCE,
+                "launch.credentials",
+                f"{no_credential_source}. Without a credential DSH fails with a no-API-key "
+                "error before any model work (observed in M0), and HFlow would record that "
+                "invocation outcome_unknown, spend the approved submission and leave a "
+                "ledger entry for `hflow ledger settle`. Refused before anything was "
+                "dispatched or charged: set DEEPSEEK_API_KEY in the environment hflow runs "
+                "in (the child inherits it; HFlow never reads its value), or bind DSH_HOME "
+                "to an absolute directory outside the project that holds .credentials.yaml "
+                "or .env (DSH_HOME is part of the launch, so a real run then needs an "
+                "authorization for the new binding), then prepare again. A presence check "
+                "only: it does not prove the credential is valid",
             )
         )
 
@@ -560,28 +521,24 @@ def predictable_dispatch_problems(
     if spec.scope.write_allow:
         if spec.workspace.mode != "worktree":
             issues.append(
-                ValidationIssue(
-                    code=RefusalCode.SCOPE_VIOLATION,
-                    detail=(
-                        "this task declares write paths but workspace.mode="
-                        f"{spec.workspace.mode!r}. A real change must run in an isolated Git "
-                        "worktree (workspace.mode='worktree' with a base commit); an in-place "
-                        "run would write into the user's own checkout"
-                    ),
-                    location="workspace.mode",
+                _issue(
+                    RefusalCode.SCOPE_VIOLATION,
+                    "workspace.mode",
+                    "this task declares write paths but workspace.mode="
+                    f"{spec.workspace.mode!r}. A real change must run in an isolated Git "
+                    "worktree (workspace.mode='worktree' with a base commit); an in-place "
+                    "run would write into the user's own checkout",
                 )
             )
         if not implementer_writes:
             issues.append(
-                ValidationIssue(
-                    code=RefusalCode.SCOPE_VIOLATION,
-                    detail=(
-                        f"this task declares write paths but {ENV_ALLOW_WRITES} is not enabled, so "
-                        "the invocation would be launched read-only and could not make the "
-                        "change. Enable writes for this run (see docs/operations.md) or submit a "
-                        "task that changes nothing"
-                    ),
-                    location="scope.write_allow",
+                _issue(
+                    RefusalCode.SCOPE_VIOLATION,
+                    "scope.write_allow",
+                    f"this task declares write paths but {ENV_ALLOW_WRITES} is not enabled, so "
+                    "the invocation would be launched read-only and could not make the "
+                    "change. Enable writes for this run (see docs/operations.md) or submit a "
+                    "task that changes nothing",
                 )
             )
 
@@ -592,14 +549,12 @@ def predictable_dispatch_problems(
     #    depends on this run's history rather than on the spec.
     if spec.needs_review(project) and spec.budget.max_agent_turns < 2:
         issues.append(
-            ValidationIssue(
-                code=RefusalCode.BUDGET_EXCEEDED,
-                detail=(
-                    "review is required (project floor or task request) but "
-                    f"budget.max_agent_turns={spec.budget.max_agent_turns} covers only the "
-                    "implementation turn. A reviewed delivery needs at least 2"
-                ),
-                location="budget.max_agent_turns",
+            _issue(
+                RefusalCode.BUDGET_EXCEEDED,
+                "budget.max_agent_turns",
+                "review is required (project floor or task request) but "
+                f"budget.max_agent_turns={spec.budget.max_agent_turns} covers only the "
+                "implementation turn. A reviewed delivery needs at least 2",
             )
         )
 
@@ -616,13 +571,11 @@ def predictable_dispatch_problems(
             continue
         seen_launches.add(key)
         issues.append(
-            ValidationIssue(
-                code=RefusalCode.NOT_IMPLEMENTED,
-                detail=(
-                    f"the launch for driver {launch.driver_id!r} could not be resolved, so no "
-                    f"process could be started: {launch.detail or 'no detail'}"
-                ),
-                location="effective_config.launch",
+            _issue(
+                RefusalCode.NOT_IMPLEMENTED,
+                "effective_config.launch",
+                f"the launch for driver {launch.driver_id!r} could not be resolved, so no "
+                f"process could be started: {launch.detail or 'no detail'}",
             )
         )
 

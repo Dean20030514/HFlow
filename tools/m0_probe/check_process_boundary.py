@@ -11,13 +11,14 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hflow.drivers.winjob import (  # noqa: E402
     ProcessBoundary,
-    platform_summary,
     popen_in_boundary,
     process_gone,
 )
+from probe_processes import platform_summary  # noqa: E402
 
 GRANDCHILD = "import time; time.sleep(300)"
 HELPER = (

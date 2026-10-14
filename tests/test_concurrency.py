@@ -40,6 +40,8 @@ from hflow.ids import utc_now
 from hflow.store import Store, StoreError
 from hflow.verify import CheckRunners, FakeCheckRunner
 
+from .store_helpers import claim_run, dispatch_attempt, reserve_turn
+
 
 def _receipt(run_id: str, spec: TaskSpec, *, attempt_id: str) -> ResultReceipt:
     return ResultReceipt(
@@ -79,18 +81,16 @@ def _seed_checking(
         turn_limit=turn_limit,
         repair_limit=repair_limit,
     )
-    store.claim_run(run["run_id"], "local-controller")
+    claim_run(store, run["run_id"], "local-controller")
     store.set_task_state(run["run_id"], [TaskState.DRAFT], TaskState.READY)
-    store.dispatch_attempt(
+    dispatch_attempt(
+        store,
         run_id=run["run_id"],
         controller_id="local-controller",
         attempt_id="A-race",
-        role="implementer",
+        invocation_id="I-race",
         reservation_id="B-race",
-        reserved_turns=1,
-        reservation_expires_at="2999-01-01T00:00:00Z",
     )
-    store.record_invocation("A-race", "I-race")
     store.advance_to_checking(run_id=run["run_id"], attempt_id="A-race", phase=__import__(
         "hflow.contracts", fromlist=["CheckPhase"]
     ).CheckPhase.VERIFICATION)
@@ -119,14 +119,14 @@ def _seed_ready(store: Store, project, spec: TaskSpec, *, run_id: str, turn_limi
         turn_limit=turn_limit,
         repair_limit=repair_limit,
     )
-    store.claim_run(run["run_id"], "local-controller")
+    claim_run(store, run["run_id"], "local-controller")
     store.set_task_state(run["run_id"], [TaskState.DRAFT], TaskState.READY)
     return str(run["run_id"])
 
 
 def _reserve_turns(store: Store, run_id: str, turns: int) -> None:
     if turns:
-        store.reserve_turn(run_id, "local-controller", turns=turns)
+        reserve_turn(store, run_id, "local-controller", turns=turns)
 
 
 # --------------------------------------------------------------------------
@@ -342,7 +342,7 @@ def test_concurrent_writers_do_not_deadlock_or_lose_updates(tmp_path: Path, proj
             barrier.wait(timeout=20)  # start together: maximal interleaving pressure
             for _ in range(5):
                 try:
-                    store.reserve_turn(run_id, "local-controller", turns=1)
+                    reserve_turn(store, run_id, "local-controller", turns=1)
                     with reserve_lock:
                         granted += 1
                 except StoreError:
@@ -390,7 +390,7 @@ def test_store_survives_a_concurrent_close_of_the_other_handle(tmp_path: Path, p
         thread = threading.Thread(target=poll, daemon=True)
         thread.start()
         for _ in range(10):
-            writer.reserve_turn(run_id, "local-controller", turns=1)
+            reserve_turn(writer, run_id, "local-controller", turns=1)
         stop.set()
         thread.join(timeout=10)
         assert seen and all(state in {"CHECKING"} for state in seen)
@@ -412,7 +412,7 @@ def test_lock_is_released_when_a_transaction_body_raises(tmp_path: Path, project
 
         assert store.get_run(run_id)["turns_reserved"] == 1, "the write must be rolled back"
         # Still usable, and still able to take a real transaction.
-        store.reserve_turn(run_id, "local-controller", turns=1)
+        reserve_turn(store, run_id, "local-controller", turns=1)
         assert store.get_run(run_id)["turns_reserved"] == 2
     finally:
         store.close()
@@ -451,15 +451,19 @@ def test_transaction_is_one_write_unit_in_the_file(tmp_path: Path, project, task
 
         thread = threading.Thread(target=observe, daemon=True)
         thread.start()
-        for index in range(3):
-            store.dispatch_attempt(
+        # The production reservation, twice: the run's first implementer attempt, then its one
+        # repair attempt (a run buys no third).
+        for index in range(2):
+            store.reserve_dispatch(
                 run_id=run_id,
                 controller_id="local-controller",
-                attempt_id=f"A-atomic-{index}",
-                role=f"implementer-{index}",
+                invocation_id=f"I-atomic-{index}",
+                role="implementer",
                 reservation_id=f"B-{index}",
                 reserved_turns=1,
                 reservation_expires_at="2999-01-01T00:00:00Z",
+                attempt_id=f"A-atomic-{index}",
+                is_repair=index == 1,
             )
             store.finish_attempt(
                 run_id=run_id,
@@ -481,7 +485,7 @@ def test_transaction_is_one_write_unit_in_the_file(tmp_path: Path, project, task
                 f"observed budget/attempt skew: reserved={reserved} attempts={attempts}"
             )
             assert reserved <= 8, "the ceiling must hold at every observation"
-        assert int(store.get_run(run_id)["turns_reserved"]) == 3, "one turn per dispatched attempt"
+        assert int(store.get_run(run_id)["turns_reserved"]) == 2, "one turn per dispatched attempt"
     finally:
         observer.close()
         store.close()

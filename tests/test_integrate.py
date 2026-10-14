@@ -38,9 +38,9 @@ from hflow.contracts import (
 )
 from hflow.controller import Controller
 from hflow.drivers.fake import FakeDriver, FakeScript
-from hflow.gitworkspace import GitRepo
+from hflow.gitworkspace import GitError, GitRepo
+from hflow.hints import shell_word
 from hflow.integrate import (
-    _shell_word,
     apply_integration,
     prepare_integration,
     reconcile_integration,
@@ -268,7 +268,7 @@ def test_squash_prepare_builds_one_checked_commit_and_moves_nothing(scene: Scene
     # The scene's ledger is not the default one, so the printed command names it.
     assert outcome.handoff == [
         f"hflow integrate apply {record.integration_id} --expect-target {scene.base} "
-        f"--data-dir {_shell_word(os.path.abspath(scene.data_dir))}"
+        f"--data-dir {shell_word(os.path.abspath(scene.data_dir))}"
     ]
 
 
@@ -575,6 +575,86 @@ def test_an_interrupted_apply_whose_target_moved_elsewhere_goes_stale(
     assert outcome.record.state is IntegrationState.STALE
 
 
+def _ref_reads_fail(monkeypatch: pytest.MonkeyPatch, ref: str) -> None:
+    """``git rev-parse --verify --quiet <ref>`` fails as a git that could not start does.
+
+    Windows reports ``0xC0000142`` with no output at all when a process cannot initialise, which
+    was seen under load. Every other git call runs for real.
+    """
+    real_run = subprocess.run
+
+    def flaky(argv, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003 - subprocess.run shape
+        if argv[:2] == ["git", "rev-parse"] and "--quiet" in argv and argv[-1] == ref:
+            return subprocess.CompletedProcess(argv, 0xC0000142, "", "")
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", flaky)
+
+
+def test_a_failed_target_read_leaves_an_applied_integration_unsettled_not_stale(
+    scene: Scene, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CAS moved the branch, then the process died; a failing read must not record STALE.
+
+    Read as "the branch is gone", the failure would settle an integration that did land as
+    ``stale ... (deleted)``. It raises instead, the record stays ``applying``, and a reconcile
+    that can read the branch records what happened.
+    """
+    run_id = scene.accept()
+    prepared = scene.prepare(run_id).record
+    real = GitRepo.update_ref_cas
+
+    def update_then_crash(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        real(self, *args, **kwargs)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(GitRepo, "update_ref_cas", update_then_crash)
+    with pytest.raises(KeyboardInterrupt):
+        scene.apply(prepared.integration_id, scene.base)
+    monkeypatch.undo()
+    assert scene.tip() == prepared.integration_commit
+
+    real_run = subprocess.run
+    _gone(monkeypatch)
+    _ref_reads_fail(monkeypatch, prepared.target_ref)
+    for attempt in (
+        lambda: reconcile_integration(
+            scene.store, integration_id=prepared.integration_id, controller_build=BUILD
+        ),
+        lambda: scene.apply(prepared.integration_id, scene.base),
+    ):
+        with pytest.raises(GitError, match="0xC0000142"):
+            attempt()
+        assert scene.store.integration(prepared.integration_id).state is IntegrationState.APPLYING
+
+    monkeypatch.setattr(subprocess, "run", real_run)
+    outcome = reconcile_integration(
+        scene.store, integration_id=prepared.integration_id, controller_build=BUILD
+    )
+    assert outcome.record.state is IntegrationState.INTEGRATED
+    assert outcome.record.basis == "observed_after_interruption"
+
+
+def test_a_failed_target_read_never_records_a_ready_integration_stale(
+    scene: Scene, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = scene.accept()
+    prepared = scene.prepare(run_id).record
+    real_run = subprocess.run
+    _ref_reads_fail(monkeypatch, prepared.target_ref)
+    with pytest.raises(GitError, match="0xC0000142"):
+        scene.apply(prepared.integration_id, scene.base)
+    with pytest.raises(GitError, match="0xC0000142"):
+        reconcile_integration(
+            scene.store, integration_id=prepared.integration_id, controller_build=BUILD
+        )
+    assert scene.store.integration(prepared.integration_id).state is IntegrationState.READY
+    assert scene.tip() == scene.base
+
+    monkeypatch.setattr(subprocess, "run", real_run)
+    assert scene.apply(prepared.integration_id, scene.base).record.state is IntegrationState.INTEGRATED
+
+
 def test_a_prepare_interrupted_during_checks_reconciles_to_interrupted(
     scene: Scene, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -743,7 +823,7 @@ def test_a_printed_apply_command_names_the_data_dir_and_works_as_pasted(
                  "main", "--project", str(project_file)]) == 0
     printed = capsys.readouterr().out.splitlines()
     [command] = [line.removeprefix("next:").strip() for line in printed if line.startswith("next: ")]
-    assert command.endswith(f" --data-dir {_shell_word(os.path.abspath(scene.data_dir))}")
+    assert command.endswith(f" --data-dir {shell_word(os.path.abspath(scene.data_dir))}")
     argv = _paste(command)
 
     # Without it the command opens the default ledger, where this integration does not exist.
@@ -782,7 +862,7 @@ def test_a_checked_out_hand_off_prints_commands_that_work_as_pasted(
     )
     assert reconcile == (
         f"hflow integrate reconcile {record.integration_id} "
-        f"--data-dir {_shell_word(os.path.abspath(scene.data_dir))}"
+        f"--data-dir {shell_word(os.path.abspath(scene.data_dir))}"
     )
 
     subprocess.run(  # noqa: S603 - the printed command, as an operator would paste it
@@ -825,7 +905,7 @@ def test_a_printed_path_is_one_word_in_the_documented_shells(
     text: str, windows: bool, expected: str
 ) -> None:
     """PowerShell on Windows (double quotes unless it would expand or end there), sh elsewhere."""
-    assert _shell_word(text, windows=windows) == expected
+    assert shell_word(text, windows=windows) == expected
 
 
 def _powershell(name: str) -> str | None:
@@ -868,10 +948,10 @@ def test_a_printed_path_reaches_the_program_as_that_directory_through_powershell
     ]
     echo = tmp_path / "echo_argv.py"
     echo.write_text("import json, sys\nprint(json.dumps(sys.argv[1:]))\n", encoding="utf-8")
-    words = " ".join(f"{_shell_word(path, windows=True)} next" for path in paths)
+    words = " ".join(f"{shell_word(path, windows=True)} next" for path in paths)
     script = tmp_path / "paste.ps1"
     script.write_text(
-        f"& {_shell_word(sys.executable, windows=True)} {_shell_word(str(echo), windows=True)} "
+        f"& {shell_word(sys.executable, windows=True)} {shell_word(str(echo), windows=True)} "
         f"{words}\n",
         encoding="utf-8-sig",  # Windows PowerShell 5.1 reads a script without a BOM as ANSI
     )
@@ -954,7 +1034,7 @@ def test_a_failed_ref_update_returns_to_ready_and_does_not_exit_zero(
     assert "cannot lock ref" in out
     assert (
         f"next: hflow integrate apply {prepared.integration_id} --expect-target "
-        f"{scene.base} --data-dir {_shell_word(os.path.abspath(scene.data_dir))}\n"
+        f"{scene.base} --data-dir {shell_word(os.path.abspath(scene.data_dir))}\n"
     ) in out
     store = Store(scene.data_dir / "hflow.sqlite")
     try:

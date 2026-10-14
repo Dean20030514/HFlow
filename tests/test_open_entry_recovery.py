@@ -23,10 +23,10 @@ everything it must not do:
   row is added, no driver is called, nothing is refunded, and a second ``resume`` is a no-op;
 * overlapping resumes over the same open snapshot: nothing is closed twice, a call that changed
   nothing writes nothing, and each note describes only its own call's closures;
-* ``status`` says, in one line, what closes such entries: ``resume`` once the owner is gone,
-  ``resume``'s reconcile for an ``outcome_unknown`` / ``owner_lost`` run (for an ``outcome_unknown``
-  run with an owner token, once that owner is gone), or ``resume --legacy-owner-gone`` on the
-  operator's attestation for a pre-v6 run that recorded a controller pid.
+* ``status`` lists such entries as facts, and its ``next:`` lines - with the ledger's
+  ``--data-dir`` - say what closes them: ``resume`` (its reconcile for an ``outcome_unknown`` /
+  ``owner_lost`` run), or ``resume --legacy-owner-gone`` on the operator's attestation for a pre-v6
+  run that recorded a controller pid, then ``ledger settle``.
 
 Offline only: ``FakeDriver`` subclasses, ``FakeCheckRunner``, a real ``Store`` under ``tmp_path``.
 A dead owner is simulated the way the owner-lease tests do it: the controller releases its lock
@@ -75,6 +75,7 @@ from .test_batch_e_ledger import (
     _seed_ready_run,
 )
 from .owner_exit import owner_exits
+from .store_helpers import mark_invocation_started
 from .test_owner_lease import _controller, windows_only
 
 ATTEST = "Checked the provider console: no request from this launch appears."
@@ -202,6 +203,20 @@ def _cli_settle(store: Store, invocation_id: str, settled_as: str = "consumed") 
     ])
 
 
+def _open_entry_line(store: Store, run_id: str) -> str:
+    """The ``open entries`` line ``status`` prints for ``run_id`` (exactly one)."""
+    status = status_text(inspect_run(store, run_id))
+    (line,) = [item for item in status.splitlines() if item.startswith("open entries")]
+    return line
+
+
+def _cli_next(store: Store, run_id: str, capsys: pytest.CaptureFixture[str]) -> list[str]:
+    """The ``next:`` lines ``hflow status`` prints for ``run_id`` from this test's ledger."""
+    capsys.readouterr()
+    assert main(["--data-dir", str(store.path.parent), "status", run_id]) == EXIT_OK
+    return [line for line in capsys.readouterr().out.splitlines() if line.startswith("next: ")]
+
+
 def _no_driver_call(controller: Controller) -> None:
     for driver in {id(controller.driver): controller.driver,
                    id(controller.reviewer_driver): controller.reviewer_driver}.values():
@@ -235,8 +250,18 @@ def test_a_driver_failure_entry_is_closed_by_resume_and_then_voided_by_ledger_se
     (failure,) = [n for n in store.notes_for(run_id) if "without reporting a spawn fact" in n]
     assert f"`hflow resume {run_id}`" in failure and "hflow ledger settle" in failure, failure
     assert "no command" not in failure, failure
-    assert "open entries  1 ledger entry left open" in status_text(inspect_run(store, run_id))
-    assert f"`hflow resume {run_id}` closes" in status_text(inspect_run(store, run_id))
+    line = _open_entry_line(store, run_id)
+    assert line.startswith(f"open entries  1 ledger entry left open on this ended run "
+                           f"({entry.invocation_id})"), line
+    assert "the next: lines say what closes it" in line and "hflow resume" not in line, line
+    assert (
+        f"  {entry.invocation_id}  role=implementer state=requested"
+        in status_text(inspect_run(store, run_id))
+    )
+    # The next: line names the resume with this ledger's --data-dir, which the old status line
+    # left out.
+    steps = _cli_next(store, run_id, capsys)
+    assert steps[0].startswith(f"next: hflow resume {run_id} --data-dir "), steps
 
     # ledger settle still refuses an open entry, pointing at resume.
     capsys.readouterr()
@@ -463,7 +488,7 @@ def test_a_stop_of_a_run_that_had_already_ended_is_not_used_as_the_entrys_fact(
                              spec=task_spec)
     assert _reserve(store, run_id=run_id, invocation_id="I-late-stop", binding=binding,
                     limits=limits).is_new
-    assert store.mark_invocation_started("I-late-stop") is True
+    assert mark_invocation_started(store, "I-late-stop") is True
     store.set_blocked(run_id, block, "seeded: the run ended before the stop")
     store.record_cancel_receipt(
         run_id,
@@ -505,7 +530,7 @@ def _seed_ended_entry(
     if shape in {"requested", "started"}:
         assert store.mark_invocation_launch_requested(invocation_id) is True
     if shape == "started":
-        assert store.mark_invocation_started(invocation_id, process_created=False) is True
+        assert mark_invocation_started(store, invocation_id, process_created=False) is True
     store.set_blocked(run_id, block, f"seeded: the run ended {block.value}")
     if stop is not None:
         store.record_cancel_receipt(run_id, stop)
@@ -865,7 +890,7 @@ def _legacy_ended_run(
     assert store.get_run(run_id)["owner_token"] is None
     assert _reserve(store, run_id=run_id, invocation_id="I-legacy", binding=binding,
                     limits=limits).is_new
-    assert store.mark_invocation_started("I-legacy") is True
+    assert mark_invocation_started(store, "I-legacy") is True
     store.set_blocked(run_id, block, f"seeded: the run ended {block.value}")
     return run_id
 
@@ -881,15 +906,17 @@ def _record_controller_pid(store: Store, run_id: str) -> None:
 
 def test_a_run_that_recorded_no_owner_and_no_controller_is_closed(
     store: Store, project, task_spec: TaskSpec, project_root: Path, fake_script: FakeScript,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     run_id = _legacy_ended_run(store, project, task_spec, project_root)
     frozen = _frozen(store, run_id)
     successor = _controller(store, project_root, fake_script)
-    status = status_text(inspect_run(store, run_id))
-    assert (
-        f"`hflow resume {run_id}` closes it once the run's owner is gone, then "
-        "`hflow ledger settle <invocation_id>`"
-    ) in status, status
+    assert "(I-legacy) keeps the root blocked" in _open_entry_line(store, run_id)
+    assert "  I-legacy  role=implementer state=started" in status_text(inspect_run(store, run_id))
+    steps = _cli_next(store, run_id, capsys)
+    assert steps[0].startswith(f"next: hflow resume {run_id} --data-dir "), steps
+    assert "--legacy-owner-gone" not in steps[0], steps
+    assert steps[1].startswith("next: hflow ledger settle I-legacy --attest "), steps
 
     resumed = successor.resume(run_id)
 
@@ -905,27 +932,29 @@ def test_a_run_that_recorded_no_owner_and_no_controller_is_closed(
 
 def test_a_pre_v6_run_with_a_recorded_controller_pid_is_refused_and_unchanged(
     store: Store, project, task_spec: TaskSpec, project_root: Path, fake_script: FakeScript,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """A controller pid with no host is never judged: without an attestation, nothing closes.
 
-    ``status`` names the one way out - ``resume --legacy-owner-gone`` on the operator's
-    attestation (``tests/test_resume_owner_check.py``) - instead of "once the owner is gone".
+    ``status``'s ``next:`` lines name the one way out - ``resume --legacy-owner-gone`` on the
+    operator's attestation (``tests/test_resume_owner_check.py``), then ``ledger settle`` with the
+    same flag - instead of a plain ``resume``.
     """
     run_id = _legacy_ended_run(store, project, task_spec, project_root)
     _record_controller_pid(store, run_id)
     frozen, notes = _frozen(store, run_id), store.notes_for(run_id)
     status = status_text(inspect_run(store, run_id))
-    (line,) = [item for item in status.splitlines() if item.startswith("open entries")]
+    line = _open_entry_line(store, run_id)
     assert "1 ledger entry left open on this ended run (I-legacy)" in line, line
-    assert "recorded a controller pid with no host" in line, line
-    assert "HFlow can never prove its owner gone" in line, line
-    assert (
-        f"`hflow resume {run_id} --legacy-owner-gone --attest \"<what you know and why>\"` "
-        "closes it on your attestation (recorded as one, never as an observation), then "
-        "`hflow ledger settle <invocation_id> --legacy-owner-gone`"
-    ) in line, line
-    assert "`hflow ledger settle` refuses an open entry, so it keeps blocking the root" in line
-    assert "closes it once" not in line and "reconciles" not in line, line
+    assert "`hflow ledger settle` refuses an open entry" in line, line
+    steps = _cli_next(store, run_id, capsys)
+    assert steps[0].startswith(
+        f'next: hflow resume {run_id} --legacy-owner-gone --attest "<what you know and why>" '
+        "--data-dir "
+    ), steps
+    assert "pre-v6 controller has exited" in steps[0], steps
+    assert steps[1].startswith("next: hflow ledger settle I-legacy --attest "), steps
+    assert "--legacy-owner-gone" in steps[1], steps
 
     refused = _controller(store, project_root, fake_script).resume(run_id)
 
@@ -948,33 +977,24 @@ def test_a_pre_v6_run_with_a_recorded_controller_pid_is_refused_and_unchanged(
 )
 def test_status_names_resumes_reconcile_for_an_outcome_unknown_or_owner_lost_run(
     store: Store, project, task_spec: TaskSpec, project_root: Path, fake_script: FakeScript,
-    block: RefusalCode, legacy_pid: bool,
+    block: RefusalCode, legacy_pid: bool, capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Such a run is reconciled by ``resume``'s reconcile path, which waits on no owner here.
 
     The run has no owner token: an ``outcome_unknown`` one is reconciled without an owner check
     (none can be proven gone - ``cancel`` + ``resume`` is its documented way out), an ``owner_lost``
     one because the takeover already proved its owner gone. That path comes first in ``resume``,
-    so it holds even for a pre-v6 run that recorded a controller pid - the case whose
-    ``open entries`` line otherwise asks for ``--legacy-owner-gone``. (An ``outcome_unknown`` run
-    with an owner token waits for that owner: ``tests/test_resume_owner_check.py``.)
+    so it holds even for a pre-v6 run that recorded a controller pid - the case whose ``next:``
+    line otherwise asks for ``--legacy-owner-gone``. (An ``outcome_unknown`` run with an owner
+    token waits for that owner: ``tests/test_resume_owner_check.py``.)
     """
     run_id = _legacy_ended_run(store, project, task_spec, project_root, block)
     if legacy_pid:
         _record_controller_pid(store, run_id)
-    status = status_text(inspect_run(store, run_id))
-    (line,) = [item for item in status.splitlines() if item.startswith("open entries")]
-    why = (
-        "a run with no owner token is reconciled without waiting on an owner, since none can be "
-        "proven gone"
-        if block is RefusalCode.OUTCOME_UNKNOWN
-        else "the takeover that blocked this run owner_lost already proved its previous owner gone"
-    )
-    assert (
-        f"`hflow resume {run_id}` reconciles it - {why} - recording each as unknown or "
-        "launch_unknown, then `hflow ledger settle <invocation_id>`"
-    ) in line, line
-    assert "--legacy-owner-gone" not in line and "once the run's owner is gone" not in line, line
+    assert "(I-legacy) keeps the root blocked" in _open_entry_line(store, run_id)
+    steps = _cli_next(store, run_id, capsys)
+    assert steps[0].startswith(f"next: hflow resume {run_id} --data-dir "), steps
+    assert "--legacy-owner-gone" not in steps[0], steps
 
     successor = _controller(store, project_root, fake_script)
     resumed = successor.resume(run_id)

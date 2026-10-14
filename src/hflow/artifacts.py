@@ -4,8 +4,8 @@ Two problems this module solves, both about *control* rather than features:
 
 * a chatty check must not be able to grow controller memory or fill the disk. Output is drained
   continuously (so the child never blocks on a full pipe) and written to a file only up to a
-  declared limit; the digest covers everything, the retained file covers only what fits, and
-  the difference is recorded instead of being hidden;
+  declared limit; every byte is counted, the retained file and its digest cover only what fits,
+  and the difference is recorded instead of being hidden;
 * a check must not inherit the controller's provider credentials. The environment is built from
   an explicit allowlist of what a process needs to start and find its runtime, plus the variables
   a project declares as approved test variables.
@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import IO
 
 #: Bytes retained per check stream by default (plan 8.2). The *first* bytes are kept and the rest
-#: are read, counted and digested but not written: a true bound needs a bounded amount of memory
+#: are read and counted but not written: a true bound needs a bounded amount of memory
 #: as well as a bounded file, which is why the reader never accumulates the whole stream.
 DEFAULT_STREAM_LIMIT_BYTES = 8 * 1024 * 1024
 #: How much of a stream's head is quoted into an evidence row's detail text.
@@ -73,11 +73,11 @@ class StreamCapture:
 
 
 class BoundedTextSink:
-    """Drain a binary stream into a bounded file while digesting everything read.
+    """Drain a binary stream into a bounded file while counting everything read.
 
     The file is truncated at ``limit``; nothing else about the stream is dropped silently - the
-    total byte count, the digest and a truncation flag describe what was actually seen, so a
-    reader can tell "this is all of it" from "this is the head of it".
+    total byte count, the digest of the retained head and a truncation flag describe what was
+    actually seen, so a reader can tell "this is all of it" from "this is the head of it".
     """
 
     def __init__(self, path: Path, *, limit: int = DEFAULT_STREAM_LIMIT_BYTES) -> None:
@@ -85,7 +85,6 @@ class BoundedTextSink:
         self.limit = max(0, int(limit))
         self.total_bytes = 0
         self.retained_bytes = 0
-        self._digest = hashlib.sha256()
         self._retained_digest = hashlib.sha256()
         self._handle: IO[bytes] | None = None
         self._excerpt = bytearray()
@@ -104,10 +103,9 @@ class BoundedTextSink:
         self.close()
 
     def write(self, chunk: bytes) -> None:
-        """Count and digest everything; retain the head. Never raises, never lies about failing."""
+        """Count everything; retain and digest the head. Never raises, never lies about failing."""
         if not chunk:
             return
-        self._digest.update(chunk)
         self.total_bytes += len(chunk)
         if len(self._excerpt) < self._excerpt_limit:
             room = self._excerpt_limit - len(self._excerpt)
@@ -144,17 +142,6 @@ class BoundedTextSink:
     def truncated(self) -> bool:
         """Has anything been read that was not retained?"""
         return self.total_bytes > self.retained_bytes
-
-    @property
-    def exhausted(self) -> bool:
-        """Is the retention budget used up? Checked before writing another retained record."""
-        return self.retained_bytes >= self.limit
-
-    def excerpt(self, limit: int | None = None) -> str:
-        """The head of the stream, decoded for an evidence row (never the whole thing)."""
-        text = bytes(self._excerpt[: limit or self._excerpt_limit]).decode("utf-8", "replace")
-        suffix = "… (truncated)" if self.truncated else ""
-        return text + suffix
 
     def capture(self) -> StreamCapture:
         self.close()
@@ -290,7 +277,6 @@ def child_environment(
     *,
     extra: dict[str, str] | None = None,
     base: dict[str, str] | None = None,
-    allow: tuple[str, ...] = (),
 ) -> tuple[dict[str, str], list[str]]:
     """The environment a check may see, plus a list of what was withheld.
 
@@ -302,10 +288,6 @@ def child_environment(
     source = dict(os.environ if base is None else base)
     allowed: dict[str, str] = {}
     for name in _BASE_ALLOWED_NAMES:
-        value = source.get(name)
-        if value is not None and not is_secret_like(name):
-            allowed[name] = value
-    for name in allow:
         value = source.get(name)
         if value is not None and not is_secret_like(name):
             allowed[name] = value

@@ -512,7 +512,7 @@ def test_top_level_help_names_every_subcommand_and_the_live_driver(
     subcommands = next(
         action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
     ).choices
-    assert len(subcommands) == 12
+    assert len(subcommands) == 15
     for name in subcommands:
         assert name in description, name
     assert "offline in M1" not in description
@@ -823,6 +823,66 @@ def test_cli_cancel_of_an_offline_run_owned_by_another_fake_driver_is_unknown(
     assert implementer.cancel_calls == [], "the CLI's own driver answered, not the owner's"
     row = store.get_run(run_id)
     assert row["block_code"] == RefusalCode.OUTCOME_UNKNOWN.value, row["block_reason"]
+
+
+def test_cli_cancel_text_prints_the_receipt_detail_and_the_next_command(
+    store: Store, project_root: Path, run_request: RunRequest, tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Text mode: the status word, the receipt's detail, then ``next:`` lines from stored facts -
+    here ``resume`` (with this ledger's ``--data-dir``), which reconciles the stop the CLI could
+    not confirm once the owning controller is gone."""
+    from hflow.hints import shell_word
+
+    from .test_cancel_routing import RunningRun, _pair
+
+    implementer, reviewer = _pair(project_root)
+    implementer.gate = True
+    runner = FakeCheckRunner()
+    owner = Controller(
+        store,
+        implementer,
+        reviewer_driver=reviewer,
+        controller_build="cli-cancel-test",
+        runners=CheckRunners({"fake": runner, "command": runner}),
+        data_dir=tmp_path / "data",
+        production=False,
+        effective_config=_recorded_config("fake", "fake"),
+    )
+    with RunningRun(owner, run_request) as running:
+        request = running.wait_for_role(implementer, "implementer")
+        assert implementer.entered.wait(timeout=30)
+        run_id = running.run_id()
+        exit_code = main(["cancel", run_id, "--data-dir", str(tmp_path / "data")])
+        lines = capsys.readouterr().out.splitlines()
+
+    assert exit_code == EXIT_OK
+    assert lines[0] == "unknown", lines
+    assert lines[1].startswith("detail        ") and request.invocation_id in lines[1], lines
+    resume = f"next: hflow resume {run_id} --data-dir {shell_word(str(tmp_path / 'data'))}  # "
+    assert any(line.startswith(resume) for line in lines), lines
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["status", "R-nope"],
+        ["report", "R-nope"],
+        ["cancel", "R-nope"],
+        ["resume", "R-nope"],
+        ["clean", "R-nope"],
+        ["clean", "R-nope", "--apply"],
+        ["clean", "R-nope", "--reconcile"],
+        ["integrate", "prepare", "R-nope", "--target", "main"],
+    ],
+    ids=lambda argv: "-".join(word for word in argv if word != "R-nope"),
+)
+def test_every_command_names_an_unknown_run_the_same_way(
+    argv: list[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main([*argv, "--data-dir", str(tmp_path / "data")]) == EXIT_USAGE
+    err = capsys.readouterr().err
+    assert err.strip() == "unknown run R-nope", err
 
 
 def test_an_interrupted_controller_leaves_a_run_resume_reconciles(

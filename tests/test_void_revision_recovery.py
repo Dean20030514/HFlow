@@ -13,6 +13,7 @@ from hflow.drivers.fake import FakeDriver, FakeScript
 from hflow.verify import CheckRunners, FakeCheckRunner
 
 from .conftest import write_project, write_task
+from .store_helpers import settlement_for
 from .test_batch_e_repair import (
     FIXED_SOURCE, FailingOnceThenPassing, RepairingDriver, _git, _policy, _project,
     _request, _spec, sample_repo as sample_repo,
@@ -185,7 +186,7 @@ def test_settlement_then_fresh_revision_preserves_history_and_obeys_budget(
     assert [dict(row) for row in store.attempts_for(run_id)] == prior_attempts
     assert store.authorization_state("AUTH-first") == prior_authorization
     assert store.invocations_for(run_id) == prior_invocations
-    assert store.settlement_for(entries[0].invocation_id) == settlement
+    assert settlement_for(store, entries[0].invocation_id) == settlement
     root = store.root_budget_view(binding.root_id)
     assert root.first_dispatch_at == prior_root.first_dispatch_at
     assert root.deadline_at == prior_root.deadline_at

@@ -53,6 +53,7 @@ from hflow.store import Store
 from hflow.verify import CheckRunners, FakeCheckRunner
 
 from .owner_exit import owner_exits, successor
+from .store_helpers import claim_run, dispatch_attempt
 from .test_driver_acpx_dsh import FAKE_CLIENT, STUB_AGENT
 
 
@@ -281,18 +282,16 @@ def _seed_implementer_run(
         turn_limit=4,
         repair_limit=0,
     )
-    store.claim_run(run_id, "local-controller")
+    claim_run(store, run_id, "local-controller")
     store.set_task_state(run_id, [TaskState.DRAFT], TaskState.READY)
-    store.dispatch_attempt(
+    dispatch_attempt(
+        store,
         run_id=run_id,
         controller_id="local-controller",
         attempt_id=attempt_id,
-        role="implementer",
+        invocation_id=invocation_id,
         reservation_id=f"B-{attempt_id}",
-        reserved_turns=1,
-        reservation_expires_at="2999-01-01T00:00:00Z",
     )
-    store.record_invocation(attempt_id, invocation_id)
     if phase is not None:
         store.advance_to_checking(run_id=run_id, attempt_id=attempt_id, phase=phase)
     if block_code is not None:
@@ -530,7 +529,9 @@ def test_resume_reconciles_the_active_roles_invocation(
     store.advance_to_checking(
         run_id="R-reconcile-review", attempt_id="A-review", phase=CheckPhase.REVIEW
     )
-    store.record_review_invocation("A-review", "I-reviewer")
+    assert store.register_attempt_invocation_unless_stopped(
+        "R-reconcile-review", "A-review", column="review_invocation_id", invocation_id="I-reviewer"
+    )
     store.set_blocked(
         "R-reconcile-review",
         RefusalCode.OUTCOME_UNKNOWN,
@@ -590,6 +591,51 @@ def test_reconcile_reports_not_started_instead_of_asking_the_wrong_driver(
     )
     assert controller.reconcile("R-reconcile-none").value == "not_started"
     assert implementer.reconcile_calls == [] and reviewer.reconcile_calls == []
+
+
+def test_a_recorded_confirmed_stop_is_reapplied_on_a_live_run_without_an_open_attempt(
+    store: Store, project, task_spec, project_root: Path, tmp_path: Path
+) -> None:
+    """A receipt that names an invocation, on a live run with no open attempt, still ends it.
+
+    The re-applied confirmed stop used to hand the missing attempt to the attempt bookkeeping,
+    which raised ``TypeError`` instead of returning the recorded receipt. The driver is not asked
+    again, and there is no attempt or ledger entry to close.
+    """
+    implementer, reviewer = _pair(project_root)
+    controller = _controller(store, implementer, reviewer, tmp_path / "data")
+    run_id = "R-reapply-without-attempt"
+    store.create_run(
+        run_id=run_id,
+        project_id=project.project_id,
+        spec=task_spec,
+        spec_digest=task_spec.spec_digest(),
+        controller_build="cancel-routing-test",
+        checks_digest=project.checks_digest(),
+        turn_limit=4,
+        repair_limit=0,
+    )
+    recorded = CancellationReceipt(
+        invocation_id="I-recorded",
+        status="confirmed_stopped",
+        mechanism="forced",
+        local_process_stopped=True,
+        detail="recorded by an earlier cancel that never wrote its block",
+    )
+    store.record_cancel_intent(run_id)
+    store.record_cancel_receipt(run_id, recorded)
+    assert store.open_attempt(run_id) is None
+
+    receipt = controller.cancel(run_id)
+
+    assert receipt == recorded
+    row = store.get_run(run_id)
+    assert (row["task_state"], row["block_code"]) == (
+        TaskState.BLOCKED.value,
+        RefusalCode.CANCELLED_BY_OPERATOR.value,
+    )
+    assert implementer.cancel_calls == [] and reviewer.cancel_calls == []
+    assert any("re-applied" in note for note in store.notes_for(run_id))
 
 
 # --------------------------------------------------------------------------

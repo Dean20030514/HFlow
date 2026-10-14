@@ -28,6 +28,8 @@ not restate the design; read the plan (`docs/history/Harness_Agnostic_Workflow_G
 | `status` / `report` text from stored facts | `src/hflow/report.py` |
 | The operator's next command (`next:` lines) from stored facts; pasteable quoting and `--data-dir` | `src/hflow/hints.py` |
 | Commands and exit codes | `src/hflow/cli.py` |
+| `hflow init project/profile/task` scaffolds (exclusive create, never answers the fit test) | `src/hflow/scaffold.py` |
+| `hflow runs` listing and its `--needs-you` facts; `hflow diff` | `src/hflow/listing.py` |
 | The one production driver (acpx → DSH ACP) | `src/hflow/drivers/acpx_dsh.py` |
 | Windows Job Object process boundary | `src/hflow/drivers/winjob.py` |
 | Neutral event projection from the client stream | `src/hflow/drivers/acp_events.py` |

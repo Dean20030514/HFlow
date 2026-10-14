@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,41 @@ def _entry(path: str, payload: bytes) -> dict[str, object]:
     }
 
 
+class _TargetFds:
+    """Watch the low-level reads of one file: candidate hashing opens it with ``os.open``
+    (non-blocking, regular files only) and reads it with ``os.read`` in bounded chunks."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, target: Path) -> None:
+        self.target = target
+        self.fds: set[int] = set()
+        self.closed: set[int] = set()
+        self.reads: list[int] = []
+        self._open, self._read, self._close = os.open, os.read, os.close
+        monkeypatch.setattr(os, "open", self.open)
+        monkeypatch.setattr(os, "read", self.read)
+        monkeypatch.setattr(os, "close", self.close)
+
+    def opens_target(self, path) -> bool:
+        return Path(path) == self.target
+
+    def open(self, path, flags, *args, **kwargs):
+        fd = self._open(path, flags, *args, **kwargs)
+        if self.opens_target(path):
+            self.fds.add(fd)
+        return fd
+
+    def read(self, fd: int, count: int) -> bytes:
+        if fd in self.fds:
+            assert 0 < count <= 65536, "a candidate file must never be read all at once"
+            self.reads.append(count)
+        return self._read(fd, count)
+
+    def close(self, fd: int) -> None:
+        if fd in self.fds:
+            self.closed.add(fd)
+        self._close(fd)
+
+
 @pytest.mark.parametrize("size", [0, 1, 65535, 65536, 65537, 131072, 196613])
 def test_hashes_match_the_original_bytes_without_whole_file_reads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, size: int
@@ -28,40 +64,17 @@ def test_hashes_match_the_original_bytes_without_whole_file_reads(
     target = tmp_path / "binary.dat"
     target.write_bytes(payload)
     expected = _entry("binary.dat", payload)
-    original_open = Path.open
-    reads: list[int] = []
-    handles = []
-
-    class BoundedReader:
-        def __init__(self, source):
-            self.source = source
-            handles.append(source)
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            self.source.close()
-
-        def read(self, count: int = -1) -> bytes:
-            assert 0 < count <= 65536, "a candidate file must never be read all at once"
-            reads.append(count)
-            return self.source.read(count)
-
-    def open_bounded(path, mode="r", *args, **kwargs):
-        source = original_open(path, mode, *args, **kwargs)
-        return BoundedReader(source) if path == target and mode == "rb" else source
 
     def refuse_read_bytes(_path):
         raise AssertionError("candidate hashing must use bounded binary reads")
 
-    monkeypatch.setattr(Path, "open", open_bounded)
+    watch = _TargetFds(monkeypatch, target)
     monkeypatch.setattr(Path, "read_bytes", refuse_read_bytes)
 
     assert manifest(tmp_path) == {"binary.dat": expected["digest"]}
     assert candidate_fingerprint(tmp_path, Scope(write_allow=["binary.dat"])) == digest_of([expected])
-    assert reads, "the resource bound must be exercised, including for an empty file"
-    assert all(source.closed for source in handles)
+    assert watch.reads, "the resource bound must be exercised, including for an empty file"
+    assert watch.fds and watch.closed == watch.fds
 
 
 def test_streaming_keeps_scope_sorting_deduplication_deny_and_missing_paths(tmp_path: Path) -> None:
@@ -85,19 +98,23 @@ def test_hash_size_counts_short_reads_instead_of_the_files_prior_size(
     target = tmp_path / "file.bin"
     target.write_bytes(b"prior size")
     payload = bytes(range(256)) * 4
-    original_open = Path.open
+    watch = _TargetFds(monkeypatch, target)
+    streams: dict[int, io.BytesIO] = {}
 
-    class ShortReader(io.BytesIO):
-        def read(self, count=-1):
+    def fresh_open(path, flags, *args, **kwargs):
+        fd = watch.open(path, flags, *args, **kwargs)
+        if fd in watch.fds:
+            streams[fd] = io.BytesIO(payload)  # a reused fd number starts a new stream
+        return fd
+
+    def short_read(fd: int, count: int) -> bytes:
+        if fd in watch.fds:
             assert 0 < count <= 65536
-            return super().read(min(count, 7))
+            return streams[fd].read(min(count, 7))
+        return watch._read(fd, count)
 
-    def short_open(path, mode="r", *args, **kwargs):
-        if path == target and mode == "rb":
-            return ShortReader(payload)
-        return original_open(path, mode, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "open", short_open)
+    monkeypatch.setattr(os, "open", fresh_open)
+    monkeypatch.setattr(os, "read", short_read)
     expected = _entry("file.bin", payload)
     assert manifest(tmp_path) == {"file.bin": expected["digest"]}
     assert candidate_fingerprint(tmp_path, Scope(write_allow=["file.bin"])) == digest_of([expected])
@@ -109,37 +126,26 @@ def test_io_failure_keeps_the_whole_file_unreadable_and_closes_the_reader(
 ) -> None:
     target = tmp_path / "file.bin"
     target.write_bytes(b"x" * 65537)
-    original_open = Path.open
-    handles = []
+    watch = _TargetFds(monkeypatch, target)
+    reads: dict[int, int] = {}
 
-    class FailingReader:
-        def __init__(self, source):
-            self.source = source
-            self.reads = 0
-            handles.append(source)
+    def failing_open(path, flags, *args, **kwargs):
+        if watch.opens_target(path) and failure_stage == "open":
+            raise PermissionError("offline injected open failure")
+        return watch.open(path, flags, *args, **kwargs)
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            self.source.close()
-
-        def read(self, count):
-            self.reads += 1
-            if self.reads > 1:
+    def failing_read(fd: int, count: int) -> bytes:
+        if fd in watch.fds:
+            reads[fd] = reads.get(fd, 0) + 1
+            if reads[fd] > 1:
                 raise OSError("offline injected read failure")
-            return self.source.read(count)
+        return watch._read(fd, count)
 
-    def failing_open(path, mode="r", *args, **kwargs):
-        if path == target and mode == "rb":
-            if failure_stage == "open":
-                raise PermissionError("offline injected open failure")
-            return FailingReader(original_open(path, mode, *args, **kwargs))
-        return original_open(path, mode, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "open", failing_open)
+    monkeypatch.setattr(os, "open", failing_open)
+    monkeypatch.setattr(os, "read", failing_read)
     assert manifest(tmp_path) == {"file.bin": "unreadable"}
     assert candidate_fingerprint(tmp_path, Scope(write_allow=["file.bin"])) == digest_of(
         [{"path": "file.bin", "size": None, "digest": "unreadable"}]
     )
-    assert all(source.closed for source in handles)
+    assert watch.closed == watch.fds
+    assert bool(watch.fds) is (failure_stage == "read")

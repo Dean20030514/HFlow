@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from functools import partial
 from typing import Literal
 
 from .contracts import (
@@ -702,49 +703,34 @@ def render_reviewer_packet(
     before. Without ``context_changes`` the packet is the one this build rendered before.
     """
     changes = list(context_changes or [])
+    text = partial(
+        _reviewer_text,
+        task_id=task_id,
+        task_revision=task_revision,
+        goal=goal,
+        acceptance=acceptance,
+        scope=scope,
+        workspace=workspace,
+        spec_digest=spec_digest,
+        candidate_fingerprint=candidate_fingerprint,
+        deadline_seconds=deadline_seconds,
+        candidate=candidate,
+        verification_status=verification_status,
+        verification_detail=verification_detail,
+        check_summaries=check_summaries,
+        evidence_rows=evidence_rows,
+    )
     try:
         return _finish(
             "reviewer",
-            _reviewer_text(
-                task_id=task_id,
-                task_revision=task_revision,
-                goal=goal,
-                acceptance=acceptance,
-                scope=scope,
-                workspace=workspace,
-                spec_digest=spec_digest,
-                candidate_fingerprint=candidate_fingerprint,
-                deadline_seconds=deadline_seconds,
-                candidate=candidate,
-                verification_status=verification_status,
-                verification_detail=verification_detail,
-                check_summaries=check_summaries,
-                evidence_rows=evidence_rows,
-                context_section=_reviewer_context_section(changes, candidate, with_diffs=True),
-            ),
+            text(context_section=_reviewer_context_section(changes, candidate, with_diffs=True)),
         )
     except PacketTooLargeError:
         if not changes:
             raise
     return _finish(
         "reviewer",
-        _reviewer_text(
-            task_id=task_id,
-            task_revision=task_revision,
-            goal=goal,
-            acceptance=acceptance,
-            scope=scope,
-            workspace=workspace,
-            spec_digest=spec_digest,
-            candidate_fingerprint=candidate_fingerprint,
-            deadline_seconds=deadline_seconds,
-            candidate=candidate,
-            verification_status=verification_status,
-            verification_detail=verification_detail,
-            check_summaries=check_summaries,
-            evidence_rows=evidence_rows,
-            context_section=_reviewer_context_section(changes, candidate, with_diffs=False),
-        ),
+        text(context_section=_reviewer_context_section(changes, candidate, with_diffs=False)),
     )
 
 

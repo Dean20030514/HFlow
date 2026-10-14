@@ -58,6 +58,7 @@ from hflow.verify import CheckOutcome, CheckRunners, FakeCheckRunner
 from hflow.workspace import DSH_CONTEXT_LIST_SOURCE
 
 from .owner_exit import owner_exits, successor
+from .store_helpers import claim_run
 
 
 def _wait_for_exit(pid: int, *, timeout_seconds: float) -> bool:
@@ -2216,7 +2217,7 @@ def test_a_repair_round_without_its_context_is_refused_before_any_dispatch(
         )
         # The run has to be claimed by the controller that will drive it: `reopen_for_repair`
         # refuses a run owned by somebody else, which is the ownership rule working.
-        store.claim_run(run_id, "local-controller")
+        claim_run(store, run_id, "local-controller")
         previous = CandidateIdentity(
             round=1,
             attempt_id="A-previous",
@@ -2898,7 +2899,8 @@ def test_an_interrupted_revision_resubmitted_after_the_repair_was_spent_ends_blo
     conditional block path with the gate's own code, dispatching nothing and moving no counter.
     """
     from hflow.contracts import RootBudgetLimits
-    from hflow.ownership import identity_of
+
+    from .owner_exit import identity_of
 
     store = Store(tmp_path / "hflow.sqlite")
     project = _project()
@@ -3170,6 +3172,70 @@ def test_the_first_packet_states_the_deadline_the_first_invocation_is_given(
         stated = re.search(r"^- deadline: (\d+) seconds$", driver.packets[0], re.MULTILINE)
         assert stated is not None
         assert int(stated.group(1)) == driver.deadlines[0] <= limits.deadline_seconds
+    finally:
+        store.close()
+
+
+def test_the_reviewer_packet_states_the_deadline_the_reviewer_is_given(
+    tmp_path: Path, sample_repo: Path, monkeypatch
+) -> None:
+    """The root's clock moves while the review turn is bought: the packet and the invocation agree.
+
+    The reviewer packet used to state the capped deadline read before the context diff and the
+    dispatch transaction, while the invocation was given a second, later reading - so a reviewer
+    could be told it had more time than its invocation was actually given.
+    """
+    import re
+    from datetime import datetime, timedelta, timezone
+
+    import hflow.controller as controller_module
+    import hflow.store as store_module
+
+    now = [datetime(2030, 1, 1, tzinfo=timezone.utc)]
+
+    def utc_now() -> str:
+        return now[0].isoformat().replace("+00:00", "Z")
+
+    monkeypatch.setattr(controller_module, "utc_now", utc_now)
+    monkeypatch.setattr(store_module, "utc_now", utc_now)
+
+    class ClockRecorder(DeadlineRecorder):
+        def start(self, request):  # noqa: ANN001 - Protocol shape
+            result = super().start(request)
+            if request.role == "implementer":
+                # The root's default clock is 86400 s: leave 600 of it, below the reviewer's 900.
+                now[0] += timedelta(seconds=86400 - 600)
+            return result
+
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    spec = _spec(policy=None, base_commit=base)
+    driver = ClockRecorder(sample_repo, first_plan={"src/parser.py": FIXED_SOURCE}, repair_plan={})
+    store = Store(tmp_path / "hflow.sqlite")
+    controller = _controller(
+        store, project_root=sample_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": FailingOnceThenPassing(fail_first=None)}),
+    )
+    reserve = controller._reserve_dispatch
+
+    def slow_reviewer_reservation(**kwargs):  # noqa: ANN003, ANN202 - the wrapped method's shape
+        reservation = reserve(**kwargs)
+        if kwargs["role"] == "reviewer":
+            now[0] += timedelta(seconds=5)  # the transaction took five seconds of the root's clock
+        return reservation
+
+    monkeypatch.setattr(controller, "_reserve_dispatch", slow_reviewer_reservation)
+    try:
+        outcome = controller.run_task(
+            _request(project=_project(), spec=spec, project_root=sample_repo)
+        )
+        assert outcome.task_state is TaskState.ACCEPTED, outcome.block_reason
+        reviewer = driver.labels.index("reviewer")
+        stated = re.search(r"^- deadline: (\d+) seconds$", driver.packets[reviewer], re.MULTILINE)
+        assert stated is not None
+        assert int(stated.group(1)) == driver.deadlines[reviewer] == 595, (
+            "the reviewer must be told the deadline its invocation is given: what the root had "
+            "left when it was launched"
+        )
     finally:
         store.close()
 

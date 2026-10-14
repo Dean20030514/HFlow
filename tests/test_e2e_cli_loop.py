@@ -50,7 +50,7 @@ from hflow.contracts import (
     WorkspaceSpec,
 )
 
-from hflow.integrate import _shell_word
+from hflow.hints import shell_word
 
 from .conftest import write_project, write_task
 
@@ -234,7 +234,7 @@ class CliProject:
         ledger is not the default one, so the printed line can be pasted as it stands.
         """
         return " ".join(
-            ["hflow", *words, "--data-dir", _shell_word(os.path.abspath(self.data_dir))]
+            ["hflow", *words, "--data-dir", shell_word(os.path.abspath(self.data_dir))]
         )
 
     def admission_flags(self) -> list[str]:

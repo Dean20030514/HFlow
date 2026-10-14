@@ -16,6 +16,7 @@ import pytest
 
 from hflow.contracts import LaunchConfig, LaunchSurfaces
 from hflow.drivers import dsh_surfaces
+from hflow.report import launch_surfaces_lines
 from hflow.drivers.acpx_dsh import (
     DRIVER_ID,
     INVOCATION_ID_PLACEHOLDER,
@@ -693,3 +694,296 @@ def test_the_driver_records_the_user_agents_file_at_spawn_and_in_its_probe(
     assert entry.present is False, "the invocation's own home is created empty"
     assert "DSH_AGENTS_HOME" not in result.launch_surfaces.dsh_env_names
     assert _sha(data) not in result.model_dump_json()
+
+
+# --------------------------------------------------------------------------
+# the sandbox mode a new ACP session gets, and DSH #9626 under the Desktop shim
+# (documented from upstream source and community reports, not observed)
+# --------------------------------------------------------------------------
+
+CMD = r"C:\Windows\System32\cmd.exe"
+
+
+def _desktop_launch(tmp_path: Path, **fields: object) -> LaunchConfig:
+    """A launch whose dsh is a Desktop-layout shim (read, never run)."""
+    shim = tmp_path / "desktop" / "resources" / "runtime" / "cli" / "bin" / "dsh.cmd"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_text(
+        '@echo off\r\nset "ELECTRON_RUN_AS_NODE=1"\r\n'
+        '"%~dp0..\\..\\..\\..\\DeepSeek Harness.exe" "%~dp0..\\..\\..\\app.asar\\cli.js" %*\r\n',
+        encoding="utf-8",
+    )
+    argv = [CMD, "/c", str(shim), "--profile", "acp"]
+    return _launch(dsh_executable=str(shim), agent_argv=argv, profile="acp", **fields)
+
+
+def _npm_launch(tmp_path: Path, **fields: object) -> LaunchConfig:
+    shim = tmp_path / "npm" / "dsh.CMD"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_text(
+        '@"%~dp0\\node_modules\\@deepseek-ai\\dsh\\bin\\dsh.js" %*\r\n', encoding="utf-8"
+    )
+    argv = [CMD, "/c", str(shim), "--profile", "acp"]
+    return _launch(dsh_executable=str(shim), agent_argv=argv, profile="acp", **fields)
+
+
+def _mode_notes(surfaces: LaunchSurfaces) -> tuple[list[str], list[str]]:
+    """``(sandbox-mode notes, DSH #9626 notes)`` of one record."""
+    return (
+        [note for note in surfaces.notes if note.startswith("DSH sandbox mode:")],
+        [note for note in surfaces.notes if "DSH #9626" in note],
+    )
+
+
+def _observe_bound(launch: LaunchConfig, home: Path) -> LaunchSurfaces:
+    return observe_launch_surfaces(launch, dsh_home=home, dsh_home_kind="bound", child_env={})
+
+
+def test_a_bound_workspace_write_home_under_the_desktop_shim_cites_dsh_9626(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "bound"
+    profile = home / "profiles" / "acp"
+    profile.mkdir(parents=True)
+    (profile / "cordis.patch.yml").write_text(
+        "# the user's acp layer\n"
+        "- id: sandbox-policy\n"
+        "  config:\n"
+        "    mode: workspace-write  # chosen here\n"
+        "- id: hmr\n"
+        "  disabled: true\n",
+        encoding="utf-8",
+    )
+    launch = _desktop_launch(tmp_path, dsh_home=str(home))
+    reads = _record_reads(monkeypatch)
+
+    surfaces = _observe_bound(launch, home)
+
+    assert surfaces.client.dsh_carrier == "desktop"
+    [mode], [cited] = _mode_notes(surfaces)
+    assert mode.startswith(
+        "DSH sandbox mode: workspace-write, set by the bound DSH home's "
+        "profiles/acp/cordis.patch.yml (sandbox-policy row, mode), read as text"
+    ), mode
+    assert "session/set_config_option takes only model and reasoning_effort" in mode
+    assert "never enforced" in mode
+    assert cited.startswith("the dsh carrier is the Desktop shim and the DSH sandbox mode is "
+                            "workspace-write: DSH #9626")
+    for fact in (
+        "0xC0000142",
+        "[process.execPath, runner]",
+        "DeepSeek Harness.exe",
+        "sandbox-local/src/index.ts:571-580",
+        "npm-installed CLI",
+        "whose sandbox mode the user chooses",
+        "not confirmed by maintainers",
+        "never enforced",
+    ):
+        assert fact in cited, fact
+    # The probe (what `hflow doctor --profile` prints as dependencies) carries both notes.
+    probe = dsh_surfaces.probe_notes(surfaces)
+    assert mode in probe and cited in probe
+    # Read as bounded text through the module's one opener; the shim is read, never run.
+    assert profile / "cordis.patch.yml" in reads
+    assert {path.name for path in reads} <= {
+        "cordis.patch.yml",
+        "package.json",
+        "dsh.cmd",
+        "runtime.json",
+    }
+    # The text preview (prepare, report) shows the mode and the warning in one line each.
+    text = "\n".join(launch_surfaces_lines("implementer", surfaces))
+    assert "sandbox       implementer workspace-write, set by the bound DSH home's" in text
+    assert "warning       implementer DSH #9626" in text
+
+    # A record only: the same launch under the npm shim gets the mode note, not #9626.
+    npm = _observe_bound(_npm_launch(tmp_path, dsh_home=str(home)), home)
+    assert npm.client.dsh_carrier == "npm"
+    [npm_mode], cited_npm = _mode_notes(npm)
+    assert npm_mode.startswith("DSH sandbox mode: workspace-write, set by") and cited_npm == []
+    npm_text = "\n".join(launch_surfaces_lines("implementer", npm))
+    assert "sandbox       implementer workspace-write" in npm_text
+    assert "DSH #9626" not in npm_text
+
+
+def test_a_read_only_or_full_access_mode_gets_no_dsh_9626_note(tmp_path: Path) -> None:
+    home = tmp_path / "bound"
+    profile = home / "profiles" / "acp"
+    profile.mkdir(parents=True)
+    (profile / "cordis.patch.yml").write_text(
+        "- id: sandbox-policy\n  config:\n    mode: workspace-write\n", encoding="utf-8"
+    )
+    launch = _desktop_launch(tmp_path, dsh_home=str(home))
+
+    # The home-level layer outranks the profile layer (DSH applies it later, per row).
+    (home / "cordis.patch.yml").write_text(
+        "- id: sandbox-policy\n  config: {mode: 'read-only'}\n", encoding="utf-8"
+    )
+    [mode], cited = _mode_notes(_observe_bound(launch, home))
+    assert mode.startswith(
+        "DSH sandbox mode: read-only, set by the bound DSH home's cordis.patch.yml"
+    ), mode
+    assert cited == []
+
+    # A permission row's defaultPreset pins new sessions, whatever the sandbox-policy row says.
+    (home / "cordis.patch.yml").write_text(
+        "- id: permission\n  config:\n    defaultPreset: danger-full-access\n", encoding="utf-8"
+    )
+    [mode], cited = _mode_notes(_observe_bound(launch, home))
+    assert mode.startswith(
+        "DSH sandbox mode: danger-full-access, set by the bound DSH home's cordis.patch.yml "
+        "(permission row, defaultPreset danger-full-access)"
+    ), mode
+    assert cited == []
+
+    # A preset table of the row's own decides what the preset bundles: not evaluated.
+    (home / "cordis.patch.yml").write_text(
+        "- id: permission\n  config:\n    presets:\n      mine:\n        sandbox: read-only\n"
+        "        approval: ask\n    defaultPreset: mine\n",
+        encoding="utf-8",
+    )
+    [mode], [cited] = _mode_notes(_observe_bound(launch, home))
+    assert mode.startswith("DSH sandbox mode: unknown - ") and "defaultPreset mine" in mode
+    assert cited.startswith(
+        "the DSH sandbox mode could not be determined; if it is workspace-write"
+    )
+
+
+def test_an_unset_mode_is_dsh_default_for_a_bound_or_per_invocation_home(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "bound"
+    (home / "profiles" / "acp").mkdir(parents=True)
+    # Patch layers that name neither deciding row; "sandbox: mode:" is not DSH's row spelling.
+    (home / "cordis.patch.yml").write_text("- id: hmr\n  disabled: true\n", encoding="utf-8")
+    (home / "profiles" / "acp" / "cordis.patch.yml").write_text(
+        "sandbox:\n  mode: read-only\n", encoding="utf-8"
+    )
+    launch = _desktop_launch(tmp_path, dsh_home=str(home))
+
+    [mode], [cited] = _mode_notes(_observe_bound(launch, home))
+    assert mode.startswith(
+        "DSH sandbox mode: not set (DSH default, documented as workspace-write): no patch layer "
+        "of the bound DSH home names the permission or sandbox-policy row, and the driver "
+        "keeps DSH's permission-mode variable out of the child"
+    ), mode
+    assert cited.startswith("the dsh carrier is the Desktop shim and the DSH sandbox mode is "
+                            "workspace-write: DSH #9626")
+
+    # The per-invocation home is never looked into before dispatch: it is created empty.
+    child_home = child_home_for(tmp_path / "data", INVOCATION_ID_PLACEHOLDER)
+    kind, fresh_home = effective_dsh_home(_desktop_launch(tmp_path), child_home=child_home)
+    fresh = observe_launch_surfaces(
+        _desktop_launch(tmp_path),
+        dsh_home=fresh_home,
+        dsh_home_kind=kind,
+        child_env={},
+        look_in_home=False,
+    )
+    [mode], [cited] = _mode_notes(fresh)
+    assert mode.startswith(
+        "DSH sandbox mode: not set (DSH default, documented as workspace-write): the "
+        "per-invocation DSH home is created empty"
+    ), mode
+    assert "DSH #9626" in cited
+    assert not (tmp_path / "data").exists(), "naming the home creates nothing"
+
+    # Should the variable reach the child, the fallback is its value - never recorded.
+    ambient = observe_launch_surfaces(
+        _desktop_launch(tmp_path, dsh_home=str(home)),
+        dsh_home=home,
+        dsh_home_kind="bound",
+        child_env={"DSH_PERMISSION_MODE": "mode-sentinel"},
+    )
+    [mode], [_cited] = _mode_notes(ambient)
+    assert mode.startswith("DSH sandbox mode: unknown - ") and "not recorded" in mode
+    assert "mode-sentinel" not in ambient.model_dump_json()
+
+
+def test_an_expression_or_unrecognised_spelling_is_unknown_never_guessed(tmp_path: Path) -> None:
+    home = tmp_path / "bound"
+    home.mkdir()
+    launch = _npm_launch(tmp_path, dsh_home=str(home))
+    for text in (
+        "- id: sandbox-policy\n  config:\n    mode: !!js process.env.X ?? 'read-only'\n",
+        "- id: sandbox-policy\n  disabled: true\n",
+        "- id: sandbox-policy\n  config:\n    # mode: read-only\n    workspaceRoot: /w\n",
+        "- name: '@deepseek-ai/dsh-sandbox-policy'\n  id: sandbox-policy\n",
+        "- id: sandbox-policy\n  config:\n    mode: read-only\n- id: sandbox-policy\n"
+        "  config:\n    mode: [read-only]\n",
+    ):
+        (home / "cordis.patch.yml").write_text(text, encoding="utf-8")
+        [mode], cited = _mode_notes(_observe_bound(launch, home))
+        assert mode.startswith("DSH sandbox mode: unknown - "), (text, mode)
+        assert cited == [], "the npm carrier never gets the #9626 note"
+
+    # A row named only in a comment is not a row: DSH's default applies.
+    (home / "cordis.patch.yml").write_text(
+        "# sandbox-policy and defaultPreset are left alone\n- id: hmr\n  disabled: true\n",
+        encoding="utf-8",
+    )
+    [mode], _ = _mode_notes(_observe_bound(launch, home))
+    assert mode.startswith("DSH sandbox mode: not set (DSH default"), mode
+
+
+def test_an_oversized_or_unreadable_patch_layer_is_a_note_not_a_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "bound"
+    profile = home / "profiles" / "acp"
+    profile.mkdir(parents=True)
+    (profile / "cordis.patch.yml").write_text(
+        "- id: sandbox-policy\n  config:\n    mode: read-only\n", encoding="utf-8"
+    )
+    big = home / "cordis.patch.yml"
+    big.write_bytes(b"- id: sandbox-policy\n  config:\n    mode: read-only\n" + b"#" * 4096)
+    launch = _desktop_launch(tmp_path, dsh_home=str(home))
+    monkeypatch.setattr(dsh_surfaces, "MANIFEST_READ_LIMIT_BYTES", 1024)
+
+    [mode], [cited] = _mode_notes(_observe_bound(launch, home))
+    # The unread home layer outranks the profile layer's read-only, so the mode is unknown.
+    assert mode.startswith(
+        "DSH sandbox mode: unknown - the bound DSH home's cordis.patch.yml could not be read "
+        "(larger than 1024 bytes: not read)"
+    ), mode
+    assert cited.startswith("the DSH sandbox mode could not be determined")
+    monkeypatch.undo()
+
+    # Not a regular file, undecodable bytes, a relative home before dispatch: never an exception.
+    big.unlink()
+    big.mkdir()
+    [mode], _ = _mode_notes(_observe_bound(launch, home))
+    assert mode.startswith("DSH sandbox mode: unknown - the bound DSH home's cordis.patch.yml "
+                           "could not be read"), mode
+    big.rmdir()
+    big.write_bytes(b"\xff\xfe\x00- id: \x80sandbox-policy\n\x00\x00")
+    [mode], _ = _mode_notes(_observe_bound(launch, home))
+    assert mode.startswith("DSH sandbox mode: "), mode
+    relative = observe_launch_surfaces(
+        _desktop_launch(tmp_path, dsh_home="rel-home"),
+        dsh_home=Path("rel-home"),
+        dsh_home_kind="bound",
+        child_env={},
+    )
+    [mode], [cited] = _mode_notes(relative)
+    assert mode.startswith("DSH sandbox mode: unknown - the bound DSH home was not looked into")
+    assert "could not be determined" in cited
+
+
+def test_the_driver_probe_carries_the_sandbox_mode_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``hflow doctor --profile`` prints the probe's notes as each role's dependencies."""
+    from hflow.contracts import AgentBinding
+
+    from .test_driver_acpx_dsh import DriverHarness
+
+    monkeypatch.delenv("DSH_HOME", raising=False)
+    harness = DriverHarness(tmp_path / "default", "cooperative")
+    probe = harness.driver.probe(AgentBinding(harness="dsh", driver=DRIVER_ID))
+    (note,) = [note for note in probe.notes if note.startswith("DSH sandbox mode:")]
+    assert "not set (DSH default, documented as workspace-write)" in note
+    assert "per-invocation DSH home is created empty" in note
+    # The stub agent is not a dsh shim: no carrier, so no #9626 note.
+    assert not [note for note in probe.notes if "DSH #9626" in note]
+    assert harness.stub_files("spawn") == [], "the probe launched nothing"

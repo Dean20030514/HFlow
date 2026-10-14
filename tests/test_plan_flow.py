@@ -31,12 +31,24 @@ from pathlib import Path
 import pytest
 
 from hflow.authorization import load_authorization, verify_authorization
-from hflow.cli import EXIT_OK, EXIT_REFUSED, EXIT_USAGE, build_parser, main
-from hflow.contracts import PlanArguments, RefusalCode, RefusedError, RunPlan
-from hflow.integrate import _shell_word
+from hflow import cli
+from hflow.cli import (
+    _RESOLUTION_FLAGS,
+    _STATE_EXIT_CODES,
+    EXIT_INTERRUPTED,
+    EXIT_OK,
+    EXIT_REFUSED,
+    EXIT_USAGE,
+    build_parser,
+    main,
+)
+from hflow.contracts import PlanArguments, RefusalCode, RefusedError, RunPlan, TaskState
+from hflow.hints import next_lines, next_steps
+from hflow.hints import shell_word as _shell_word
 from hflow.paths import database_path
 from hflow.plan import approval_code, default_authorization_path, frozen_arguments, load_plan
 from hflow.prepare import pending_binding, resolve_arguments, root_binding_for
+from hflow.store import Store
 
 from .conftest import write_profile, write_project, write_task
 from .test_e2e_cli_loop import (
@@ -376,10 +388,9 @@ def test_approve_writes_an_authorization_from_the_terminal_and_never_overwrites_
     assert record.max_top_level_submissions == 2  # implementer + reviewer
     assert record.root_limits == plan.root_limits
     assert "approving     binding " + plan.binding_digest in captured.err
-    assert (
-        f"next: hflow run --plan {_shell_word(str(plan_file))} "
-        f"--authorization-file {_shell_word(str(written))}"
-    ) in captured.out
+    # The default file is the one `run --plan` looks up by itself, so it is not named.
+    assert f"next: hflow run --plan {_shell_word(str(plan_file))}\n" in captured.out
+    assert "--authorization-file" not in captured.out
     assert not database_path(project.data_dir).exists(), "approve opened no ledger"
 
     before = written.read_bytes()
@@ -493,8 +504,7 @@ def test_approve_puts_summary_code_and_prompts_on_stderr_and_the_result_on_stdou
     assert captured.out.splitlines() == [
         f"authorization {written}",
         f"id            {record.authorization_id}",
-        f"next: hflow run --plan {_shell_word(str(plan_file))} "
-        f"--authorization-file {_shell_word(str(written))}",
+        f"next: hflow run --plan {_shell_word(str(plan_file))}",
     ]
     err = captured.err
     summary = err.index("approving     binding " + plan.binding_digest)
@@ -523,6 +533,11 @@ def test_approve_json_prints_only_the_payload_on_stdout(
     payload = json.loads(captured.out)  # --json: the payload alone
     assert payload["authorization_file"] == str(out_file)
     assert load_authorization(out_file).user_text == "yes, this one task"
+    # Not the default file, so `run --plan` would not find it: the next command names it.
+    assert payload["next"] == (
+        f"hflow run --plan {_shell_word(str(plan_file))} "
+        f"--authorization-file {_shell_word(str(out_file))}"
+    )
 
 
 @pytest.mark.parametrize("text", ["", "   \t", None])
@@ -550,7 +565,9 @@ def test_approval_text_and_code_are_never_taken_from_the_command_line(
 ) -> None:
     subcommands = build_parser()._subparsers._group_actions[0].choices  # type: ignore[union-attr]
     dests = {action.dest for action in subcommands["approve"]._actions}
-    assert dests == {"help", "plan", "out", "json", "data_dir"}
+    assert dests == {"help", "plan", "out", "run", "json", "data_dir"}
+    run_flag = next(a for a in subcommands["approve"]._actions if a.dest == "run")
+    assert run_flag.nargs == 0, "--run takes no value: it is not a way to pass an approval"
 
     project = cli_project
     assert _prepare(project) == EXIT_OK
@@ -563,6 +580,9 @@ def test_approval_text_and_code_are_never_taken_from_the_command_line(
         [code, APPROVAL_TEXT],
         ["--code", code],
         ["--text", APPROVAL_TEXT],
+        ["--run", code],
+        ["--run", "--yes"],
+        ["--run=yes"],
     ):
         monkeypatch.setattr(sys, "stdin", _UnreadableInput())
         with pytest.raises(SystemExit) as usage:
@@ -773,6 +793,195 @@ def test_run_plan_refuses_an_approval_issued_for_another_plan(
 
 
 # --------------------------------------------------------------------------
+# approve --run
+# --------------------------------------------------------------------------
+
+
+def _scripted_change(monkeypatch: pytest.MonkeyPatch, project: CliProject) -> None:
+    """The offline driver writes the task's change, as ``--fake-write-plan`` would make it.
+
+    ``approve --run`` takes no run flag - it runs exactly ``run --plan`` - so the offline change is
+    scripted into the driver here instead of being passed on the command line.
+    """
+    writes = json.loads(project.plan_file.read_text(encoding="utf-8"))
+    original = cli.FakeScript
+
+    def scripted(*args: object, **kwargs: object) -> object:
+        script = original(*args, **kwargs)  # type: ignore[arg-type]
+        script.write_plan = dict(writes)
+        return script
+
+    monkeypatch.setattr(cli, "FakeScript", scripted)
+
+
+def _status_json(project: CliProject, run_id: str, capsys: pytest.CaptureFixture[str]) -> dict:
+    argv = ["status", run_id, "--project-root", str(project.repo), "--json"]
+    assert main([*argv, "--data-dir", str(project.data_dir)]) == EXIT_OK
+    return json.loads(capsys.readouterr().out)
+
+
+def test_approve_run_approves_then_runs_the_plan_in_the_same_process(
+    cli_project: CliProject, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The approval exactly as without ``--run``, then exactly ``run --plan`` with that file: the
+    run's outcome, its ``next:`` lines and its exit code."""
+    project = cli_project
+    assert _prepare(project) == EXIT_OK
+    capsys.readouterr()
+    plan_file = _plan_path(project)
+    plan = load_plan(plan_file)
+    _scripted_change(monkeypatch, project)
+
+    assert _approve(monkeypatch, plan_file, _typed(plan_file), "--run") == EXIT_OK
+    captured = capsys.readouterr()
+    written = default_authorization_path(plan_file, plan.binding_digest)
+    record = load_authorization(written)
+    assert record.user_text == APPROVAL_TEXT and record.origin == "user_artifact"
+    err = captured.err
+    assert err.index(f"approval code {approval_code(plan.binding_digest)}") < err.index(
+        "Approve this run in your own words"
+    )
+    lines = captured.out.splitlines()
+    assert lines[:3] == [
+        f"authorization {written}",
+        f"id            {record.authorization_id}",
+        f"running       hflow run --plan {_shell_word(str(plan_file))} "
+        f"--authorization-file {_shell_word(str(written))}",
+    ]
+    assert lines[3].startswith("run        ")
+    run_id = lines[3].split()[1]
+    assert lines[4] == "state      ACCEPTED"
+
+    # The same next: lines `run --plan` prints for this run - never a re-run or a re-approval.
+    store = Store(database_path(project.data_dir))
+    try:
+        expected = next_lines(next_steps(store, run_id, project_file=plan.arguments.project))
+    finally:
+        store.close()
+    assert expected and lines[-len(expected):] == expected
+    assert all(" run " not in line and " approve " not in line for line in expected)
+
+    status = _status_json(project, run_id, capsys)
+    assert {item["authorization_id"] for item in status["invocations"]} == {record.authorization_id}
+
+
+@pytest.mark.parametrize("case", ["pipe", "wrong-code", "empty-text", "stale", "file-exists"])
+def test_approve_run_runs_nothing_when_the_approval_fails(
+    case: str,
+    cli_project: CliProject,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project = cli_project
+    assert _prepare(project) == EXIT_OK
+    capsys.readouterr()
+    plan_file = _plan_path(project)
+    plan = load_plan(plan_file)
+    code = approval_code(plan.binding_digest)
+    existing: list[Path] = []
+    if case == "stale":
+        task = json.loads(project.task_file.read_text(encoding="utf-8"))
+        task["goal"] = "Set value to 3 in app.txt"
+        project.task_file.write_text(json.dumps(task), encoding="utf-8")
+    if case == "file-exists":
+        existing = [default_authorization_path(plan_file, plan.binding_digest)]
+        existing[0].write_text("{}", encoding="utf-8")
+    stdin = {
+        "pipe": _UnreadableInput(terminal=False),
+        "wrong-code": _TerminalInput(f"no\n{APPROVAL_TEXT}\n"),
+        "empty-text": _TerminalInput(f"{code}\n\n"),
+        "stale": _UnreadableInput(),
+        "file-exists": _UnreadableInput(),
+    }[case]
+
+    assert _approve(monkeypatch, plan_file, stdin, "--run") == EXIT_REFUSED
+    captured = capsys.readouterr()
+    assert captured.out == "", "no approval result and no run output"
+    assert "running" not in captured.err
+    assert _authorizations(plan_file.parent) == existing
+    assert not database_path(project.data_dir).exists(), "nothing ran: no ledger was opened"
+
+
+def test_approve_run_interrupted_exits_130_and_keeps_the_approval(
+    cli_project: CliProject, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A Ctrl+C inside the run reaches the top level exactly as it does for ``run --plan``."""
+    project = cli_project
+    assert _prepare(project) == EXIT_OK
+    capsys.readouterr()
+    plan_file = _plan_path(project)
+
+    def interrupted(self: object, request: object) -> object:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.Controller, "run_task", interrupted)
+    assert _approve(monkeypatch, plan_file, _typed(plan_file), "--run") == EXIT_INTERRUPTED
+    captured = capsys.readouterr()
+    assert "interrupted: this command stopped where it was" in captured.err
+    assert "running       hflow run --plan" in captured.out
+    [written] = _authorizations(plan_file.parent)
+    assert load_authorization(written).user_text == APPROVAL_TEXT
+
+
+def test_approve_run_json_prints_two_lines_and_exits_with_the_run(
+    cli_project: CliProject, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With ``--out`` the run is handed that file; without a scripted change the offline run
+    ends however ``run --plan`` would end it, and that is ``approve``'s exit code."""
+    project = cli_project
+    assert _prepare(project) == EXIT_OK
+    capsys.readouterr()
+    plan_file = _plan_path(project)
+    out_file = project.tmp_path / "approval.json"
+
+    stdin = _typed(plan_file)
+    code = _approve(monkeypatch, plan_file, stdin, "--run", "--out", str(out_file), "--json")
+    captured = capsys.readouterr()
+    approval_line, run_line = captured.out.splitlines()
+    approval = json.loads(approval_line)
+    outcome = json.loads(run_line)
+    assert approval["authorization_file"] == str(out_file)
+    assert "next" not in approval
+    assert approval["running"] == (
+        f"hflow run --plan {_shell_word(str(plan_file))} "
+        f"--authorization-file {_shell_word(str(out_file))}"
+    )
+    # No change was made, so the run does not end accepted - and approve exits with its code.
+    assert outcome["task_state"] != "ACCEPTED", outcome
+    assert code == _STATE_EXIT_CODES[TaskState(outcome["task_state"])] != EXIT_OK
+    status = _status_json(project, outcome["run_id"], capsys)
+    record = load_authorization(out_file)
+    assert {item["authorization_id"] for item in status["invocations"]} == {record.authorization_id}
+
+
+def test_approve_run_on_an_offline_plan_runs_what_run_plan_runs(
+    cli_project: CliProject, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An offline plan needs no approval, so nothing is asked - as for ``run --plan`` itself."""
+    project = cli_project
+    assert _prepare(project, *_offline_flags(project)) == EXIT_OK
+    capsys.readouterr()
+    plan_file = _plan_path(project)
+    _scripted_change(monkeypatch, project)
+
+    stdin = _UnreadableInput(terminal=False)
+    assert _approve(monkeypatch, plan_file, stdin, "--run") == EXIT_OK
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].startswith("authorization not needed: ")
+    assert lines[1] == f"running       hflow run --plan {_shell_word(str(plan_file))}"
+    assert "state      ACCEPTED" in lines
+    assert _authorizations(plan_file.parent) == []
+
+
+def test_the_resolution_flags_are_exactly_the_plan_arguments() -> None:
+    """``_resolution_arguments`` is derived from ``_RESOLUTION_FLAGS``; both cover every input a
+    plan records, the data directory aside (it is ``--data-dir``, before or after the verb)."""
+    dests = [dest for dest, _flag in _RESOLUTION_FLAGS]
+    assert len(dests) == len(set(dests))
+    assert {*dests, "data_dir"} == set(PlanArguments.model_fields)
+
+
+# --------------------------------------------------------------------------
 # a real-driver plan (stand-in client; nothing is dispatched)
 # --------------------------------------------------------------------------
 
@@ -836,6 +1045,39 @@ def test_a_real_driver_plan_is_approved_into_an_artifact_the_run_check_accepts(
     payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert payload["reason"] == "live_authorization_missing"
     assert "hflow approve --plan" in payload["detail"]
+    assert not database_path(Path(plan.arguments.data_dir)).exists()
+
+
+def test_a_stale_plan_names_the_changed_configuration_fields_and_their_variables(
+    live_plan: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A shell with other environment values resolves another configuration: the refusal names
+    the fields and the variables they are read from, not only two digests."""
+    plan = load_plan(live_plan)
+    assert _approve(monkeypatch, live_plan, _typed(live_plan)) == EXIT_OK  # approved as planned
+    capsys.readouterr()
+    monkeypatch.setenv("HFLOW_ALLOW_WRITES", "false")
+    other_home = tmp_path / "another-dsh-home"
+    monkeypatch.setenv("DSH_HOME", str(other_home))
+
+    for argv in (["approve", "--plan", str(live_plan)], ["run", "--plan", str(live_plan)]):
+        monkeypatch.setattr(sys, "stdin", _UnreadableInput())
+        assert main(argv) == EXIT_REFUSED
+        err = capsys.readouterr().err
+        assert "is stale" in err and "Nothing was written or dispatched" in err
+        assert "effective_config_digest: planned " in err
+        assert plan.prepare_report.effective_config_digest in err
+        assert (
+            "effective_config.implementer_writes: planned True != now False "
+            "(read from the environment: HFLOW_ALLOW_WRITES)"
+        ) in err
+        for role in ("implementer", "reviewer"):
+            assert f"effective_config.roles[{role}].launch.dsh_home: planned " in err
+        assert f"!= now {str(other_home)!r} (read from the environment: DSH_HOME)" in err
+        assert "effective_config.profile_id" not in err, "the plan names its profile"
     assert not database_path(Path(plan.arguments.data_dir)).exists()
 
 
@@ -930,10 +1172,8 @@ def test_prepare_approve_run_through_the_cli_reaches_the_hand_built_outcome(
     assert record.binding_digest() == report["authorization"]["binding_digest"]
     assert record.root_limits is not None
     assert record.root_limits.model_dump(mode="json") == ROOT_LIMITS
-    assert (
-        f"next: hflow run --plan {_shell_word(str(plan_file))} "
-        f"--authorization-file {_shell_word(str(approval))}"
-    ) in approved.stdout
+    assert f"next: hflow run --plan {_shell_word(str(plan_file))}\n" in approved.stdout
+    assert "--authorization-file" not in approved.stdout, "the default file is found by run"
     assert not database_path(project.data_dir).exists(), "approve wrote no ledger"
 
     # No resolution flag repeated, and no --authorization-file: the plan's default approval.

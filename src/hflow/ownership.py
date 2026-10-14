@@ -34,6 +34,7 @@ creation time there, so a takeover is never proven on such a host.
 from __future__ import annotations
 
 import ctypes
+import functools
 import os
 import re
 import secrets
@@ -138,7 +139,9 @@ def filetime_iso(value: int | None) -> str:
 # -- Windows process queries -------------------------------------------------------------------
 
 
+@functools.cache
 def _api() -> Any:
+    """kernel32 with the signatures this module calls, declared once per process."""
     from ctypes import wintypes
 
     api: Any = winjob._kernel32()  # noqa: SLF001 - same package, one kernel32 loader
@@ -203,22 +206,6 @@ def current_identity() -> ProcessIdentity:
     return ProcessIdentity(pid=os.getpid(), created=created, host=current_host())
 
 
-def identity_of(pid: int) -> ProcessIdentity | None:
-    """Another local process's identity, read through a handle; ``None`` when unreadable."""
-    if not winjob.IS_WINDOWS or pid <= 0:
-        return None
-    handle, _error = _open_process(pid)
-    if handle is None:
-        return None
-    try:
-        created = _creation_time(handle)
-    finally:
-        _close(handle)
-    if created is None:
-        return None
-    return ProcessIdentity(pid=pid, created=created, host=current_host())
-
-
 def _open_for_probe(pid: int, host: str | None) -> tuple[Any, Probe | None]:
     """Shared front half of both probes: refuse what cannot be asked, open what can."""
     here = current_host()
@@ -246,22 +233,30 @@ def _open_for_probe(pid: int, host: str | None) -> tuple[Any, Probe | None]:
     return handle, None
 
 
+def _running_creation_time(pid: int, host: str | None) -> tuple[int | None, Probe | None]:
+    """The creation FILETIME of the process now running as ``pid`` (``None`` when unreadable), or
+    the ``Probe`` that already answers: it cannot be asked, it is not there, it has exited."""
+    handle, early = _open_for_probe(pid, host)
+    if early is not None:
+        return None, early
+    try:
+        exited = _exited(handle)
+        if exited is None:
+            return None, Probe("unknown", f"waiting on pid {pid} failed")
+        if exited:
+            return None, Probe("gone", f"pid {pid} has exited (its process object is signalled)")
+        return _creation_time(handle), None
+    finally:
+        _close(handle)
+
+
 def probe(identity: ProcessIdentity) -> Probe:
     """``matching`` (this exact process runs), ``gone`` (proven), or ``unknown`` (anything else)."""
     if identity.created is None:
         return Probe("unknown", "the owner's creation time was not recorded")
-    handle, early = _open_for_probe(identity.pid, identity.host)
+    created, early = _running_creation_time(identity.pid, identity.host)
     if early is not None:
         return early
-    try:
-        exited = _exited(handle)
-        if exited is None:
-            return Probe("unknown", f"waiting on pid {identity.pid} failed")
-        if exited:
-            return Probe("gone", f"pid {identity.pid} has exited (its process object is signalled)")
-        created = _creation_time(handle)
-    finally:
-        _close(handle)
     if created is None:
         return Probe("unknown", f"the creation time of pid {identity.pid} could not be read")
     if created != identity.created:
@@ -290,18 +285,9 @@ def probe_recorded(pid: int, recorded_at: str | None, host: str | None) -> Probe
         recorded = parse_ts(recorded_at)
     except ValueError:
         return Probe("unknown", f"pid {pid} has an unreadable recorded start {recorded_at!r}")
-    handle, early = _open_for_probe(pid, host)
+    created, early = _running_creation_time(pid, host)
     if early is not None:
         return early
-    try:
-        exited = _exited(handle)
-        if exited is None:
-            return Probe("unknown", f"waiting on pid {pid} failed")
-        if exited:
-            return Probe("gone", f"pid {pid} has exited (its process object is signalled)")
-        created = _creation_time(handle)
-    finally:
-        _close(handle)
     moment = filetime_to_datetime(created)
     if moment is None:
         return Probe("unknown", f"the creation time of pid {pid} could not be read")

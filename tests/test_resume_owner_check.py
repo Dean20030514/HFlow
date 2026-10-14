@@ -50,6 +50,7 @@ from hflow.report import status_text
 from hflow.store import ATTESTATION_MAX_CHARS, Store, StoreError
 
 from .owner_exit import owner_exits, windows_only
+from .store_helpers import settlement_for
 from .test_batch_e_dispatch import FAKE_WRITE_PLAN, RunningTask
 from .test_batch_e_ledger import _binding as _ledger_binding
 from .test_batch_e_ledger import _register_authorization, _reserve, _seed_ready_run
@@ -444,7 +445,7 @@ def test_pasting_each_printed_attestation_hint_verbatim_is_refused(
     err = capsys.readouterr().err
     assert "is a placeholder" in err and "replace the placeholder" in err, err
     assert store.invocation("I-legacy").state is InvocationStartState.UNKNOWN
-    assert store.settlement_for("I-legacy") is None
+    assert settlement_for(store, "I-legacy") is None
 
     argv[argv.index("--attest") + 1] = ATTEST
     assert main(argv) == EXIT_OK, capsys.readouterr().err

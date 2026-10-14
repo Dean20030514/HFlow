@@ -32,6 +32,7 @@ from hflow.contracts import (
 from hflow.store import OFFLINE_REPROCESSING_KIND, Store, StoreError
 
 from .conftest import copy_recorded_file
+from .store_helpers import claim_run, dispatch_attempt
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROBE = REPO_ROOT / ".probe" / "m2-live"
@@ -346,18 +347,16 @@ def _seed_blocked_run(store: Store, state: TaskState = TaskState.BLOCKED, *, rea
         turn_limit=4,
         repair_limit=0,
     )
-    store.claim_run("R-guard", "test")
+    claim_run(store, "R-guard", "test")
     # The recorded attempt must exist: the finalization names it, and evidence references it.
-    store.dispatch_attempt(
+    dispatch_attempt(
+        store,
         run_id="R-guard",
         controller_id="test",
         attempt_id="A-guard",
-        role="implementer",
+        invocation_id="I-guard",
         reservation_id="B-guard",
-        reserved_turns=1,
-        reservation_expires_at="2999-01-01T00:00:00Z",
     )
-    store.record_invocation("A-guard", "I-guard")
     with store.transaction() as conn:
         conn.execute(
             "UPDATE attempts SET state = 'SUCCEEDED', outcome = 'completed' WHERE attempt_id = ?",

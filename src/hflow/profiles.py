@@ -67,6 +67,15 @@ def profile_path(data_dir: Path, profile_id: str) -> Path:
     return profiles_dir(data_dir) / f"{profile_id}.json"
 
 
+def available_profile_ids(data_dir: Path) -> list[str]:
+    """The ids of the profile files in ``<data_dir>/profiles``, sorted. Listed, never opened."""
+    try:
+        names = [path.stem for path in profiles_dir(data_dir).glob("*.json") if path.is_file()]
+    except OSError:
+        return []
+    return sorted(name for name in names if _is_plain_profile_id(name))
+
+
 def requested_profile_id(cli_value: str | None, env: Mapping[str, str] | None = None) -> str:
     """Which profile was asked for: ``--profile`` beats ``HFLOW_PROFILE``.
 
@@ -123,10 +132,12 @@ def load_profile(data_dir: Path, profile_id: str) -> MachineProfile:
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
+        existing = ", ".join(available_profile_ids(data_dir)) or "none"
         raise RefusedError(
             RefusalCode.INVALID_SPEC,
-            f"profile {name!r} not found at {path}. Nothing falls back to a default "
-            "binding; create the profile or name one that exists.",
+            f"profile {name!r} not found at {path}. Profiles in {profiles_dir(data_dir)}: "
+            f"{existing}. Nothing falls back to a default binding; create the profile or name "
+            "one that exists.",
         ) from exc
     except json.JSONDecodeError as exc:
         raise RefusedError(

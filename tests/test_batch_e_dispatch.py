@@ -64,6 +64,7 @@ from hflow.store import Store, StoreError
 from hflow.verify import CheckRunners, FakeCheckRunner
 
 from .owner_exit import owner_exits, successor
+from .store_helpers import claim_run, mark_invocation_started
 from .test_driver_acpx_dsh import FAKE_CLIENT, STUB_AGENT
 
 PROJECT_ID = "demo-project"
@@ -164,7 +165,7 @@ def _seed(
         turn_limit=spec.budget.max_agent_turns,
         repair_limit=0,
     )
-    store.claim_run(run_id, CONTROLLER_ID)
+    claim_run(store, run_id, CONTROLLER_ID)
     return run_id
 
 
@@ -274,7 +275,7 @@ def _review_phase_run(
         invocation_id="I-implementer",
         authorization_id=authorization_id,
     )
-    store.mark_invocation_started("I-implementer")
+    mark_invocation_started(store, "I-implementer")
     store.settle_invocation(
         "I-implementer", outcome=InvocationOutcome.COMPLETED, detail="seeded implementer result"
     )
@@ -526,9 +527,9 @@ def test_a_suppressed_spawn_keeps_the_spend_and_is_not_a_started_call(
     assert counts.started == 0, "a reserved-then-suppressed invocation is not a started one"
     assert counts.ever_started == 0, "the report must not present it as a call to the model"
     assert counts.not_started == 1
-    assert [entry.invocation_id for entry in store.unstarted_invocations(run_id)] == [
-        "I-suppressed"
-    ], "the report reads its 'consumed but never launched' set from exactly this record"
+    assert [
+        entry.invocation_id for entry in store.invocations_for(run_id) if entry.started_at is None
+    ] == ["I-suppressed"], "the 'consumed but never launched' set is exactly this record"
 
     # The consumption is kept: this is a fact about what happened, not a refund.
     assert _counters(
@@ -537,9 +538,6 @@ def test_a_suppressed_spawn_keeps_the_spend_and_is_not_a_started_call(
     view = store.root_budget_view(binding.root_id)
     assert view is not None and view.used_top_level_submissions == 1
     assert store.get_run(run_id)["turns_reserved"] == 1
-    assert store.mark_invocation_started("I-suppressed") is False, (
-        "a suppressed reservation can never be rounded up to a started call"
-    )
 
 
 def test_the_report_does_not_count_a_suppressed_launch_as_a_started_call(
@@ -704,7 +702,7 @@ def test_a_silent_driver_that_produced_work_is_recorded_as_launched(
             "a silent driver never said what its launch creates; the inference must not say it"
         )
         assert not intent.process_created, "an inferred launch is not an observed process"
-    assert store.unstarted_invocations(outcome.run_id) == [], (
+    assert [e for e in store.invocations_for(outcome.run_id) if e.started_at is None] == [], (
         "a run that produced a candidate and a verdict has no consumed allowance without a call"
     )
     counts = store.invocation_state_counts(outcome.run_id)
@@ -1311,7 +1309,7 @@ def test_the_rootless_dispatch_transaction_refuses_a_task_that_has_a_root(
         turn_limit=task_spec.budget.max_agent_turns,
         repair_limit=0,
     )
-    store.claim_run("R-rootless", CONTROLLER_ID)
+    claim_run(store, "R-rootless", CONTROLLER_ID)
 
     with pytest.raises(StoreError, match="new revision with --root-budget-file"):
         store.reserve_dispatch(
@@ -1463,7 +1461,7 @@ def test_a_second_invocation_id_for_the_same_role_cannot_dispatch_twice(
 
     # Now the first review is finished. The rule still holds: one review per candidate, and the
     # attempt keeps naming the invocation that actually produced the verdict.
-    store.mark_invocation_started("I-review")
+    mark_invocation_started(store, "I-review")
     store.settle_invocation("I-review", outcome=InvocationOutcome.COMPLETED, detail="verdict recorded")
     assert store.pending_invocations(binding.root_id) == [], "nothing is pending any more"
     settled_counters = _counters(
@@ -1694,7 +1692,7 @@ def test_settling_never_moves_an_entry_that_is_no_longer_open(
     elif recorded is InvocationStartState.LAUNCH_UNKNOWN:
         store.mark_launch_unresolved("I-closed", "a stop was confirmed before any spawn report")
     else:
-        store.mark_invocation_started("I-closed", process_created=False)
+        mark_invocation_started(store, "I-closed", process_created=False)
         store.settle_invocation(
             "I-closed",
             outcome=InvocationOutcome.COMPLETED
@@ -1742,7 +1740,7 @@ def test_settling_an_open_entry_closes_it_and_says_so(
     )
     store.mark_invocation_launch_requested("I-open")
     if launched:
-        store.mark_invocation_started("I-open", process_created=False)
+        mark_invocation_started(store, "I-open", process_created=False)
 
     moved = store.settle_invocation(
         "I-open", outcome=InvocationOutcome.COMPLETED, detail="the driver's result"

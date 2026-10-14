@@ -12,7 +12,8 @@ hflow doctor --json                        # what is on this machine; no model c
 hflow doctor --profile <id>                # resolve the profile per role; non-zero if unusable
 hflow prepare --task task.json --profile <id> --project-root <repo> --plan-out task.plan.json
 hflow approve --plan task.plan.json        # at a terminal only: shows the plan and its approval code; you type the code, then YOUR approval
-hflow run --plan task.plan.json            # every resolution input comes from the plan; a stale plan is refused
+hflow run --plan task.plan.json            # every resolution input comes from the plan; a stale plan is refused; finds approve's default file itself
+hflow approve --plan task.plan.json --run  # the same approval, then exactly `run --plan` in the same process (exit code = the run's)
 hflow run --task task.json --project-root <repo> --driver fake --json
 hflow status <run_id>
 hflow report <run_id>
@@ -46,7 +47,8 @@ outcome prints `key: value` lines (lists as `- item`, a nested record as one com
 **`next:` lines.** `run`, `status`, `report`, `resume`, `ledger settle` and every `integrate`
 subcommand end their text output with `next: <command>` lines - what to run next for that run,
 read from stored facts only (no model, no process probe, nothing written); `prepare --plan-out`
-and `approve` end with the `approve` / `run --plan` command. `--json` and `--receipt-out` output
+and `approve` end with the `approve` / `run --plan` command (`approve --run` prints `running
+<command>` instead, then the run's own lines). `--json` and `--receipt-out` output
 carry none. The order is: `resume <run>` then `ledger settle <invocation> --attest "<what you
 know and why>"` after an interruption (`--legacy-owner-gone` for a pre-v6 owner) - replace the
 placeholder with your own words: an `--attest` text that is still a `<...>` placeholder, or the
@@ -196,8 +198,11 @@ a terminal:
 ```sh
 hflow prepare --task task.json --profile dsh-local --project-root <repo> --plan-out task.plan.json
 hflow approve --plan task.plan.json          # shows the summary and an approval code; type the code, then your approval
-hflow run --plan task.plan.json --authorization-file "<the file approve printed>"
+hflow run --plan task.plan.json              # uses the file approve wrote next to the plan
 ```
+
+`approve --plan task.plan.json --run` does the last two in one command: the approval exactly as
+below, then - only once the file is written - exactly `run --plan` in the same process.
 
 - **`prepare --plan-out <file>`** writes a plan (`kind: "hflow-plan"`, generated contract
   `RunPlan`): the resolution inputs as you gave them, with every path made absolute (the task,
@@ -215,7 +220,13 @@ hflow run --plan task.plan.json --authorization-file "<the file approve printed>
   again through the same function `prepare` and `run` use, and refuses (exit `2`, nothing written)
   when the binding or the root ceilings changed since the plan was written - an edited task or
   contract, a moved branch, another profile or launch, a changed root budget file: "plan ... is
-  stale", listing each differing field; re-run `prepare --plan-out`. A plan that needs no
+  stale", listing each differing field; re-run `prepare --plan-out`. When the effective
+  configuration is what changed, the refusal also lists each configuration field that differs
+  (`effective_config.implementer_writes`, `effective_config.roles[<role>].launch.dsh_home`, ...)
+  and, for a field read from the environment of the process resolving the plan, the variable:
+  `HFLOW_ALLOW_WRITES`, `DSH_HOME`, `HFLOW_ACPX_CLI`, `HFLOW_ACPX_NODE`, `PATH` (`dsh`, `node`,
+  `python`), `SystemRoot` (`cmd.exe`), and `HFLOW_PROFILE` for a plan that names no profile - a
+  shell with another value resolves another configuration. A plan that needs no
   authorization (the offline fake driver without a root budget) is said to need none (exit `0`,
   nothing written). A task the run would refuse is refused here too, its issues printed on
   stderr. Otherwise it needs **a person at an interactive terminal**. When standard input is not
@@ -242,7 +253,22 @@ hflow run --plan task.plan.json --authorization-file "<the file approve printed>
   `<plan stem>.<first 12 hex of the binding digest>.authorization.json` (a trailing `.plan` is
   dropped from the stem), so re-preparing never collides with an older approval. An existing
   file is **never overwritten** (checked before you are asked, and the write is an exclusive
-  create). It ends with a `next:` line and the exact `run` command, quoted for PowerShell.
+  create). It ends with a `next:` line and the exact `run` command, quoted for PowerShell:
+  `hflow run --plan <plan>`, which finds the default file by itself, or - for a file `--out` put
+  anywhere else - `hflow run --plan <plan> --authorization-file <file>`.
+- **`approve --plan <file> --run`** is `approve` followed by `run --plan`, in one process. The
+  approval is unchanged - the same staleness check, the same refusal of a non-terminal standard
+  input before anything is read, the code and your own words typed, the exclusive create - and
+  there is no flag that skips any of it. Only once the file is written does it print `running
+  hflow run --plan <plan> --authorization-file <the file just written>` in place of the `next:`
+  line and continue with exactly that command: the plan is loaded and resolved again (a plan that
+  went stale in between is refused), the approval is verified, the run takes the owner lease and
+  ends with its own `next:` lines, a Ctrl+C exits `130`, and the exit code is the run's. The file
+  just written is named explicitly, so a plan re-prepared in between is refused rather than run
+  under another approval. When the approval fails, nothing runs and no ledger is opened. With
+  `--json` stdout carries two JSON lines: the approval's payload (`running` in place of `next`),
+  then the run's. An offline plan that needs no authorization is run straight away, as `run
+  --plan` would run it.
 - **`run --plan <file>`** takes every resolution input from the plan: `--task`, `--project`,
   `--project-root`, `--profile`, `--driver`, `--base-commit`, `--workspace`,
   `--authorization-mode`, `--root-budget-file` or `--repair-policy-file` given as well - even
@@ -499,10 +525,11 @@ What the root file does, and what it does not:
   never requested -> `not_started`); every other open entry becomes `unknown` (a launch was
   recorded) or `launch_unknown` (no launch recorded), with a `dispatch: resume closed ...` note. No
   driver is called, nothing is dispatched or refunded, and the run's state, block code, receipt
-  and outcome stay as they were; a second `resume` is a no-op. `status`/`report` show one
-  `open entries` line naming `hflow resume <run_id>` (with `--legacy-owner-gone --attest` for a
-  pre-v6 run that recorded a controller pid) while such entries remain, and the run's failure note
-  names the same two steps.
+  and outcome stay as they were; a second `resume` is a no-op. While such entries remain,
+  `status`/`report` show an `open entries` section (the entries, one fact line each) and their
+  `next:` lines name `hflow resume <run_id>` (with `--legacy-owner-gone --attest` for a pre-v6 run
+  that recorded a controller pid, and `--data-dir` for a non-default ledger); the run's failure
+  note names the same two steps.
 - `hflow resume <run_id> --legacy-owner-gone --attest "<text>"` (batch J) passes exactly one
   blocker: an ended run with no owner token whose attempts recorded a controller pid (no host, so
   HFlow can never probe it). `--attest` is required with the flag and has the settle bounds
@@ -1327,8 +1354,8 @@ primary way to produce one is the plan flow ("From preview to run" above):
 ```sh
 hflow prepare --task task.json --project .hflow/project.json --project-root <repo> \
               --profile dsh-local --data-dir <data> --plan-out task.plan.json
-hflow approve --plan task.plan.json
-hflow run --plan task.plan.json --authorization-file <the file approve printed> --json
+hflow approve --plan task.plan.json         # or: approve --plan task.plan.json --run
+hflow run --plan task.plan.json --json      # add --authorization-file <file> only after approve --out <file>
 ```
 
 **Writing the artifact by hand** is the documented alternative. Copy `authorization.binding`
@@ -1476,10 +1503,11 @@ Three facts about this wiring:
   the receiving agent's own record of what it read;
 - the implementer is never told the candidate identity or the check results (it produces them),
   and the reviewer is never handed the implementer's own summary of its work;
-- the implementer's stated deadline is the deadline its invocation is actually given: the
-  configured value capped by what is left of the root's clock, or, before that clock has started,
-  by the root's `deadline_seconds`. A packet rendered earlier that names a longer one is
-  re-rendered before launch (the value can only shrink, so the packet cannot grow). `hflow
+- each role's stated deadline is the deadline its invocation is actually given: the configured
+  value (the reviewer's is 900 s) capped by what is left of the root's clock, or, before that
+  clock has started, by the root's `deadline_seconds`. A packet rendered earlier that names a
+  longer one is re-rendered before launch (the value can only shrink, so the packet cannot grow;
+  a re-rendered reviewer packet gets its own `role_input_packet` note). `hflow
   prepare`'s packet preview still renders the configured value, so when a root's
   `deadline_seconds` is below the task's deadline the preview's deadline line, length and digest
   differ from the packet the run sends.

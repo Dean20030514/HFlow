@@ -66,6 +66,25 @@ def test_an_unknown_profile_id_refuses_without_falling_back(tmp_path: Path) -> N
     assert "Nothing falls back to a default binding" in excinfo.value.message
 
 
+def test_an_unknown_profile_id_lists_the_profiles_that_exist(
+    tmp_path: Path, live_profile: MachineProfile
+) -> None:
+    """The refusal names what is there to choose from: plain ids of ``*.json`` files only."""
+    with pytest.raises(RefusedError) as excinfo:
+        load_profile(tmp_path, "dsh-locl")
+    assert f"Profiles in {tmp_path / 'profiles'}: none." in excinfo.value.message
+
+    write_profile(tmp_path, live_profile)
+    write_profile(tmp_path, live_profile.model_copy(update={"profile_id": "a-first"}))
+    (tmp_path / "profiles" / "notes.txt").write_text("not a profile", encoding="utf-8")
+    (tmp_path / "profiles" / "folder.json").mkdir()
+    with pytest.raises(RefusedError) as excinfo:
+        load_profile(tmp_path, "dsh-locl")
+    assert excinfo.value.code is RefusalCode.INVALID_SPEC
+    assert f"Profiles in {tmp_path / 'profiles'}: a-first, dsh-local." in excinfo.value.message
+    assert "Nothing falls back to a default binding" in excinfo.value.message
+
+
 def test_an_empty_profile_id_says_no_profile_was_selected(tmp_path: Path) -> None:
     with pytest.raises(RefusedError) as excinfo:
         load_profile(tmp_path, "")

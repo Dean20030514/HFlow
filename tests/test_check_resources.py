@@ -50,6 +50,8 @@ from hflow.drivers.fake import FakeDriver, FakeScript
 from hflow.store import Store
 from hflow.verify import CheckRunners, CommandCheckRunner, _detail_with_references, verify_candidate
 
+from .store_helpers import claim_run, dispatch_attempt
+
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 CHECK_HELPER = FIXTURES / "check_helper.py"
 
@@ -464,6 +466,29 @@ def test_an_incomplete_capture_can_never_be_reported_as_passed(tmp_path: Path, m
     assert "incomplete" in outcome.detail
 
 
+def test_a_pipe_still_held_open_is_waited_for_once_not_twice(tmp_path: Path, monkeypatch) -> None:
+    """The bounded reader wait is spent once: the clean-up path does not wait it out again.
+
+    Nothing between the first wait and the clean-up could release a pipe a descendant holds, so
+    a second wait only doubled how long an incomplete check took to report.
+    """
+    original = CommandCheckRunner._join_readers
+    waits: list[int] = []
+
+    def held_open(self, readers):  # noqa: ANN001, ANN202
+        waits.append(len(readers))
+        original(self, readers)
+        return False
+
+    monkeypatch.setattr(CommandCheckRunner, "_join_readers", held_open, raising=True)
+    runner = CommandCheckRunner(artifact_factory=lambda _check, _eid: tmp_path / "art")
+
+    outcome = runner.run(_check([sys.executable, "-c", "print('done')"]), tmp_path, 60)
+
+    assert outcome.exit_reason == "output_capture_error"
+    assert waits == [2]
+
+
 def test_a_failed_sink_write_can_never_be_reported_as_passed(tmp_path: Path, monkeypatch) -> None:
     """The reported defect: a capture that failed to write still ended as ``passed/completed``.
 
@@ -716,18 +741,16 @@ def _seed_checking_run(
         turn_limit=4,
         repair_limit=1,
     )
-    store.claim_run(run["run_id"], "local-controller")
+    claim_run(store, run["run_id"], "local-controller")
     store.set_task_state(run["run_id"], [TaskState.DRAFT], TaskState.READY)
-    store.dispatch_attempt(
+    dispatch_attempt(
+        store,
         run_id=run["run_id"],
         controller_id="local-controller",
         attempt_id=attempt_id,
-        role="implementer",
+        invocation_id="I-reason",
         reservation_id="B-reason",
-        reserved_turns=1,
-        reservation_expires_at="2999-01-01T00:00:00Z",
     )
-    store.record_invocation(attempt_id, "I-reason")
     store.advance_to_checking(run_id=run["run_id"], attempt_id=attempt_id, phase=CheckPhase.VERIFICATION)
     return str(run["run_id"])
 

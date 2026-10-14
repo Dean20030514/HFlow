@@ -23,7 +23,7 @@ process, an access-denied read) is still ``windows_only``.
 
 ``successor`` is the controller of the process that resumes afterwards. It answers through the
 owner's own driver objects, so a test can still see what the reconcile asked them; a real successor
-process holds no handle to the owner's children (``hflow.cli._observer_controller``).
+process holds no handle to the owner's children (``hflow.cli._observer``).
 """
 
 from __future__ import annotations
@@ -87,6 +87,22 @@ def _simulated_dead_identity(monkeypatch: pytest.MonkeyPatch) -> ownership.Proce
 
     monkeypatch.setattr(ownership, "probe", probe)
     return dead
+
+
+def identity_of(pid: int) -> ownership.ProcessIdentity | None:
+    """Another local process's identity, read through a handle; ``None`` when unreadable."""
+    if not ownership.winjob.IS_WINDOWS or pid <= 0:
+        return None
+    handle, _error = ownership._open_process(pid)  # noqa: SLF001
+    if handle is None:
+        return None
+    try:
+        created = ownership._creation_time(handle)  # noqa: SLF001
+    finally:
+        ownership._close(handle)  # noqa: SLF001
+    if created is None:
+        return None
+    return ownership.ProcessIdentity(pid=pid, created=created, host=ownership.current_host())
 
 
 def successor(owner: Controller) -> Controller:

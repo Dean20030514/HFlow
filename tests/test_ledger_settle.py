@@ -52,6 +52,7 @@ from hflow.store import (
     Store,
     StoreError,
 )
+from tests.store_helpers import mark_invocation_started, settlement_for
 from tests.test_batch_e_ledger import (
     AUTHORIZATION_ID,
     _binding,
@@ -101,7 +102,7 @@ def _unknown_entry(
     assert _reserve(
         store, run_id=run_id, invocation_id=invocation_id, binding=binding, limits=limits
     ).is_new
-    assert store.mark_invocation_started(invocation_id) is True
+    assert mark_invocation_started(store, invocation_id) is True
     store.settle_invocation(invocation_id, outcome=None, detail="no observable result")
     store.set_blocked(run_id, RefusalCode.OUTCOME_UNKNOWN, "seeded unknown outcome")
 
@@ -313,7 +314,7 @@ def test_void_of_a_reviewer_launch_returns_one_submission_and_no_repair(
     reservation = _reserve(
         store, run_id=run, invocation_id="I-impl", binding=binding, limits=limits
     )
-    store.mark_invocation_started("I-impl")
+    mark_invocation_started(store, "I-impl")
     store.settle_invocation("I-impl", outcome=InvocationOutcome.COMPLETED, detail="seeded")
     store.finish_attempt(
         run_id=run, attempt_id=reservation.attempt_id, state=AttemptState.SUCCEEDED,
@@ -350,7 +351,7 @@ def test_void_from_unknown_is_refused_and_writes_nothing(
         store.settle_by_operator("I-u", settled_as="void", attested_by="op", attestation=ATTEST)
 
     assert store.invocation("I-u").state is InvocationStartState.UNKNOWN  # type: ignore[union-attr]
-    assert store.settlement_for("I-u") is None
+    assert settlement_for(store, "I-u") is None
     assert _counters(store, binding, [run]) == before
     assert store.notes_for(run) == notes_before
 
@@ -454,7 +455,7 @@ def test_an_open_entry_is_refused_and_points_to_resume(
     if open_state in {"requested", "started"}:
         store.mark_invocation_launch_requested("I-open")
     if open_state == "started":
-        store.mark_invocation_started("I-open")
+        mark_invocation_started(store, "I-open")
     # The run ended without closing the entry (a cancelled_by_operator whose ledger write failed).
     store.set_blocked(run, RefusalCode.CANCELLED_BY_OPERATOR, "seeded")
     assert store.invocation("I-open").state.value == open_state  # type: ignore[union-attr]
@@ -472,7 +473,7 @@ def test_a_final_entry_is_refused(
     run = _seed_ready_run(store, run_id="R-final", project_id=project.project_id, spec=task_spec)
     assert _reserve(store, run_id=run, invocation_id="I-final", binding=binding, limits=limits).is_new
     if final_state == "settled":
-        store.mark_invocation_started("I-final")
+        mark_invocation_started(store, "I-final")
         store.settle_invocation("I-final", outcome=InvocationOutcome.COMPLETED, detail="seeded")
     else:
         store.mark_invocation_not_started("I-final", "seeded")
@@ -838,7 +839,7 @@ def _assert_refused_unchanged(store: Store, invocation_id: str, code: int, capsy
     assert err.startswith("refused: ") and "nothing was written" in err
     entry = store.invocation(invocation_id)
     assert entry is not None and entry.state is InvocationStartState.UNKNOWN
-    assert store.settlement_for(invocation_id) is None
+    assert settlement_for(store, invocation_id) is None
     return err
 
 
@@ -1003,6 +1004,6 @@ def test_a_pre_v6_run_with_a_recorded_controller_settles_only_on_an_explicit_att
         "--attest", ATTEST, "--legacy-owner-gone",
     ])
     assert code == EXIT_OK, capsys.readouterr().err
-    settlement = store.settlement_for("I-legacy")
+    settlement = settlement_for(store, "I-legacy")
     assert settlement is not None
     assert "operator attests the pre-v6 owner of this run is gone" in settlement.attestation

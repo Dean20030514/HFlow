@@ -72,6 +72,8 @@ from hflow.verify import (
     verify_candidate,
 )
 
+from .store_helpers import claim_run, dispatch_attempt
+
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 CHECK_HELPER = FIXTURES / "check_helper.py"
 
@@ -145,18 +147,16 @@ def _seed_checking_run(
         turn_limit=4,
         repair_limit=1,
     )
-    store.claim_run(run["run_id"], "local-controller")
+    claim_run(store, run["run_id"], "local-controller")
     store.set_task_state(run["run_id"], [TaskState.DRAFT], TaskState.READY)
-    store.dispatch_attempt(
+    dispatch_attempt(
+        store,
         run_id=run["run_id"],
         controller_id="local-controller",
         attempt_id=attempt_id,
-        role="implementer",
+        invocation_id="I-e2-verify",
         reservation_id="B-e2-verify",
-        reserved_turns=1,
-        reservation_expires_at="2999-01-01T00:00:00Z",
     )
-    store.record_invocation(attempt_id, "I-e2-verify")
     store.advance_to_checking(
         run_id=run["run_id"], attempt_id=attempt_id, phase=CheckPhase.VERIFICATION
     )
@@ -1264,7 +1264,7 @@ def _seed_ready_run(
         turn_limit=turn_limit,
         repair_limit=1,
     )
-    store.claim_run(run["run_id"], "local-controller")
+    claim_run(store, run["run_id"], "local-controller")
     store.set_task_state(run["run_id"], [TaskState.DRAFT], TaskState.READY)
     return str(run["run_id"])
 
@@ -1387,7 +1387,9 @@ def test_a_reviewer_attaches_to_the_attempt_the_run_is_working_on(tmp_path: Path
         # registration is what puts the invocation id on the attempt row (see
         # ``register_attempt_invocation_unless_stopped``). Done here for both rounds, because the
         # "one review per attempt" rule reads that column.
-        store.record_invocation(first.attempt_id, "I-1")
+        assert store.register_attempt_invocation_unless_stopped(
+            run_id, first.attempt_id, column="invocation_id", invocation_id="I-1"
+        )
         assert store.register_attempt_invocation_unless_stopped(
             run_id, first.attempt_id, column="review_invocation_id", invocation_id="I-r1"
         )
@@ -1395,9 +1397,7 @@ def test_a_reviewer_attaches_to_the_attempt_the_run_is_working_on(tmp_path: Path
         # The repair handoff returns the run to RUNNING with no phase before the second
         # implementer attempt: an implementer dispatch is only reserved before the candidate is
         # checked.
-        store.set_task_state(
-            run_id, [TaskState.CHECKING], TaskState.RUNNING, clear_phase=True
-        )
+        store.set_task_state(run_id, [TaskState.CHECKING], TaskState.RUNNING)
         repair = _dispatch(store, run_id, invocation_id="I-2", is_repair=True)
         store.finish_attempt(
             run_id=run_id,
@@ -1414,7 +1414,9 @@ def test_a_reviewer_attaches_to_the_attempt_the_run_is_working_on(tmp_path: Path
         assert review_two.attempt_id == repair.attempt_id, (
             "round two's verdict must belong to round two's attempt"
         )
-        store.record_invocation(repair.attempt_id, "I-2")
+        assert store.register_attempt_invocation_unless_stopped(
+            run_id, repair.attempt_id, column="invocation_id", invocation_id="I-2"
+        )
         assert store.register_attempt_invocation_unless_stopped(
             run_id, repair.attempt_id, column="review_invocation_id", invocation_id="I-r2"
         )

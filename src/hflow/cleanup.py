@@ -25,6 +25,7 @@ Anything unclear refuses and keeps the scene, which is the correct outcome.
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from dataclasses import dataclass, field
@@ -34,7 +35,14 @@ from .contracts import (
     AttemptState, RefusedError, ResultReceipt, TaskSpec, TaskState,
     WorkspaceProvenance,
 )
-from .gitworkspace import IGNORED_ARTIFACT_ALLOWLIST, GitError, GitRepo, _base_env
+from .gitworkspace import (
+    IGNORED_ARTIFACT_ALLOWLIST,
+    GitError,
+    GitRepo,
+    _git_failure,
+    _run_git,
+    is_full_oid,
+)
 from .store import Store, StoreError
 from .workspace import matches_pattern
 
@@ -103,8 +111,6 @@ def _refuse(plan: CleanPlan, code: str, detail: str) -> None:
     plan.refusals.append({"reason": code, "detail": detail})
 
 
-#: A full commit id (SHA-1 or SHA-256 object format).
-_FULL_COMMIT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 #: The note the controller writes when it resolves the task's base name to a commit.
 _BASE_NOTE = re.compile(r"base .+ -> (?P<commit>[0-9a-f]{40}(?:[0-9a-f]{24})?)")
 #: The namespaces whose refs count as keeping a commit: a branch, a tag, or an HFlow ref. A
@@ -131,7 +137,7 @@ def _recorded_base_commit(store: Store, run_id: str, spec: TaskSpec) -> str:
     except StoreError:
         pass  # unreadable is "not recorded", which keeps the stricter gate
     named = spec.workspace.base_commit
-    return named if _FULL_COMMIT.fullmatch(named) else ""
+    return named if is_full_oid(named) else ""
 
 
 def _recorded_frozen_commit(store: Store, run_id: str, attempt_id: str) -> str:
@@ -147,6 +153,30 @@ def _recorded_frozen_commit(store: Store, run_id: str, attempt_id: str) -> str:
         return ""
     frozen = [record.candidate_commit for record in records if record.attempt_id == attempt_id]
     return frozen[-1] if frozen else ""
+
+
+def _rootless_source(store: Store, run_id: str) -> tuple[str, str] | None:
+    """``(repository path, absolute Git common dir)`` for a run recorded without provenance.
+
+    Such a (legacy) run names its repository only on its root budget; ``None`` when it has none.
+    The common directory is what that repository resolves to now.
+    """
+    root = store.root_budget_for_run(run_id)
+    if root is None:
+        return None
+    path = str(root["repo_path"])
+    return path, GitRepo.discover(Path(path)).absolute_common_dir
+
+
+def _read_candidate_ref(plan: CleanPlan, repo: GitRepo, run_id: str, attempt_id: str) -> bool:
+    """Record the attempt's candidate ref and its target; ``False`` (refused) when unreadable."""
+    plan.candidate_ref = repo.candidate_ref(run_id, attempt_id)
+    try:
+        plan.candidate_ref_target = repo.ref_target(plan.candidate_ref) or ""
+    except GitError as exc:
+        _refuse(plan, "git_query_failed", f"could not read {plan.candidate_ref}: {exc}")
+        return False
+    return True
 
 
 def _refs_containing(repo: GitRepo, commit: str) -> list[str]:
@@ -217,7 +247,7 @@ def plan_cleanup(store: Store, run_id: str) -> CleanPlan:
             f"the run is {plan.task_state}; only a terminal run's workspace may be released",
         )
     receipt = (
-        ResultReceipt.model_validate(__import__("json").loads(row["receipt_json"]))
+        ResultReceipt.model_validate(json.loads(row["receipt_json"]))
         if row["receipt_json"]
         else None
     )
@@ -229,7 +259,7 @@ def plan_cleanup(store: Store, run_id: str) -> CleanPlan:
         else "the run's evidence, stored outside the worktree (this run has no receipt)",
         "the run's history, notes and any cleanup record",
     ]
-    spec = TaskSpec.model_validate(__import__("json").loads(row["task_spec_json"]))
+    spec = TaskSpec.model_validate(json.loads(row["task_spec_json"]))
     recorded_path = row["worktree_path"] or (receipt.candidate.worktree if receipt else "")
 
     if str(row["worktree_state"]) == WORKSPACE_REMOVED:
@@ -257,19 +287,16 @@ def plan_cleanup(store: Store, run_id: str) -> CleanPlan:
         return plan
     try:
         if plan.provenance is not None:
-            source_repo = GitRepo.discover(Path(plan.provenance.project_root))
-            source_common = str((source_repo.root / source_repo.common_dir).resolve())
+            source_common = GitRepo.discover(Path(plan.provenance.project_root)).absolute_common_dir
             if source_common != plan.provenance.git_common_dir:
                 _refuse(plan, "provenance_mismatch", "recorded repository now has a different Git common directory")
                 return plan
         else:
-            root = store.root_budget_for_run(run_id)
-            if root is None:
+            source = _rootless_source(store, run_id)
+            if source is None:
                 _refuse(plan, "workspace_provenance_missing", "legacy rootless run has no reliable recorded repository source")
                 return plan
-            plan.root_repository = str(root["repo_path"])
-            source_repo = GitRepo.discover(Path(plan.root_repository))
-            source_common = str((source_repo.root / source_repo.common_dir).resolve())
+            plan.root_repository, source_common = source
     except (GitError, RefusedError, OSError) as exc:
         _refuse(plan, "provenance_unreadable", f"recorded repository source cannot be checked: {exc}")
         return plan
@@ -288,12 +315,16 @@ def plan_cleanup(store: Store, run_id: str) -> CleanPlan:
     except RefusedError as exc:
         _refuse(plan, "not_a_worktree", str(exc))
         return plan
-    plan.common_dir = str((repo.root / repo.common_dir).resolve())
+    except GitError as exc:
+        _refuse(plan, "git_query_failed", str(exc))
+        return plan
+    plan.common_dir = repo.absolute_common_dir
     if plan.common_dir != source_common:
         _refuse(plan, "provenance_mismatch", "Git common directory differs from its recorded source")
         return plan
     try:
         registration = repo.worktree_registration(worktree)
+        is_main = registration is not None and repo.is_main_worktree(worktree)
     except GitError as exc:
         _refuse(plan, "git_query_failed", str(exc))
         return plan
@@ -301,7 +332,7 @@ def plan_cleanup(store: Store, run_id: str) -> CleanPlan:
         _refuse(plan, "not_registered", "git does not have this path registered as a worktree")
         return plan
     plan.registered = True
-    if repo.is_main_worktree(worktree):
+    if is_main:
         _refuse(
             plan,
             "is_source_repository",
@@ -363,12 +394,16 @@ def plan_cleanup(store: Store, run_id: str) -> CleanPlan:
         )
 
     # --- 3. HEAD must still be the frozen candidate, with nothing unfrozen
-    plan.head = repo.worktree_commit(worktree)
+    try:
+        plan.head = repo.worktree_commit(worktree)
+    except GitError as exc:
+        _refuse(plan, "git_query_failed", f"could not read the worktree's HEAD: {exc}")
+        return plan
     base_commit = ""
     if receipt is not None:
         plan.expected_candidate = receipt.candidate.git_commit
-        plan.candidate_ref = repo.candidate_ref(run_id, receipt.attempt_id)
-        plan.candidate_ref_target = repo.ref_target(plan.candidate_ref) or ""
+        if not _read_candidate_ref(plan, repo, run_id, receipt.attempt_id):
+            return plan
         if plan.expected_candidate and plan.head != plan.expected_candidate:
             _refuse(
                 plan,
@@ -384,8 +419,8 @@ def plan_cleanup(store: Store, run_id: str) -> CleanPlan:
             frozen = _recorded_frozen_commit(store, run_id, str(attempt["attempt_id"]))
             if frozen:
                 plan.expected_candidate = frozen
-                plan.candidate_ref = repo.candidate_ref(run_id, str(attempt["attempt_id"]))
-                plan.candidate_ref_target = repo.ref_target(plan.candidate_ref) or ""
+                if not _read_candidate_ref(plan, repo, run_id, str(attempt["attempt_id"])):
+                    return plan
         if plan.expected_candidate and plan.head not in {plan.expected_candidate, base_commit}:
             _refuse(
                 plan,
@@ -397,7 +432,7 @@ def plan_cleanup(store: Store, run_id: str) -> CleanPlan:
     try:
         status = repo.status_report(worktree)
         flagged = repo.index_flagged_paths(worktree)
-    except (GitError, Exception) as exc:  # noqa: BLE001 - a failed read must refuse, not guess
+    except Exception as exc:  # noqa: BLE001 - a failed read must refuse, not guess
         _refuse(plan, "status_failed", repr(exc))
         return plan
     plan.tracked_changes = list(status.changed)
@@ -528,10 +563,6 @@ def apply_cleanup(store: Store, run_id: str, *, operator: str = "local-controlle
             "detail": "another cleanup already holds the intent for this run",
         }
 
-    refused = _recheck_cleanup_claim(store, plan)
-    if refused is not None:
-        return refused
-
     worktree = Path(plan.path)
     # A check's child process may still be closing its last handles when the run settles
     # (Windows keeps a directory undeletable until the last handle goes). One bounded retry
@@ -540,20 +571,26 @@ def apply_cleanup(store: Store, run_id: str, *, operator: str = "local-controlle
     # The retry calls git from the *main worktree*, not from inside the target: a failed
     # `worktree remove` may already have deleted the target's `.git` file, after which
     # discovering a repository through that path fails and would report a misleading
-    # "not a git repository" instead of the real reason.
-    try:
-        driver_repo = GitRepo.discover(worktree)
-        command_root = driver_repo.main_worktree() or driver_repo.root
-    except (RefusedError, GitError) as exc:
-        return {
-            "applied": False, "status": "REGISTRATION_UNKNOWN", "path": str(worktree),
-            "detail": f"workspace repository could not be checked: {exc}; cleanup intent kept",
-        }
+    # "not a git repository" instead of the real reason. So the main worktree is found once,
+    # before the first removal - and only after the first recheck, which settles a path that
+    # vanished after the claim and releases a claim whose guards no longer hold.
+    command_root: Path | None = None
     attempts: list[str] = []
     for attempt in range(2):
         refused = _recheck_cleanup_claim(store, plan)
         if refused is not None:
-            return {**refused, "attempts": attempts}
+            return {**refused, "attempts": attempts} if attempts else refused
+        if command_root is None:
+            try:
+                driver_repo = GitRepo.discover(worktree)
+                command_root = driver_repo.main_worktree() or driver_repo.root
+            except (RefusedError, GitError) as exc:
+                return {
+                    "applied": False, "status": "REGISTRATION_UNKNOWN", "path": str(worktree),
+                    "detail": (
+                        f"workspace repository could not be checked: {exc}; cleanup intent kept"
+                    ),
+                }
         try:
             GitRepo(command_root).remove_worktree_checked(worktree)
             attempts.append(f"attempt {attempt + 1}: removed")
@@ -616,18 +653,10 @@ def apply_cleanup(store: Store, run_id: str, *, operator: str = "local-controlle
 
 def git_registration_exists(common_dir: str, worktree: Path) -> bool:
     """Is this path still registered, judged from the repository's own metadata?"""
-    import subprocess
-
-    completed = subprocess.run(  # noqa: S603,S607 - read-only query
-        ["git", "--git-dir", common_dir, "worktree", "list", "--porcelain"],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-        env=_base_env(),
-    )
+    args = ("--git-dir", common_dir, "worktree", "list", "--porcelain")
+    completed = _run_git(args, cwd=None, timeout=60)
     if completed.returncode != 0:
-        raise GitError(completed.stderr.strip()[:200])
+        raise _git_failure(args, completed)
     for line in completed.stdout.splitlines():
         if line.startswith("worktree ") and Path(line.split(" ", 1)[1]).resolve() == worktree.resolve():
             return True
@@ -658,11 +687,10 @@ def reconcile_cleanup(store: Store, run_id: str) -> dict:
                 raise StoreError("workspace provenance names a different path")
             common_dir = provenance.git_common_dir
         else:
-            root = store.root_budget_for_run(run_id)
-            if root is None:
+            source = _rootless_source(store, run_id)
+            if source is None:
                 raise StoreError("legacy rootless run has no recorded repository source")
-            source_repo = GitRepo.discover(Path(root["repo_path"]))
-            common_dir = str((source_repo.root / source_repo.common_dir).resolve())
+            common_dir = source[1]
         registered = git_registration_exists(common_dir, worktree)
     except Exception as exc:  # noqa: BLE001 - a failed read never proves removal
         return {

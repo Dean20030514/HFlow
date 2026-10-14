@@ -114,7 +114,8 @@ stand-in for acpx / the installed pinned acpx).
 ## Install and test
 
 Python 3.12+ (developed on 3.14.7). Runtime dependency: `pydantic>=2.12,<3`.
-Development dependency: `pytest>=9.0,<10`. Git 2.31 or later for worktree runs (`git rev-parse
+Development dependencies: `pytest>=9.0,<10` and `pytest-xdist` (`python -m pytest -q -n 8`; on the
+development machine `-n 16` exhausted the Windows page file, WinError 1455). Git 2.31 or later for worktree runs (`git rev-parse
 --path-format=absolute`; `git config --show-scope` needs 2.26). The global attributes file is
 located with `git var GIT_ATTR_GLOBAL` on Git 2.42+, and on older Git from `core.attributesFile`,
 else `$XDG_CONFIG_HOME/git/attributes`, else `~/.config/git/attributes`. `hflow integrate` needs Git
@@ -156,6 +157,11 @@ locale, and one more when the temp directory lies inside a Git checkout.
 ## Commands
 
 ```sh
+hflow init project                        # writes .hflow/project.json: `command` checks inferred
+                                          # from pyproject/package.json (or --check ID=COMMAND)
+hflow init profile dsh-local              # writes <data-dir>/profiles/dsh-local.json (both roles)
+hflow init task T-1 --goal "..." --allow src/x.py   # writes T-1.task.json; the reuse fit test is
+                                          # left for you to answer, so admission refuses until then
 hflow doctor   --json                     # read-only environment probe, no model calls; never
                                           # runs dsh; integrate/acpx/dsh/credential readiness
 hflow doctor   --profile dsh-local        # resolve a profile per role; non-zero if unusable
@@ -165,6 +171,7 @@ hflow prepare  --task t.json --profile dsh-local --plan-out t.plan.json
                                           # the same preview, saved as a plan
 hflow approve  --plan t.plan.json         # at a terminal: shows the plan and its approval code,
                                           # you type the code and your own approval text
+hflow approve  --plan t.plan.json --run   # the same approval, then `run --plan` in this terminal
 hflow run      --plan t.plan.json         # every input from the plan; a stale plan is refused
 hflow run      --task examples/task.json --project examples/project.json --project-root . --driver fake --json
 hflow run      --task t.json --profile dsh-local --authorization-file auth.json --json
@@ -174,7 +181,10 @@ hflow run      --task t.json --profile dsh-local --authorization-file auth.json 
 hflow prepare  --task t.json --profile dsh-local --repair-policy-file repair.json
 hflow run      --task t.json --profile dsh-local --authorization-file auth.json \
                --repair-policy-file repair.json      # opt in to ONE bounded repair (batch E2)
+hflow runs     [--needs-you] [--json]     # every run, newest first, with its first next: line
 hflow status   R-xxxxxxxxxx               # pure SQLite read, zero model calls
+hflow diff     R-xxxxxxxxxx [--stat]      # the recorded base..candidate commits (Git identity,
+                                          # not the content fingerprint); never a working tree
 hflow report   R-xxxxxxxxxx --json        # receipt + evidence + the config it ran under
 hflow resume   R-xxxxxxxxxx               # reconcile an interrupted attempt, or close the
                                           # open ledger entries of an ended run - both once
@@ -196,7 +206,8 @@ hflow integrate reconcile G-xxxxxxxxxx    # settle an interrupted or hand-merged
 hflow schema                              # generated JSON Schema, MachineProfile included
 ```
 
-**The short path for one task:** `prepare --plan-out` → `approve --plan` → `run --plan`, then
+**The short path for one task:** `init project` / `init profile` / `init task` once, then
+`prepare --plan-out` → `approve --plan --run` (or `approve --plan`, then `run --plan`), then
 follow the `next:` lines each command prints (`integrate prepare` → `integrate apply` → `clean`;
 after an interruption `resume` → `ledger settle`). A printed `next:` line is read from stored facts
 only and never re-runs a task or reuses an approval. The plan saves `prepare`'s inputs, so `run`
@@ -432,8 +443,10 @@ Each item below is absent from this tree, not merely untested:
 - **No `hflow repair` command** and no revival of a historical `BLOCKED` run: the one bounded
   repair is a decision inside a live run under an explicit `repair_policy`, never a retry of an
   environment or transport failure.
-- **No `hflow init`** (a project contract is hand-written) and no `--format markdown` handoff
-  renderer.
+- **`hflow init` only scaffolds**: it never answers the reuse/adapt fit test, never writes a root
+  budget, plan or authorization, never overwrites a file, and infers checks only from
+  `pyproject.toml`/`pytest.ini`/`setup.cfg`/`tox.ini` (pytest) and a real `package.json` test
+  script. No `--format markdown` handoff renderer.
 - **No reuse-research automation and no metrics against a direct-DSH baseline.**
 - **No operator attestation for an owner this build recorded that reads `unknown`** (another host,
   elevated or another user, every owner off Windows): its run's open entries and an

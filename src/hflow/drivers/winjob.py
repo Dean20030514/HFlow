@@ -26,7 +26,6 @@ from __future__ import annotations
 import ctypes
 import os
 import subprocess
-import sys
 from ctypes import wintypes
 from typing import Any
 
@@ -334,18 +333,15 @@ def popen_in_boundary(
     (:func:`close_output_handles`) once it no longer needs them.
     """
     flags = suspending_flags()
-    try:
-        child = subprocess.Popen(  # noqa: S603 - argv is constructed by the driver
-            argv,
-            cwd=cwd,
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=stdout_handle,
-            stderr=stderr_handle,
-            creationflags=flags,
-        )
-    except BaseException:
-        raise
+    child = subprocess.Popen(  # noqa: S603 - argv is constructed by the driver
+        argv,
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=stdout_handle,
+        stderr=stderr_handle,
+        creationflags=flags,
+    )
     child._hflow_stdout = stdout_handle  # type: ignore[attr-defined]
     child._hflow_stderr = stderr_handle  # type: ignore[attr-defined]
     try:
@@ -375,48 +371,6 @@ def close_output_handles(child: subprocess.Popen) -> None:
             stream.close()
         except OSError:
             pass
-
-
-def parent_pid(pid: int) -> int | None:
-    """Parent process id, or ``None`` when it cannot be read.
-
-    Used only to attribute a helper process to the managed boundary by walking up from the
-    process the harness actually started. Process-scope evidence, not a security claim.
-    """
-    if not IS_WINDOWS:
-        return None
-    api = _kernel32()
-    TH32CS_SNAPPROCESS = 0x00000002
-
-    class _ProcessEntry32(ctypes.Structure):
-        _fields_ = [
-            ("dwSize", wintypes.DWORD),
-            ("cntUsage", wintypes.DWORD),
-            ("th32ProcessID", wintypes.DWORD),
-            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
-            ("th32ModuleID", wintypes.DWORD),
-            ("cntThreads", wintypes.DWORD),
-            ("th32ParentProcessID", wintypes.DWORD),
-            ("pcPriClassBase", wintypes.LONG),
-            ("dwFlags", wintypes.DWORD),
-            ("szExeFile", wintypes.CHAR * 260),
-        ]
-
-    snapshot = api.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if snapshot == wintypes.HANDLE(-1).value:
-        return None
-    entry = _ProcessEntry32()
-    entry.dwSize = ctypes.sizeof(_ProcessEntry32)
-    try:
-        if not api.Process32First(snapshot, ctypes.byref(entry)):
-            return None
-        while True:
-            if entry.th32ProcessID == pid:
-                return int(entry.th32ParentProcessID)
-            if not api.Process32Next(snapshot, ctypes.byref(entry)):
-                return None
-    finally:
-        api.CloseHandle(snapshot)
 
 
 def process_gone(pid: int, wait_seconds: float = 0.0) -> bool | None:
@@ -457,11 +411,3 @@ def process_gone(pid: int, wait_seconds: float = 0.0) -> bool | None:
         return False if result == WAIT_TIMEOUT else None
     finally:
         api.CloseHandle(handle)
-
-
-def platform_summary() -> dict[str, object]:
-    return {
-        "job_objects_supported": IS_WINDOWS,
-        "python": sys.version.split()[0],
-        "create_suspended": bool(IS_WINDOWS),
-    }

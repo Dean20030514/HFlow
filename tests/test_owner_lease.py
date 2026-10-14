@@ -51,7 +51,6 @@ from hflow.ownership import (
     OwnerLock,
     ProcessIdentity,
     current_identity,
-    identity_of,
     lock_is_free,
     lock_path_for,
     new_owner_token,
@@ -61,6 +60,7 @@ from hflow.report import report_json, status_text
 from hflow.store import OwnerLostError, Store, StoreError
 from hflow.verify import CheckRunners, FakeCheckRunner
 
+from .owner_exit import identity_of
 from .test_batch_e_dispatch import _authorization, _binding, _limits
 
 windows_only = pytest.mark.skipif(
@@ -456,7 +456,6 @@ def test_a_zombie_owners_reserve_dispatch_is_refused_after_a_takeover(
         identity=successor.owner_identity,
         reason="owner_lost: test takeover",
         detail="test",
-        note="owner_lost: test takeover",
     )
     assert taken is not None and taken[0] == 2
 
@@ -486,7 +485,6 @@ def test_a_zombie_owners_reserve_dispatch_is_refused_after_a_takeover(
         identity=successor.owner_identity,
         reason="x",
         detail="x",
-        note="x",
     ) is None
 
 
@@ -510,7 +508,6 @@ def test_a_zombie_owners_result_is_not_applied_after_a_takeover(
             identity=successor.owner_identity,
             reason="owner_lost: taken over while the implementer ran",
             detail="test",
-            note="owner_lost: taken over while the implementer ran",
         ) is not None
         return original_start(request)
 
@@ -825,7 +822,6 @@ def test_a_not_recorded_run_with_dispatched_work_is_not_taken_over(
             identity=current_identity(),
             reason="x",
             detail="x",
-            note="x",
             require_nothing_dispatched=True,
         ) is None
         assert _snapshot(store, "R-legacy") == before

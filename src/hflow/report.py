@@ -12,7 +12,6 @@ from .contracts import (
     LaunchSurfaces,
     ModelApplied,
     ModelObservation,
-    RefusalCode,
     ResultReceipt,
     RunInspection,
     StreamOrder,
@@ -154,86 +153,38 @@ def _dispatch_ledger_lines(inspection: RunInspection) -> list[str]:
 
 
 def _open_entry_lines(inspection: RunInspection) -> list[str]:
-    """One line when an ended run left ledger entries open, naming what can close them.
+    """The ledger entries an ended run left open: a summary line, then one fact line per entry.
 
     Such an entry keeps the root blocked, and ``hflow ledger settle`` refuses it while it is open.
-    What closes it follows the order ``hflow resume`` decides in, read from stored facts only (no
-    process is probed here, so the line names the condition, never whether it holds now):
-
-    * a run blocked ``owner_lost``: ``resume`` reconciles it - the takeover that blocked it already
-      proved the previous owner gone - and records each open entry ``unknown`` or
-      ``launch_unknown``;
-    * a run blocked ``outcome_unknown`` whose owner this build recorded (an owner token): the same
-      reconcile, but only once that owner is provably gone - the block (a cross-process
-      ``hflow cancel``, for one) does not prove its controller and agent stopped;
-    * a run blocked ``outcome_unknown`` with no owner token: reconciled without waiting on an owner
-      (none can be proven gone; ``cancel`` + ``resume`` is the documented way out for it);
-    * any other ended run with no owner token whose attempts recorded a controller pid: that pid
-      carries no host, so the owner can never be proven gone - ``resume`` closes the entries only
-      on the operator's attestation (``--legacy-owner-gone --attest``);
-    * otherwise ``resume`` closes them once the run's owner is provably gone, as ``unknown`` or
-      ``launch_unknown`` (or from the run's own recorded confirmed stop).
+    What closes it - ``hflow resume`` (``--legacy-owner-gone --attest`` for a pre-v6 run that
+    recorded a controller pid), then ``hflow ledger settle`` - is decided from stored facts in one
+    place, :func:`hflow.hints.plan_next`, which ``status`` / ``report`` print as ``next:`` lines
+    carrying the ``--data-dir`` this ledger needs. This section does not restate that decision.
 
     A live run's open entry is in flight, not left behind, so it gets no line.
     """
-    run = inspection.run
-    if run.task_state not in {TaskState.ACCEPTED, TaskState.BLOCKED, TaskState.CANCELLED}:
+    ended = {TaskState.ACCEPTED, TaskState.BLOCKED, TaskState.CANCELLED}
+    if inspection.run.task_state not in ended:
         return []
-    open_ids = [
-        item.invocation_id
-        for item in inspection.invocations
-        if item.state.value in INVOCATION_OPEN_STATES
+    entries = [
+        item for item in inspection.invocations if item.state.value in INVOCATION_OPEN_STATES
     ]
-    if not open_ids:
+    if not entries:
         return []
-    count = len(open_ids)
-    them = "it" if count == 1 else "them"
-    head = (
-        f"open entries  {count} ledger entr{'y' if count == 1 else 'ies'} left open on this ended "
-        f"run ({', '.join(open_ids)}) keep{'s' if count == 1 else ''} the root blocked: "
-    )
-    owner_token = inspection.owner.token if inspection.owner is not None else None
-    reconciled = (
-        "recording each as unknown or launch_unknown, then `hflow ledger settle <invocation_id>`"
-    )
-    if run.task_state is TaskState.BLOCKED and run.block_code == RefusalCode.OWNER_LOST.value:
-        return [
-            head
-            + f"`hflow resume {run.run_id}` reconciles {them} - the takeover that blocked this "
-            f"run owner_lost already proved its previous owner gone - {reconciled}"
-        ]
-    if run.task_state is TaskState.BLOCKED and run.block_code == RefusalCode.OUTCOME_UNKNOWN.value:
-        if owner_token is not None:
-            return [
-                head
-                + f"`hflow resume {run.run_id}` reconciles {them} once the run's owner is gone - "
-                "an outcome_unknown block (a cross-process `hflow cancel`, for one) does not "
-                "prove its controller and agent stopped, and while that owner may be alive "
-                f"resume writes nothing (exit 5) - {reconciled}"
-            ]
-        return [
-            head
-            + f"`hflow resume {run.run_id}` reconciles {them} - a run with no owner token is "
-            "reconciled without waiting on an owner, since none can be proven gone - "
-            f"{reconciled}"
-        ]
-    if owner_token is None and any(a.process_id is not None for a in inspection.attempts):
-        return [
-            head
-            + "the run has no owner token (written before storage v6, or a label-only claim) and "
-            "its attempts recorded a controller pid with no host, so HFlow can never prove its "
-            "owner gone. If you know that controller has exited, "
-            f"`hflow resume {run.run_id} --legacy-owner-gone --attest \"<what you know and why>\"` "
-            f"closes {them} on your attestation (recorded as one, never as an observation), then "
-            "`hflow ledger settle <invocation_id> --legacy-owner-gone`; until then `hflow ledger "
-            f"settle` refuses an open entry, so {'it keeps' if count == 1 else 'they keep'} "
-            "blocking the root"
-        ]
-    return [
-        head
-        + f"`hflow resume {run.run_id}` closes {them} once the run's owner is gone, then "
-        "`hflow ledger settle <invocation_id>`"
+    one = len(entries) == 1
+    lines = [
+        f"open entries  {len(entries)} ledger entr{'y' if one else 'ies'} left open on this "
+        f"ended run ({', '.join(item.invocation_id for item in entries)}) "
+        f"keep{'s' if one else ''} the root blocked, and `hflow ledger settle` refuses an open "
+        "entry: the next: lines say what closes "
+        + ("it" if one else "them")
     ]
+    lines.extend(
+        f"  {item.invocation_id}  role={item.role} state={item.state.value} "
+        f"attempt={item.attempt_id}"
+        for item in entries
+    )
+    return lines
 
 
 def _settlement_lines(settlement: InvocationSettlement) -> list[str]:
@@ -462,7 +413,8 @@ def launch_surfaces_lines(
 ) -> list[str]:
     """One invocation's launch-surface record as stored, or "not recorded". Never re-observed.
 
-    The record's notes are not repeated here; ``report --json`` carries them.
+    The record's notes are not repeated here, apart from the sandbox-mode lines; ``report
+    --json`` carries them all.
     """
     if surfaces is None:
         return [
@@ -513,6 +465,18 @@ def launch_surfaces_lines(
         f"{', '.join(surfaces.dsh_env_names) or 'none'} (names only)"
     )
     lines = [home, workspace, client_line]
+    # Two notes are worth a line before the first live task: the mode DSH's sandbox would run
+    # under, and the Desktop-shim warning (DSH #9626). The full text stays in ``--json``.
+    for note in surfaces.notes:
+        if note.startswith("DSH sandbox mode: "):
+            mode = note.removeprefix("DSH sandbox mode: ").split(";", 1)[0]
+            lines.append(f"{indent}sandbox       {role} {mode} (documented, not observed)")
+        elif "DSH #9626" in note:
+            lines.append(
+                f"{indent}warning       {role} DSH #9626: under the Desktop shim with the "
+                "workspace-write sandbox, shell tool calls are reported to fail with 0xC0000142 "
+                "(unconfirmed; workarounds in --json notes)"
+            )
     if surfaces.user_agents_file is not None:
         # Absent on a record written before it was observed: nothing to say rather than "absent".
         lines.append(

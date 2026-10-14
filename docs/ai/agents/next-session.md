@@ -1,40 +1,45 @@
-# Next-session handoff — 2026-10-14 (after batch K)
+# Next-session handoff — 2026-10-14 (after batch L)
 
 ## User decision (unchanged)
 
 > 先完成“小任务从授权到集成、异常后可恢复”的真实闭环，再扩展 Team，最接近实际可用。
 
-## What batch K delivered (offline only)
+## What batch L delivered (offline only)
 
-Batch K made the operator loop shorter without relaxing a rule. It followed the 2026-10-13 GitHub
-survey (ADR 0001 addendum: acpx v0.19.5 is dependency-only, the 0.17.1 pin stays; DSH
-`dsh-v0.2.1-alpha.2` exists but this machine's Desktop still carries 0.2.0-rc.2; ACP
-schema-v1.25.0 leaves the stable v1 `StopReason` set unchanged).
+Batch L followed the seventh GitHub survey (ADR 0001 addendum 2026-10-14: acpx, ACP and DSH code
+unchanged; new DSH community reports, chiefly #9626) and a three-part code audit.
 
-- **Plan flow** (`src/hflow/plan.py`): `prepare --plan-out P` saves prepare's inputs and preview;
-  `approve --plan P` re-resolves it, refuses a stale plan, and at a terminal only takes the
-  approval code (first 8 hex of the binding digest) plus the user's own words, then writes the
-  authorization exclusively; `run --plan P` takes every input from the plan (an extra resolution
-  flag is exit 4) and refuses a stale plan. The hand-written artifact still works.
-- **Approvals bind the ledger**: a real-driver binding names `ledger_path`, so an approval spent in
-  one data directory is not a second allowance in another.
-- **`next:` lines** (`src/hflow/hints.py`) after `run`, `status`, `report`, `resume`,
-  `ledger settle` and `integrate`: read from stored facts, never a re-run or a reused approval.
-  Attestation placeholders pasted verbatim are refused.
-- **Integrate**: the whole contract digest must match the run's (`project_mismatch`), and
-  `--project` may be omitted when `<root>/.hflow/project.json` still is that contract.
-- **DSH alpha.2 hardening**: the user-level agents file is recorded; an inherited
-  `DSH_AGENTS_HOME` is removed from the child; a prompt rejected by a JSON-RPC error after partial
-  work is pinned as `OUTCOME_UNKNOWN` (already the behaviour).
-- **Simplification**: ~300 lines of dead code and legacy store paths removed, duplicated helpers
-  merged, README 1218 -> ~670 lines, root planning notes moved to `docs/history/`, stale
-  `tools/m2_live` scripts deleted.
+- **Easier start and follow-up**: `hflow init project|profile|task` scaffolds (exclusive create,
+  `command` checks only, the reuse fit test left for the human), `hflow runs [--needs-you]
+  [--json]`, `hflow diff <run> [--stat]` (recorded commits only), `approve --plan P --run` (same
+  terminal gate, then exactly `run --plan`), a stale plan names the changed field and the
+  environment variable behind it, approve's `next:` omits the default authorization path, doctor
+  prints the acpx install command, error texts name their fix.
+- **DSH sandbox mode recorded**: every launch record notes the mode DSH would run under (bound
+  home's patch layers, else DSH's default `workspace-write`), and under the Desktop shim the #9626
+  warning; `prepare`/`report` show both as a `sandbox`/`warning` line. Records only.
+- **Bugs fixed**: a range `git diff` without `--` (ENAMETOOLONG under a deep cwd), the reviewer
+  packet stating a later deadline than the one sent, a TypeError reapplying a stop without an open
+  attempt, an unreadable root id list silently reset to `[]`, an identical TaskSpec refused after
+  its contract changed instead of answering from history, a report line printing `resume` without
+  `--data-dir`.
+- **Simplification**: the legacy store API (test-only) moved to `tests/store_helpers.py`; store,
+  migrate, controller, admission, CLI, drivers deduplicated (roughly 1 000 fewer source lines
+  before the new commands).
 
 ## Next step: the first live small task (needs its own explicit approval and budget)
 
 The live budget is still **0**. Run this checklist only after the user approves this specific
 task (AGENTS rule 10).
 
+0. **Open user decision first - the DSH sandbox route (#9626).** Through the Desktop shim a
+   `workspace-write` sandbox (DSH's default for a per-invocation home) is reported to make every
+   shell tool call exit `0xC0000142`. `prepare` now prints the mode as a `sandbox` line and the
+   risk as a `warning` line. Options for the user: (a) put an npm-installed `@deepseek-ai/dsh`
+   (`@0.2.0-rc.2` or a tagged alpha; an untagged `dsh-acp`/`dsh-headless` install gets 0.0.1-rc.1)
+   first on `PATH`, so node.exe is the runner; (b) bind a `DSH_HOME` whose patch layer the user sets
+   to the mode they choose; (c) accept the risk and treat a shell failure as the task's result.
+   HFlow records the choice, never makes it.
 1. Use a shell where the following holds:
    - The DSH Desktop shim directory
      `%LOCALAPPDATA%\Programs\DeepSeek Harness\resources\runtime\cli\bin` is prepended to `PATH`.
@@ -45,11 +50,14 @@ task (AGENTS rule 10).
 2. `python tools/m0_probe/real_client_checks.py all`. This is model-free.
 3. `python -m hflow doctor --profile <id>`. Every readiness line must be usable, and credentials
    must not say "would be REFUSED".
-4. `python -m hflow prepare --task <t.json> --profile <id> --project-root <repo> --plan-out
+4. (Once per repo/machine: `hflow init project` and `hflow init profile <id>`; per task
+   `hflow init task <id> --goal ... --allow ...`, then answer the reuse fit test by hand.)
+   `python -m hflow prepare --task <t.json> --profile <id> --project-root <repo> --plan-out
    <t.plan.json>` with a small task whose checks finish in seconds. Keep the turn well under DSH's
    reported 300 s stream timeout (and #9515: a lost tool-call start can hang; HFlow's wall-clock
    limit and the Job Object stop are the only bound).
-5. The user runs `python -m hflow approve --plan <t.plan.json>` in their own terminal: it shows
+5. The user runs `python -m hflow approve --plan <t.plan.json>` (or `... --run`, which then runs it in
+   the same terminal, so Ctrl+C reaches the owner) in their own terminal: it shows
    the plan and its approval code; the user types the code and their own approval text. An agent
    never types this - a scripted approval is a hand-written artifact quoting the user verbatim.
 6. `python -m hflow run --plan <t.plan.json>`. Then follow the `next:` lines: for

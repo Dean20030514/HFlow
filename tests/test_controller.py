@@ -31,12 +31,14 @@ from hflow.contracts import (
 from hflow.controller import Controller, inspect_run
 from hflow.drivers.fake import FakeDriver, FakeScript
 from hflow.ids import utc_now
+from hflow.ownership import current_identity, new_owner_token
 from hflow.report import status_text
 from hflow.store import Store, StoreError
 from hflow.verify import CheckRunners, FakeCheckRunner
 
 from .conftest import unit_only
 from .owner_exit import owner_exits, successor
+from .store_helpers import claim_run, reserve_turn
 
 
 # --------------------------------------------------------------------------
@@ -74,13 +76,13 @@ def _seed_live_run(
     )
     run_id = run["run_id"]
     if owner is None:
-        assert store.claim_run(run_id, "local-controller")
+        assert claim_run(store, run_id, "local-controller")
     else:
         assert store.claim_run_owned(
             run_id, "local-controller", token=owner.owner_token, identity=owner.owner_identity
         ) is not None
     if reserve:
-        store.reserve_turn(run_id, "local-controller", turns=reserve)
+        reserve_turn(store, run_id, "local-controller", turns=reserve)
     store.set_task_state(run_id, [TaskState.DRAFT], TaskState.READY)
     return run_id
 
@@ -231,6 +233,27 @@ def test_identical_spec_inside_a_loop_never_creates_a_second_accepted_run(
         row for row in store.list_runs() if row["task_state"] == TaskState.ACCEPTED.value
     ]
     assert len(accepted) == 1
+
+
+def test_an_ended_run_is_a_history_query_even_when_admission_would_now_refuse_it(
+    controller: Controller, driver, run_request: RunRequest
+) -> None:
+    """The contract changed after the run ended (its check is gone): the recorded outcome is
+    returned, not a refusal - nothing is admitted, reserved or dispatched either way."""
+    first = controller.run_task(run_request)
+    assert first.task_state is TaskState.ACCEPTED
+    changed = run_request.project.model_copy(
+        update={"checks": [c for c in run_request.project.checks if c.id != "unit"]}
+    )
+    again = controller.run_task(run_request.model_copy(update={"project": changed}))
+    assert again.run_id == first.run_id
+    assert again.task_state is TaskState.ACCEPTED
+    assert any("identical TaskSpec" in note for note in again.notes), again.notes
+    assert len(_implementer_turns(driver)) == 1
+    # A new TaskSpec under that contract is still refused at admission.
+    fresh = run_request.task.model_copy(update={"task_id": "T-002"})
+    with pytest.raises(RefusedError):
+        controller.run_task(run_request.model_copy(update={"project": changed, "task": fresh}))
 
 
 # --------------------------------------------------------------------------
@@ -541,22 +564,27 @@ def test_a_release_that_raises_changes_no_decision(
 def test_reservation_and_attempt_are_written_atomically(
     store: Store, run_request: RunRequest, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """If dispatch intent cannot be recorded, the reservation must not survive."""
+    """If dispatch intent cannot be recorded, the reservation must not survive.
+
+    The rootless path of ``reserve_dispatch``; the root path's own injection test is in
+    ``test_batch_e_ledger``.
+    """
     run_id = _seed_live_run(store, run_request, turn_limit=4, reserve=0)
     boot_count = {"value": 0}
 
-    def explode(**_kwargs: object) -> None:
+    def explode(*_args: object, **_kwargs: object) -> None:
         boot_count["value"] += 1
         raise StoreError("simulated crash while recording dispatch intent")
 
-    monkeypatch.setattr(store, "create_attempt", explode)
+    monkeypatch.setattr(store, "_attempt_for_dispatch_locked", explode)
 
     with pytest.raises(StoreError):
-        store.dispatch_attempt(
+        store.reserve_dispatch(
             run_id=run_id,
             controller_id="local-controller",
-            attempt_id="A-atomic",
+            invocation_id="I-atomic",
             role="implementer",
+            attempt_id="A-atomic",
             reservation_id="B-atomic",
             reserved_turns=1,
             reservation_expires_at=utc_now(),
@@ -577,10 +605,12 @@ def test_claim_is_exclusive_across_two_connections(
     run_id = _seed_live_run(store, run_request, turn_limit=4, reserve=0)
     other = Store(tmp_path / "data" / "hflow.sqlite")
     try:
-        assert other.claim_run(run_id, "controller-two") is False
+        assert other.claim_run_owned(
+            run_id, "controller-two", token=new_owner_token(), identity=current_identity()
+        ) is None
         assert other.get_run(run_id)["claimed_by"] == "local-controller"
         with pytest.raises(StoreError):
-            other.reserve_turn(run_id, "controller-two", turns=1)
+            reserve_turn(other, run_id, "controller-two", turns=1)
     finally:
         other.close()
 
@@ -589,9 +619,9 @@ def test_budget_ceiling_is_enforced_by_the_database_itself(
     store: Store, run_request: RunRequest
 ) -> None:
     run_id = _seed_live_run(store, run_request, turn_limit=1, reserve=0)
-    store.reserve_turn(run_id, "local-controller", turns=1)
+    reserve_turn(store, run_id, "local-controller", turns=1)
     with pytest.raises(StoreError):
-        store.reserve_turn(run_id, "local-controller", turns=1)
+        reserve_turn(store, run_id, "local-controller", turns=1)
 
 
 # --------------------------------------------------------------------------
@@ -622,26 +652,6 @@ def test_review_rejection_blocks_acceptance(
     assert outcome.task_state is TaskState.BLOCKED
     assert outcome.block_code is RefusalCode.REVIEW_REJECTED
     assert outcome.receipt is None
-
-
-def test_reviewer_isolation_is_recorded_from_enforcement_not_claims(
-    controller: Controller,
-    store: Store,
-    driver,
-    run_request: RunRequest,
-    fake_script: FakeScript,
-) -> None:
-    """Acceptance A08: text that says 'read-only' never upgrades the recorded level."""
-    fake_script.review = ReviewOutput(verdict="accepted", findings=[])
-    fake_script.claimed_isolation = "readonly_enforced"
-
-    outcome = controller.run_task(run_request)
-
-    assert outcome.receipt is not None
-    assert outcome.receipt.review.isolation is IsolationLevel.PROMPT_ONLY
-    review_evidence = store.evidence_for(outcome.run_id, "review")
-    assert len(review_evidence) == 1
-    assert "readonly_enforced" not in review_evidence[0]["detail"]
 
 
 def test_write_outside_declared_scope_refuses_acceptance(

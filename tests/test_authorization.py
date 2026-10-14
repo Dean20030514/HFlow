@@ -35,6 +35,8 @@ from hflow.controller import Controller
 from hflow.store import Store, StoreError
 from hflow.verify import CheckRunners, FakeCheckRunner
 
+from .store_helpers import claim_authorized_submission
+
 USER_TEXT = "I approve one real M2 run on this exact task, driver and base commit."
 
 #: A checked-in authorization written in the *old* format - the shape this repository produced
@@ -584,12 +586,12 @@ def test_an_unchanged_legacy_record_keeps_one_ledger_row(
     authorization = _record(real_request, project, tmp_path / "task.json", max_submissions=1)
     try:
         store.register_authorization(authorization.as_store_record())
-        store.claim_authorized_submission("AUTH-test-1")
+        claim_authorized_submission(store, "AUTH-test-1")
         # Re-registering the identical artifact returns the existing row rather than a new one.
         again = store.register_authorization(authorization.as_store_record())
         assert again["used_top_level_submissions"] == 1
         with pytest.raises(StoreError):
-            store.claim_authorized_submission("AUTH-test-1")
+            claim_authorized_submission(store, "AUTH-test-1")
     finally:
         store.close()
 
@@ -651,14 +653,14 @@ def test_a_fresh_authorization_id_resets_allowance_which_is_also_a_trust_limit(
     try:
         first = _record(real_request, project, tmp_path / "task.json", max_submissions=1)
         store.register_authorization(first.as_store_record())
-        store.claim_authorized_submission(first.authorization_id)
+        claim_authorized_submission(store, first.authorization_id)
         with pytest.raises(StoreError):
-            store.claim_authorized_submission(first.authorization_id)
+            claim_authorized_submission(store, first.authorization_id)
 
         # A different id - same user, same task, same everything else - has fresh allowance.
         second = first.model_copy(update={"authorization_id": "AUTH-test-2"})
         store.register_authorization(second.as_store_record())
-        assert store.claim_authorized_submission("AUTH-test-2") == 1
+        assert claim_authorized_submission(store, "AUTH-test-2") == 1
     finally:
         store.close()
 
@@ -708,9 +710,9 @@ def test_authorization_allowance_is_durable_and_exhausts(
 
     first = Store(path)
     first.register_authorization(authorization.as_store_record())
-    assert first.claim_authorized_submission("AUTH-test-1") == 1
+    assert claim_authorized_submission(first, "AUTH-test-1") == 1
     with pytest.raises(StoreError) as excinfo:
-        first.claim_authorized_submission("AUTH-test-1")
+        claim_authorized_submission(first, "AUTH-test-1")
     assert "exhausted" in str(excinfo.value)
     first.close()
 
@@ -720,7 +722,7 @@ def test_authorization_allowance_is_durable_and_exhausts(
         state = second.authorization_state("AUTH-test-1")
         assert state is not None and state["used_top_level_submissions"] == 1
         with pytest.raises(StoreError):
-            second.claim_authorized_submission("AUTH-test-1")
+            claim_authorized_submission(second, "AUTH-test-1")
     finally:
         second.close()
 

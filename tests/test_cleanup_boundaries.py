@@ -201,6 +201,37 @@ def test_retry_rechecks_new_hidden_index_flags(store, managed, monkeypatch, flag
     assert store.get_run("R-clean")["cleanup_intent_at"] is None
 
 
+def test_a_removal_rechecks_the_guards_once_per_attempt(store, managed, monkeypatch):
+    """The preview, then one recheck right before each ``git worktree remove`` - not two."""
+    _, worktree, _ = managed
+    original = cleanup.plan_cleanup
+    plans = []
+
+    def counting(*args, **kwargs):
+        plans.append(args[1])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(cleanup, "plan_cleanup", counting)
+    result = cleanup.apply_cleanup(store, "R-clean")
+    assert result["status"] == "REMOVED" and result["applied"]
+    assert plans == ["R-clean", "R-clean"]
+    assert not worktree.exists()
+
+
+def test_a_git_read_that_fails_during_planning_refuses_instead_of_raising(store, managed, monkeypatch):
+    _, worktree, _ = managed
+
+    def fail(*args, **kwargs):
+        raise GitError("git rev-parse --verify --end-of-options HEAD failed (exit 0xC0000142): no message")
+
+    monkeypatch.setattr(GitRepo, "worktree_commit", fail)
+    plan = cleanup.plan_cleanup(store, "R-clean")
+    assert not plan.allowed
+    assert "git_query_failed" in [item["reason"] for item in plan.refusals]
+    assert cleanup.apply_cleanup(store, "R-clean")["status"] == "REFUSED"
+    assert worktree.exists() and store.get_run("R-clean")["cleanup_intent_at"] is None
+
+
 def test_directory_vanishing_after_claim_never_marks_residual_registration_removed(store, managed, monkeypatch):
     _, worktree, provenance = managed
     original = store.record_cleanup_intent

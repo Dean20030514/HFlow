@@ -19,11 +19,13 @@ from __future__ import annotations
 import contextlib
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable
+from dataclasses import KW_ONLY, dataclass, field
 from pathlib import Path
 from typing import Protocol
 
@@ -73,18 +75,19 @@ REASON_BYTECODE_NOT_CLEARED = "bytecode_not_cleared"
 NOTE_BYTECODE_REMOVED = "bytecode_removed"
 
 
+@dataclass(slots=True, eq=False)
 class BytecodeRemoval:
     """What :func:`remove_worker_bytecode` removed, and what it refused to touch."""
 
-    def __init__(
-        self, files: int = 0, directories: int = 0, refused: Iterable[str] = ()
-    ) -> None:
-        self.files = files
-        self.directories = directories
-        #: Bytecode-shaped entries that were left in place and that a check could still load: a
-        #: ``__pycache__`` that is a link or junction, a ``.pyc`` link, or a file that could not be
-        #: removed. Any entry here means the check must not run.
-        self.refused = tuple(refused)
+    files: int = 0
+    directories: int = 0
+    #: Bytecode-shaped entries that were left in place and that a check could still load: a
+    #: ``__pycache__`` that is a link or junction, a ``.pyc`` link, or a file that could not be
+    #: removed. Any entry here means the check must not run.
+    refused: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        self.refused = tuple(self.refused)
 
     def note(self) -> str:
         return (
@@ -211,6 +214,7 @@ REASON_NOT_LAUNCHED = "not_launched"
 CLEAN_EXIT_REASONS = frozenset({REASON_COMPLETED, REASON_NONZERO_EXIT})
 
 
+@dataclass(slots=True, eq=False)
 class CheckOutcome:
     """Result of one check execution, before it becomes stored evidence.
 
@@ -220,46 +224,18 @@ class CheckOutcome:
     make the run's own record readable after the fact.
     """
 
-    __slots__ = (
-        "artifact_path",
-        "artifacts",
-        "command",
-        "detail",
-        "environment",
-        "exit_code",
-        "exit_reason",
-        "stderr_digest",
-        "stdout_digest",
-        "status",
-        "timed_out",
-    )
-
-    def __init__(
-        self,
-        status: EvidenceStatus,
-        *,
-        exit_code: int | None = None,
-        stdout_digest: str = "",
-        stderr_digest: str = "",
-        detail: str = "",
-        command: list[str] | None = None,
-        exit_reason: str = "",
-        timed_out: bool = False,
-        artifacts: dict[str, dict[str, object]] | None = None,
-        artifact_path: str = "",
-        environment: str = "",
-    ) -> None:
-        self.status = status
-        self.exit_code = exit_code
-        self.stdout_digest = stdout_digest
-        self.stderr_digest = stderr_digest
-        self.detail = detail
-        self.command = command or []
-        self.exit_reason = exit_reason
-        self.timed_out = timed_out
-        self.artifacts = artifacts or {}
-        self.artifact_path = artifact_path
-        self.environment = environment
+    status: EvidenceStatus
+    _: KW_ONLY
+    exit_code: int | None = None
+    stdout_digest: str = ""
+    stderr_digest: str = ""
+    detail: str = ""
+    command: list[str] = field(default_factory=list)
+    exit_reason: str = ""
+    timed_out: bool = False
+    artifacts: dict[str, dict[str, object]] = field(default_factory=dict)
+    artifact_path: str = ""
+    environment: str = ""
 
 
 class CheckRunner(Protocol):
@@ -315,9 +291,8 @@ class FakeCheckRunner:
 class CommandCheckRunner:
     """Runs an approved argv as a subprocess inside an owned process boundary.
 
-    Output is captured through temporary files rather than pipes: it is portable,
-    avoids deadlocks on large output, and keeps the controller free of a reader
-    thread. Only digests and a short excerpt reach the database.
+    Only digests, artifact references and a short excerpt reach the database; how the output
+    is captured is described below.
 
     The process itself is owned rather than merely started. On Windows the check is
     launched *inside* a Job Object (``drivers/winjob.py``), so a check that leaves
@@ -351,10 +326,10 @@ class CommandCheckRunner:
     Output is captured through pipes drained by two reader threads into bounded sinks, and the
     environment a check sees is built from an allowlist. What that means, and what it does not:
 
-    * a check that writes gigabytes is read to the end, digested in full, and *retained* only up
-      to the stream limit - so neither controller memory nor disk grows without bound, and the
-      difference between "this is all of it" and "this is the head of it" is recorded rather
-      than hidden. Draining continuously is also what keeps the child from blocking on a full
+    * a check that writes gigabytes is read to the end, counted in full, and *retained* (and
+      digested) only up to the stream limit - so neither controller memory nor disk grows
+      without bound, and the difference between "this is all of it" and "this is the head of
+      it" is recorded rather than hidden. Draining continuously is also what keeps the child from blocking on a full
       pipe, which capturing to a file never had to worry about;
     * the retained bytes, their sizes, digests and truncation state are written as artifacts
       under the run's data directory, and the evidence row names them - so "the log is
@@ -422,23 +397,6 @@ class CommandCheckRunner:
                 environment=environment_summary(env, withheld=withheld),
             )
         summary = environment_summary(env, withheld=withheld)
-        return self._run_in_environment(
-            check, cwd, argv, env, summary, started, deadline, artifact_dir, keep_artifacts
-        )
-
-    def _run_in_environment(
-        self,
-        check: CheckDef,
-        cwd: Path,
-        argv: list[str],
-        env: dict[str, str],
-        summary: str,
-        started: float,
-        deadline: float,
-        artifact_dir: Path,
-        keep_artifacts: bool,
-    ) -> CheckOutcome:
-        """One check's execution and evidence, in the environment :meth:`run` prepared."""
         out_sink = BoundedTextSink(artifact_dir / "stdout.txt", limit=self.stream_limit_bytes)
         err_sink = BoundedTextSink(artifact_dir / "stderr.txt", limit=self.stream_limit_bytes)
         try:
@@ -526,7 +484,8 @@ class CommandCheckRunner:
         else:
             outcome.artifact_path = str(manifest)
         if not keep_artifacts:
-            self._discard_artifacts(artifact_dir)
+            # A private temporary directory; failing to remove it is not a check failure.
+            shutil.rmtree(artifact_dir, ignore_errors=True)
         return outcome
 
     def _resolve_artifact_dir(self, check: CheckDef) -> tuple[str, Path | None, bool]:
@@ -546,18 +505,6 @@ class CommandCheckRunner:
         except OSError as exc:
             return f"could not create a temporary directory: {exc}", None, False
         return str(directory), directory, False
-
-    @staticmethod
-    def _discard_artifacts(directory: Path) -> None:
-        """Remove a private temporary artifact directory; a failure here is not a check failure."""
-        for child in sorted(directory.glob("**/*"), reverse=True):
-            with contextlib.suppress(OSError):
-                if child.is_file():
-                    child.unlink()
-                else:
-                    child.rmdir()
-        with contextlib.suppress(OSError):
-            directory.rmdir()
 
     # -- one execution, fully owned ------------------------------------------
 
@@ -583,6 +530,7 @@ class CommandCheckRunner:
 
         child: subprocess.Popen | None = None
         readers: list[threading.Thread] = []
+        readers_joined = False
         details: list[str] = [f"boundary={boundary.kind}"]
         try:
             out_sink.__enter__()
@@ -630,6 +578,7 @@ class CommandCheckRunner:
                 # None is an unanswered query (the pid could not be opened), not an exit.
                 details.append(f"direct_child_gone={'unknown' if gone is None else gone}")
             readers_incomplete = not self._join_readers(readers)
+            readers_joined = True
             reader_status = {
                 str(getattr(thread, "_hflow_name", index)): str(
                     getattr(thread, "_hflow_status", "unknown")
@@ -643,9 +592,6 @@ class CommandCheckRunner:
                     "reader_status="
                     + ",".join(f"{name}:{status}" for name, status in reader_status.items())
                 )
-            read_seconds = round(
-                sum(getattr(thread, "_hflow_finished_at", 0.0) for thread in readers), 3
-            )
             return {
                 "phase": "completed",
                 "returncode": returncode,
@@ -655,14 +601,16 @@ class CommandCheckRunner:
                 "details": details,
                 "readers_incomplete": readers_incomplete,
                 "reader_status": reader_status,
-                "read_seconds": read_seconds,
             }
         finally:
             # Everything that holds a pipe or a boundary handle is released here, on every path:
             # a reader left running would keep a pipe open, and on Windows a process still inside
             # the boundary holds its stdout/stderr handles. Closing the boundary also settles
-            # whatever is left in it (kill-on-close).
-            self._join_readers(readers)
+            # whatever is left in it (kill-on-close). The readers get their bounded wait once: a
+            # path that already waited for them and found a pipe still held open does not wait
+            # a second time, since nothing between the two waits could have released it.
+            if not readers_joined:
+                self._join_readers(readers)
             with contextlib.suppress(Exception):
                 out_sink.close()
             with contextlib.suppress(Exception):
@@ -703,9 +651,7 @@ class CommandCheckRunner:
         except (OSError, ValueError) as exc:  # defensive: drain reports instead of raising
             status = f"read_failed: {type(exc).__name__}: {exc}"
         finally:
-            thread = threading.current_thread()
-            thread._hflow_status = status  # type: ignore[attr-defined]
-            thread._hflow_finished_at = time.monotonic()  # type: ignore[attr-defined]
+            threading.current_thread()._hflow_status = status  # type: ignore[attr-defined]
 
     def _join_readers(self, readers: list[threading.Thread]) -> bool:
         """Wait a bounded time for the drain threads. ``False`` means a pipe is still held open."""

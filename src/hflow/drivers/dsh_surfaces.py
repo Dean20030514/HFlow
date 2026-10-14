@@ -14,7 +14,9 @@ environment-only ``DSH_AGENTS_HOME`` defaulting to ``~/.agents`` (:func:`user_ag
 This module checks a FIXED list of paths. It never lists a directory, never opens a ``.env`` or
 the home's stored-credentials file, never records a value (``DSH_AGENTS_HOME`` is a directory, and
 is recorded only as the location of the file it names), executes nothing, refuses nothing and
-binds nothing. :func:`_read_regular` is the only place a file is opened. :func:`carrier_files`
+binds nothing. The home's patch layers are read as bounded text for two notes (turn-time git,
+:func:`turn_git_notes`; the sandbox mode, :func:`sandbox_mode_notes`), from which only fixed
+tokens are recorded. :func:`_read_regular` is the only place a file is opened. :func:`carrier_files`
 and :func:`package_manifest_for` only *name* files; the binding by content is
 ``launch_content``'s. :func:`credential_sources` reports which credential sources a launch would
 have (a variable's name, two home files by stat); the refusal built on it lives in the driver
@@ -35,7 +37,8 @@ from typing import Literal, NamedTuple
 from ..contracts import ClientIdentity, LaunchConfig, LaunchSurfaces, SurfaceFile
 from ..ids import utc_now
 from ..report import surface_summary
-from .acpx_dsh import _client_module_tree, env_keys, path_inside
+from ..workspace import DSH_INSTRUCTION_FILE_NAMES, DSH_SKILL_DIRS, DSH_WORKSPACE_ENV_FILE
+from .acpx_dsh import DSH_AGENTS_HOME_ENV, _client_module_tree, env_key, path_inside
 
 #: The paths DSH reads in its home (pinned to dsh-v0.2.0-rc.2). The profile entry is formatted
 #: with the launch's profile and skipped when it has none.
@@ -47,8 +50,8 @@ DSH_HOME_SURFACE_NAMES = (
     "skills",
 )
 #: DSH's user-level agents file: ``$DSH_AGENTS_HOME/AGENTS.md``, the environment-only
-#: ``DSH_AGENTS_HOME`` defaulting to ``<home>/.agents`` (see :data:`USER_AGENTS_SOURCE`).
-DSH_AGENTS_HOME_NAME = "DSH_AGENTS_HOME"
+#: ``DSH_AGENTS_HOME`` (``acpx_dsh.DSH_AGENTS_HOME_ENV``) defaulting to ``<home>/.agents`` (see
+#: :data:`USER_AGENTS_SOURCE`).
 USER_AGENTS_DEFAULT_DIR = ".agents"
 USER_AGENTS_FILE_NAME = "AGENTS.md"
 #: Where the user-level agents file comes from, as far as it is known.
@@ -56,16 +59,18 @@ USER_AGENTS_SOURCE = (
     "read by DSH >= 0.2.1-alpha.2 after $DSH_HOME/AGENTS.md, per upstream source (commit "
     "21d0c2e2, tag dsh-v0.2.1-alpha.2): documented, not observed; dsh-v0.2.0-rc.2 does not read it"
 )
-#: Instruction files DSH's agent-instructions source reads in each directory from the project
-#: root down to the cwd (pinned to dsh-v0.2.0-rc.2). Whether DSH loads all four or only the
-#: first per directory is not verified.
-INSTRUCTION_FILE_NAMES = ("AGENTS.md", "CLAUDE.md", "AGENTS.local.md", "CLAUDE.local.md")
-#: Project skill directories, relative to the project root (pinned to dsh-v0.2.0-rc.2).
-PROJECT_SKILL_DIRS = (".dsh/skills", ".agents/skills")
+# The instruction files DSH reads in each directory from the project root down to the cwd
+# (``workspace.DSH_INSTRUCTION_FILE_NAMES``) and the project skill directories relative to the
+# project root (``workspace.DSH_SKILL_DIRS``) are defined once, in ``hflow.workspace``, which
+# classifies a candidate's changed paths against the same list (pinned to dsh-v0.2.0-rc.2).
+# Whether DSH loads all four instruction files or only the first per directory is not verified
+# here.
+
 #: What marks the project root for the instruction chain. A worktree's ``.git`` file counts.
 PROJECT_ROOT_MARKER = ".git"
-#: A ``.env`` may hold credentials, so it is examined by stat only, never opened.
-ENV_FILE_NAME = ".env"
+#: The env file DSH reads in its cwd and in its home (``workspace.DSH_WORKSPACE_ENV_FILE``). A
+#: ``.env`` may hold credentials, so it is examined by stat only, never opened.
+ENV_FILE_NAME = DSH_WORKSPACE_ENV_FILE
 #: A regular surface file above this size is recorded without a digest.
 SURFACE_HASH_LIMIT_BYTES = 4 * 1024 * 1024
 #: A package.json, a shim or a manifest above this size is not read.
@@ -199,13 +204,6 @@ def surface_file(base: Path, name: str, *, digest: bool = True) -> SurfaceFile:
     )
 
 
-def env_has_name(env: Mapping[str, str], name: str) -> bool:
-    """Whether ``name`` is a variable of ``env`` (case-insensitive on Windows). Never reads it."""
-    if os.name == "nt":
-        return bool(env_keys(env, name))
-    return name in env
-
-
 def stat_presence(path: Path) -> str:
     """``present`` / ``absent`` / ``present (not a file)`` / ``unknown (<error>)``, by one stat.
 
@@ -258,7 +256,7 @@ def credential_sources(
     ``.env`` is not looked at here: a real launch never starts on one (``workspace_env_file``).
     ``child_env`` is the environment the child is (or would be) started with
     (``acpx_dsh.child_environment``); ``DEEPSEEK_API_KEY`` is looked up by name only
-    (:func:`env_has_name`). A bound home that is not absolute is not looked into - where DSH
+    (``acpx_dsh.env_key``). A bound home that is not absolute is not looked into - where DSH
     resolves it depends on its working directory - so its files read ``unknown``. Records only:
     the refusal built on it is ``acpx_dsh.credential_source_problem``.
     """
@@ -275,7 +273,7 @@ def credential_sources(
             for name in HOME_CREDENTIAL_FILE_NAMES
         )
     return CredentialSources(
-        api_key_in_env=env_has_name(child_env, DEEPSEEK_API_KEY_NAME),
+        api_key_in_env=env_key(child_env, DEEPSEEK_API_KEY_NAME) is not None,
         dsh_home_kind=dsh_home_kind,
         dsh_home=str(home),
         home_files=files,
@@ -628,29 +626,18 @@ def carrier_files(launch: LaunchConfig) -> CarrierFiles:
     return CarrierFiles(carrier, shim, entry, manifest, "", [interpreter_note])
 
 
-def _env_value(env: Mapping[str, str], name: str) -> str | None:
-    """The value of ``name`` in ``env``, or ``None`` (case-insensitive on Windows, an exact
-    spelling first) - the lookup :func:`env_has_name` makes, for a variable whose value is a path.
-    """
-    if name in env:
-        return env[name]
-    if os.name == "nt":
-        for key, value in env.items():
-            if key.upper() == name.upper():
-                return value
-    return None
-
-
 def child_user_home(child_env: Mapping[str, str], child_home: Path | None = None) -> Path:
     """The directory DSH's ``os.homedir()`` returns in a child started with ``child_env``.
 
     ``child_home`` when given: the driver points every child's USERPROFILE/HOME at its
     invocation's own home (``acpx_dsh.child_home_for``). Otherwise Node's rule - USERPROFILE on
-    Windows, HOME elsewhere - read from ``child_env``, and failing that this process's home.
+    Windows, HOME elsewhere - read from ``child_env`` (``acpx_dsh.env_key``, an exact spelling
+    first), and failing that this process's home.
     """
     if child_home is not None:
         return Path(child_home)
-    value = _env_value(child_env, "USERPROFILE" if os.name == "nt" else "HOME")
+    key = env_key(child_env, "USERPROFILE" if os.name == "nt" else "HOME", exact_first=True)
+    value = child_env[key] if key is not None else ""
     return Path(value) if value else Path.home()
 
 
@@ -659,8 +646,8 @@ def user_agents_file(
 ) -> SurfaceFile:
     """DSH's user-level agents file at this launch (:data:`USER_AGENTS_SOURCE`). Records only.
 
-    ``$DSH_AGENTS_HOME/AGENTS.md`` when that variable reaches the child (looked up like
-    :func:`env_has_name`), else ``<home>/.agents/AGENTS.md`` with ``<home>`` from
+    ``$DSH_AGENTS_HOME/AGENTS.md`` when that variable reaches the child (``acpx_dsh.env_key``, an
+    exact spelling first), else ``<home>/.agents/AGENTS.md`` with ``<home>`` from
     :func:`child_user_home`. Examined like every other surface (:func:`surface_file`: presence,
     size, and a digest within :data:`SURFACE_HASH_LIMIT_BYTES`); never enforced and never a
     reason to refuse. An empty or relative ``DSH_AGENTS_HOME`` is not looked into - how DSH
@@ -669,9 +656,10 @@ def user_agents_file(
     """
     from .acpx_dsh import INVOCATION_ID_PLACEHOLDER
 
-    configured = _env_value(child_env, DSH_AGENTS_HOME_NAME)
-    if configured is not None:
-        name = f"${DSH_AGENTS_HOME_NAME}/{USER_AGENTS_FILE_NAME}"
+    configured_key = env_key(child_env, DSH_AGENTS_HOME_ENV, exact_first=True)
+    if configured_key is not None:
+        configured = child_env[configured_key]
+        name = f"${DSH_AGENTS_HOME_ENV}/{USER_AGENTS_FILE_NAME}"
         base = Path(configured)
         if not configured or not base.is_absolute():
             return SurfaceFile(
@@ -680,7 +668,7 @@ def user_agents_file(
                 present=None,
                 kind="unknown",
                 detail=(
-                    f"{DSH_AGENTS_HOME_NAME} is "
+                    f"{DSH_AGENTS_HOME_ENV} is "
                     + ("empty" if not configured else "a relative path")
                     + ": how DSH resolves it is not verified, so it was not looked into"
                 ),
@@ -751,6 +739,287 @@ def turn_git_notes(home: Path, profile: str) -> list[str]:
     return notes
 
 
+#: DSH's file-sandbox modes (``SANDBOX_MODES``,
+#: packages/sandbox/sandbox-policy/src/session-mode.ts:42, blob 0bc7110e, the same at
+#: dsh-v0.2.0-rc.2 and dsh-v0.2.1-alpha.2).
+SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access")
+#: The mode DSH's base bundle composes when no patch layer changes it and DSH_PERMISSION_MODE is
+#: unset: its ``sandbox-policy`` row reads ``mode: !!js process.env.DSH_PERMISSION_MODE ??
+#: 'workspace-write'`` (packages/bundle/base/cordis.patch.yml:232 at dsh-v0.2.0-rc.2, :241 at
+#: dsh-v0.2.1-alpha.2), and a new session is pinned to the preset matching it (permission-presets
+#: ``pinInitialPermission``). Documented from upstream source, not observed.
+DSH_DEFAULT_SANDBOX_MODE = "workspace-write"
+#: The variable that fallback reads. The driver removes it from every child
+#: (``acpx_dsh.STRIPPED_DSH_ENV``), and DSH refuses a ``DSH_*`` name from any ``.env``
+#: (bootstrap-only names, packages/boot/app-boot/src/index.ts:156-177 at dsh-v0.2.0-rc.2).
+DSH_PERMISSION_MODE_NAME = "DSH_PERMISSION_MODE"
+#: The base-bundle rows that decide a new session's mode. The ``permission`` row's
+#: ``defaultPreset`` pins a new session to that preset's mode; without one the preset matching the
+#: ``sandbox-policy`` row's ``mode`` is used. A patch row replaces the targeted row's whole
+#: ``config`` (apps/cli/reference/README.md:9 at dsh-v0.2.0-rc.2), so a ``permission`` row
+#: patched without ``presets`` keeps only the schema-default table, whose two presets
+#: (workspace-write, danger-full-access) bundle the mode of the same name
+#: (packages/interaction/permission-presets/src/index.ts:182-199, blob 8135d742).
+SANDBOX_POLICY_ROW = "sandbox-policy"
+PERMISSION_ROW = "permission"
+SCHEMA_DEFAULT_PRESET_MODES = ("workspace-write", "danger-full-access")
+#: How an ACP client could change the mode: it cannot. At dsh-v0.2.0-rc.2 and -alpha.2 DSH's ACP
+#: server handles initialize, authenticate, session/new|list|resume|close|prompt|cancel and
+#: session/set_config_option, whose only options are ``model`` and ``reasoning_effort``
+#: (packages/acp/acp/src/index.ts:379-390 and model-control.ts:8-9, 103-130 at rc.2).
+ACP_SANDBOX_MODE_FACT = (
+    "an ACP client cannot change it per session: DSH's ACP server offers no session mode, and "
+    "session/set_config_option takes only model and reasoning_effort (dsh-v0.2.0-rc.2 and "
+    "-alpha.2 source)"
+)
+#: Shell tool calls under the Desktop carrier with the workspace-write sandbox (DSH discussion
+#: #9626, 2026-10-13, three independent reproductions; duplicates #9467, #9507, #9548, #9621,
+#: #9493; no maintainer confirmation).
+DSH_9626_NOTE = (
+    "DSH #9626 (community reports, three independent reproductions on Desktop 0.2.0-rc.2; not "
+    "confirmed by maintainers, not observed here): the Desktop build starts its Windows ACL "
+    "sandbox runner as [process.execPath, runner], and under the Desktop shim process.execPath "
+    "is DeepSeek Harness.exe (ELECTRON_RUN_AS_NODE=1), so with the workspace-write sandbox every "
+    "sandboxed shell tool call is reported to exit 0xC0000142 (STATUS_DLL_INIT_FAILED) with no "
+    "output; read-only and danger-full-access are reported unaffected (upstream "
+    "packages/sandbox/sandbox-local/src/index.ts:571-580, blob 45028746, the same at "
+    "dsh-v0.2.0-rc.2 and dsh-v0.2.1-alpha.2). Workarounds: start DSH from the npm-installed CLI "
+    "(@deepseek-ai/dsh), whose runner is node.exe; or bind a DSH home whose sandbox mode the "
+    "user chooses in its cordis.patch.yml. Documented, unconfirmed; recorded, never enforced"
+)
+#: A ``- id: <row>`` line of a patch file; the row's block is every following line indented
+#: deeper than its dash (blank and comment lines included).
+_PATCH_ROW = re.compile(
+    r"^(?P<indent>[ \t]*)-[ \t]+id[ \t]*:[ \t]*(?P<quote>['\"]?)(?P<id>[A-Za-z0-9_.@/-]+)"
+    r"(?P=quote)[ \t]*(?:#.*)?$"
+)
+#: A preset name worth naming in a note; anything else is "not a plain name".
+_PRESET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+#: A YAML comment: ``#`` at a line's start or after whitespace, to the end of the line.
+_YAML_COMMENT = re.compile(r"(?:^|(?<=\s))#.*$")
+
+
+def _uncommented(text: str) -> str:
+    """``text`` with YAML comments cut and tabs expanded, so a commented-out key never counts.
+
+    Conservative: a ``#`` inside a quoted value is cut too, which can only turn a value into one
+    that is not recognised.
+    """
+    return "\n".join(_YAML_COMMENT.sub("", line.expandtabs()) for line in text.splitlines())
+
+
+def _patch_rows(text: str) -> dict[str, str]:
+    """The block of each ``- id: <row>`` entry of a patch file, by row id (YAML-free).
+
+    ``text`` is :func:`_uncommented`. A block runs from its ``- id:`` line to the next non-blank
+    line indented no deeper than its dash. Only that spelling is recognised (an ``id`` that is
+    not a row's first key is not); a row named twice in one file keeps its last block.
+    """
+    rows: dict[str, str] = {}
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        match = _PATCH_ROW.match(lines[index])
+        if match is None:
+            index += 1
+            continue
+        depth = len(match.group("indent"))
+        block = [lines[index]]
+        index += 1
+        while index < len(lines):
+            line = lines[index]
+            if line.strip() and len(line) - len(line.lstrip()) <= depth:
+                break
+            block.append(line)
+            index += 1
+        rows[match.group("id")] = "\n".join(block)
+    return rows
+
+
+def _row_values(block: str, key: str) -> list[str]:
+    """Every value written for ``key`` inside one row block: block or flow style, quotes off.
+
+    An expression (``!!js ...``) is returned as its tag, so it never matches a plain value.
+    """
+    pattern = re.compile(
+        rf"(?:^|[\s{{,]){re.escape(key)}[ \t]*:[ \t]*"
+        r"(?P<value>!![A-Za-z]+|'[^'\r\n]*'|\"[^\"\r\n]*\"|[^\s,}\]#]+)",
+        re.MULTILINE,
+    )
+    return [match.group("value").strip("'\"") for match in pattern.finditer(block)]
+
+
+def _has_key(block: str, key: str) -> bool:
+    return re.search(rf"(?:^|[\s{{,]){re.escape(key)}[ \t]*:", block, re.MULTILINE) is not None
+
+
+class SandboxModeFinding(NamedTuple):
+    """The sandbox mode a new ACP session would get, as far as text can say. Records only.
+
+    ``mode`` is one of :data:`SANDBOX_MODES`, or ``""`` when it could not be determined;
+    ``source`` says where it comes from (or why it is unknown); ``default`` is True when no
+    layer sets it and DSH's own default applies.
+    """
+
+    mode: str
+    source: str
+    default: bool = False
+
+
+def configured_sandbox_mode(
+    home: Path,
+    profile: str,
+    *,
+    dsh_home_kind: Literal["bound", "per_invocation"],
+    look_in_home: bool,
+    child_env: Mapping[str, str],
+) -> SandboxModeFinding:
+    """Which sandbox mode DSH would start a new ACP session in, read from the home's patch layers.
+
+    DSH composes its tree from bundle layers, then ``profiles/<profile>/cordis.patch.yml``, then
+    ``$DSH_HOME/cordis.patch.yml`` (which outranks the profile layer); later layers win per row
+    (apps/cli/src/profile-boot.ts:185-195 and apps/cli/reference/README.md:9 at dsh-v0.2.0-rc.2).
+    Those two files are read - bounded, as text - for a ``permission`` row's ``defaultPreset``
+    and a ``sandbox-policy`` row's ``mode``; nothing is evaluated, so an expression, a redefined
+    preset table, an unrecognised spelling or a file that cannot be read gives ``""`` with why.
+    Neither file naming either row means DSH's default (:data:`DSH_DEFAULT_SANDBOX_MODE`). A
+    profile whose bundle list replaces ``dsh-base`` is not considered. Never a refusal.
+    """
+    which = "bound DSH home" if dsh_home_kind == "bound" else "per-invocation DSH home"
+    if not look_in_home and dsh_home_kind == "bound":
+        return SandboxModeFinding("", f"the {which} was not looked into")
+    # Per row, the highest-precedence layer naming it: ("row", file, block), or ("unread", file,
+    # why) for a layer that exists but could not be read - it may name either row.
+    winners: dict[str, tuple[str, str, str]] = {}
+    unrecognised = ""
+    layers = ([f"profiles/{profile}/cordis.patch.yml"] if profile else []) + ["cordis.patch.yml"]
+    for name in layers if look_in_home else ():  # lowest precedence first
+        path = home / name
+        if not os.path.exists(path):
+            continue
+        data, _size, detail = _read_regular(path, MANIFEST_READ_LIMIT_BYTES)
+        if data is None:
+            for row in (PERMISSION_ROW, SANDBOX_POLICY_ROW):
+                winners[row] = ("unread", name, detail)
+            continue
+        text = _uncommented(data.decode("utf-8", errors="replace"))
+        rows = _patch_rows(text)
+        for row in (PERMISSION_ROW, SANDBOX_POLICY_ROW):
+            if row in rows:
+                winners[row] = ("row", name, rows[row])
+        folded = text.casefold()
+        if (SANDBOX_POLICY_ROW not in rows and SANDBOX_POLICY_ROW in folded) or (
+            PERMISSION_ROW not in rows and "defaultpreset" in folded
+        ):
+            unrecognised = (
+                f"the {which}'s {name} mentions the sandbox-policy row or a defaultPreset in a "
+                "form this text scan does not recognise: not evaluated"
+            )
+
+    def unread(entry: tuple[str, str, str]) -> SandboxModeFinding:
+        _kind, name, detail = entry
+        return SandboxModeFinding(
+            "", f"the {which}'s {name} could not be read ({detail}), and it may set the mode"
+        )
+
+    permission = winners.get(PERMISSION_ROW)
+    if permission is not None:
+        kind, name, block = permission
+        if kind == "unread":
+            return unread(permission)
+        presets = _row_values(block, "defaultPreset")
+        if presets:
+            preset = presets[-1]
+            shown = preset if _PRESET_NAME.fullmatch(preset) else "a value that is not a plain name"
+            where = f"the {which}'s {name} (permission row, defaultPreset {shown})"
+            if (
+                len(set(presets)) == 1
+                and preset in SCHEMA_DEFAULT_PRESET_MODES
+                and not _has_key(block, "presets")
+            ):
+                return SandboxModeFinding(preset, f"set by {where}, read as text")
+            return SandboxModeFinding(
+                "", f"{where} decides it; which mode that preset bundles is not evaluated here"
+            )
+    policy = winners.get(SANDBOX_POLICY_ROW)
+    if policy is not None:
+        kind, name, block = policy
+        if kind == "unread":
+            return unread(policy)
+        modes = _row_values(block, "mode")
+        where = f"the {which}'s {name} (sandbox-policy row, mode)"
+        if len(set(modes)) == 1 and modes[0] in SANDBOX_MODES:
+            return SandboxModeFinding(modes[0], f"set by {where}, read as text")
+        return SandboxModeFinding(
+            "",
+            f"{where} names the row without one plain mode (an expression, or a config that "
+            "omits it): not evaluated",
+        )
+    if unrecognised:
+        return SandboxModeFinding("", unrecognised)
+    if env_key(child_env, DSH_PERMISSION_MODE_NAME) is not None:
+        return SandboxModeFinding(
+            "",
+            f"no patch layer sets it and {DSH_PERMISSION_MODE_NAME} reaches the child, so DSH's "
+            "fallback is that variable (its value is not recorded)",
+        )
+    if dsh_home_kind == "per_invocation":
+        why = "the per-invocation DSH home is created empty, so no patch layer changes it"
+    else:
+        why = "no patch layer of the bound DSH home names the permission or sandbox-policy row"
+    # The variable is not named here: the probe's own note on DSH's mode variables says which
+    # ones it found and removed.
+    return SandboxModeFinding(
+        DSH_DEFAULT_SANDBOX_MODE,
+        f"not set (DSH default, documented as {DSH_DEFAULT_SANDBOX_MODE}): {why}, and the driver "
+        "keeps DSH's permission-mode variable out of the child",
+        default=True,
+    )
+
+
+def sandbox_mode_notes(
+    home: Path,
+    profile: str,
+    *,
+    dsh_home_kind: Literal["bound", "per_invocation"],
+    look_in_home: bool,
+    child_env: Mapping[str, str],
+    carrier: str,
+) -> list[str]:
+    """The sandbox-mode note, and DSH #9626's when the carrier is the Desktop shim. Records only.
+
+    The mode is :func:`configured_sandbox_mode`'s. The #9626 note (:data:`DSH_9626_NOTE`) is
+    added for the Desktop carrier when the mode is workspace-write - set, or DSH's default - or
+    could not be determined; never for read-only or danger-full-access, and never for the npm
+    carrier. Nothing is refused and no capability changes.
+    """
+    finding = configured_sandbox_mode(
+        home,
+        profile,
+        dsh_home_kind=dsh_home_kind,
+        look_in_home=look_in_home,
+        child_env=child_env,
+    )
+    if finding.default:
+        head = f"DSH sandbox mode: {finding.source}"
+    elif finding.mode:
+        head = f"DSH sandbox mode: {finding.mode}, {finding.source}"
+    else:
+        head = f"DSH sandbox mode: unknown - {finding.source}"
+    notes = [
+        f"{head}; {ACP_SANDBOX_MODE_FACT}. Documented from upstream source, not observed; "
+        "recorded, never enforced"
+    ]
+    if carrier == "desktop" and finding.mode in ("", "workspace-write"):
+        prefix = (
+            "the DSH sandbox mode could not be determined; if it is workspace-write: "
+            if not finding.mode
+            else "the dsh carrier is the Desktop shim and the DSH sandbox mode is workspace-write: "
+        )
+        notes.append(prefix + DSH_9626_NOTE)
+    return notes
+
+
 def observe_launch_surfaces(
     launch: LaunchConfig,
     *,
@@ -801,6 +1070,17 @@ def observe_launch_surfaces(
                 surface_file(home, name, digest=Path(name).name != ENV_FILE_NAME)
             )
         notes.extend(turn_git_notes(home, launch.profile))
+    client = observe_client_identity(launch)
+    notes.extend(
+        sandbox_mode_notes(
+            home,
+            launch.profile,
+            dsh_home_kind=dsh_home_kind,
+            look_in_home=look_in_home,
+            child_env=child_env,
+            carrier=client.dsh_carrier,
+        )
+    )
     workspace_env: SurfaceFile | None = None
     project_root = ""
     instruction_files: list[SurfaceFile] = []
@@ -822,13 +1102,13 @@ def observe_launch_surfaces(
         base = root if root is not None else ws
         for directory in chain:
             prefix = directory.relative_to(base).as_posix()
-            for name in INSTRUCTION_FILE_NAMES:
+            for name in DSH_INSTRUCTION_FILE_NAMES:
                 entry = surface_file(directory, name)
                 if entry.present is False:
                     continue
                 relative_name = name if prefix == "." else f"{prefix}/{name}"
                 instruction_files.append(entry.model_copy(update={"name": relative_name}))
-        skill_dirs = [surface_file(base, rel) for rel in PROJECT_SKILL_DIRS]
+        skill_dirs = [surface_file(base, rel) for rel in DSH_SKILL_DIRS]
     return LaunchSurfaces(
         observed_at=utc_now(),
         dsh_home_kind=dsh_home_kind,
@@ -838,12 +1118,12 @@ def observe_launch_surfaces(
         user_agents_file=user_agents_file(child_env, child_home=child_home),
         workspace=str(ws) if ws is not None else "",
         workspace_env=workspace_env,
-        deepseek_api_key_inherited=env_has_name(child_env, DEEPSEEK_API_KEY_NAME),
+        deepseek_api_key_inherited=env_key(child_env, DEEPSEEK_API_KEY_NAME) is not None,
         project_root=project_root,
         instruction_files=instruction_files,
         skill_dirs=skill_dirs,
         dsh_env_names=dsh_env_names(child_env),
-        client=observe_client_identity(launch),
+        client=client,
         notes=notes,
     )
 
