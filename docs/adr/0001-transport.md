@@ -483,3 +483,24 @@ the mode is the bound home's patch layers or, for a per-invocation home, `worksp
 mode is or may be `workspace-write`. Per the source `read-only` also runs through the same runner
 (`sandbox-local/src/index.ts` L369-377); only `danger-full-access` skips it, so "read-only works"
 in #9626 is the reporters' observation, not something the code explains.
+
+### Follow-up 2026-10-14 (later) — DSH alpha.3 and the sandbox route
+
+- DSH `dsh-v0.2.1-alpha.3` (`2fbf4359`, released 2026-10-14 13:32Z; npm `alpha` 0.2.1-alpha.3,
+  `latest`/`next` still 0.2.0-rc.2): 852 commits after alpha.2, but `packages/acp/acp/src` is still
+  tree `5d63d1b7` and `packages/sandbox/sandbox-local/src/index.ts` is still blob `45028746`, so
+  #9626 is not fixed there. *documented*
+- The Desktop shim cannot be pointed at another runner: `dsh.cmd` starts `DeepSeek Harness.exe`
+  with `ELECTRON_RUN_AS_NODE=1` on an entry inside `app.asar`, which a plain node.exe cannot load.
+  The user chose (2026-10-14) the npm route for the first live task: `@deepseek-ai/dsh@0.2.0-rc.2`
+  (the Desktop's version, so the same source was read) installed with `--ignore-scripts` under the
+  HFlow data directory, not globally, and put first on `PATH` only in the live shell. Its runner is
+  then the node.exe that runs DSH, which #9626 reports as working; that stays *documented* until
+  the live task observes it.
+- The install (536 packages, 510 MB, `--ignore-scripts`) needs none of the four skipped scripts on
+  Windows x64: node-pty ships `prebuilds/win32-x64` (conpty.node, conpty.dll, OpenConsole.exe),
+  koffi loads its binary from `@koromix/koffi-win32-x64`, and the other two only set a POSIX
+  executable bit or print a version check. Its shim sits in `node_modules/.bin` and names the
+  package through `..`, which `dsh_surfaces` now classifies as the npm carrier
+  (`npm_package_dir`), so the approval binds `@deepseek-ai/dsh/lib/bin.js` and its package.json by
+  content; `doctor` reports `dsh carrier npm 0.2.0-rc.2` and no #9626 note.

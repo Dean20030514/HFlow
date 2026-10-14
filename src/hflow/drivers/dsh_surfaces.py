@@ -106,6 +106,9 @@ BATCH_SHIM_SUFFIXES = (".cmd", ".bat")
 #: backslashes with forward slashes and casefolding. Pinned to dsh-v0.2.0-rc.2.
 DESKTOP_SHIM_MARKERS = ("electron_run_as_node", "deepseek harness.exe")
 NPM_SHIM_MARKER = "node_modules/@deepseek-ai/dsh/"
+#: A local install's shim (``npm install --prefix P`` puts it in ``P/node_modules/.bin``) names the
+#: package relative to itself: ``"%dp0%\..\@deepseek-ai\dsh\lib\bin.js"`` (npm 11, dsh-v0.2.0-rc.2).
+NPM_LOCAL_SHIM_MARKER = "/../@deepseek-ai/dsh/"
 #: What a recorded version may look like; anything else is not recorded.
 _VERSION_TOKEN = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}")
 #: A script a batch shim runs, written relative to the shim's own directory - npm's
@@ -323,6 +326,24 @@ def _json_file(path: Path, notes: list[str]) -> dict | None:
     return parsed
 
 
+def npm_package_dir(shim: Path, text: str) -> Path | None:
+    """The ``@deepseek-ai/dsh`` package directory an npm shim runs, or ``None``. Reads nothing.
+
+    ``text`` is the shim's text with ``/`` separators, casefolded. A global install's shim sits
+    beside ``node_modules`` (:data:`NPM_SHIM_MARKER`); a local install's sits in
+    ``node_modules/.bin`` and names the package through ``..`` (:data:`NPM_LOCAL_SHIM_MARKER`).
+    """
+    if NPM_SHIM_MARKER in text:
+        return shim.parent / "node_modules" / "@deepseek-ai" / "dsh"
+    if (
+        NPM_LOCAL_SHIM_MARKER in text
+        and shim.parent.name.casefold() == ".bin"
+        and shim.parent.parent.name.casefold() == "node_modules"
+    ):
+        return shim.parent.parent / "@deepseek-ai" / "dsh"
+    return None
+
+
 def observe_client_identity(launch: LaunchConfig) -> ClientIdentity:
     """The acpx, SDK and dsh carrier versions, read from files. Nothing is executed."""
     notes: list[str] = []
@@ -402,9 +423,9 @@ def observe_client_identity(launch: LaunchConfig) -> ClientIdentity:
                             )
                 else:
                     notes.append("the Desktop shim has no runtime manifest location")
-            elif NPM_SHIM_MARKER in text:
+            elif (package_dir := npm_package_dir(shim, text)) is not None:
                 carrier = "npm"
-                manifest = shim.parent / "node_modules" / "@deepseek-ai" / "dsh" / "package.json"
+                manifest = package_dir / "package.json"
                 package = _json_file(manifest, notes)
                 if package is not None:
                     identity["dsh_version"] = _version(
@@ -500,8 +521,9 @@ def carrier_files(launch: LaunchConfig) -> CarrierFiles:
 
     Classified the way :func:`observe_client_identity` classifies the carrier (same markers):
     the Desktop shim runs ``DeepSeek Harness.exe`` on a script, the npm shim runs ``node`` on
-    ``node_modules/@deepseek-ai/dsh/...``. The script is the one path ending in ``.js``/``.mjs``/
-    ``.cjs`` that the shim writes relative to its own directory (``%~dp0`` / ``%dp0%``).
+    ``@deepseek-ai/dsh/...`` (:func:`npm_package_dir`: a global or a local install). The script
+    is the one path ending in ``.js``/``.mjs``/``.cjs`` that the shim writes relative to its own
+    directory (``%~dp0`` / ``%dp0%``).
     """
     dsh = launch.dsh_executable
     if not dsh or dsh not in launch.agent_argv:
@@ -539,7 +561,7 @@ def carrier_files(launch: LaunchConfig) -> CarrierFiles:
             "the Desktop shim's DeepSeek Harness.exe (the program that runs the carrier entry) is "
             "bound by path only"
         )
-    elif NPM_SHIM_MARKER in text:
+    elif npm_package_dir(shim, text) is not None:
         carrier = "npm"
         interpreter_note = (
             "the npm shim starts node from its own directory or from PATH; that node is bound by "

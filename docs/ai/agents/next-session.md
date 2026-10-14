@@ -32,17 +32,17 @@ unchanged; new DSH community reports, chiefly #9626) and a three-part code audit
 The live budget is still **0**. Run this checklist only after the user approves this specific
 task (AGENTS rule 10).
 
-0. **Open user decision first - the DSH sandbox route (#9626).** Through the Desktop shim a
+0. **DSH sandbox route (#9626) - decided 2026-10-14: the npm CLI.** Through the Desktop shim a
    `workspace-write` sandbox (DSH's default for a per-invocation home) is reported to make every
-   shell tool call exit `0xC0000142`. `prepare` now prints the mode as a `sandbox` line and the
-   risk as a `warning` line. Options for the user: (a) put an npm-installed `@deepseek-ai/dsh`
-   (`@0.2.0-rc.2` or a tagged alpha; an untagged `dsh-acp`/`dsh-headless` install gets 0.0.1-rc.1)
-   first on `PATH`, so node.exe is the runner; (b) bind a `DSH_HOME` whose patch layer the user sets
-   to the mode they choose; (c) accept the risk and treat a shell failure as the task's result.
-   HFlow records the choice, never makes it.
+   shell tool call exit `0xC0000142`. The user chose the npm route: `@deepseek-ai/dsh@0.2.0-rc.2`
+   is installed (`--ignore-scripts`) at `%LOCALAPPDATA%\HFlow\dsh\0.2.0-rc.2`; in the live shell put
+   `%LOCALAPPDATA%\HFlow\dsh\0.2.0-rc.2\node_modules\.bin` first on `PATH` *instead of* the Desktop
+   shim directory. `prepare`'s `client` line must then say `dsh=npm`, and no `warning ... DSH #9626`
+   line may appear. If a native module turns out to need an install script, report it rather than
+   re-installing with scripts.
 1. Use a shell where the following holds:
-   - The DSH Desktop shim directory
-     `%LOCALAPPDATA%\Programs\DeepSeek Harness\resources\runtime\cli\bin` is prepended to `PATH`.
+   - The npm DSH bin directory from step 0 is prepended to `PATH` (not the Desktop shim
+     directory `%LOCALAPPDATA%\Programs\DeepSeek Harness\resources\runtime\cli\bin`).
    - `DEEPSEEK_API_KEY` is set in that shell, or `DSH_HOME` is bound to a home that holds
      `.credentials.yaml` and boots headless. Never create a home from nothing (DSH #7978).
    - `HFLOW_ALLOW_WRITES=1` is set.

@@ -727,6 +727,57 @@ def _npm_launch(tmp_path: Path, **fields: object) -> LaunchConfig:
     return _launch(dsh_executable=str(shim), agent_argv=argv, profile="acp", **fields)
 
 
+#: The shim npm 11 writes to ``P/node_modules/.bin/dsh.cmd`` for ``npm install --prefix P
+#: @deepseek-ai/dsh@0.2.0-rc.2`` (copied from such an install on 2026-10-14).
+NPM_LOCAL_SHIM = (
+    "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\n"
+    "CALL :find_dp0\r\n\r\nIF EXIST \"%dp0%\\node.exe\" (\r\n  SET \"_prog=%dp0%\\node.exe\"\r\n"
+    ") ELSE (\r\n  SET \"_prog=node\"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\n"
+    "endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"  "
+    "\"%dp0%\\..\\@deepseek-ai\\dsh\\lib\\bin.js\" %*\r\n"
+)
+
+
+def test_a_local_npm_install_is_the_npm_carrier_and_binds_its_entry(tmp_path: Path) -> None:
+    """``npm install --prefix P`` puts the shim in ``P/node_modules/.bin`` and names the package
+    through ``..``: the same carrier as a global install, with its entry and package.json named."""
+    from hflow.drivers.dsh_surfaces import carrier_files
+
+    modules = tmp_path / "prefix" / "node_modules"
+    shim = modules / ".bin" / "dsh.cmd"
+    shim.parent.mkdir(parents=True)
+    shim.write_text(NPM_LOCAL_SHIM, encoding="utf-8", newline="")
+    package = modules / "@deepseek-ai" / "dsh"
+    (package / "lib").mkdir(parents=True)
+    (package / "lib" / "bin.js").write_text("// dsh\n", encoding="utf-8")
+    (package / "package.json").write_text(
+        json.dumps({"name": "@deepseek-ai/dsh", "version": "0.2.0-rc.2"}), encoding="utf-8"
+    )
+    launch = _launch(
+        dsh_executable=str(shim), agent_argv=[CMD, "/c", str(shim), "--profile", "acp"],
+        profile="acp",
+    )
+
+    identity = observe_client_identity(launch)
+    assert identity.dsh_carrier == "npm", identity.notes
+    assert identity.dsh_version == "0.2.0-rc.2"
+    files = carrier_files(launch)
+    assert files.carrier == "npm"
+    assert files.entry == package / "lib" / "bin.js"
+    assert files.package_json == package / "package.json"
+
+    # The same text outside node_modules/.bin names no package: unknown, never a guess.
+    stray = tmp_path / "elsewhere" / "dsh.cmd"
+    stray.parent.mkdir()
+    stray.write_text(NPM_LOCAL_SHIM, encoding="utf-8", newline="")
+    odd = _launch(
+        dsh_executable=str(stray), agent_argv=[CMD, "/c", str(stray), "--profile", "acp"],
+        profile="acp",
+    )
+    assert observe_client_identity(odd).dsh_carrier == "unknown"
+    assert carrier_files(odd).carrier == "unknown"
+
+
 def _mode_notes(surfaces: LaunchSurfaces) -> tuple[list[str], list[str]]:
     """``(sandbox-mode notes, DSH #9626 notes)`` of one record."""
     return (
