@@ -62,10 +62,12 @@ task (AGENTS rule 10).
 8. After the run, check the worktree root with `icacls`, because of the reported DSH Windows
    sandbox ACE/Low-label leftovers (#8312). If `clean` refuses, record the refusal; never force it.
 
-Open, not decided (ask before acting): pinning `@agentclientprotocol/sdk` for a fresh acpx 0.17.1
-install (it now resolves 1.8.0, stricter on malformed values); whether DSH's ACP/headless profile
-runs `git add` at turn start (#9382, reported for Web/Desktop) - if so, a worktree's shared hooks
-and filters could run during a turn.
+Settled 2026-10-14: the ACP SDK is not pinned (user ruling) - after any acpx reinstall run
+`python tools/m0_probe/real_client_checks.py all --acpx-cli <entry>` and add a passing SDK version
+to `CHECKED_SDK_VERSIONS`; DSH's turn-time `git add` (#9382) is Web/Desktop-only by source, so the
+ACP path is unaffected unless a bound home's acp profile adds `dsh-web-app` (noted by
+`dsh_surfaces`). A bound `DSH_HOME` for the live task should keep the acp profile's bundles at
+`[dsh-base, dsh-acp-app]`.
 
 Only after that real evidence comes Team/DAG work. Before parallel tasks:
 

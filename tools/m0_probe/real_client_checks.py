@@ -18,6 +18,12 @@ Usage:
     python tools/m0_probe/real_client_checks.py version
     python tools/m0_probe/real_client_checks.py mock
     python tools/m0_probe/real_client_checks.py all
+    python tools/m0_probe/real_client_checks.py all --acpx-cli <node_modules/acpx/dist/cli.js>
+
+``--acpx-cli`` (default: ``HFLOW_ACPX_CLI``, else the checkout's ``.probe/acpx`` install) checks
+another installation - a fresh install resolves whatever ``@agentclientprotocol/sdk`` its range
+allows, so run this after any reinstall. The report records the acpx and SDK versions it
+exercised. A pass is model-free evidence against the mock agent, not a live compatibility proof.
 """
 
 from __future__ import annotations
@@ -52,6 +58,23 @@ def resolve_node() -> str:
     if not node:
         raise SystemExit("node is not on PATH; the real acpx client cannot be launched")
     return node
+
+
+def client_versions(entry: Path) -> dict:
+    """The acpx and @agentclientprotocol/sdk versions this entry resolves (package.json reads)."""
+    from hflow.drivers.dsh_surfaces import package_manifest_for, sdk_manifest_for
+
+    versions: dict = {"acpx_version": None, "sdk_version": None}
+    for key, manifest in (
+        ("acpx_version", package_manifest_for(entry)),
+        ("sdk_version", sdk_manifest_for(entry)),
+    ):
+        if manifest is not None:
+            try:
+                versions[key] = json.loads(manifest.read_text(encoding="utf-8")).get("version")
+            except (OSError, ValueError):
+                pass
+    return versions
 
 
 def node_syntax_check(node: str, entry: Path) -> dict:
@@ -365,15 +388,23 @@ def check_permission(node: str, *, allow_writes: bool) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
+    global INSTALLED_ACPX  # every check launches this entry; --acpx-cli replaces it
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "check", choices=["version", "mock", "config", "permission", "all"], nargs="?", default="all"
     )
     parser.add_argument("--out", default=str(PROBE_ROOT / "results.json"))
+    parser.add_argument(
+        "--acpx-cli",
+        default=os.environ.get("HFLOW_ACPX_CLI") or str(INSTALLED_ACPX),
+        help="the acpx dist/cli.js to check (default: HFLOW_ACPX_CLI, else .probe/acpx)",
+    )
     args = parser.parse_args(argv)
 
+    INSTALLED_ACPX = Path(args.acpx_cli).resolve()
     node = resolve_node()
     results: dict = {"node": node, "installed_acpx": str(INSTALLED_ACPX)}
+    results.update(client_versions(INSTALLED_ACPX))
     if args.check in {"version", "all"}:
         results["version"] = check_version(node)
     if args.check in {"config", "all"}:

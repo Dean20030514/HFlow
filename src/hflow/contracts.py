@@ -771,6 +771,9 @@ LaunchFileKind = Literal[
     "client_interpreter",
     "client_entry",
     "client_package_json",
+    # The @agentclientprotocol/sdk package.json Node resolves from the client entry: the SDK is
+    # not pinned (user ruling 2026-10-14), so the version a launch runs with is bound instead.
+    "client_sdk_package_json",
     "dsh_launcher",
     "carrier_entry",
     "carrier_package_json",

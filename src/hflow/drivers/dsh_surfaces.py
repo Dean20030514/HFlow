@@ -81,10 +81,18 @@ STORED_CREDENTIALS_NAME = ".credentials.yaml"
 HOME_CREDENTIAL_FILE_NAMES = (STORED_CREDENTIALS_NAME, ENV_FILE_NAME)
 #: :func:`stat_presence`'s answer for a regular file - the only answer that counts as a source.
 PRESENT = "present"
-#: The acpx version ADR 0001 recorded, and the @agentclientprotocol/sdk version observed with the
-#: pinned acpx on 2026-10-02. A different version is noted, never refused.
+#: The acpx version ADR 0001 recorded. A different version is noted, never refused.
 RECORDED_ACPX_VERSION = "0.17.1"
-RECORDED_SDK_VERSION = "1.4.0"
+#: The @agentclientprotocol/sdk versions the pinned acpx has passed the model-free client checks
+#: with (``tools/m0_probe/real_client_checks.py all``: the real client against the mock agent -
+#: not a live compatibility proof). The SDK is deliberately not pinned (user ruling 2026-10-14): a
+#: fresh acpx install resolves whatever ``^1.4.0`` allows, the launch content binding covers the
+#: SDK's package.json, and a version outside this list is noted - never refused - with the check
+#: to run before a live task.
+CHECKED_SDK_VERSIONS = {
+    "1.4.0": "2026-10-02, the checkout's .probe/acpx install",
+    "1.8.0": "2026-10-14, a fresh acpx 0.17.1 install",
+}
 #: Only a Windows batch shim's text is classified; compared casefolded (the test stand-in is
 #: ``dsh.CMD``, the Desktop shim ``dsh.cmd``).
 BATCH_SHIM_SUFFIXES = (".cmd", ".bat")
@@ -343,18 +351,7 @@ def observe_client_identity(launch: LaunchConfig) -> ClientIdentity:
                     f"acpx {identity['acpx_version']} differs from {RECORDED_ACPX_VERSION}, the "
                     "version ADR 0001 recorded; nothing here re-verified it"
                 )
-        # Node resolves a bare import from the importing file's directory upwards, trying each
-        # ``node_modules`` it passes (without NODE_PATH); a directory that is itself a
-        # node_modules is not searched inside.
-        start = Path(os.path.abspath(entry)).parent
-        sdk_manifest = None
-        for directory in (start, *start.parents):
-            if directory.name.casefold() == "node_modules":
-                continue
-            candidate = directory / "node_modules" / "@agentclientprotocol" / "sdk" / "package.json"
-            if os.path.isfile(candidate):
-                sdk_manifest = candidate
-                break
+        sdk_manifest = sdk_manifest_for(Path(entry))
         if sdk_manifest is None:
             notes.append(
                 "no @agentclientprotocol/sdk package.json on Node's node_modules walk from the "
@@ -367,10 +364,13 @@ def observe_client_identity(launch: LaunchConfig) -> ClientIdentity:
                 identity["sdk_version"] = _version(
                     sdk.get("version"), "@agentclientprotocol/sdk", notes
                 )
-                if identity["sdk_version"] and identity["sdk_version"] != RECORDED_SDK_VERSION:
+                if identity["sdk_version"] and identity["sdk_version"] not in CHECKED_SDK_VERSIONS:
                     notes.append(
-                        f"@agentclientprotocol/sdk {identity['sdk_version']} differs from "
-                        f"{RECORDED_SDK_VERSION}, observed with the pinned acpx on 2026-10-02"
+                        f"@agentclientprotocol/sdk {identity['sdk_version']} has not passed the "
+                        "model-free client checks (checked: "
+                        f"{', '.join(CHECKED_SDK_VERSIONS)}); run `python "
+                        "tools/m0_probe/real_client_checks.py all --acpx-cli <this entry>` "
+                        "before a live task"
                     )
 
     carrier: Literal["desktop", "npm", "unknown", "not_applicable"] = "unknown"
@@ -417,6 +417,23 @@ def observe_client_identity(launch: LaunchConfig) -> ClientIdentity:
             else:
                 notes.append("the shim matches neither the Desktop nor the npm layout")
     return ClientIdentity(dsh_carrier=carrier, notes=notes, **identity)
+
+
+def sdk_manifest_for(entry: Path) -> Path | None:
+    """The ``@agentclientprotocol/sdk`` package.json Node would resolve from ``entry``, or ``None``.
+
+    Node resolves a bare import from the importing file's directory upwards, trying each
+    ``node_modules`` it passes (without NODE_PATH); a directory that is itself a node_modules is
+    not searched inside.
+    """
+    start = Path(os.path.abspath(entry)).parent
+    for directory in (start, *start.parents):
+        if directory.name.casefold() == "node_modules":
+            continue
+        candidate = directory / "node_modules" / "@agentclientprotocol" / "sdk" / "package.json"
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 
 def package_manifest_for(entry: Path) -> Path | None:
@@ -694,6 +711,46 @@ def user_agents_file(
     return surface_file(base, USER_AGENTS_FILE_NAME).model_copy(update={"name": name})
 
 
+#: What loads DSH's ``workspace-changes`` plugin: its own id, or the Web/Desktop bundle that lists
+#: it (``packages/bundle/web-app/cordis.patch.yml``, dsh-v0.2.0-rc.2 and dsh-v0.2.1-alpha.2).
+TURN_GIT_MARKERS = ("workspace-changes", "dsh-web-app")
+
+
+def turn_git_notes(home: Path, profile: str) -> list[str]:
+    """A note when a bound home's profile layers name what runs git at every turn. Records only.
+
+    DSH's ``workspace-changes`` plugin runs ``git add --all`` and ``git write-tree`` in the
+    workspace repository at each top-level turn start and end, with a private index but the
+    repository's own config, so its hooks, fsmonitor and clean/process filters can run (DSH #9382,
+    unconfirmed by maintainers). Only the Web/Desktop bundle loads it; the ACP profile template is
+    ``[dsh-base, dsh-acp-app]`` and a per-invocation home always gets that template (upstream
+    source, documented - not observed). A bound home's ``profiles/<profile>/package.json`` (its
+    bundle list) or a patch layer can add it, so those files are searched - bounded, as text,
+    for :data:`TURN_GIT_MARKERS` - and a hit is noted with what it would mean. A mention may also
+    be an entry that disables it; the note says "names", not "loads".
+    """
+    candidates = ["cordis.patch.yml"]
+    if profile:
+        candidates += [f"profiles/{profile}/cordis.patch.yml", f"profiles/{profile}/package.json"]
+    notes: list[str] = []
+    for name in candidates:
+        data, _size, _detail = _read_regular(home / name, MANIFEST_READ_LIMIT_BYTES)
+        if data is None:
+            continue
+        text = data.decode("utf-8", errors="replace").casefold()
+        found = [marker for marker in TURN_GIT_MARKERS if marker in text]
+        if found:
+            notes.append(
+                f"the bound DSH home's {name} names {', '.join(found)}: DSH's workspace-changes "
+                "plugin runs `git add --all` and `git write-tree` in the workspace repository at "
+                "every turn start and end, which can run that repository's hooks, fsmonitor and "
+                "clean/process filters (DSH #9382; documented from dsh-v0.2.0-rc.2 and "
+                "-alpha.2 source, not observed). The default acp profile does not load it; check "
+                "whether this entry enables it (recorded, never enforced)"
+            )
+    return notes
+
+
 def observe_launch_surfaces(
     launch: LaunchConfig,
     *,
@@ -743,6 +800,7 @@ def observe_launch_surfaces(
             home_files.append(
                 surface_file(home, name, digest=Path(name).name != ENV_FILE_NAME)
             )
+        notes.extend(turn_git_notes(home, launch.profile))
     workspace_env: SurfaceFile | None = None
     project_root = ""
     instruction_files: list[SurfaceFile] = []

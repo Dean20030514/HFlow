@@ -345,7 +345,9 @@ Consequences worth knowing:
 - **Launch entry files are bound by content; transitive modules and anything Node loads later
   remain bound by path** (`launch_content_digest`, user ruling 2026-10-03). The list is fixed and
   short: the client interpreter (`node.exe`), the acpx entry file and its package's
-  `package.json`, the dsh launcher the agent argv starts, and for a Desktop or npm carrier the
+  `package.json`, the `@agentclientprotocol/sdk` `package.json` Node resolves from that entry
+  (`client_sdk_package_json`; see "The ACP SDK is not pinned" below), the dsh launcher the agent
+  argv starts, and for a Desktop or npm carrier the
   carrier entry its shim runs (the one `%~dp0`/`%dp0%`-relative `.js` path in the shim) and that
   file's `package.json`. For the installed Desktop carrier that script
   (`..\..\..\app.asar\dsh\node_modules\@deepseek-ai\dsh-desktop-host\lib\cli.js`) and its
@@ -365,7 +367,7 @@ Consequences worth knowing:
   just before `CreateProcess`, and refuses a changed byte, a changed size, or a path that now
   resolves elsewhere (`launch_content_changed`, spawn reported as not created, the run blocked;
   `prepare` again and re-issue). Hashing `node.exe` (~90 MB) costs about 60 ms warm.
-- What this does not cover: `node_modules` trees and everything Node resolves at runtime, DSH's
+- What this does not cover: `node_modules` trees (beyond the two `package.json` files above) and everything Node resolves at runtime, DSH's
   own code loading, the Desktop carrier's `DeepSeek Harness.exe` and `app.asar.unpacked` tree,
   the npm shim's `node`,
   `cmd.exe`, and whatever an unclassified dsh launcher starts (the launcher file itself is bound).
@@ -374,6 +376,18 @@ Consequences worth knowing:
   that path is both hashed and started, so a link cannot point the hash at one file and the spawn
   at another. A missing or unreadable file, a Node entry outside any `node_modules` package, or a
   Desktop/npm shim whose carrier entry cannot be named makes the launch not resolvable.
+- **The ACP SDK is not pinned** (user ruling 2026-10-14: keep compatibility checkable rather than
+  lock a version). acpx 0.17.1 declares `@agentclientprotocol/sdk ^1.4.0` and ships no lockfile,
+  so a fresh install resolves the newest 1.x (1.8.0 on 2026-10-14); the checkout's `.probe/acpx`
+  install keeps 1.4.0 through its own `package-lock.json`. Three things keep that safe: the SDK's
+  `package.json` is bound by content, so a reinstall after approval refuses the approval
+  (`launch_content_changed`) instead of running a client nobody saw; `prepare`/`doctor` note an SDK
+  version that has not passed the model-free client checks (`CHECKED_SDK_VERSIONS` in
+  `src/hflow/drivers/dsh_surfaces.py`: 1.4.0 and 1.8.0 so far); and `python
+  tools/m0_probe/real_client_checks.py all --acpx-cli <node_modules/acpx/dist/cli.js>` runs those
+  checks against any install (the real client against the mock agent: version, config, permission
+  mapping and a full `exec` turn - not a live compatibility proof). After a reinstall that resolves
+  a new SDK, run it, and add the version to the list only when it passes.
 - **The base commit is bound as a SHA.** `workspace.base_commit` (or `--base-commit`) may name a
   ref such as `HEAD` or `main`; `prepare` and `run` resolve it once to a 40-hex commit, and the
   binding's `base_commit` is that SHA, not the name. The task text and its `spec_digest` do not
@@ -1908,6 +1922,15 @@ enforced, refused or part of an approval.
   instruction file elsewhere that no approval binds is not pointed at; and the client identity - acpx and @agentclientprotocol/sdk versions from
   their package.json (the SDK found by Node's node_modules walk from the client entry), and the
   dsh carrier.
+- **Turn-time git (DSH #9382):** DSH's `workspace-changes` plugin runs `git add --all` and
+  `git write-tree` in the workspace repository at every top-level turn start and end, with a
+  private index but the repository's own config - so its hooks (`post-index-change`,
+  `core.hooksPath`), fsmonitor and clean/process filters can run, and a worktree shares the user
+  checkout's config. Only the Web/Desktop bundle (`dsh-web-app`) loads it; the ACP profile
+  template HFlow launches is `[dsh-base, dsh-acp-app]`, and a per-invocation home always starts
+  from that template (dsh-v0.2.0-rc.2 and -alpha.2 source, documented - not observed). For a bound
+  home, the patch layers and `profiles/<profile>/package.json` are searched as text and a mention
+  of `workspace-changes` or `dsh-web-app` is noted in the record (recorded, never enforced).
 - **How it is read:** a fixed list of paths, never a directory listing. A regular file gets its
   size and SHA-256 (none above 4 MiB); a `.env` is examined by stat only - presence and size,
   never opened - and the home's stored-credentials file is never read. An entry that cannot be

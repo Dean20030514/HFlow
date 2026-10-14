@@ -2,7 +2,9 @@
 
 What is bound, and nothing more: SHA-256 of the client interpreter (``node.exe`` for the real
 acpx; the Python interpreter for the test stand-in), the acpx entry file and the package.json of
-the package it lies in, the dsh launcher file the agent argv starts, and - for a Desktop or npm
+the package it lies in, the ``@agentclientprotocol/sdk`` package.json Node resolves from that entry (the SDK is not
+pinned, so its version is bound instead), the dsh launcher file the agent argv starts, and - for a
+Desktop or npm
 carrier - the carrier entry file its shim runs and that file's package.json. When that entry's
 path passes through a regular file named ``*.asar`` (the installed Desktop app's
 ``resources/app.asar``), the entry and its package.json exist only inside that Electron archive;
@@ -103,7 +105,12 @@ def launch_entry_files(
     package.json, a classified carrier whose entry cannot be named); the launch is then not
     resolvable. A note says what is deliberately left bound by path.
     """
-    from .dsh_surfaces import NODE_SCRIPT_SUFFIXES, carrier_files, package_manifest_for
+    from .dsh_surfaces import (
+        NODE_SCRIPT_SUFFIXES,
+        carrier_files,
+        package_manifest_for,
+        sdk_manifest_for,
+    )
 
     files: list[tuple[str, str]] = []
     problems: list[str] = []
@@ -116,6 +123,12 @@ def launch_entry_files(
         manifest = package_manifest_for(Path(entry))
         if manifest is not None:
             files.append(("client_package_json", final_path(str(manifest))))
+            # The SDK is not pinned (user ruling 2026-10-14); its package.json is bound so that a
+            # reinstall resolving another version after approval refuses the approval instead of
+            # running a client the user did not see.
+            sdk = sdk_manifest_for(Path(entry))
+            if sdk is not None:
+                files.append(("client_sdk_package_json", final_path(str(sdk))))
         elif Path(entry).suffix.casefold() in NODE_SCRIPT_SUFFIXES:
             problems.append(
                 f"the acpx client entry {entry} is a Node script outside any node_modules "

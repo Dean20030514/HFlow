@@ -261,6 +261,38 @@ def test_a_node_entry_without_its_package_json_is_not_resolvable(tmp_path: Path)
     assert len(changes) == 1 and changes[0].startswith("client_package_json")
 
 
+def test_the_unpinned_sdk_is_bound_by_its_package_json(tmp_path: Path) -> None:
+    """The SDK is not pinned (user ruling 2026-10-14): a reinstall that resolves another
+    @agentclientprotocol/sdk version after approval is a content change, never a silent one."""
+    modules = tmp_path / "npm" / "node_modules"
+    entry = modules / "acpx" / "dist" / "cli.js"
+    entry.parent.mkdir(parents=True)
+    entry.write_text("// stand-in", encoding="utf-8")
+    (modules / "acpx" / "package.json").write_text(
+        '{"name": "acpx", "version": "0.17.1"}', encoding="utf-8"
+    )
+    sdk = modules / "@agentclientprotocol" / "sdk" / "package.json"
+    sdk.parent.mkdir(parents=True)
+    sdk.write_text('{"name": "@agentclientprotocol/sdk", "version": "1.8.0"}', encoding="utf-8")
+    node = tmp_path / "nodejs" / "node.exe"
+    node.parent.mkdir()
+    node.write_bytes(b"MZ-node-stand-in")
+
+    bound = resolve_launch_config(
+        data_dir=tmp_path / "data",
+        acpx_cli=entry,
+        node_executable=str(node),
+        agent_argv_override=[sys.executable, "-c", "pass"],
+    )
+
+    assert bound.resolvable, bound.detail
+    paths = {item.kind: item.path for item in bound.content_digests}
+    assert paths["client_sdk_package_json"] == str(sdk)
+    sdk.write_text('{"name": "@agentclientprotocol/sdk", "version": "1.9.0"}', encoding="utf-8")
+    changes = launch_content_changes(bound)
+    assert len(changes) == 1 and changes[0].startswith("client_sdk_package_json")
+
+
 def test_an_npm_carrier_binds_its_entry_and_package_json(tmp_path: Path) -> None:
     if os.name != "nt":
         pytest.skip("the carrier shims are Windows batch files")

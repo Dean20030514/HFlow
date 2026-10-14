@@ -136,10 +136,54 @@ def test_a_bound_home_is_examined_from_a_fixed_list_and_its_stored_credentials_a
     assert files["cordis.patch.yml"].sha256 == _sha(cordis)
     assert files["skills"].kind == "directory"
     assert files[".env"].kind == "file" and files[".env"].sha256 == ""
-    assert {path.name for path in reads} <= {"cordis.patch.yml", "AGENTS.md"}
+    # The patch layers and the profile's bundle list are read as text for the turn-git note;
+    # nothing else is opened, and never the stored credentials or the .env.
+    assert {path.name for path in reads} <= {"cordis.patch.yml", "AGENTS.md", "package.json"}
     dumped = surfaces.model_dump_json()
     assert "cred-sentinel" not in dumped and "unrelated.txt" not in dumped
     assert ".credentials" not in dumped
+    assert not [note for note in surfaces.notes if "workspace-changes" in note]
+
+
+def test_a_bound_home_whose_profile_loads_the_web_bundle_is_noted_not_refused(
+    tmp_path: Path,
+) -> None:
+    """DSH #9382: workspace-changes runs `git add` at every turn; only dsh-web-app loads it."""
+    home = tmp_path / "bound"
+    profile = home / "profiles" / "acp"
+    profile.mkdir(parents=True)
+    (profile / "package.json").write_text(
+        '{"dependencies": {"@deepseek-ai/dsh-base": "*", "@deepseek-ai/dsh-acp-app": "*"}}',
+        encoding="utf-8",
+    )
+
+    def observe():
+        return observe_launch_surfaces(
+            _launch(dsh_home=str(home), profile="acp"),
+            dsh_home=home,
+            dsh_home_kind="bound",
+            child_env={},
+        )
+
+    assert not [note for note in observe().notes if "workspace-changes" in note]
+
+    (profile / "package.json").write_text(
+        '{"dependencies": {"@deepseek-ai/dsh-base": "*", "@deepseek-ai/dsh-web-app": "*"}}',
+        encoding="utf-8",
+    )
+    [note] = [note for note in observe().notes if "workspace-changes" in note]
+    assert "profiles/acp/package.json names dsh-web-app" in note
+    assert "git add --all" in note and "never enforced" in note
+
+    # A per-invocation home is never looked into: it always starts from the acp template.
+    fresh = observe_launch_surfaces(
+        _launch(profile="acp"),
+        dsh_home=home,
+        dsh_home_kind="per_invocation",
+        child_env={},
+        look_in_home=False,
+    )
+    assert not [note for note in fresh.notes if "workspace-changes" in note]
 
 
 def test_an_entry_that_cannot_be_examined_is_unknown_not_absent(
@@ -313,12 +357,22 @@ def test_client_and_sdk_versions_are_read_from_package_files(tmp_path: Path) -> 
     assert identity.sdk_version == "1.4.0"
     assert identity.acpx_package_json == str(acpx_manifest)
     assert identity.sdk_package_json == str(sdk_manifest)
-    assert not [note for note in identity.notes if "differs from" in note]
+    assert not [note for note in identity.notes if "client checks" in note]
 
-    _package(modules / "acpx" / "node_modules" / "@agentclientprotocol" / "sdk", "sdk", "1.7.0")
+    # A version outside the model-free-checked list is noted with the check to run, never refused.
+    nested_sdk = modules / "acpx" / "node_modules" / "@agentclientprotocol" / "sdk"
+    _package(nested_sdk, "sdk", "1.7.0")
     nested = observe_client_identity(_launch(client_entry=str(entry)))
     assert nested.sdk_version == "1.7.0"
-    assert any("differs from 1.4.0" in note for note in nested.notes)
+    assert any(
+        "1.7.0 has not passed the model-free client checks" in note
+        and "real_client_checks.py all --acpx-cli" in note
+        for note in nested.notes
+    )
+    _package(nested_sdk, "sdk", "1.8.0")
+    checked = observe_client_identity(_launch(client_entry=str(entry)))
+    assert checked.sdk_version == "1.8.0"
+    assert not [note for note in checked.notes if "client checks" in note]
 
     _package(modules / "acpx", "acpx", "1.0.0; rm -rf")
     odd = observe_client_identity(_launch(client_entry=str(entry)))

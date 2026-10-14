@@ -421,3 +421,23 @@ names `@deepseek-ai/dsh-desktop` and `@deepseek-ai/dsh-desktop-runtime` 0.2.0-rc
 archive header, nothing executed; file dated 2026-09-29), so the alpha.2 behaviour above does not
 apply to it until Desktop updates itself - and an update changes the launch content an approval
 binds, so it surfaces as a refused approval rather than as a silent change.
+
+### Follow-up 2026-10-14 — the two open items
+
+- **SDK: not pinned** (user ruling: keep compatibility checkable rather than lock a version). A
+  fresh `npm install acpx@0.17.1` resolved `@agentclientprotocol/sdk` 1.8.0, `@openclaw/fs-safe`
+  0.12.0 and zod 4.6.7. `tools/m0_probe/real_client_checks.py all` (now with `--acpx-cli`) passed
+  all six model-free checks - version, config reads/writes, permission reads/writes and a full
+  `exec` turn against the mock agent - both on that install (SDK 1.8.0) and on the checkout's
+  `.probe/acpx` (SDK 1.4.0). That is *offline-tested* against a mock agent, not a live
+  compatibility proof. The SDK's `package.json` is now bound in `launch_content_digest`, and a
+  version outside `CHECKED_SDK_VERSIONS` is noted with the check to run.
+- **#9382 does not apply to the ACP path by default** (*documented* from source, `dsh-v0.2.0-rc.2`
+  `639ed015` and `dsh-v0.2.1-alpha.2` `d7432673`): the `git add --all` / `git write-tree` comes
+  from the `workspace-changes` plugin (`packages/deliverables/workspace-changes/src/git.ts:154-172`,
+  hooked on `turn/start`/`turn/end`), which only `packages/bundle/web-app/cordis.patch.yml` loads;
+  the ACP profile template is `[dsh-base, dsh-acp-app]` (`packages/boot/app-boot/src/profile.ts:180-182`)
+  and `packages/acp` runs no git. It uses a private index and object store but the repository's
+  own config, with no hooks or fsmonitor override, so a bound home whose acp profile adds
+  `dsh-web-app` or the plugin would run the workspace repository's hooks and filters at every
+  turn; `dsh_surfaces` now notes such a home. #9382 has no maintainer reply.
