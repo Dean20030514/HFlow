@@ -1,5 +1,7 @@
 """Cleanup cannot race a live admission or infer a missing registration."""
 
+import contextlib
+import os
 import shutil
 import subprocess
 import threading
@@ -12,6 +14,7 @@ import hflow.cleanup as cleanup
 from hflow.contracts import TaskState, WorkspaceProvenance, WorkspaceSpec, canonical_json, digest_of
 from hflow.drivers.fake import FakeDriver, FakeScript
 from hflow.gitworkspace import GitError, GitRepo
+from hflow.hints import shell_word
 from hflow.store import Store
 from tests.test_batch_e_repair import (
     FIXED_SOURCE, FailingOnceThenPassing, _controller, _git, _project, _request,
@@ -19,6 +22,26 @@ from tests.test_batch_e_repair import (
 )
 from hflow.verify import CheckRunners
 from tests.owner_exit import owner_exits
+
+
+def _blocked_run_in_a_worktree(store, task_spec, project_root):
+    """A settled run ``R-clean`` whose worktree was made from ``project_root``'s repository."""
+    repo = GitRepo.discover(project_root)
+    base = repo.resolve_commit("HEAD")
+    worktree = repo.create_worktree("R-clean", base)
+    spec = task_spec.model_copy(update={"workspace": WorkspaceSpec(mode="worktree", base_commit=base)})
+    store.create_run(
+        run_id="R-clean", project_id="P-clean", spec=spec,
+        spec_digest=digest_of(spec.model_dump(mode="json")), controller_build="test",
+        checks_digest="checks", turn_limit=4, repair_limit=0,
+    )
+    provenance = WorkspaceProvenance(
+        project_root=str(project_root), git_common_dir=str((repo.root / repo.common_dir).resolve()),
+        worktree_path=str(worktree),
+    )
+    store.record_worktree("R-clean", worktree, provenance=provenance)
+    store.conn.execute("UPDATE runs SET task_state='BLOCKED' WHERE run_id='R-clean'")
+    return repo, worktree, provenance
 
 
 @pytest.fixture()
@@ -30,22 +53,7 @@ def managed(store, task_spec, tmp_path):
     _git(repo_path, "init", "-q", "-b", "main")
     _git(repo_path, "add", ".")
     _git(repo_path, "commit", "-q", "-m", "fixture")
-    repo = GitRepo.discover(repo_path)
-    base = repo.resolve_commit("HEAD")
-    worktree = repo.create_worktree("R-clean", base)
-    spec = task_spec.model_copy(update={"workspace": WorkspaceSpec(mode="worktree", base_commit=base)})
-    store.create_run(
-        run_id="R-clean", project_id="P-clean", spec=spec,
-        spec_digest=digest_of(spec.model_dump(mode="json")), controller_build="test",
-        checks_digest="checks", turn_limit=4, repair_limit=0,
-    )
-    provenance = WorkspaceProvenance(
-        project_root=str(repo_path), git_common_dir=str((repo.root / repo.common_dir).resolve()),
-        worktree_path=str(worktree),
-    )
-    store.record_worktree("R-clean", worktree, provenance=provenance)
-    store.conn.execute("UPDATE runs SET task_state='BLOCKED' WHERE run_id='R-clean'")
-    return repo, worktree, provenance
+    return _blocked_run_in_a_worktree(store, task_spec, repo_path)
 
 
 @pytest.mark.parametrize("state", ["DRAFT", "READY"])
@@ -272,6 +280,137 @@ def test_postclaim_plan_cannot_redirect_deletion_to_another_valid_worktree(store
     assert store.get_run("R-clean")["cleanup_intent_at"] is None
 
 
+@contextlib.contextmanager
+def _partly_undeletable(worktree: Path):
+    """Something keeps part of the worktree from being deleted while ``git worktree remove`` runs.
+
+    On Windows an open handle does (an editor, an indexer, a check's last child); elsewhere a
+    directory without write permission does the same to the entries in it.
+    """
+    if os.name == "nt":
+        with open(worktree / "sample.txt", "rb"):
+            yield
+        return
+    if os.geteuid() == 0:
+        pytest.skip("root deletes entries of a read-only directory")
+    os.chmod(worktree, 0o500)
+    try:
+        yield
+    finally:
+        os.chmod(worktree, 0o700)
+
+
+def test_a_half_failed_removal_is_partial_keeps_its_intent_and_never_says_nothing_was_removed(
+    store, managed, monkeypatch
+):
+    """Git deletes what it can, then the registration, then fails: the run must not strand.
+
+    The retry used to re-plan through the worktree's own ``.git`` - deleted by the first attempt -
+    so it refused ``not_a_worktree``, recorded the workspace PRESENT, dropped the intent and said
+    nothing was removed; every later clean refused and reconcile said UNREGISTERED.
+    """
+    _, worktree, provenance = managed
+    monkeypatch.setattr(cleanup.time, "sleep", lambda _: None)
+    with _partly_undeletable(worktree):
+        result = cleanup.apply_cleanup(store, "R-clean")
+        assert result["status"] == "PARTIAL" and not result["applied"], result
+        assert worktree.is_dir()
+        assert not cleanup.git_registration_exists(provenance.git_common_dir, worktree)
+        detail = result["detail"]
+        assert "sample.txt" in detail and "by hand" in detail and "--reconcile" in detail, detail
+        assert "nothing was removed" not in detail
+        for again in (cleanup.apply_cleanup(store, "R-clean"), cleanup.reconcile_cleanup(store, "R-clean")):
+            assert again["status"] == "PARTIAL", again
+            assert "nothing was removed" not in again["detail"]
+        row = store.get_run("R-clean")
+        assert row["worktree_state"] == "REMOVING"
+        assert row["cleanup_intent_at"] is not None and row["cleanup_done_at"] is None
+        assert worktree.is_dir(), "HFlow never deletes what git left behind"
+    # The operator removes what is left; reconcile then records the removal.
+    shutil.rmtree(worktree)
+    assert cleanup.reconcile_cleanup(store, "R-clean")["status"] == "REMOVED"
+    assert store.get_run("R-clean")["cleanup_done_at"] is not None
+    assert cleanup.apply_cleanup(store, "R-clean")["status"] == "REMOVED"
+
+
+def test_a_run_worktree_of_a_bare_repository_is_cleaned(store, task_spec, tmp_path):
+    """The removal ran from ``main_worktree()``, which is the bare directory itself: git refuses an
+    implicitly bare repository (``safe.bareRepository=explicit``), so clean always failed."""
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    (seed / "sample.txt").write_text("sample\n")
+    _git(seed, "init", "-q", "-b", "main")
+    _git(seed, "add", ".")
+    _git(seed, "commit", "-q", "-m", "fixture")
+    bare = tmp_path / "project.git"
+    _git(tmp_path, "clone", "-q", "--bare", str(seed), str(bare))
+    checkout = tmp_path / "project"
+    _git(bare, "worktree", "add", "-q", str(checkout), "main")
+    _, worktree, provenance = _blocked_run_in_a_worktree(store, task_spec, checkout)
+    assert Path(provenance.git_common_dir) == bare.resolve()
+
+    result = cleanup.apply_cleanup(store, "R-clean")
+    assert result["status"] == "REMOVED" and result["applied"], result
+    assert not worktree.exists()
+    assert not cleanup.git_registration_exists(provenance.git_common_dir, worktree)
+    assert (checkout / "sample.txt").is_file() and bare.is_dir()
+
+
+@pytest.mark.parametrize(
+    ("change", "reason", "commands"),
+    [
+        ("edit", "unfrozen_changes", ("status --short --ignored", "diff --stat")),
+        ("ignored", "unknown_ignored_files", ("status --short --ignored",)),
+        ("flag", "index_flags_hide_changes", ("ls-files -v", "status --short --ignored")),
+        ("commit", "head_drift", ("log --oneline", "status --short --ignored")),
+    ],
+)
+def test_a_refusal_names_read_only_commands_to_inspect_the_worktree(
+    store, managed, monkeypatch, change, reason, commands
+):
+    _, worktree, _ = managed
+    if change == "edit":
+        (worktree / "sample.txt").write_text("edited\n")
+    elif change == "ignored":
+        (worktree / ".env").write_text("a user's secret\n")
+    elif change == "flag":
+        _git(worktree, "update-index", "--assume-unchanged", "sample.txt")
+    else:
+        # The latest attempt froze the base; the worker then committed on top of it.
+        frozen = _git(worktree, "rev-parse", "HEAD").strip()
+        monkeypatch.setattr(store, "open_attempt", lambda run_id: {"attempt_id": "A1", "state": "FAILED"})
+        monkeypatch.setattr(cleanup, "_recorded_frozen_commit", lambda *args: frozen)
+        (worktree / "sample.txt").write_text("committed by the worker\n")
+        _git(worktree, "commit", "-q", "-am", "worker commit")
+    plan = cleanup.plan_cleanup(store, "R-clean")
+    [detail] = [item["detail"] for item in plan.refusals if item["reason"] == reason]
+    quoted = shell_word(str(worktree))
+    for command in commands:
+        assert f"git -C {quoted} {command}" in detail, detail
+    for word in ("remove", "rm ", "clean -", "reset", "checkout", "stash"):
+        assert word not in detail.split("inspect", 1)[-1], detail
+
+
+def test_ignored_files_under_pycache_that_are_not_bytecode_are_not_known_artifacts(store, managed):
+    """``**/__pycache__/**`` allowed any ignored file there; ``__pycache__/helper.py`` is importable
+    (a namespace package) and neither committed nor fingerprinted."""
+    _, worktree, provenance = managed
+    exclude = Path(provenance.git_common_dir) / "info" / "exclude"
+    exclude.parent.mkdir(exist_ok=True)
+    exclude.write_text("__pycache__/\n.pytest_cache/\n")
+    cache = worktree / "pkg" / "__pycache__"
+    cache.mkdir(parents=True)
+    (cache / "mod.cpython-314.pyc").write_bytes(b"bytecode")
+    (worktree / ".pytest_cache" / "v").mkdir(parents=True)
+    (worktree / ".pytest_cache" / "v" / "nodeids").write_text("[]")
+    assert cleanup.plan_cleanup(store, "R-clean").allowed
+
+    (cache / "helper.py").write_text("x = 1\n")
+    plan = cleanup.plan_cleanup(store, "R-clean")
+    [detail] = [item["detail"] for item in plan.refusals if item["reason"] == "unknown_ignored_files"]
+    assert "pkg/__pycache__/helper.py" in detail and ".pyc" not in detail.split("inspect", 1)[0]
+
+
 def test_missing_directory_with_residual_registration_keeps_intent(store, managed):
     repo, worktree, _ = managed
     store.record_cleanup_intent("R-clean", "test")
@@ -374,7 +513,8 @@ def test_bad_record_reports_exit_six_then_cancel_and_resume_still_work(
     else:
         note = record + ": " + invalid
         store.record_note(run_id, note, limit=len(note))
-    common = ["--data-dir", str(store.path.parent), "--project-root", str(run_request.project_root)]
+    data = ["--data-dir", str(store.path.parent)]
+    common = [*data, "--project-root", str(run_request.project_root)]
     snapshot = list(store.conn.iterdump())
     for verb in ("status", "report"):
         for json_mode in ([], ["--json"]):
@@ -383,11 +523,11 @@ def test_bad_record_reports_exit_six_then_cancel_and_resume_still_work(
             assert record in output.err and "Traceback" not in output.err
             assert len(output.err.strip().splitlines()) == 1 and output.out == ""
             assert list(store.conn.iterdump()) == snapshot
-    assert main(["cancel", run_id, *common, "--json"]) == EXIT_OK
+    assert main(["cancel", run_id, *data, "--json"]) == EXIT_OK
     assert json.loads(capsys.readouterr().out)["status"] == "unknown"
     # resume reconciles outcome_unknown once the owner is gone
     owner_exits(store, run_id, owner, monkeypatch)
-    assert main(["resume", run_id, *common, "--json"]) == EXIT_BLOCKED
+    assert main(["resume", run_id, *data, "--json"]) == EXIT_BLOCKED
     resumed = capsys.readouterr()
     assert "Traceback" not in resumed.err
     assert json.loads(resumed.out)["run_id"] == run_id

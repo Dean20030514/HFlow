@@ -7,6 +7,7 @@ and from seeded ledger rows. Nothing here calls a model, and neither command wri
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -52,8 +53,9 @@ def _status_next(data_dir: Path, run_id: str, capsys: pytest.CaptureFixture[str]
 
 
 def test_attention_names_only_explicit_stored_facts() -> None:
-    assert attention(RunFacts(run_id="R-1", task_state=TaskState.RUNNING)) == []
-    assert attention(RunFacts(run_id="R-1", task_state=TaskState.READY)) == []
+    assert attention(RunFacts(run_id="R-1", task_state=TaskState.RUNNING)) == [
+        "live RUNNING, no owner process recorded"
+    ]
     # An integrated candidate whose worktree is still there needs nothing but housekeeping.
     assert attention(_accepted(integrations=(_record(IntegrationState.INTEGRATED),))) == []
     assert attention(_accepted(git_candidate=False)) == [], "in place: nothing to integrate"
@@ -80,6 +82,31 @@ def test_attention_names_only_explicit_stored_facts() -> None:
     assert attention(
         RunFacts(run_id="R-1", task_state=TaskState.ACCEPTED, worktree_state="REMOVING")
     ) == ["cleanup interrupted"]
+
+
+def test_a_live_run_names_its_owner_and_a_deadline_the_clock_has_passed() -> None:
+    """A controller killed hard (during checks, say) leaves a live run with no open ledger
+    entry: it is listed from stored facts and the clock alone - no process is probed, so a passed
+    deadline reads "probably interrupted" and leaves the verdict to ``resume``."""
+    live = RunFacts(
+        run_id="R-1", task_state=TaskState.CHECKING, owner_pid=4242,
+        owner_since="2026-10-14T10:00:00Z", updated_at="2026-10-14T10:05:00Z",
+        deadline_seconds=900,
+    )
+    before = datetime(2026, 10, 14, 10, 19, 59, tzinfo=UTC)
+    after = datetime(2026, 10, 14, 10, 20, 1, tzinfo=UTC)
+    owner = "live CHECKING, recorded owner pid 4242 since 2026-10-14T10:00:00Z"
+    assert attention(live, now=before) == [owner]
+    [first, second] = attention(live, now=after)
+    assert first == owner
+    assert second.startswith("past its deadline: nothing recorded since 2026-10-14T10:05:00Z")
+    assert "900s" in second and "probably interrupted" in second
+    assert "`hflow resume R-1` decides (exit 5 while the owner may be alive)" in second
+    # No deadline recorded (no readable admission binding): the clock decides nothing.
+    unbound = RunFacts(
+        run_id="R-1", task_state=TaskState.RUNNING, updated_at="2026-10-14T10:05:00Z"
+    )
+    assert attention(unbound, now=after) == ["live RUNNING, no owner process recorded"]
 
 
 # --------------------------------------------------------------------------
@@ -131,19 +158,21 @@ def test_runs_lists_each_run_with_the_hint_status_prints_and_needs_you_filters(
     finally:
         store.close()
     assert [item["needs_you"] for item in listed] == [
-        ["blocked: outcome_unknown"], [], ["accepted candidate not integrated"],
-    ], "no default attention: a live run names nothing"
+        ["blocked: outcome_unknown"],
+        ["live READY, no owner process recorded"],
+        ["accepted candidate not integrated"],
+    ], "a live run names its recorded owner (here: none)"
 
     code, out, _ = _runs(scene.data_dir, capsys, "--limit", "1", "--json")
     assert [item["run_id"] for item in json.loads(out)] == [blocked]
     code, out, _ = _runs(scene.data_dir, capsys, "--needs-you", "--json")
-    assert [item["run_id"] for item in json.loads(out)] == [blocked, accepted]
+    assert [item["run_id"] for item in json.loads(out)] == [blocked, live, accepted]
     code, out, _ = _runs(scene.data_dir, capsys, "--needs-you", "--limit", "1", "--json")
     assert [item["run_id"] for item in json.loads(out)] == [blocked]
     code, out, _ = _runs(scene.data_dir, capsys, "--needs-you")
     assert "  needs you: blocked: outcome_unknown" in out
     assert "  needs you: accepted candidate not integrated" in out
-    assert live not in out
+    assert "  needs you: live READY, no owner process recorded" in out
     assert (scene.data_dir / "hflow.sqlite").read_bytes() == sqlite_before, "runs wrote nothing"
 
     # Once the candidate reaches a branch it needs nothing more from the operator here.
@@ -158,7 +187,7 @@ def test_runs_lists_each_run_with_the_hint_status_prints_and_needs_you_filters(
     applied = scene.apply(prepared.integration_id, scene.tip()).record
     assert applied.state is IntegrationState.INTEGRATED
     code, out, _ = _runs(scene.data_dir, capsys, "--needs-you", "--json")
-    assert [item["run_id"] for item in json.loads(out)] == [blocked]
+    assert [item["run_id"] for item in json.loads(out)] == [blocked, live]
 
 
 def test_an_unreadable_run_is_named_and_the_rest_still_listed(
@@ -175,12 +204,22 @@ def test_an_unreadable_run_is_named_and_the_rest_still_listed(
     store.close()
     data = tmp_path / "data"
 
-    for flags in ((), ("--json",), ("--needs-you",)):
+    for flags in ((), ("--needs-you",)):
         code, out, err = _runs(data, capsys, *flags)
         assert code == EXIT_RECORD_UNREADABLE, flags
         assert f"stored record unreadable for run {bad}" in err
         assert bad not in out
-        assert (good in out) is ("--needs-you" not in flags), "a live run needs nothing"
+        assert good in out, "the readable (live) run is still listed"
+    # --json names the unreadable run as an entry of its own, never only on stderr.
+    for flags in (("--json",), ("--json", "--needs-you")):
+        code, out, err = _runs(data, capsys, *flags)
+        assert code == EXIT_RECORD_UNREADABLE, flags
+        assert f"stored record unreadable for run {bad}" in err
+        entries = {item["run_id"]: item for item in json.loads(out)}
+        assert set(entries) == {good, bad}
+        assert set(entries[bad]) == {"run_id", "error"}
+        assert entries[bad]["error"].startswith("stored record unreadable: not valid JSON")
+        assert "error" not in entries[good]
 
     code, out, err = _diff(data, bad, capsys)
     assert code == EXIT_RECORD_UNREADABLE and out == ""

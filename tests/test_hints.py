@@ -511,3 +511,77 @@ def test_next_lines_are_one_per_step() -> None:
         "next: hflow status R-1",
         "next: hflow clean R-1",
     ]
+
+
+# --------------------------------------------------------------------------
+# integrate prepare --target, prefilled from the task's base branch
+# --------------------------------------------------------------------------
+
+
+def test_the_target_is_prefilled_only_from_a_base_branch_that_exists() -> None:
+    steps = plan_next(_accepted(base_branch="main"))
+    assert steps == [
+        f"hflow integrate prepare R-1 --target main --project {PROJECT_PLACEHOLDER}  # from the "
+        "task's base"
+    ]
+    assert _commands(plan_next(_accepted())) == [
+        f"hflow integrate prepare R-1 --target {BRANCH_PLACEHOLDER} --project {PROJECT_PLACEHOLDER}"
+    ]
+
+
+def test_existing_branch_reads_the_ref_files_and_never_guesses(tmp_path: Path) -> None:
+    from hflow.hints import existing_branch
+    from tests.test_integrate import _git
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "a.txt").write_text("a\n", encoding="utf-8")
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    _git(repo, "branch", "feature/x")
+    common = str(repo / ".git")
+    head = _git(repo, "rev-parse", "HEAD").strip()
+
+    assert existing_branch("main", common) == "main"
+    assert existing_branch("refs/heads/feature/x", common) == "feature/x"
+    _git(repo, "pack-refs", "--all")
+    assert not (repo / ".git" / "refs" / "heads" / "feature" / "x").exists()
+    assert existing_branch("feature/x", common) == "feature/x", "a packed ref counts"
+    for base in ("gone", head, head[:12], "HEAD", "../main", "-x", "main.lock", ""):
+        assert existing_branch(base, common) == "", base
+    assert existing_branch("main", "") == ""
+    assert existing_branch("main", str(tmp_path / "no-such-dir")) == ""
+
+
+def test_a_stored_run_based_on_a_branch_names_it_as_the_target(
+    scene: Scene, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from hflow.contracts import RunRequest
+    from hflow.controller import Controller
+    from hflow.drivers.fake import FakeDriver, FakeScript
+    from tests.test_integrate import BUILD, _git, _task
+
+    controller = Controller(
+        scene.store,
+        FakeDriver(scene.repo, FakeScript(write_plan={"app.txt": "value = 2\n"}, agent_turns=1)),
+        controller_build=BUILD,
+        runners=CheckRunners.offline_default(),
+        data_dir=scene.data_dir,
+        production=False,
+    )
+    outcome = controller.run_task(
+        RunRequest(
+            task=_task("main", "T-branch"),
+            project=scene.project,
+            project_root=scene.repo,
+            workspace_root=scene.repo,
+        )
+    )
+    assert outcome.task_state is TaskState.ACCEPTED, outcome.block_reason
+    [step] = next_steps(scene.store, outcome.run_id)
+    assert " --target main " in step and step.endswith("# from the task's base"), step
+
+    _git(scene.repo, "branch", "-D", "main")
+    [step] = next_steps(scene.store, outcome.run_id)
+    assert f" --target {BRANCH_PLACEHOLDER} " in step and "#" not in step, step

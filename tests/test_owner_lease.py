@@ -459,7 +459,7 @@ def test_a_zombie_owners_reserve_dispatch_is_refused_after_a_takeover(
     )
     assert taken is not None and taken[0] == 2
 
-    with pytest.raises(OwnerLostError, match="owner_lost"):
+    with pytest.raises(OwnerLostError, match="owner_lost") as refused:
         store.reserve_dispatch(
             run_id=run_id,
             controller_id=zombie.controller_id,
@@ -472,9 +472,8 @@ def test_a_zombie_owners_reserve_dispatch_is_refused_after_a_takeover(
         )
     assert store.attempts_for(run_id) == []
     assert store.get_run(run_id)["turns_reserved"] == 0
-    assert zombie._dispatch_refusal_code(
-        "owner_lost: run R is owned by pid=1"
-    ) is RefusalCode.OWNER_LOST
+    assert zombie._dispatch_refusal_code(refused.value) is RefusalCode.OWNER_LOST
+    assert refused.value.concurrent, "the run is the successor's to record, not the zombie's"
     # A second takeover from the stale generation is a no-op, not a second block.
     assert store.take_over_run(
         run_id,
@@ -881,12 +880,11 @@ def test_cli_resume_exit_codes_follow_the_owner(
     finally:
         store.close()
 
-    root = str(run_request.project_root)
-    assert main(["resume", "R-live", "--project-root", root, "--data-dir", str(data_dir)]) == (
+    assert main(["resume", "R-live", "--data-dir", str(data_dir)]) == (
         EXIT_IN_PROGRESS
     )
     assert "owner may be alive" in capsys.readouterr().out
-    assert main(["resume", "R-dead", "--project-root", root, "--data-dir", str(data_dir)]) == (
+    assert main(["resume", "R-dead", "--data-dir", str(data_dir)]) == (
         EXIT_BLOCKED
     )
     assert "owner_lost" in capsys.readouterr().out

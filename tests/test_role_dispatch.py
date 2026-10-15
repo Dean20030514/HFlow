@@ -23,6 +23,7 @@ from hflow.store import Store
 from hflow.verify import CheckRunners, FakeCheckRunner
 
 from .conftest import write_profile, write_project, write_task
+from .store_helpers import record_effective_config
 
 WRITE_PLAN = {
     "src/parser.py": "def parse(text):\n    if not text:\n        return None\n    return text\n"
@@ -192,11 +193,11 @@ def test_the_first_recorded_configuration_wins(
     )
     second = first.model_copy(update={"profile_id": "second"})
 
-    store.record_effective_config(outcome.run_id, first)
+    record_effective_config(store, outcome.run_id, first)
     from hflow.store import StoreError
 
     with pytest.raises(StoreError, match="conflicting immutable effective_config"):
-        store.record_effective_config(outcome.run_id, second)
+        record_effective_config(store, outcome.run_id, second)
 
     recorded = store.effective_config_for(outcome.run_id)
     assert recorded is not None and recorded.profile_id == "first"

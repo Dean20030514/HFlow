@@ -129,6 +129,10 @@ def test_prepare_binds_the_launch_entry_files_by_content(
     assert f"launch_content_digest {binding.launch_content_digest}" in text
     assert any(note.startswith(CONTENT_BINDING_LABEL) for note in report.notes)
     assert "binary verified" not in text
+    # Where the launch found its dsh (the conftest stand-in is first on PATH), recorded as the
+    # first content note and shown with the launch.
+    assert launch.content_notes[0].startswith("dsh=PATH: ")
+    assert "content note: dsh=PATH: " in text
 
     # The JSON form carries the same digests in the launch and in the pending binding.
     data_dir = tmp_path / "data"
@@ -316,7 +320,7 @@ def test_an_npm_carrier_binds_its_entry_and_package_json(tmp_path: Path) -> None
         env={"SystemRoot": os.environ["SystemRoot"], "PATH": ""},
     )
     assert launch.resolvable, launch.detail
-    assert launch.agent_argv[:3] == [str(cmd), "/c", str(shim)]
+    assert launch.agent_argv[:4] == [str(cmd), "/d", "/c", str(shim)]
     paths = {item.kind: item.path for item in launch.content_digests}
     assert paths["dsh_launcher"] == str(shim)
     assert os.path.normcase(paths["carrier_entry"]) == os.path.normcase(str(script))

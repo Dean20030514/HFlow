@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
+from collections.abc import Callable
 from pathlib import Path
 
 from ..contracts import LaunchConfig, LaunchFileDigest
@@ -61,39 +62,73 @@ def final_path(path: str) -> str:
     return real
 
 
-def hash_file(path: str) -> tuple[str, int]:
-    """``("sha256:<hex>", size)`` of one regular file, streamed. Raises :class:`LaunchContentError`."""
+class RegularFileError(Exception):
+    """Why :func:`read_regular` gave up. ``kind``: ``open``, ``not_regular``, ``too_large``,
+    ``grew`` or ``read``; ``cause`` names the ``OSError`` class for ``open``/``read``; ``size`` is
+    the size seen, for ``too_large``/``grew``."""
+
+    def __init__(self, kind: str, *, cause: str = "", size: int | None = None) -> None:
+        super().__init__(kind)
+        self.kind = kind
+        self.cause = cause
+        self.size = size
+
+
+def read_regular(
+    path: str | os.PathLike[str],
+    limit: int,
+    consume: Callable[[bytes], object],
+    *,
+    chunk_bytes: int = HASH_CHUNK_BYTES,
+) -> int:
+    """Stream one regular file of at most ``limit`` bytes into ``consume``; return its size.
+
+    The one bounded reader of the drivers (the launch content binding hashes through it,
+    ``dsh_surfaces`` reads manifests and shims through it). The open is non-blocking, so a FIFO
+    cannot hold the caller; the type and size are taken from the open descriptor, and a file that
+    grows past ``limit`` while it is read is refused rather than cut. Raises
+    :class:`RegularFileError`; nothing past ``limit`` is ever passed to ``consume``.
+    """
     try:
-        fd = os.open(
-            path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
-        )
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0))
     except OSError as exc:
-        raise LaunchContentError(f"{path} could not be opened ({type(exc).__name__})") from exc
+        raise RegularFileError("open", cause=type(exc).__name__) from exc
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
-            raise LaunchContentError(f"{path} is not a regular file")
-        if info.st_size > LAUNCH_HASH_LIMIT_BYTES:
-            raise LaunchContentError(
-                f"{path} is larger than {LAUNCH_HASH_LIMIT_BYTES} bytes: not hashed"
-            )
-        digest = hashlib.sha256()
+            raise RegularFileError("not_regular")
+        if info.st_size > limit:
+            raise RegularFileError("too_large", size=info.st_size)
         total = 0
         while True:
-            chunk = os.read(fd, HASH_CHUNK_BYTES)
+            chunk = os.read(fd, min(chunk_bytes, limit + 1 - total))
             if not chunk:
-                break
+                return total
             total += len(chunk)
-            if total > LAUNCH_HASH_LIMIT_BYTES:
-                raise LaunchContentError(
-                    f"{path} grew past {LAUNCH_HASH_LIMIT_BYTES} bytes while it was hashed"
-                )
-            digest.update(chunk)
-        return "sha256:" + digest.hexdigest(), total
+            if total > limit:
+                raise RegularFileError("grew", size=total)
+            consume(chunk)
     except OSError as exc:
-        raise LaunchContentError(f"{path} could not be read ({type(exc).__name__})") from exc
+        raise RegularFileError("read", cause=type(exc).__name__) from exc
     finally:
         os.close(fd)
+
+
+def hash_file(path: str) -> tuple[str, int]:
+    """``("sha256:<hex>", size)`` of one regular file, streamed. Raises :class:`LaunchContentError`."""
+    digest = hashlib.sha256()
+    try:
+        size = read_regular(path, LAUNCH_HASH_LIMIT_BYTES, digest.update)
+    except RegularFileError as exc:
+        reason = {
+            "open": f"could not be opened ({exc.cause})",
+            "not_regular": "is not a regular file",
+            "too_large": f"is larger than {LAUNCH_HASH_LIMIT_BYTES} bytes: not hashed",
+            "grew": f"grew past {LAUNCH_HASH_LIMIT_BYTES} bytes while it was hashed",
+            "read": f"could not be read ({exc.cause})",
+        }[exc.kind]
+        raise LaunchContentError(f"{path} {reason}") from exc
+    return "sha256:" + digest.hexdigest(), size
 
 
 def launch_entry_files(

@@ -1075,6 +1075,29 @@ def test_a_prepare_that_dies_inside_worktree_add_is_found_by_its_staging_name(
     assert GitRepo(scene.repo).worktree_registration(staging) is None
 
 
+def test_a_removal_git_could_not_finish_is_reported_as_unregistered_not_as_refused(
+    scene: Scene,
+) -> None:
+    """Git deletes the registration even when the directory stays (an open file on Windows)."""
+    from tests.test_cleanup_boundaries import _partly_undeletable
+
+    git = GitRepo(scene.repo)
+    worktree = git.create_worktree("I-half-removed", git.head)
+    # LF bytes, not ``write_text``: this commit goes through the test's own git, which reads the
+    # system config (Git for Windows sets core.autocrlf there), while HFlow's git never does. A
+    # CRLF file committed as LF then reads as modified to HFlow whenever the index entry is
+    # racily clean, and ``worktree remove`` refuses before deleting anything.
+    (worktree / "sample.txt").write_bytes(b"held\n")
+    _git(worktree, "add", "sample.txt")
+    _git(worktree, "commit", "-q", "-m", "a file to hold open")
+    assert integrate_module._half_removed(git, worktree) == ""
+    with _partly_undeletable(worktree):
+        with pytest.raises(GitError) as failed:
+            git.remove_worktree_checked(worktree)
+        assert worktree.is_dir() and git.worktree_registration(worktree) is None, failed.value
+        assert "no longer registers it" in integrate_module._half_removed(git, worktree)
+
+
 def test_a_worktree_already_removed_is_recorded_removed_not_left(
     scene: Scene, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1134,16 +1157,22 @@ def test_an_owner_that_cannot_be_judged_needs_an_attestation(
         assert main(["integrate", "reconcile", record.integration_id, "--owner-gone", "--attest",
                      placeholder, *data]) == 4
         assert "is a placeholder" in capsys.readouterr().err
-    assert stored() == before, "nothing was settled"
+    # The attestation is recorded whole or refused: longer than the 500 characters the run's
+    # audit note holds is a usage error, never a silent cut.
     assert main(["integrate", "reconcile", record.integration_id, "--owner-gone", "--attest",
-                 "the machine was rebooted", *data]) == 3
+                 "the machine was rebooted " + "x" * 500, *data]) == 4
+    assert "at most 500" in capsys.readouterr().err
+    assert stored() == before, "nothing was settled"
+    attestation = "the machine was rebooted " + "y" * (500 - len("the machine was rebooted "))
+    assert main(["integrate", "reconcile", record.integration_id, "--owner-gone", "--attest",
+                 attestation, *data]) == 3
     assert "interrupted" in capsys.readouterr().out
 
     # A process HFlow sees running is never overridden by an attestation.
     store = Store(scene.data_dir / "hflow.sqlite")
     try:
         notes = store.notes_for(run_id)
-        assert any("attested by" in note and "rebooted" in note for note in notes)
+        assert any("attested by" in note and attestation in note for note in notes)
     finally:
         store.close()
 

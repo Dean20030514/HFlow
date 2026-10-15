@@ -207,9 +207,21 @@ def current_identity() -> ProcessIdentity:
 
 
 def _open_for_probe(pid: int, host: str | None) -> tuple[Any, Probe | None]:
-    """Shared front half of both probes: refuse what cannot be asked, open what can."""
+    """Shared front half of both probes: refuse what cannot be asked, open what can.
+
+    A pid recorded without a host (``None``: a run written before storage v6, or claimed without
+    an owner identity) reads ``unknown``, exactly like one from another host: a local lookup of
+    another machine's pid would read ``gone``, which is not an observation of that process.
+    """
     here = current_host()
-    if host is not None and host != here:
+    if host is None:
+        return None, Probe(
+            "unknown",
+            f"pid {pid} was recorded without a host, so this build cannot tell whether it ran on "
+            f"this machine ({here!r}); not probed",
+            probed=False,
+        )
+    if host != here:
         return None, Probe(
             "unknown",
             f"recorded on host {host!r}; this is {here!r}, which cannot ask that host",
@@ -278,6 +290,7 @@ def probe_recorded(pid: int, recorded_at: str | None, host: str | None) -> Probe
     recorded time cannot be the recorded one (the pid was reused after it exited); one created
     earlier *may* be it, so it reads ``matching`` - this probe can over-report "alive", never
     "gone". Wall-clock changes between the two readings can move that comparison (documented).
+    ``host`` is the owner's recorded host; ``None`` (no host recorded) reads ``unknown``.
     """
     if recorded_at is None:
         return Probe("unknown", f"pid {pid} has no recorded start time to compare with")

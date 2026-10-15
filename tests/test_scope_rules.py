@@ -7,6 +7,7 @@ accepted it: a deny rule that silently did nothing.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -104,3 +105,101 @@ def test_a_unc_or_drive_deny_entry_keeps_the_absolute_message(entry: str) -> Non
 
     (problem,) = write_deny_problems([entry], owner="task")
     assert "is absolute or drive-qualified" in problem
+
+
+# --------------------------------------------------------------------------
+# a write_allow entry cannot name a denied path by another Windows spelling
+# --------------------------------------------------------------------------
+
+
+def _deny_root(tmp_path: Path) -> Path:
+    root = tmp_path / "repo"
+    for name in (".git", ".hflow", "secrets_directory", "src"):
+        (root / name).mkdir(parents=True)
+    (root / ".acpxrc.json").write_text("{}", encoding="utf-8")
+    return root
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        ".git.",
+        ".hflow.",
+        ".acpxrc.json.",
+        "secrets_directory.",
+        "secrets_directory ",
+        "secrets_directory./key.txt",
+        ".git /config",
+        "src/a.py:hidden",
+        "src/...",
+    ],
+)
+def test_a_segment_windows_would_open_under_another_name_is_refused(
+    tmp_path: Path, entry: str
+) -> None:
+    """``.git.`` opens ``.git`` on Windows, so a deny rule matched on the text never saw it.
+
+    Each of these passed ``check_scope`` before: the deny lists were matched against the entry as
+    written while ``resolve_within`` resolved it physically, to the denied directory.
+    """
+    from hflow.workspace import check_scope
+
+    problems = check_scope(
+        Scope(write_allow=[entry]), _deny_root(tmp_path), ["secrets_directory/**"]
+    )
+
+    assert len(problems) == 1, problems
+    assert entry in problems[0]
+    assert "ending in a dot or a space" in problems[0] or "containing ':'" in problems[0]
+
+
+@pytest.mark.parametrize("entry", ["C:/repo/src", "C:src", "a:b", r"\\server\share\x"])
+def test_a_drive_is_still_refused_as_drive_qualified(tmp_path: Path, entry: str) -> None:
+    """The ``:`` of a drive is left to ``resolve_within``, which names the real problem."""
+    from hflow.workspace import check_scope
+
+    (problem,) = check_scope(Scope(write_allow=[entry]), _deny_root(tmp_path), [])
+    assert "absolute or drive-qualified" in problem
+
+
+@pytest.mark.parametrize("entry", ["src", "./src", "src/notes~draft.txt", "src/v1.2/a.py", "~src"])
+def test_ordinary_entries_and_a_tilde_in_a_name_are_still_admitted(tmp_path: Path, entry: str) -> None:
+    from hflow.workspace import check_scope
+
+    assert check_scope(Scope(write_allow=[entry]), _deny_root(tmp_path), ["secrets_directory/**"]) == []
+
+
+def _short_name(path: Path) -> str:
+    """The 8.3 short name Windows generated for ``path``, or ``""`` when there is none."""
+    import ctypes
+
+    buffer = ctypes.create_unicode_buffer(1024)
+    length = ctypes.windll.kernel32.GetShortPathNameW(str(path), buffer, len(buffer))  # type: ignore[attr-defined]
+    short = Path(buffer.value).name if 0 < length < len(buffer) else ""
+    return "" if short.casefold() == path.name.casefold() else short
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="8.3 short names are a Windows spelling")
+@pytest.mark.parametrize(
+    ("denied", "deny", "suffix", "message"),
+    [
+        ("secrets_directory", ["secrets_directory"], "", "covered by project write_deny"),
+        ("secrets_directory", ["secrets_directory/**"], "/key.txt", "covered by project write_deny"),
+        (".hflow", [], "/state.json", "HFlow never lets a worker write"),
+    ],
+)
+def test_a_short_name_of_a_denied_directory_is_matched_by_its_resolved_spelling(
+    tmp_path: Path, denied: str, deny: list[str], suffix: str, message: str
+) -> None:
+    """``SECRET~1`` resolves to ``secrets_directory``; the deny lists are matched on both."""
+    from hflow.workspace import check_scope
+
+    root = _deny_root(tmp_path)
+    short = _short_name(root / denied)
+    if not short:
+        pytest.skip("this volume does not generate 8.3 short names")
+    entry = short + suffix
+
+    problems = check_scope(Scope(write_allow=[entry]), root, deny)
+
+    assert any(message in problem and entry in problem for problem in problems), problems

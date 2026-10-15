@@ -504,3 +504,28 @@ in #9626 is the reporters' observation, not something the code explains.
   package through `..`, which `dsh_surfaces` now classifies as the npm carrier
   (`npm_package_dir`), so the approval binds `@deepseek-ai/dsh/lib/bin.js` and its package.json by
   content; `doctor` reports `dsh carrier npm 0.2.0-rc.2` and no #9626 note.
+
+## Addendum 2026-10-14 (evening) — eighth read of the upstreams
+
+Appended; the decision and every capability state above stand. Release metadata, compare views,
+source, discussions and npm dist-tags only; nothing was executed against DSH or a model, so every
+row is *documented*.
+
+| Fact | Label |
+|---|---|
+| acpx: no release after `v0.19.5` (`95adbc56`); npm `latest` 0.19.5. `main` moved `66599833` -> `af85b88f` (#875, a zod bump; the compare touches only `pnpm-lock.yaml`); `src/async-control.ts` is still blob `2e318c1d`. Open issues #835, #850, #854, #861, #867 have only bot labels since the last read. At `v0.17.1` the agent is spawned with `stdio: ["pipe","pipe","pipe"]` and `windowsHide: true` (`src/acp/auth-env.ts` blob `6750493a`, used at `src/acp/client.ts` L793), which libuv turns into `CREATE_NO_WINDOW` | documented |
+| ACP: no release after `schema-v1.25.0` / v1.11.0 (`4cf3dd85`); `main` `bacbb62b`, `schema/v1/schema.json` still blob `d6f7731b`. The only v1 change is documentation (#2389, `docs/protocol/v1/cancellation.mdx`: a client sending `session/cancel` must answer pending permission requests `cancelled`; cascading `$/cancel_request` is optional). Release PR #2379 (head `2526897f`) proposes unstable-only additions. typescript-sdk: no release after 1.8.0; unreleased #282 turns omitted/null request params into `{}` | documented |
+| DSH: no tag after `dsh-v0.2.1-alpha.3` (`2fbf4359`); `master` `57190202` (16 commits: plugin previews, desktop summary, agent-team prompt). At both: `packages/acp/acp/src` tree `5d63d1b7`, `sandbox-local/src/index.ts` blob `45028746`, `sandbox-windows-acl/src` tree `5d0facae` (same at rc.2), `profile.ts` blob `cbece01b`, SDK pin 1.4.0, `DEFAULT_STREAM_IDLE_TIMEOUT_MS` 300 000 - #9626 is not fixed. npm `@deepseek-ai/dsh` `latest`/`next` 0.2.0-rc.2 (shasum `dfc8f7e0...8925`), `alpha` 0.2.1-alpha.3; `dsh-acp`/`dsh-headless` `latest` is still 0.0.1-rc.1 | documented |
+| DSH's ACL sandbox README (rc.2, `packages/sandbox/sandbox-windows-acl/README.md` blob `dbb5fdef`): "console isolation is unavailable" - restricted children created with `CREATE_NO_WINDOW`/`CREATE_NEW_CONSOLE` die with `0xC0000142` and share the host console (L127); the logon SID + Everyone pair is needed for DLL init and for pwsh's CNG path (L102) | documented |
+| **#9693** (npm 0.2.0-rc.2, `dsh --profile acp`): with a `permission` preset and `fs-sandbox`, an fs write outside the workspace is denied in headless/web sessions but succeeds in ACP sessions. The source it rests on is real: rc.2 `packages/acp/acp/src/index.ts` (blob `44ef4741`) L200-203 composes no permission presets for ACP sessions, and `agentOptions` (L444) returns only provider and model; alpha.3 is the same | source documented; effect unconfirmed |
+| Other new community reports, no maintainer reply on any tracked or new thread: #9682 and #8497 (pwsh / any restricted child exits `0xC0000142` when the host has no console; a local `AllocConsole` patch reportedly fixes it), #9687 (a restricted token without BUILTIN\Users cannot start pwsh; a failed shell call arrives as a successful tool result with a non-zero `exitCode`), #9711 (editing a bound home's profile `package.json` during a turn hot-reloads the profile and aborts the turn), #9666/#8312 (the Low integrity label stays on the workspace; one reproduction on Windows 11 10.0.26300, this machine's build), #9683/#9716 (`max_tokens` turns with no output) | documented (unconfirmed) |
+
+Nothing here needs a transport change; the acpx 0.17.1 pin and the unpinned-SDK ruling stand, and
+`CHECKED_SDK_VERSIONS` needs nothing. For the first live task: the npm route removes the Electron
+runner cause of #9626, but two other unconfirmed causes of failing shell calls remain (a host
+without a console - acpx starts DSH with `CREATE_NO_WINDOW` - and pwsh under the restricted
+token), so a first task whose checks HFlow runs itself and that needs no DSH shell call depends on
+none of them; a shell call that failed is still an `end_turn`, so only HFlow's approved checks
+decide acceptance. #9693 means the recorded `sandbox` line is the shell runner's mode, not a
+boundary for DSH's own file tools on the ACP path: HFlow's scope check and the user-checkout
+fingerprint are what notice an outside write. #9711 does not apply to a per-invocation home.

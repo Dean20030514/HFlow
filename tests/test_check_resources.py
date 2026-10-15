@@ -407,6 +407,67 @@ def test_a_system_path_a_runtime_needs_reaches_the_check_process(
     assert "HFLOW_FAKE_PROVIDER_TOKEN" in parse_environment_summary(outcome.environment)["withheld"]
 
 
+def test_variables_that_choose_what_code_a_check_loads_are_not_inherited() -> None:
+    """An absolute PYTHONPATH naming the user's checkout made a check test the checkout.
+
+    PYTHONPATH, NODE_PATH and NODE_OPTIONS change which code a check imports or preloads, only
+    their names are recorded and no value is in the checks digest - so they are not inherited.
+    The runtime-locating variables stay.
+    """
+    base = {
+        "PATH": "/usr/bin",
+        "PYTHONPATH": "C:/Users/someone/checkout/src",
+        "NODE_PATH": "C:/Users/someone/checkout/node_modules",
+        "NODE_OPTIONS": "--require C:/Users/someone/preload.js",
+        "VIRTUAL_ENV": "C:/venv",
+        "CONDA_PREFIX": "C:/conda",
+        "USERNAME": "someone",
+    }
+
+    env, withheld = child_environment(base=base)
+
+    assert "PYTHONPATH" not in env and "NODE_PATH" not in env and "NODE_OPTIONS" not in env
+    assert env["VIRTUAL_ENV"] == "C:/venv" and env["CONDA_PREFIX"] == "C:/conda"
+    assert env["USERNAME"] == "someone"
+    assert withheld == [], "they are not credentials, so they are not reported as withheld"
+
+
+def test_a_check_imports_the_candidate_not_a_module_on_the_controllers_pythonpath(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The end-to-end version: a module only the controller's PYTHONPATH names is not importable."""
+    shadow = tmp_path / "checkout-src"
+    shadow.mkdir()
+    (shadow / "hflow_shadow_probe.py").write_text("VALUE = 'checkout'\n", encoding="utf-8")
+    monkeypatch.setenv("PYTHONPATH", str(shadow))
+    monkeypatch.setenv("NODE_OPTIONS", "--require ./not-real.js")
+    runner = CommandCheckRunner(artifact_factory=lambda _check, _eid: tmp_path / "art")
+    probe = (
+        "import importlib.util, sys; "
+        "sys.exit(0 if importlib.util.find_spec('hflow_shadow_probe') is None else 7)"
+    )
+
+    outcome = runner.run(_check([sys.executable, "-c", probe]), tmp_path, 60)
+
+    assert outcome.status is EvidenceStatus.PASSED, outcome.detail
+    names = parse_environment_summary(outcome.environment)["names"]
+    assert "PYTHONPATH" not in names and "NODE_OPTIONS" not in names
+
+
+def test_getpass_works_inside_a_check(tmp_path: Path, monkeypatch) -> None:
+    """``getpass.getuser()`` raises on Windows without USERNAME, so USERNAME is inherited."""
+    monkeypatch.setenv("USERNAME", "hflow-check-user")
+    runner = CommandCheckRunner(artifact_factory=lambda _check, _eid: tmp_path / "art")
+
+    outcome = runner.run(
+        _check([sys.executable, "-c", "import getpass; print(getpass.getuser())"]), tmp_path, 60
+    )
+
+    assert outcome.status is EvidenceStatus.PASSED, outcome.detail
+    stdout = Path(str(outcome.artifacts["stdout"]["path"])).read_text(encoding="utf-8")
+    assert stdout.strip() == "hflow-check-user"
+
+
 def test_the_minimal_environment_still_runs_python_and_node(tmp_path: Path) -> None:
     """The allowlist must not be so small that a normal runtime stops working."""
     runner = CommandCheckRunner(artifact_factory=lambda _check, _eid: tmp_path / "art")
@@ -492,19 +553,37 @@ def test_a_pipe_still_held_open_is_waited_for_once_not_twice(tmp_path: Path, mon
 def test_a_failed_sink_write_can_never_be_reported_as_passed(tmp_path: Path, monkeypatch) -> None:
     """The reported defect: a capture that failed to write still ended as ``passed/completed``.
 
-    The real failure path is injected here - the sink's ``write`` raises, exactly as a full disk or
-    a closed handle would - and a real child process exits 0 after printing. The reader thread
-    exits too, so "did the thread finish?" cannot distinguish this from a clean capture; the reader
-    has to *report how it ended*, and the result must be ERROR with the child's exit code kept.
+    The real failure path is injected here - the artifact file's ``write`` raises, exactly as a
+    full disk or a closed handle would - and a real child process exits 0 after printing. The
+    reader thread exits too, so "did the thread finish?" cannot distinguish this from a clean
+    capture; the reader has to *report how it ended*, and the result must be ERROR with the child's
+    exit code kept.
     """
-    original_write = BoundedTextSink.write
+    original_enter = BoundedTextSink.__enter__
     calls = {"n": 0}
 
-    def failing_write(self, chunk: bytes) -> None:
-        calls["n"] += 1
-        raise OSError("simulated full disk")
+    class _FullDisk:
+        """The opened artifact file, except that every write fails."""
 
-    monkeypatch.setattr(BoundedTextSink, "write", failing_write)
+        def __init__(self, handle) -> None:  # noqa: ANN001
+            self._handle = handle
+
+        def write(self, data: bytes) -> int:
+            calls["n"] += 1
+            raise OSError("simulated full disk")
+
+        def flush(self) -> None:
+            self._handle.flush()
+
+        def close(self) -> None:
+            self._handle.close()
+
+    def full_disk_enter(self: BoundedTextSink) -> BoundedTextSink:
+        original_enter(self)
+        self._handle = _FullDisk(self._handle)  # type: ignore[assignment]
+        return self
+
+    monkeypatch.setattr(BoundedTextSink, "__enter__", full_disk_enter)
     try:
         runner = CommandCheckRunner(artifact_factory=lambda _check, _eid: tmp_path / "art")
         outcome = runner.run(
@@ -513,7 +592,7 @@ def test_a_failed_sink_write_can_never_be_reported_as_passed(tmp_path: Path, mon
             60,
         )
     finally:
-        monkeypatch.setattr(BoundedTextSink, "write", original_write)
+        monkeypatch.setattr(BoundedTextSink, "__enter__", original_enter)
 
     assert calls["n"] > 0, "the injected failure must actually have been exercised"
     assert outcome.status is EvidenceStatus.ERROR

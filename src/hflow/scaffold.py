@@ -45,9 +45,16 @@ from .contracts import (
     RefusedError,
     TaskSpec,
 )
-from .hints import command, shell_word
+from .hints import command, data_dir_word, shell_word
 from .paths import default_data_dir
-from .profiles import _is_plain_profile_id, profile_path, summarize_validation_error
+from .profiles import (
+    ENV_PROFILE,
+    _is_plain_profile_id,
+    available_profile_ids,
+    profile_path,
+    requested_profile_id,
+    summarize_validation_error,
+)
 
 #: Deny rules a new project contract starts with: Git's own metadata, HFlow's contract, and CI
 #: configuration, which a task should change only when it names it and the contract allows it.
@@ -111,16 +118,6 @@ def write_exclusive(path: Path, document: dict[str, Any]) -> Path:
     except OSError as exc:
         raise _refuse(f"{path} could not be written: {exc}") from exc
     return path.resolve()
-
-
-def _named_data_dir(data_dir: Path | None) -> str | None:
-    """The ``--data-dir`` a printed command needs, or ``None`` when the default reaches it."""
-    if data_dir is None:
-        return None
-    given = os.path.normcase(os.path.abspath(data_dir))
-    if given == os.path.normcase(os.path.abspath(default_data_dir())):
-        return None
-    return os.path.abspath(data_dir)
 
 
 # --------------------------------------------------------------------------
@@ -293,7 +290,7 @@ def init_project(
             f"the project contract is not valid: {summarize_validation_error(exc)}"
         ) from exc
     path = write_exclusive(target, contract.model_dump(mode="json"))
-    data = _named_data_dir(data_dir)
+    data = data_dir_word(data_dir)
     scaffold = Scaffold(path=path, notes=notes)
     for check in approved:
         scaffold.todo.append(
@@ -350,7 +347,7 @@ def init_profile(profile_id: str, *, data_dir: Path | None) -> Scaffold:
     document = profile.model_dump(mode="json")
     MachineProfile.model_validate(document)
     path = write_exclusive(profile_path(root, profile_id), document)
-    data = _named_data_dir(data_dir)
+    data = data_dir_word(data_dir)
     return Scaffold(
         path=path,
         todo=[
@@ -389,23 +386,43 @@ def _git_query(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def current_base(root: Path) -> str:
-    """The checked-out branch's name, or the commit of a detached ``HEAD``.
+def current_base(root: Path) -> tuple[str, bool]:
+    """``(the checked-out branch's name, False)``, or ``(the commit, True)`` of a detached ``HEAD``.
 
     The task keeps the name; ``prepare`` resolves it to a commit once and binds that commit, so
     a branch that moves before ``run`` makes an approval for the old commit stop applying.
     """
     branch = _git_query(root, "symbolic-ref", "--quiet", "--short", "HEAD")
     if branch.returncode == 0 and branch.stdout.strip():
-        return branch.stdout.strip()
+        return branch.stdout.strip(), False
     detached = _git_query(root, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
     if detached.returncode == 0 and detached.stdout.strip():
-        return detached.stdout.strip()
+        return detached.stdout.strip(), True
     raise _refuse(
         f"{root} is not a Git repository with a commit (git: "
         f"{(branch.stderr or detached.stderr or '').strip()[:200] or 'no HEAD'}); a task runs in "
         "an isolated worktree created from a base commit"
     )
+
+
+def _profile_for_hint(data_dir: Path | None) -> tuple[str, str]:
+    """The ``--profile`` word for the printed ``prepare``, and a note saying where it came from.
+
+    ``HFLOW_PROFILE`` when it is set (``prepare`` would use it anyway), else the one profile in
+    ``<data-dir>/profiles`` when there is exactly one; otherwise the placeholder - with several
+    profiles, choosing one is the operator's decision. Names only: no profile file is opened.
+    """
+    from .hints import word
+
+    from_env = requested_profile_id(None)
+    if from_env:
+        return word(from_env), f"--profile {from_env} is {ENV_PROFILE}'s value"
+    available = available_profile_ids(
+        Path(data_dir) if data_dir is not None else default_data_dir()
+    )
+    if len(available) == 1:
+        return word(available[0]), f"--profile {available[0]} is the only profile in the data dir"
+    return PROFILE_PLACEHOLDER, ""
 
 
 def _unanswered_reuse() -> dict[str, Any]:
@@ -462,7 +479,7 @@ def init_task(
             f"{contract_path} approves no kind=command check; a real delivery is refused when its "
             "acceptance names only kind=fake checks"
         )
-    base = current_base(root)
+    base, detached = current_base(root)
     target = Path(out) if out is not None else Path.cwd() / f"{task_id}.task.json"
     if target.exists():
         raise _refuse(f"{target} already exists; init never overwrites a file")
@@ -524,16 +541,26 @@ def init_task(
         scaffold.notes.append(
             "not wired (kind=fake, refused for a real delivery): " + ", ".join(skipped)
         )
-    scaffold.notes.append(
-        f"base_commit is the branch name {base!r}; prepare resolves it to a commit and binds that"
-    )
-    data = _named_data_dir(data_dir)
+    if detached:
+        scaffold.notes.append(
+            f"base_commit is the commit {base} (HEAD is detached, so there is no branch to "
+            "name); prepare binds exactly that commit"
+        )
+    else:
+        scaffold.notes.append(
+            f"base_commit is the branch name {base!r}; prepare resolves it to a commit and binds "
+            "that"
+        )
+    data = data_dir_word(data_dir)
     words = ["prepare", "--task", shell_word(str(path))]
     if project_file is not None:
         words += ["--project", shell_word(str(contract_path))]
     stem = path.name.removesuffix(".json").removesuffix(".task")
+    profile, profile_note = _profile_for_hint(data_dir)
+    if profile_note:
+        scaffold.notes.append(profile_note)
     words += [
-        "--project-root", shell_word(str(root)), "--profile", PROFILE_PLACEHOLDER,
+        "--project-root", shell_word(str(root)), "--profile", profile,
         "--plan-out", shell_word(str(path.with_name(f"{stem}.plan.json"))),
     ]
     scaffold.next.append(

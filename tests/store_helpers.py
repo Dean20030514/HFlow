@@ -10,9 +10,37 @@ from __future__ import annotations
 
 import sqlite3
 
-from hflow.contracts import InvocationSettlement, InvocationStartState, SpawnKind
+from hflow.contracts import (
+    EffectiveConfig,
+    InvocationIntent,
+    InvocationSettlement,
+    InvocationStartState,
+    SpawnKind,
+)
 from hflow.ids import utc_now
-from hflow.store import RunNotFound, Store
+from hflow.store import _EFFECTIVE_CONFIG_PREFIX, RunNotFound, Store
+
+
+def pending_invocations(store: Store, root_id: str) -> list[InvocationIntent]:
+    """The root's ledger entries that are still pending, oldest first."""
+    return [entry for entry in store.invocations_for_root(root_id) if entry.pending]
+
+
+def turns_remaining(store: Store, run_id: str) -> int:
+    """The run's turn ceiling minus its reserved turns (the generated column)."""
+    return int(store.get_run(run_id)["turns_remaining"])
+
+
+def record_effective_config(store: Store, run_id: str, config: EffectiveConfig) -> None:
+    """Record a run's effective configuration after its creation, through the store's own rule.
+
+    Production records it in ``create_run``'s insert; this is the same write-once note, for a
+    test of what a second, different configuration does.
+    """
+    with store.transaction() as conn:
+        store._record_structured_note_locked(  # noqa: SLF001
+            conn, run_id, _EFFECTIVE_CONFIG_PREFIX, config
+        )
 
 
 def claim_run(store: Store, run_id: str, controller_id: str) -> bool:

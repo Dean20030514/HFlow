@@ -7,6 +7,8 @@ import pytest
 from hflow.contracts import EffectiveConfig, RunAdmissionBinding, TaskSpec, WorkspaceProvenance, digest_of
 from hflow.store import Store, StoreError, StoredRecordUnreadable
 
+from .store_helpers import record_effective_config
+
 
 def _binding(tmp_path: Path, config: EffectiveConfig | None = None) -> RunAdmissionBinding:
     return RunAdmissionBinding(
@@ -34,7 +36,7 @@ def test_full_config_and_admission_commit_together(store, task_spec, tmp_path):
     assert store.effective_config_for("R-binding") == config
     assert any(len(note) > 8000 for note in store.notes_for("R-binding"))
     with pytest.raises(StoreError, match="conflicting immutable"):
-        store.record_effective_config("R-binding", config.model_copy(update={"profile_id": "other"}))
+        record_effective_config(store, "R-binding", config.model_copy(update={"profile_id": "other"}))
     assert store.effective_config_for("R-binding") == config
 
 

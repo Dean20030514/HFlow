@@ -320,3 +320,226 @@ def test_an_inherited_pathspec_mode_does_not_break_the_freeze(
 
     freeze = git.freeze_candidate(worktree, ["app.txt"], expected_head=git.head)
     assert freeze.paths == ("app.txt",)
+
+
+# -- creating a run's worktree ---------------------------------------------------------------
+
+
+def _user_worktree_files(linked: Path) -> dict[str, bytes]:
+    """The two files that link the user's own linked worktree to the repository, as bytes."""
+    gitdir = (linked / ".git").read_bytes()
+    admin = Path(gitdir.decode("utf-8").removeprefix("gitdir: ").strip())
+    if not admin.is_absolute():
+        admin = (linked / admin).resolve()
+    return {".git": gitdir, "admin gitdir": (admin / "gitdir").read_bytes()}
+
+
+def test_creating_a_run_worktree_leaves_the_users_other_worktrees_byte_identical(
+    repo: Path, tmp_path: Path
+) -> None:
+    """Rule 12. ``git worktree repair`` rewrote *every* linked worktree's ``.git`` file.
+
+    With ``worktree.useRelativePaths`` set after the user made a worktree, the repair that used to
+    follow the staging rename turned the user's absolute ``gitdir:`` into a relative one. Only the
+    run's own worktree may change.
+    """
+    linked = tmp_path / "user-linked"
+    _git(repo, "worktree", "add", "-q", "-b", "user-branch", str(linked))
+    _git(repo, "config", "worktree.useRelativePaths", "true")
+    before = _user_worktree_files(linked)
+    assert Path(before[".git"].decode("utf-8").removeprefix("gitdir: ").strip()).is_absolute()
+
+    git = GitRepo(repo)
+    worktree = git.create_worktree("R-relative", git.head)
+
+    assert _user_worktree_files(linked) == before
+    assert git.worktree_registration(worktree) is not None
+    assert GitRepo.discover(worktree).root == worktree.resolve()
+    assert [path.name for path in worktree.parent.iterdir()] == ["R-relative"], "no staging left"
+    assert git.status_report(worktree) == gitworkspace.StatusReport((), (), ())
+
+
+def test_a_staging_name_left_by_an_earlier_process_with_the_same_pid_does_not_collide(
+    repo: Path,
+) -> None:
+    git = GitRepo(repo)
+    parent = git.worktree_parent()
+    parent.mkdir()
+    (parent / f"R-pid.staging-{os.getpid()}").mkdir()
+
+    worktree = git.create_worktree("R-pid", git.head)
+
+    assert git.worktree_registration(worktree) is not None
+    assert (parent / f"R-pid.staging-{os.getpid()}").is_dir(), "an earlier process's path is kept"
+
+
+@pytest.mark.parametrize("failure", ["git-error", "os-error"])
+def test_a_failed_move_into_place_is_a_git_error_and_removes_the_staging_worktree(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """An antivirus or indexer holding the staging directory made ``hflow run`` print a traceback
+    (an ``OSError`` the controller does not catch) and left ``<run>.staging-<pid>`` registered."""
+    git = GitRepo(repo)
+    real_run = subprocess.run
+
+    def failing_move(argv, *args, **kwargs):  # noqa: ANN001,ANN002,ANN003 - subprocess.run shape
+        if list(argv[:3]) == ["git", "worktree", "move"]:
+            if failure == "os-error":
+                raise PermissionError(13, "The process cannot access the file")
+            return subprocess.CompletedProcess(argv, 1, "", "fatal: move failed")
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", failing_move)
+    with pytest.raises(GitError, match="worktree"):
+        git.create_worktree("R-move-fails", git.head)
+    monkeypatch.undo()
+
+    assert list(git.worktree_parent().iterdir()) == []
+    assert [Path(block["worktree"]).resolve() for block in git.worktree_blocks()] == [repo.resolve()]
+
+
+def test_a_parent_that_cannot_be_created_is_a_git_error(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    git = GitRepo(repo)
+
+    def denied(self, *args, **kwargs):  # noqa: ANN001,ANN002,ANN003 - Path.mkdir shape
+        raise PermissionError(13, "Access is denied", str(self))
+
+    monkeypatch.setattr(Path, "mkdir", denied)
+    with pytest.raises(GitError, match="Access is denied"):
+        git.create_worktree("R-no-parent", git.head)
+
+
+def test_git_that_cannot_start_is_a_git_error(repo: Path) -> None:
+    """A ``cwd`` that vanished makes ``subprocess`` raise ``OSError`` before git runs."""
+    with pytest.raises(GitError, match="could not start"):
+        GitRepo(repo).run("status", cwd=repo / "no-such-directory")
+
+
+# -- forced configuration ----------------------------------------------------------------------
+
+
+def _forced(key: str) -> str:
+    return dict(_forced_config())[key]
+
+
+def test_no_directory_can_ever_exist_where_the_hooks_path_points(repo: Path, tmp_path: Path) -> None:
+    """``core.hooksPath`` names a path below an existing file no worker can replace.
+
+    The empty directory it used to name lived in the user's temporary directory, where a worker
+    running as the same user could plant ``post-commit`` or ``reference-transaction`` - hooks
+    ``--no-verify`` does not stop. ``GIT_GRAFT_FILE`` sat in that directory too.
+    """
+    hooks = Path(_forced("core.hooksPath"))
+    graft = Path(_base_env()["GIT_GRAFT_FILE"])
+    assert graft.parent == hooks.parent
+    assert hooks.parent.exists() and not hooks.parent.is_dir()
+    for path in (hooks, graft):
+        with pytest.raises(OSError):
+            os.makedirs(path / "post-commit")
+
+    marker = tmp_path / "hook-ran"
+    for name in ("pre-commit", "post-commit", "reference-transaction", "post-checkout"):
+        (repo / ".git" / "hooks" / name).write_text(
+            f"#!/bin/sh\necho {name} >> '{marker.as_posix()}'\n", encoding="utf-8", newline="\n"
+        )
+    # Control: plain git runs them.
+    _commit(repo, "control", {"app.txt": "value = 3\n"})
+    assert marker.exists()
+    marker.unlink()
+
+    git = GitRepo(repo)
+    worktree = git.create_worktree("R-hooks", git.head)
+    (worktree / "app.txt").write_text("value = 4\n", encoding="utf-8", newline="\n")
+    git.freeze_candidate(worktree, ["app.txt"], expected_head=git.head)
+    # Git says nothing about the hooks path or the graft file: no warning, no hint.
+    args = ("commit", "--allow-empty", "-q", "-m", "x")
+    completed = gitworkspace._run_git(args, cwd=worktree, timeout=60)
+    assert (completed.returncode, completed.stderr) == (0, "")
+    assert not marker.exists()
+
+
+def test_a_commit_starts_no_automatic_maintenance(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``git commit`` runs ``git maintenance run --auto``; Windows cannot detach it, so it ran in
+    the foreground of the freeze. Forced off, in protected ``command`` scope."""
+    assert (_forced("maintenance.auto"), _forced("gc.auto")) == ("false", "0")
+    trace = tmp_path / "trace2.json"
+    monkeypatch.setenv("GIT_TRACE2_EVENT", str(trace))
+    # Control: plain git starts it.
+    _commit(repo, "control", {"app.txt": "value = 3\n"})
+    assert '"maintenance"' in trace.read_text(encoding="utf-8")
+    trace.unlink()
+
+    git = GitRepo(repo)
+    worktree = git.create_worktree("R-maintenance", git.head)
+    (worktree / "app.txt").write_text("value = 4\n", encoding="utf-8", newline="\n")
+    git.freeze_candidate(worktree, ["app.txt"], expected_head=git.head)
+    events = trace.read_text(encoding="utf-8")
+    assert '"commit"' in events and '"maintenance"' not in events
+    assert git.run("config", "--show-scope", "--get", "gc.auto") == "command\t0\n"
+
+
+def test_git_output_is_read_as_utf_8_whatever_the_ansi_code_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Git for Windows writes paths as UTF-8; ``text=True`` decoded them with the ANSI code page."""
+    import locale
+
+    root = tmp_path / "projet-é-数据"
+    root.mkdir()
+    _git(root, "init", "-q", "-b", "main")
+    _commit(root, "first", {"app.txt": "value = 1\n"})
+    name = "naïve-数据.txt"
+    # A Western-European Windows: what ``subprocess`` decodes text-mode output with.
+    monkeypatch.setattr(locale, "getencoding", lambda: "cp1252")
+
+    git = GitRepo.discover(root)
+    assert git.root == root.resolve()
+    worktree = git.create_worktree("R-utf8-é", git.head)
+    assert git.worktree_registration(worktree) is not None
+    (worktree / name).write_text("x\n", encoding="utf-8")
+    assert git.status_report(worktree).changed == (name,)
+    freeze = git.freeze_candidate(worktree, [name], expected_head=git.head)
+    assert freeze.paths == (name,)
+    assert git.diff_paths(git.head, freeze.candidate_commit) == [name]
+    assert git.checked_out_at("refs/heads/main") == [root.resolve()]
+
+
+# -- what git may reach and read -------------------------------------------------------------
+
+
+def test_git_reads_no_standard_input(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Git for Windows asks "Unlink of file ... failed. Should I try again? (y/n)" on a terminal."""
+    git = GitRepo(repo)
+    real_run = subprocess.run
+    seen: list[object] = []
+
+    def recording(argv, *args, **kwargs):  # noqa: ANN001,ANN002,ANN003 - subprocess.run shape
+        seen.append(kwargs.get("stdin"))
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", recording)
+    git.run("status")
+    git.is_ancestor(git.head, git.head)
+    assert seen == [subprocess.DEVNULL, subprocess.DEVNULL]
+
+
+def test_a_partial_clone_never_fetches_a_missing_object(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``GIT_NO_LAZY_FETCH=1``: a missing blob is an error, never a fetch from a remote."""
+    monkeypatch.setenv("GIT_NO_LAZY_FETCH", "0")
+    assert _base_env()["GIT_NO_LAZY_FETCH"] == "1"
+    _git(repo, "config", "uploadpack.allowFilter", "true")
+    blob = _git(repo, "rev-parse", "HEAD~1:app.txt").strip()
+    clone = tmp_path / "partial"
+    _git(tmp_path, "clone", "-q", "--filter=blob:none", "--no-checkout", repo.as_uri(), str(clone))
+
+    with pytest.raises(GitError):
+        GitRepo(clone).run("cat-file", "-p", blob)
+    # Control: plain git fetches it from the remote.
+    monkeypatch.delenv("GIT_NO_LAZY_FETCH")
+    assert _git(clone, "cat-file", "-p", blob) == "value = 1\n"

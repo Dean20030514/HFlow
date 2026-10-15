@@ -24,8 +24,10 @@ documented Win32 API; there is no general-purpose process-management framework h
 from __future__ import annotations
 
 import ctypes
+import functools
 import os
 import subprocess
+import time
 from ctypes import wintypes
 from typing import Any
 
@@ -47,6 +49,10 @@ WAIT_TIMEOUT = 0x00000102
 
 #: The one ``OpenProcess`` failure that means no process has this id (Win32 error 87).
 ERROR_INVALID_PARAMETER = 87
+
+#: The longest single blocking wait in :func:`wait_interruptibly`, and so the longest a console
+#: Ctrl+C waits before it reaches the controller.
+WAIT_SLICE_SECONDS = 0.1
 
 
 class JobBoundaryError(RuntimeError):
@@ -102,8 +108,68 @@ class _BasicAccountingInformation(ctypes.Structure):
     ]
 
 
-def _kernel32() -> object:
-    return ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+class _ThreadEntry32(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ThreadID", wintypes.DWORD),
+        ("th32OwnerProcessID", wintypes.DWORD),
+        ("tpBasePri", wintypes.LONG),
+        ("tpDeltaPri", wintypes.LONG),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+TH32CS_SNAPTHREAD = 0x00000004
+THREAD_SUSPEND_RESUME = 0x0002
+#: What ``CreateToolhelp32Snapshot`` returns on failure, as a ``HANDLE`` restype reads it.
+INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+#: What ``ResumeThread`` returns on failure: ``(DWORD)-1``.
+RESUME_THREAD_FAILED = 0xFFFFFFFF
+
+#: ``(restype, argtypes)`` of every kernel32 function this package calls, declared once on the
+#: one binding :func:`_kernel32` returns. Without them ctypes reads every result as a C ``int``,
+#: which truncates a 64-bit handle and turns ``INVALID_HANDLE_VALUE`` into ``-1``.
+_SIGNATURES: dict[str, tuple[Any, list[Any]]] = {
+    "CloseHandle": (wintypes.BOOL, [wintypes.HANDLE]),
+    "CreateJobObjectW": (wintypes.HANDLE, [wintypes.LPVOID, wintypes.LPCWSTR]),
+    "SetInformationJobObject": (
+        wintypes.BOOL,
+        [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD],
+    ),
+    "QueryInformationJobObject": (
+        wintypes.BOOL,
+        [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD, wintypes.LPDWORD],
+    ),
+    "AssignProcessToJobObject": (wintypes.BOOL, [wintypes.HANDLE, wintypes.HANDLE]),
+    "TerminateJobObject": (wintypes.BOOL, [wintypes.HANDLE, wintypes.UINT]),
+    "IsProcessInJob": (
+        wintypes.BOOL,
+        [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)],
+    ),
+    "OpenProcess": (wintypes.HANDLE, [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]),
+    "WaitForSingleObject": (wintypes.DWORD, [wintypes.HANDLE, wintypes.DWORD]),
+    "CreateToolhelp32Snapshot": (wintypes.HANDLE, [wintypes.DWORD, wintypes.DWORD]),
+    "Thread32First": (wintypes.BOOL, [wintypes.HANDLE, ctypes.POINTER(_ThreadEntry32)]),
+    "Thread32Next": (wintypes.BOOL, [wintypes.HANDLE, ctypes.POINTER(_ThreadEntry32)]),
+    "OpenThread": (wintypes.HANDLE, [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]),
+    "ResumeThread": (wintypes.DWORD, [wintypes.HANDLE]),
+}
+
+
+@functools.cache
+def _kernel32() -> Any:
+    """kernel32 with every signature in :data:`_SIGNATURES` declared, loaded once per process.
+
+    ``use_last_error=True`` so ``ctypes.get_last_error`` reads the error of the last call made
+    through this binding. ``hflow.ownership`` declares the few it adds on this same object.
+    """
+    api = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    for name, (restype, argtypes) in _SIGNATURES.items():
+        function = getattr(api, name)
+        function.restype = restype
+        function.argtypes = argtypes
+    return api
 
 
 class ProcessBoundary:
@@ -126,15 +192,6 @@ class ProcessBoundary:
             self.kind = "direct_child_only"
             return self
         api = _kernel32()
-        api.CreateJobObjectW.restype = wintypes.HANDLE
-        api.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
-        api.SetInformationJobObject.restype = wintypes.BOOL
-        api.SetInformationJobObject.argtypes = [
-            wintypes.HANDLE,
-            ctypes.c_int,
-            wintypes.LPVOID,
-            wintypes.DWORD,
-        ]
         # lpJobAttributes=None => handle is NOT inheritable.
         handle = api.CreateJobObjectW(None, None)
         if not handle:
@@ -175,15 +232,11 @@ class ProcessBoundary:
         if self.handle is None:
             return  # non-Windows: nothing to assign
         api = self._api
-        api.OpenProcess.restype = wintypes.HANDLE
-        api.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
         rights = PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE
         process = api.OpenProcess(rights, False, pid)
         if not process:
             raise JobBoundaryError(f"OpenProcess({pid}) failed: {ctypes.get_last_error()}")  # type: ignore[attr-defined]
         try:
-            api.AssignProcessToJobObject.restype = wintypes.BOOL
-            api.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
             if not api.AssignProcessToJobObject(self.handle, process):
                 raise JobBoundaryError(
                     f"AssignProcessToJobObject({pid}) failed: {ctypes.get_last_error()}"  # type: ignore[attr-defined]
@@ -214,18 +267,11 @@ class ProcessBoundary:
         if self.handle is None or self._api is None:
             return None
         api = self._api
-        api.OpenProcess.restype = wintypes.HANDLE
         process = api.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not process:
             return None
         try:
             result = wintypes.BOOL()
-            api.IsProcessInJob.restype = wintypes.BOOL
-            api.IsProcessInJob.argtypes = [
-                wintypes.HANDLE,
-                wintypes.HANDLE,
-                ctypes.POINTER(wintypes.BOOL),
-            ]
             if not api.IsProcessInJob(process, self.handle, ctypes.byref(result)):
                 return None
             return bool(result.value)
@@ -249,9 +295,7 @@ class ProcessBoundary:
                 return True
             if active is None:
                 return False
-            import time as _time
-
-            _time.sleep(step)
+            time.sleep(step)
             waited += step
         return self.active_processes() == 0
 
@@ -274,22 +318,11 @@ def resume(pid: int) -> None:
     if not IS_WINDOWS:
         return
     api = _kernel32()
-    TH32CS_SNAPTHREAD = 0x00000004
-
-    class _ThreadEntry32(ctypes.Structure):
-        _fields_ = [
-            ("dwSize", wintypes.DWORD),
-            ("cntUsage", wintypes.DWORD),
-            ("th32ThreadID", wintypes.DWORD),
-            ("th32OwnerProcessID", wintypes.DWORD),
-            ("tpBasePri", wintypes.LONG),
-            ("tpDeltaPri", wintypes.LONG),
-            ("dwFlags", wintypes.DWORD),
-        ]
-
     snapshot = api.CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
-    if snapshot == wintypes.HANDLE(-1).value:
-        raise JobBoundaryError("CreateToolhelp32Snapshot failed for resume")
+    if not snapshot or snapshot == INVALID_HANDLE_VALUE:
+        raise JobBoundaryError(
+            f"CreateToolhelp32Snapshot failed for resume: {ctypes.get_last_error()}"  # type: ignore[attr-defined]
+        )
     entry = _ThreadEntry32()
     entry.dwSize = ctypes.sizeof(_ThreadEntry32)
     resumed = False
@@ -297,10 +330,16 @@ def resume(pid: int) -> None:
         if api.Thread32First(snapshot, ctypes.byref(entry)):
             while True:
                 if entry.th32OwnerProcessID == pid:
-                    thread = api.OpenThread(0x0002, False, entry.th32ThreadID)  # SUSPEND_RESUME
+                    thread = api.OpenThread(THREAD_SUSPEND_RESUME, False, entry.th32ThreadID)
                     if thread:
-                        api.ResumeThread(thread)
-                        api.CloseHandle(thread)
+                        try:
+                            if api.ResumeThread(thread) == RESUME_THREAD_FAILED:
+                                raise JobBoundaryError(
+                                    f"ResumeThread failed for process {pid}: "
+                                    f"{ctypes.get_last_error()}"  # type: ignore[attr-defined]
+                                )
+                        finally:
+                            api.CloseHandle(thread)
                         resumed = True
                         break
                 if not api.Thread32Next(snapshot, ctypes.byref(entry)):
@@ -398,7 +437,6 @@ def process_gone(pid: int, wait_seconds: float = 0.0) -> bool | None:
             return False
         return False
     api = _kernel32()
-    api.OpenProcess.restype = wintypes.HANDLE
     handle = api.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, pid)
     if not handle:
         error = ctypes.get_last_error()  # type: ignore[attr-defined]
@@ -407,7 +445,37 @@ def process_gone(pid: int, wait_seconds: float = 0.0) -> bool | None:
         result = api.WaitForSingleObject(handle, int(wait_seconds * 1000))
         if result == WAIT_OBJECT_0:
             return True
-        # Anything else means the wait failed: WAIT_FAILED reads as -1 through the default restype.
+        # Anything else means the wait failed (WAIT_FAILED, 0xFFFFFFFF).
         return False if result == WAIT_TIMEOUT else None
     finally:
         api.CloseHandle(handle)
+
+
+def wait_interruptibly(child: subprocess.Popen, timeout: float | None) -> int:
+    """``child.wait(timeout)`` that a console Ctrl+C interrupts within one short slice.
+
+    On Windows ``Popen.wait`` blocks in ``WaitForSingleObject``, which a console Ctrl+C does not
+    interrupt: the ``KeyboardInterrupt`` is raised only once the wait returns - for an agent
+    turn, at its deadline - so the operator's Ctrl+C in the owner's terminal would leave the
+    agent running for the rest of its allowance. Waiting in slices of at most
+    :data:`WAIT_SLICE_SECONDS` lets the interrupt through between two slices. Returns the exit
+    code, or raises ``subprocess.TimeoutExpired`` like ``Popen.wait`` once ``timeout`` has passed
+    without an exit; ``None`` waits without a limit.
+    """
+    deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+    while True:
+        if deadline is None:
+            slice_seconds = WAIT_SLICE_SECONDS
+        else:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                # One last look, so an exit right at the deadline is not reported as a timeout.
+                code = child.poll()
+                if code is not None:
+                    return code
+                raise subprocess.TimeoutExpired(child.args, timeout or 0.0)
+            slice_seconds = min(WAIT_SLICE_SECONDS, remaining)
+        try:
+            return child.wait(timeout=slice_seconds)
+        except subprocess.TimeoutExpired:
+            continue

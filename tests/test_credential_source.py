@@ -383,6 +383,55 @@ def test_the_run_gate_refuses_before_anything_is_spent_and_a_resubmission_works(
     assert harness.stub_files("spawn"), "the same TaskSpec dispatched once the key was set"
 
 
+def test_a_never_dispatched_run_resubmitted_without_a_key_is_refused_before_it_is_claimed(
+    tmp_path: Path, project, task_spec, project_root: Path, harness_factory,  # noqa: F811
+    no_key, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An admitted run continued from a shell with no key: refused like a new run, nothing spent.
+
+    Before, the continuation claimed the run and reserved a submission, and only the driver's
+    spawn gate refused - the spend this ruling exists to prevent.
+    """
+    harness = harness_factory("cooperative")
+    store = Store(tmp_path / "hflow.sqlite")
+    controller = Controller(
+        store,
+        harness.driver,
+        controller_build="test-build",
+        runners=CheckRunners({"fake": FakeCheckRunner()}),
+        data_dir=harness.data_dir,
+        production=False,
+    )
+    request = RunRequest(
+        task=task_spec, project=project, project_root=project_root, workspace_root=project_root
+    )
+    try:
+        # An earlier controller admitted the run and exited before its first dispatch.
+        run_id = "R-admitted-earlier"
+        store.create_run(
+            run_id=run_id, project_id=project.project_id, spec=task_spec,
+            spec_digest=task_spec.spec_digest(), controller_build="test-build",
+            checks_digest=project.checks_digest(), turn_limit=task_spec.budget.max_agent_turns,
+            repair_limit=task_spec.budget.max_repair_cycles,
+            admission_binding=controller._admission_binding(run_id, request),
+        )
+        before = ledger_counts(store), dict(store.get_run(run_id)), store.notes_for(run_id)
+        with pytest.raises(RefusedError) as excinfo:
+            controller.run_task(request)
+        assert excinfo.value.code is RefusalCode.NO_CREDENTIAL_SOURCE
+        assert (ledger_counts(store), dict(store.get_run(run_id)), store.notes_for(run_id)) == before
+        assert store.get_run(run_id)["claimed_by"] is None, "refused before the claim"
+        assert harness.stub_files("spawn") == []
+
+        monkeypatch.setenv(KEY, SENTINEL)
+        outcome = controller.run_task(request)
+    finally:
+        store.close()
+    assert outcome.run_id == run_id, "the same admitted run continued"
+    assert outcome.block_code is not RefusalCode.NO_CREDENTIAL_SOURCE, outcome.block_reason
+    assert harness.stub_files("spawn"), "the run dispatched once the key was set"
+
+
 def test_hflow_run_with_a_real_profile_and_no_key_exits_refused_and_records_nothing(
     tmp_path: Path, sample_repo: Path, live_profile, acpx_client,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],

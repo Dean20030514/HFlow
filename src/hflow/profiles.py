@@ -23,8 +23,9 @@ import os
 import re
 from collections.abc import Mapping
 from pathlib import Path
+from typing import TypeVar
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from .contracts import AgentBinding, MachineProfile, RefusalCode, RefusedError, digest_of
 
@@ -129,32 +130,17 @@ def load_profile(data_dir: Path, profile_id: str) -> MachineProfile:
             f"profile id {profile_id!r} is not a plain file name: it resolves to {path}, "
             f"outside {profiles_dir(data_dir)}",
         )
-    try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        existing = ", ".join(available_profile_ids(data_dir)) or "none"
-        raise RefusedError(
-            RefusalCode.INVALID_SPEC,
-            f"profile {name!r} not found at {path}. Profiles in {profiles_dir(data_dir)}: "
-            f"{existing}. Nothing falls back to a default binding; create the profile or name "
-            "one that exists.",
-        ) from exc
-    except json.JSONDecodeError as exc:
-        raise RefusedError(
-            RefusalCode.INVALID_SPEC, f"profile {name!r} at {path} is not valid JSON: {exc}"
-        ) from exc
-    except OSError as exc:
-        raise RefusedError(
-            RefusalCode.INVALID_SPEC, f"profile {name!r} at {path} could not be read: {exc}"
-        ) from exc
-    try:
-        profile = MachineProfile.model_validate(document)
-    except ValidationError as exc:
-        raise RefusedError(
-            RefusalCode.INVALID_SPEC,
-            f"profile {name!r} at {path} does not match the MachineProfile contract: "
-            f"{summarize_validation_error(exc)}",
-        ) from exc
+    existing = ", ".join(available_profile_ids(data_dir)) or "none"
+    profile = load_model(
+        path,
+        MachineProfile,
+        what=f"profile {name!r}",
+        invalid=f"profile {name!r} at {path} does not match the MachineProfile contract",
+        missing_hint=(
+            f"Profiles in {profiles_dir(data_dir)}: {existing}. Nothing falls back to a default "
+            "binding; create the profile or name one that exists."
+        ),
+    )
     if profile.profile_id != name:
         # A file whose contents name a different profile would make the recorded identity
         # disagree with the file the user named, and the digest would then cover a profile
@@ -180,6 +166,112 @@ def summarize_validation_error(exc: ValidationError) -> str:
     if len(exc.errors()) > 6:
         parts.append(f"... and {len(exc.errors()) - 6} more")
     return "; ".join(parts)
+
+
+# --------------------------------------------------------------------------
+# reading an input file: the one loader every hand-written JSON document goes through
+# --------------------------------------------------------------------------
+
+#: UTF-16 byte-order marks. Windows PowerShell 5.1's ``>`` and ``Out-File`` write UTF-16 LE with
+#: one by default, so a task, profile or approval saved that way is common - and never JSON HFlow
+#: reads.
+_UTF16_BOMS = (b"\xff\xfe", b"\xfe\xff")
+#: How to save a file as UTF-8 from the shell that most often wrote it as UTF-16.
+_UTF8_FIX = (
+    "save it as UTF-8 (in Windows PowerShell 5.1: `Get-Content FILE | Set-Content -Encoding utf8 "
+    "FILE`, or write it with PowerShell 7, whose default is UTF-8)"
+)
+
+
+def load_json_file(
+    path: Path,
+    *,
+    what: str,
+    missing_hint: str = "",
+    missing_code: RefusalCode = RefusalCode.INVALID_SPEC,
+) -> object:
+    """Read one hand-written JSON input file, refusing rather than defaulting.
+
+    The one reader for every input document (task, project contract, machine profile, plan,
+    authorization, root budget, repair policy, fake write plan), so each fails the same way: a
+    missing file is ``missing_code`` (with ``missing_hint`` after it: how to supply the file),
+    and anything else that keeps the file from being read - a directory, a permission, an I/O
+    error, UTF-16 or other non-UTF-8 text, invalid JSON - is an ``invalid_spec`` refusal naming
+    the file. Never a traceback.
+
+    The text is decoded as ``utf-8-sig``: a UTF-8 byte-order mark (what Windows PowerShell 5.1's
+    ``Set-Content -Encoding utf8`` writes) is accepted and dropped. Nothing is digested from the
+    bytes - every digest is over the parsed, validated document - so the mark changes no binding.
+    """
+    path = Path(path)
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError as exc:
+        raise RefusedError(
+            missing_code,
+            f"{what} not found: {path}" + (f". {missing_hint}" if missing_hint else ""),
+        ) from exc
+    except OSError as exc:
+        why = "it is a directory, not a file" if path.is_dir() else str(exc)
+        raise RefusedError(
+            RefusalCode.INVALID_SPEC, f"{what} {path} could not be read: {why}"
+        ) from exc
+    if data.startswith(_UTF16_BOMS) or b"\x00" in data[:4]:
+        raise RefusedError(
+            RefusalCode.INVALID_SPEC,
+            f"{what} {path} could not be read: it is UTF-16 text, not UTF-8 JSON; {_UTF8_FIX}",
+        )
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise RefusedError(
+            RefusalCode.INVALID_SPEC,
+            f"{what} {path} could not be read: it is not valid UTF-8 JSON ({exc}); {_UTF8_FIX}",
+        ) from exc
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RefusedError(
+            RefusalCode.INVALID_SPEC, f"{what} {path} is not valid JSON: {exc}"
+        ) from exc
+    except (ValueError, RecursionError) as exc:  # an over-long integer, nesting past the stack
+        raise RefusedError(
+            RefusalCode.INVALID_SPEC, f"{what} {path} could not be decoded as JSON: {exc}"
+        ) from exc
+
+
+_Model = TypeVar("_Model", bound=BaseModel)
+
+
+def load_model(
+    path: Path,
+    model: type[_Model],
+    *,
+    what: str,
+    invalid: str,
+    summarize: bool = True,
+    not_object: str = "",
+    missing_hint: str = "",
+    missing_code: RefusalCode = RefusalCode.INVALID_SPEC,
+) -> _Model:
+    """Read one input file (:func:`load_json_file`) as ``model``; a mismatch is ``invalid_spec``.
+
+    ``invalid`` starts the refusal for a document that does not match, followed by the rejected
+    fields (:func:`summarize_validation_error`) or, with ``summarize=False``, pydantic's own text.
+    ``not_object``, when given, refuses a document that is not a JSON object before validation.
+    """
+    raw = load_json_file(
+        Path(path), what=what, missing_hint=missing_hint, missing_code=missing_code
+    )
+    if not_object and not isinstance(raw, dict):
+        raise RefusedError(
+            RefusalCode.INVALID_SPEC, f"{not_object}, not a JSON {type(raw).__name__}"
+        )
+    try:
+        return model.model_validate(raw)
+    except ValidationError as exc:
+        reason = summarize_validation_error(exc) if summarize else str(exc)
+        raise RefusedError(RefusalCode.INVALID_SPEC, f"{invalid}: {reason}") from exc
 
 
 def role_binding(profile: MachineProfile, role: str) -> tuple[str, AgentBinding]:

@@ -962,3 +962,29 @@ def test_a_malformed_authorization_is_an_admission_refusal(tmp_path: Path) -> No
     assert excinfo.value.code is RefusalCode.INVALID_SPEC
     assert f"{path} is not a valid authorization" in excinfo.value.message
     assert "binding.mode" in excinfo.value.message
+
+
+def test_an_authorization_file_is_read_like_every_other_input(tmp_path: Path) -> None:
+    """One reader: a UTF-8 BOM is accepted with the same binding digest (it is over the parsed
+    record), UTF-16 and a directory are ``invalid_spec`` refusals naming the file, and a missing
+    file stays ``not_implemented`` - a real run without an approval."""
+    record = load_authorization(LEGACY_FIXTURE)
+    text = json.dumps(record.model_dump(mode="json"))
+
+    bom = tmp_path / "bom.json"
+    bom.write_bytes(b"\xef\xbb\xbf" + text.encode("utf-8"))
+    assert load_authorization(bom).binding_digest() == record.binding_digest()
+
+    wide = tmp_path / "wide.json"
+    wide.write_bytes(text.encode("utf-16"))
+    directory = tmp_path / "directory.json"
+    directory.mkdir()
+    for path in (wide, directory):
+        with pytest.raises(RefusedError) as excinfo:
+            load_authorization(path)
+        assert excinfo.value.code is RefusalCode.INVALID_SPEC
+        assert f"authorization file {path} could not be read" in excinfo.value.message
+
+    with pytest.raises(RefusedError) as excinfo:
+        load_authorization(tmp_path / "absent.json")
+    assert excinfo.value.code is RefusalCode.NOT_IMPLEMENTED

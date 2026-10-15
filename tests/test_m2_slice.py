@@ -260,7 +260,7 @@ def test_m2_slice_produces_a_frozen_git_candidate_and_a_receipt(
         # The tracked candidate is frozen clean. A check may leave *ignored* byproducts
         # (bytecode caches); those are not candidate drift, and they are listed separately.
         assert _git(worktree, "status", "--porcelain", "--untracked-files=no").strip() == ""
-        ignored = GitRepo.discover(worktree).ignored_artifacts(worktree)
+        ignored = GitRepo.discover(worktree).status_report(worktree).ignored
         assert ignored, "the check did leave a cache; the policy must still name every entry"
         assert all(matches_pattern(entry, list(IGNORED_ARTIFACT_ALLOWLIST)) for entry in ignored), (
             f"unexpected ignored artifacts in the candidate worktree: {ignored}"
@@ -327,11 +327,7 @@ def test_candidate_survives_but_check_failure_blocks_delivery(
 
         # The worktree is preserved for inspection, with the candidate still frozen in it.
         repo = GitRepo.discover(sample_repo)
-        worktrees = [
-            Path(line.split(" ", 1)[1])
-            for line in repo.worktree_list()
-            if line.startswith("worktree ")
-        ]
+        worktrees = [Path(block["worktree"]) for block in repo.worktree_blocks()]
         assert len(worktrees) >= 2, "the failed candidate must be kept, not cleaned up"
         failed_worktree = worktrees[-1]
         assert failed_worktree.exists() and failed_worktree.is_dir()
@@ -373,6 +369,51 @@ def test_worktree_drift_after_acceptance_invalidates_the_candidate(
         assert _git(Path(outcome.receipt.candidate.worktree), "status", "--porcelain").strip() != ""
     finally:
         store.close()
+
+
+@pytest.mark.parametrize("change", ["tracked_edit", "commit"])
+def test_a_check_that_leaves_the_frozen_candidate_is_not_accepted(
+    sample_repo: Path, tmp_path: Path, change: str
+) -> None:
+    """A check rewrote a tracked file outside the scope (or committed): the scoped fingerprint
+    cannot see it, but the checks after it ran on a tree that is not the candidate."""
+    from hflow.contracts import RefusalCode
+    from hflow.verify import FakeCheckRunner
+
+    class LeavingCheck(FakeCheckRunner):
+        def run(self, check, cwd, timeout_seconds):  # noqa: ANN001, ANN202 - runner shape
+            (Path(cwd) / "pyproject.toml").write_text("# rewritten by a check\n", encoding="utf-8")
+            if change == "commit":
+                _git(Path(cwd), "commit", "-qam", "a check committed")
+            return super().run(check, cwd, timeout_seconds)
+
+    store = Store(tmp_path / "data" / "hflow.sqlite")
+    base_commit = _git(sample_repo, "rev-parse", "HEAD").strip()
+    project = _project(sample_repo).model_copy(update={"checks": [CheckDef(id="unit", kind="fake")]})
+    controller = Controller(
+        store,
+        FakeDriver(sample_repo, FakeScript(write_plan={"src/textkit/__init__.py": FIXED_SOURCE})),
+        controller_build="m2-test-build",
+        runners=CheckRunners({"fake": LeavingCheck()}),
+        data_dir=tmp_path / "data",
+        production=False,
+    )
+    try:
+        outcome = controller.run_task(
+            RunRequest(
+                task=_task(sample_repo, base_commit),
+                project=project,
+                project_root=sample_repo,
+                workspace_root=sample_repo,
+            )
+        )
+    finally:
+        store.close()
+    assert outcome.task_state is TaskState.BLOCKED
+    assert outcome.block_code is RefusalCode.EVIDENCE_STALE, outcome.block_reason
+    assert outcome.receipt is None
+    expected = "pyproject.toml" if change == "tracked_edit" else "HEAD moved"
+    assert expected in (outcome.block_reason or ""), outcome.block_reason
 
 
 def test_dirty_target_repository_is_left_alone(sample_repo: Path, tmp_path: Path) -> None:
@@ -1199,16 +1240,9 @@ def test_a_config_value_that_is_not_text_makes_the_metadata_snapshot_a_git_error
 
     On Windows the decode fails in subprocess's reader thread and the output comes back as
     ``None``; on POSIX ``subprocess.run`` raises ``UnicodeDecodeError`` itself. Unconverted, either
-    escapes every ``except GitError`` and leaves the run ``RUNNING`` with no block.
+    escapes every ``except GitError`` and leaves the run ``RUNNING`` with no block. Git's output
+    is read as UTF-8 whatever the locale, so the bytes below are never text.
     """
-    import locale
-
-    try:
-        NOT_TEXT_CONFIG.decode(locale.getpreferredencoding(False))
-    except UnicodeDecodeError:
-        pass
-    else:  # pragma: no cover - a single-byte locale decodes any byte
-        pytest.skip("this locale decodes every byte, so git's output is always text here")
     repo = GitRepo.discover(sample_repo)
     worktree = repo.create_worktree("R-metadata-not-text", repo.head)
     repo.metadata_snapshot(worktree)

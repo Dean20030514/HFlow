@@ -48,6 +48,7 @@ from hflow.contracts import (
 from hflow.contracts import RefusedError
 from hflow.contracts import AttemptState, CancellationReceipt, InvocationStartState
 from hflow.controller import Controller, inspect_run
+from hflow.drivers import acpx_dsh as acpx_dsh_module
 from hflow.drivers.acpx_dsh import AcpxDshDriver
 from hflow.drivers.fake import FakeDriver, FakeScript
 from hflow.gitworkspace import GIT_METADATA_CHANGED, GitRepo
@@ -2252,6 +2253,90 @@ def test_a_repair_round_without_its_context_is_refused_before_any_dispatch(
         store.close()
 
 
+@pytest.mark.parametrize("refusal", ["stopped", "ended", "superseded"])
+def test_a_refused_reopen_is_recorded_as_what_refused_it(
+    tmp_path: Path, sample_repo: Path, refusal: str
+) -> None:
+    """Only a stop is recorded as ``stop_requested``; a verdict or a takeover is not a stop.
+
+    Before, every refused reopen was recorded ``stop_requested`` and blocked ``budget_exhausted``,
+    so an operator reading a superseded controller's run was told a human had stopped it.
+    """
+    from hflow.contracts import CandidateIdentity
+
+    store = Store(tmp_path / "hflow.sqlite")
+    project = _project()
+    base = _git(sample_repo, "rev-parse", "HEAD").strip()
+    spec = _spec(policy=_policy(), base_commit=base)
+    driver = RepairingDriver(
+        sample_repo, first_plan={}, repair_plan={"src/parser.py": FIXED_SOURCE}
+    )
+    controller = _controller(
+        store, project_root=sample_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": FailingOnceThenPassing()}),
+    )
+    try:
+        run_id = "R-reopen-refused"
+        store.create_run(
+            run_id=run_id,
+            project_id=project.project_id,
+            spec=spec,
+            spec_digest=spec.spec_digest(),
+            controller_build="repair-test",
+            checks_digest=project.checks_digest(),
+            turn_limit=4,
+            repair_limit=1,
+        )
+        claim_run(store, run_id, "local-controller")
+        if refusal == "stopped":
+            store.record_cancel_intent(run_id)
+        elif refusal == "ended":
+            store.set_blocked(run_id, RefusalCode.VERIFICATION_FAILED, "a verdict ended the run")
+        else:
+            # This controller's fence names a claim the run no longer has: a takeover superseded it.
+            controller._claims[run_id] = 7  # noqa: SLF001
+        previous = CandidateIdentity(
+            round=1, attempt_id="A-previous", base_commit=base, fingerprint="fp-previous"
+        )
+        cycle = controller._attempt_cycle(  # noqa: SLF001
+            run_id,
+            _request(project=project, spec=spec, project_root=sample_repo),
+            repo=None,
+            worktree=None,
+            execution_root=sample_repo,
+            user_tree_before="",
+            dirty_target=False,
+            implementer_writes=True,
+            implementer_packet=None,
+            previous=previous,
+            trigger=RepairTrigger.BUSINESS_CHECK_FAILED,
+            round_number=2,
+            original_base_commit=base,
+            original_base_ref=f"base:{base}",
+            policy=_policy(),
+            repair_context=None,
+        )
+        decisions = [record.decision for record in store.repair_records_for(run_id)]
+        row = store.get_run(run_id)
+    finally:
+        store.close()
+
+    assert cycle.outcome is not None and cycle.repair is None
+    assert driver.packets == [], "nothing was dispatched"
+    expected = {
+        "stopped": RepairDecision.STOP_REQUESTED,
+        "ended": RepairDecision.REOPEN_REFUSED,
+        "superseded": RepairDecision.REOPEN_REFUSED,
+    }[refusal]
+    assert decisions == [expected]
+    if refusal == "ended":
+        assert row["block_code"] == RefusalCode.VERIFICATION_FAILED.value, "never relabelled"
+    elif refusal == "superseded":
+        assert cycle.outcome.block_code is RefusalCode.OWNER_LOST, cycle.outcome.block_reason
+    else:
+        assert row["block_code"] is None, "the recorded stop decides the run; no block is written"
+
+
 # --------------------------------------------------------------------------
 # 14. a root that ran out of time buys nothing
 # --------------------------------------------------------------------------
@@ -3807,13 +3892,15 @@ def test_the_local_driver_wait_is_bounded_by_the_invocation_deadline(
     handle = driver.start_handle(invocation)
     process = driver._processes[handle.invocation_id]
     waits: list[float | None] = []
-    original_wait = process.wait
+    # The driver waits through ``wait_interruptibly`` (slices of ``Popen.wait``, so a Ctrl+C gets
+    # through); its ``timeout`` is the bound each wait was given.
+    original_wait = acpx_dsh_module.wait_interruptibly
 
-    def recorded_wait(timeout=None):  # noqa: ANN001 - mirrors Popen.wait
+    def recorded_wait(child, timeout):  # noqa: ANN001 - mirrors wait_interruptibly
         waits.append(timeout)
-        return original_wait(timeout=timeout)
+        return original_wait(child, timeout)
 
-    monkeypatch.setattr(process, "wait", recorded_wait)
+    monkeypatch.setattr(acpx_dsh_module, "wait_interruptibly", recorded_wait)
     try:
         result = driver.collect(handle)
         alive = process.poll() is None
@@ -3912,18 +3999,18 @@ def test_an_expired_deadline_stops_the_whole_process_tree_not_just_the_client(
             "the probe's child must be inside the managed boundary, or this case tests nothing"
         )
 
-        original_wait = process.wait
+        original_wait = acpx_dsh_module.wait_interruptibly
         waits: list[float | None] = []
 
-        def exit_client_during_grace(timeout=None):  # noqa: ANN001 - mirrors Popen.wait
+        def exit_client_during_grace(child, timeout):  # noqa: ANN001 - mirrors wait_interruptibly
             waits.append(timeout)
             if len(waits) == 2:
                 # The first wait is collect's deadline; the second is the graceful teardown.
                 # Release the real client here, leaving its real child in the same job.
                 release.touch()
-            return original_wait(timeout=timeout)
+            return original_wait(child, timeout)
 
-        monkeypatch.setattr(process, "wait", exit_client_during_grace)
+        monkeypatch.setattr(acpx_dsh_module, "wait_interruptibly", exit_client_during_grace)
         result = driver.collect(handle)
 
         assert result.outcome is InvocationOutcome.OUTCOME_UNKNOWN, (

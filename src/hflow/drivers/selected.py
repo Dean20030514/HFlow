@@ -26,7 +26,7 @@ from ..contracts import (
 )
 from .acpx_dsh import DRIVER_ID as ACPX_DSH_DRIVER_ID
 from .acpx_dsh import DRIVER_VERSION as ACPX_DSH_DRIVER_VERSION
-from .acpx_dsh import PROBED_CAPABILITIES, AcpxDshDriver
+from .acpx_dsh import NO_COOPERATIVE_CANCEL, PROBED_CAPABILITIES, AcpxDshDriver
 
 SELECTED_DRIVER_ID = ACPX_DSH_DRIVER_ID
 #: Names a machine profile may use for the selected transport.
@@ -123,7 +123,7 @@ def local_probe(
         notes=[
             "probe is static: no prompt, no session, no model request",
             "transport selected by M0: acpx 0.17.1 -> official DSH ACP",
-            "cooperative cancellation is unsupported on the one-shot exec path",
+            NO_COOPERATIVE_CANCEL,
         ],
     )
 

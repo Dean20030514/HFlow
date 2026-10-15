@@ -33,7 +33,6 @@ import pytest
 from hflow.authorization import load_authorization, verify_authorization
 from hflow import cli
 from hflow.cli import (
-    _RESOLUTION_FLAGS,
     _STATE_EXIT_CODES,
     EXIT_INTERRUPTED,
     EXIT_OK,
@@ -46,7 +45,14 @@ from hflow.contracts import PlanArguments, RefusalCode, RefusedError, RunPlan, T
 from hflow.hints import next_lines, next_steps
 from hflow.hints import shell_word as _shell_word
 from hflow.paths import database_path
-from hflow.plan import approval_code, default_authorization_path, frozen_arguments, load_plan
+from hflow.plan import (
+    RESOLUTION_FLAGS,
+    approval_code,
+    default_authorization_path,
+    frozen_arguments,
+    load_plan,
+    prepare_command,
+)
 from hflow.prepare import pending_binding, resolve_arguments, root_binding_for
 from hflow.store import Store
 
@@ -169,6 +175,10 @@ def test_a_plan_round_trips_and_records_absolute_inputs(
     captured = capsys.readouterr()
     report = json.loads(captured.out)  # --json: stdout is the report alone
     assert f"plan          {os.path.abspath(plan_file)}" in captured.err
+    # Offline with a root budget: `run --plan` runs it directly (charging the root to a
+    # CLI-minted record that says it is not an approval); approving first stays optional.
+    assert "offline root run" in captured.err
+    assert f"next: hflow run --plan {_shell_word(os.path.abspath(plan_file))}\n" in captured.err
     assert f"next: hflow approve --plan {_shell_word(os.path.abspath(plan_file))}" in captured.err
 
     plan = load_plan(plan_file)
@@ -395,12 +405,19 @@ def test_approve_writes_an_authorization_from_the_terminal_and_never_overwrites_
 
     before = written.read_bytes()
     assert _approve(monkeypatch, plan_file, _UnreadableInput()) == EXIT_REFUSED
-    assert "never overwritten" in capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert "never overwritten" in captured.err and captured.out == ""
+    # The approval already there is named with the run that would use it.
+    assert f"next: hflow run --plan {_shell_word(str(plan_file))}  # with the existing" in (
+        captured.err
+    )
     assert written.read_bytes() == before
     other = project.tmp_path / "other.json"
     other.write_text("{}", encoding="utf-8")
     assert _approve(monkeypatch, plan_file, _UnreadableInput(), "--out", str(other)) == EXIT_REFUSED
-    assert "never overwritten" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "never overwritten" in err
+    assert f"--authorization-file {_shell_word(str(other))}" in err
     assert other.read_text(encoding="utf-8") == "{}"
 
 
@@ -704,7 +721,10 @@ def test_run_plan_refuses_a_resolution_flag(
         ["run", "--plan", str(_plan_path(project)), *extra, "--data-dir", str(project.data_dir)]
     )
     assert code == EXIT_USAGE
-    assert "comes from the plan" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "comes from the plan" in err
+    plan = load_plan(_plan_path(project))
+    assert prepare_command(plan.arguments, _plan_path(project)) in err, err
     assert not database_path(project.data_dir).exists()
 
 
@@ -745,6 +765,10 @@ def test_run_plan_refuses_a_stale_offline_plan(
     assert code == EXIT_REFUSED
     err = capsys.readouterr().err
     assert "is stale" in err and "project_contract_digest" in err
+    # ...and ends with the command that prepares it again, flags and --data-dir included.
+    command = prepare_command(load_plan(_plan_path(project)).arguments, _plan_path(project))
+    assert err.rstrip().endswith(command), err
+    assert "--data-dir" in command and "--driver fake" in command
     assert not database_path(project.data_dir).exists(), "refused before the ledger was opened"
 
 
@@ -974,9 +998,9 @@ def test_approve_run_on_an_offline_plan_runs_what_run_plan_runs(
 
 
 def test_the_resolution_flags_are_exactly_the_plan_arguments() -> None:
-    """``_resolution_arguments`` is derived from ``_RESOLUTION_FLAGS``; both cover every input a
+    """``_resolution_arguments`` is derived from ``RESOLUTION_FLAGS``; both cover every input a
     plan records, the data directory aside (it is ``--data-dir``, before or after the verb)."""
-    dests = [dest for dest, _flag in _RESOLUTION_FLAGS]
+    dests = [dest for dest, _flag in RESOLUTION_FLAGS]
     assert len(dests) == len(set(dests))
     assert {*dests, "data_dir"} == set(PlanArguments.model_fields)
 
@@ -1199,3 +1223,33 @@ def test_prepare_approve_run_through_the_cli_reaches_the_hand_built_outcome(
     assert applied.json()["integration"]["state"] == "integrated"
     assert git(project.repo, "show", f"{project.tip()}:app.txt") == "value = 2\n"
     assert project.user_state() == user_before
+
+
+def test_run_plan_names_a_plan_the_environment_made_stale_before_asking_for_an_approval(
+    cli_project: CliProject,
+    live_profile,  # noqa: ANN001 - conftest's two-role DSH profile
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An offline plan that named no profile resolves to a real driver once ``HFLOW_PROFILE`` is
+    set. That is a stale plan - the binding names the profile - and it is said so first: telling
+    the operator to approve it would only end in the same refusal one step later."""
+    project = cli_project
+    flags = [
+        "--task", str(project.task_file),
+        "--project", str(project.project_file),
+        "--project-root", str(project.repo),
+    ]
+    assert _prepare(project, *flags) == EXIT_OK
+    capsys.readouterr()
+    write_profile(project.data_dir, live_profile)
+    monkeypatch.setenv("HFLOW_PROFILE", live_profile.profile_id)
+
+    assert _run_plan(project) == EXIT_REFUSED
+    err = capsys.readouterr().err
+    assert "is stale" in err and "HFLOW_PROFILE" in err, err
+    assert "Approve the plan first" not in err
+    command = prepare_command(load_plan(_plan_path(project)).arguments, _plan_path(project))
+    assert "--profile" not in command, "HFLOW_PROFILE decides again when the plan named none"
+    assert err.rstrip().endswith(command), err
+    assert not database_path(project.data_dir).exists()

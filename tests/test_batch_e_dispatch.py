@@ -64,7 +64,7 @@ from hflow.store import Store, StoreError
 from hflow.verify import CheckRunners, FakeCheckRunner
 
 from .owner_exit import owner_exits, successor
-from .store_helpers import claim_run, mark_invocation_started
+from .store_helpers import claim_run, mark_invocation_started, pending_invocations
 from .test_driver_acpx_dsh import FAKE_CLIENT, STUB_AGENT
 
 PROJECT_ID = "demo-project"
@@ -843,7 +843,7 @@ def test_a_silent_role_stopped_mid_run_is_not_recorded_as_never_launched(
     assert entry.state is InvocationStartState.REQUESTED, (
         f"a launch that ran and was stopped is not a launch that never happened: {entry}"
     )
-    assert [e.invocation_id for e in store.pending_invocations(binding.root_id)] == [
+    assert [e.invocation_id for e in pending_invocations(store, binding.root_id)] == [
         entry.invocation_id
     ]
 
@@ -950,7 +950,7 @@ def test_a_confirmed_stop_of_a_silent_implementer_that_ran_records_launch_unknow
     assert entry.state is InvocationStartState.LAUNCH_UNKNOWN, (
         f"a stopped launch nobody reported is not a launch that never happened: {entry}"
     )
-    assert [e.invocation_id for e in store.pending_invocations(binding.root_id)] == [
+    assert [e.invocation_id for e in pending_invocations(store, binding.root_id)] == [
         entry.invocation_id
     ]
 
@@ -1023,7 +1023,7 @@ def test_resume_closes_a_reservation_that_never_launched_as_unknown(
     assert store.get_run(run_id)["task_state"] == TaskState.BLOCKED.value
     view = store.root_budget_view(binding.root_id)
     assert view is not None and view.used_top_level_submissions == 1, "unknown is not a refund"
-    assert [entry.invocation_id for entry in store.pending_invocations(binding.root_id)] == [
+    assert [entry.invocation_id for entry in pending_invocations(store, binding.root_id)] == [
         "I-crashed"
     ], "an unresolved invocation keeps blocking its root"
 
@@ -1079,7 +1079,7 @@ def test_a_controller_interrupted_during_the_review_blocks_the_root_for_resume(
         "implementer": InvocationStartState.SETTLED,
         "reviewer": InvocationStartState.UNKNOWN,
     }, states
-    assert [entry.role for entry in store.pending_invocations(binding.root_id)] == ["reviewer"]
+    assert [entry.role for entry in pending_invocations(store, binding.root_id)] == ["reviewer"]
 
     owner_exits(store, run_id, controller, monkeypatch)  # the interrupted controller exits
     successor(controller).resume(run_id)
@@ -1233,7 +1233,7 @@ def test_a_rootless_revision_cannot_dispatch_a_task_that_already_has_a_root(
     assert _counters(
         store, run_id=run_id, binding=binding, authorization_id=AUTHORIZATION_ID
     ) == before, "the refused revision moved the root's counters"
-    assert [entry.invocation_id for entry in store.pending_invocations(binding.root_id)] == [
+    assert [entry.invocation_id for entry in pending_invocations(store, binding.root_id)] == [
         "I-unresolved"
     ]
 
@@ -1463,7 +1463,7 @@ def test_a_second_invocation_id_for_the_same_role_cannot_dispatch_twice(
     # attempt keeps naming the invocation that actually produced the verdict.
     mark_invocation_started(store, "I-review")
     store.settle_invocation("I-review", outcome=InvocationOutcome.COMPLETED, detail="verdict recorded")
-    assert store.pending_invocations(binding.root_id) == [], "nothing is pending any more"
+    assert pending_invocations(store, binding.root_id) == [], "nothing is pending any more"
     settled_counters = _counters(
         store, run_id=run_id, binding=binding, authorization_id=AUTHORIZATION_ID
     )
@@ -1718,7 +1718,7 @@ def test_settling_never_moves_an_entry_that_is_no_longer_open(
         assert after.outcome is InvocationOutcome.CANCELLED, "the report is kept beside the fact"
     else:
         assert (after.outcome, after.detail) == (before.outcome, before.detail)
-    assert [entry.invocation_id for entry in store.pending_invocations(binding.root_id)] == (
+    assert [entry.invocation_id for entry in pending_invocations(store, binding.root_id)] == (
         ["I-closed"] if before.pending else []
     )
 
@@ -1840,7 +1840,7 @@ def test_a_stop_that_wins_the_spawn_gate_after_the_launch_request_still_ends_the
     assert driver.cancel_calls == [entry.invocation_id]
     assert entry.state is InvocationStartState.NOT_STARTED, entry
     assert entry.launch_requested_at is not None and entry.started_at is None, entry
-    assert store.pending_invocations(binding.root_id) == []
+    assert pending_invocations(store, binding.root_id) == []
     row = store.get_run(run_id)
     assert row["task_state"] == TaskState.BLOCKED.value, (row["task_state"], row["block_code"])
     assert row["block_code"] == RefusalCode.CANCELLED_BY_OPERATOR.value
@@ -1981,7 +1981,7 @@ def test_a_stop_after_an_unknown_outcome_keeps_the_entry_unknown_and_the_run_rec
         RefusalCode.OUTCOME_UNKNOWN.value,
     ), "a stop must not relabel an unknown outcome"
     assert store.invocation(before.invocation_id) == before, "a stop rewrote the unknown entry"
-    assert [entry.invocation_id for entry in store.pending_invocations(binding.root_id)] == [
+    assert [entry.invocation_id for entry in pending_invocations(store, binding.root_id)] == [
         before.invocation_id
     ]
 
@@ -2068,7 +2068,7 @@ def test_a_late_implementer_result_does_not_settle_a_launch_a_forced_stop_left_u
             f"the late cancelled result moved the entry: {entry.model_dump(mode='json')}"
         )
         assert entry.pending is True
-        assert [e.invocation_id for e in store.pending_invocations(binding.root_id)] == [
+        assert [e.invocation_id for e in pending_invocations(store, binding.root_id)] == [
             entry.invocation_id
         ], "an unrecorded launch keeps blocking the root"
         assert outcome.block_code is RefusalCode.CANCELLED_BY_OPERATOR, outcome.block_reason
@@ -2178,7 +2178,7 @@ def test_a_late_result_after_an_unconfirmed_stop_changes_nothing_for_either_role
         f"a late {late.value} result closed an entry an unconfirmed stop left open: "
         f"{entry.model_dump(mode='json')}"
     )
-    assert [e.invocation_id for e in store.pending_invocations(binding.root_id)] == [
+    assert [e.invocation_id for e in pending_invocations(store, binding.root_id)] == [
         entry.invocation_id
     ], "work may still be running, so the root stays blocked"
     late_notes = [note for note in store.notes_for(run_id) if note.startswith("late_result")]
@@ -2681,7 +2681,7 @@ def test_a_late_spawn_report_never_reopens_a_launch_closed_as_unknown(
     assert entry.pending is True
     assert store.settle_invocation("I-late", outcome=InvocationOutcome.COMPLETED) is False
     assert store.invocation("I-late").state is InvocationStartState.UNKNOWN
-    assert [e.invocation_id for e in store.pending_invocations(binding.root_id)] == ["I-late"]
+    assert [e.invocation_id for e in pending_invocations(store, binding.root_id)] == ["I-late"]
 
 
 class RefusingDriver(FakeDriver):
@@ -2829,3 +2829,57 @@ def test_after_a_launch_time_refusal_only_a_new_revision_with_a_repair_left_runs
     ]
     assert implementers and implementers[0].is_repair is True, implementers
     assert implementers[0].state is not InvocationStartState.NOT_STARTED
+
+
+@pytest.mark.parametrize("role", ["implementer", "reviewer"])
+def test_a_root_clock_that_runs_out_during_the_reservation_launches_nothing(
+    store: Store, project, task_spec: TaskSpec, project_root: Path, fake_script,
+    monkeypatch: pytest.MonkeyPatch, role: str,
+) -> None:
+    """The reservation passed in the root's last second; the deadline read after it is 0.
+
+    The submission stays spent (it was reserved before any launch), but no driver is asked to
+    start an invocation that could only time out: the entry is ``not_started`` and the run blocks
+    ``budget_exhausted``.
+    """
+    from hflow.ids import utc_now
+
+    binding = _binding(store, task_spec, project_root)
+    limits = _limits()
+    authorization = _authorization(
+        spec=task_spec, binding=binding, limits=limits, project_root=project_root
+    )
+    driver = FakeDriver(project_root, fake_script)
+    controller = _root_controller(
+        store, driver, binding=binding, limits=limits, authorization=authorization,
+        data_dir=project_root.parent / "data",
+    )
+    reserve = controller._reserve_dispatch  # noqa: SLF001
+
+    def reserve_in_the_last_second(**kwargs):  # noqa: ANN003, ANN202
+        reservation = reserve(**kwargs)
+        if kwargs["role"] == role:
+            with store.transaction() as conn:
+                conn.execute(
+                    "UPDATE root_budgets SET deadline_at = ? WHERE root_id = ?",
+                    (utc_now(), binding.root_id),
+                )
+        return reservation
+
+    monkeypatch.setattr(controller, "_reserve_dispatch", reserve_in_the_last_second)
+    outcome = controller.run_task(
+        RunRequest(
+            task=task_spec, project=project, project_root=project_root,
+            workspace_root=project_root,
+        )
+    )
+
+    assert outcome.task_state is TaskState.BLOCKED
+    assert outcome.block_code is RefusalCode.BUDGET_EXHAUSTED, outcome.block_reason
+    assert "never launched" in (outcome.block_reason or "")
+    assert role not in [request.role for request in driver.started]
+    entry = store.invocations_for(outcome.run_id)[-1]
+    assert entry.role == role and entry.state is InvocationStartState.NOT_STARTED, entry
+    assert store.authorization_state(AUTHORIZATION_ID)["used_top_level_submissions"] == (
+        1 if role == "implementer" else 2
+    ), "the reserved submission stays spent"

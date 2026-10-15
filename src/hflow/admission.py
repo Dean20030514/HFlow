@@ -285,6 +285,23 @@ def _linked_scope_entries(write_allow: Sequence[str], project_root: Path) -> lis
     return problems
 
 
+def loop_turns_required(spec: TaskSpec, project: ProjectConfig) -> int:
+    """How many top-level invocations a run of ``spec`` may need, worst case.
+
+    Without a repair policy it is the fixed loop: implementer (+ reviewer). With one, the worst
+    case is the plan's four - I1 + R1 + I2 + R2 - because a repair can follow a reviewer
+    rejection, and that is the number the root, the run and the authorization all have to cover
+    before the first dispatch. An attempt that is never needed simply is not bought: this is a
+    ceiling, not a quota. Admission and the controller's allowance gates read this one answer.
+    """
+    review_turns = 1 if spec.needs_review(project) else 0
+    if spec.repair_policy is None:
+        return 1 + review_turns
+    # I1 + (R1) + I2 + (R2): the repair attempt and the review that must follow it are the ones
+    # the first attempt cannot know about, so they are priced up front.
+    return 2 * (1 + review_turns)
+
+
 def repair_policy_problems(
     spec: TaskSpec, project: ProjectConfig, *, real_transport: bool, root_bound: bool
 ) -> list[ValidationIssue]:
@@ -311,7 +328,7 @@ def repair_policy_problems(
         return issues
 
     review_turns = 1 if spec.needs_review(project) else 0
-    worst_case = 2 * (1 + review_turns)
+    worst_case = loop_turns_required(spec, project)
 
     # A repair starts from the previous round's frozen candidate. Only an isolated Git worktree
     # keeps one; an in-place run has no frozen candidate to start from and would have to repair

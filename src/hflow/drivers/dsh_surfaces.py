@@ -39,6 +39,7 @@ from ..ids import utc_now
 from ..report import surface_summary
 from ..workspace import DSH_INSTRUCTION_FILE_NAMES, DSH_SKILL_DIRS, DSH_WORKSPACE_ENV_FILE
 from .acpx_dsh import DSH_AGENTS_HOME_ENV, _client_module_tree, env_key, path_inside
+from .launch_content import RegularFileError, read_regular
 
 #: The paths DSH reads in its home (pinned to dsh-v0.2.0-rc.2). The profile entry is formatted
 #: with the launch's profile and skipped when it has none.
@@ -109,6 +110,13 @@ NPM_SHIM_MARKER = "node_modules/@deepseek-ai/dsh/"
 #: A local install's shim (``npm install --prefix P`` puts it in ``P/node_modules/.bin``) names the
 #: package relative to itself: ``"%dp0%\..\@deepseek-ai\dsh\lib\bin.js"`` (npm 11, dsh-v0.2.0-rc.2).
 NPM_LOCAL_SHIM_MARKER = "/../@deepseek-ai/dsh/"
+#: The npm CLI a launch looks for under HFlow's data directory when PATH has no ``dsh`` (user
+#: ruling 2026-10-14: DSH #9626 makes the Desktop shim's workspace-write sandbox fail every shell
+#: call, so the first live task runs the npm CLI). Installed with ``--ignore-scripts`` at
+#: ``<data-dir>/dsh/<version>`` (:func:`dsh_npm_prefix`); exactly this version is looked for.
+DSH_NPM_PACKAGE = "@deepseek-ai/dsh"
+RECORDED_DSH_NPM_VERSION = "0.2.0-rc.2"
+DSH_NPM_DATA_DIR_NAME = "dsh"
 #: What a recorded version may look like; anything else is not recorded.
 _VERSION_TOKEN = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}")
 #: A script a batch shim runs, written relative to the shim's own directory - npm's
@@ -128,36 +136,20 @@ NODE_SCRIPT_SUFFIXES = (".js", ".mjs", ".cjs")
 def _read_regular(path: Path, limit: int) -> tuple[bytes | None, int | None, str]:
     """``(bytes, size, detail)`` of a regular file of at most ``limit`` bytes.
 
-    The only function in this module that opens a file. Non-blocking, so a FIFO cannot hold the
-    spawn path; a file that is not regular, too large or unreadable gives ``None`` and why.
+    The only function in this module that opens a file, through the drivers' one bounded reader
+    (``launch_content.read_regular``: non-blocking, so a FIFO cannot hold the spawn path); a file
+    that is not regular, too large or unreadable gives ``None`` and why.
     """
+    chunks: list[bytes] = []
     try:
-        fd = os.open(
-            path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
-        )
-    except OSError as exc:
-        return None, None, f"unreadable: {type(exc).__name__}"
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
+        size = read_regular(path, limit, chunks.append, chunk_bytes=64 * 1024)
+    except RegularFileError as exc:
+        if exc.kind in ("open", "read"):
+            return None, None, f"unreadable: {exc.cause}"
+        if exc.kind == "not_regular":
             return None, None, "not a regular file"
-        if info.st_size > limit:
-            return None, info.st_size, f"larger than {limit} bytes: not read"
-        chunks: list[bytes] = []
-        total = 0
-        while total <= limit:
-            chunk = os.read(fd, min(64 * 1024, limit + 1 - total))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            total += len(chunk)
-        if total > limit:
-            return None, total, f"larger than {limit} bytes: not read"
-        return b"".join(chunks), total, ""
-    except OSError as exc:
-        return None, None, f"unreadable: {type(exc).__name__}"
-    finally:
-        os.close(fd)
+        return None, exc.size, f"larger than {limit} bytes: not read"
+    return b"".join(chunks), size, ""
 
 
 def surface_file(base: Path, name: str, *, digest: bool = True) -> SurfaceFile:
@@ -326,6 +318,26 @@ def _json_file(path: Path, notes: list[str]) -> dict | None:
     return parsed
 
 
+def dsh_npm_prefix(data_dir: Path) -> Path:
+    """The npm prefix of the data-dir install: ``<data-dir>/dsh/<RECORDED_DSH_NPM_VERSION>``."""
+    return Path(os.path.abspath(data_dir)) / DSH_NPM_DATA_DIR_NAME / RECORDED_DSH_NPM_VERSION
+
+
+def dsh_npm_bin_dir(data_dir: Path) -> Path:
+    """Where that install's shim is: the prefix's ``node_modules/.bin``. Names only."""
+    return dsh_npm_prefix(data_dir) / "node_modules" / ".bin"
+
+
+def dsh_npm_install_command(data_dir: Path) -> str:
+    """The npm command that puts the recorded CLI where a launch looks for it. Printed, never run."""
+    from ..hints import shell_word
+
+    return (
+        f"npm install --prefix {shell_word(str(dsh_npm_prefix(data_dir)))} --ignore-scripts "
+        f"{DSH_NPM_PACKAGE}@{RECORDED_DSH_NPM_VERSION}"
+    )
+
+
 def npm_package_dir(shim: Path, text: str) -> Path | None:
     """The ``@deepseek-ai/dsh`` package directory an npm shim runs, or ``None``. Reads nothing.
 
@@ -353,12 +365,10 @@ def observe_client_identity(launch: LaunchConfig) -> ClientIdentity:
     if entry is None or tree is None:
         notes.append("the client entry is not inside a node_modules tree; no package.json was read")
     else:
-        parts = Path(os.path.abspath(entry)).relative_to(tree).parts
-        package_root = tree / parts[0]
-        if parts[0].startswith("@") and len(parts) > 1:
-            package_root = package_root / parts[1]
-        manifest = package_root / "package.json"
-        package = _json_file(manifest, notes)
+        manifest = package_manifest_for(entry)
+        if manifest is None:
+            notes.append(f"the client entry {entry} lies in no node_modules package")
+        package = _json_file(manifest, notes) if manifest is not None else None
         if package is not None:
             identity["acpx_package_json"] = str(manifest)
             identity["acpx_version"] = _version(package.get("version"), "acpx", notes)
@@ -392,50 +402,86 @@ def observe_client_identity(launch: LaunchConfig) -> ClientIdentity:
                         "before a live task"
                     )
 
+    shim = read_dsh_shim(launch)
     carrier: Literal["desktop", "npm", "unknown", "not_applicable"] = "unknown"
+    if shim.state == "desktop" and shim.path is not None:
+        carrier = "desktop"
+        if len(shim.path.parents) > 2:
+            manifest = shim.path.parents[2] / "primary-runtime" / "runtime.json"
+            runtime = _json_file(manifest, notes)
+            if runtime is not None:
+                # Only desktopVersion is read; payloadDigest is never recorded.
+                identity["dsh_version"] = _version(
+                    runtime.get("desktopVersion"), "DeepSeek Desktop", notes
+                )
+                if identity["dsh_version"]:
+                    identity["dsh_version_source"] = (
+                        f"{manifest} desktopVersion (the Desktop README says the app and "
+                        "@deepseek-ai/dsh share one version: documented, not verified)"
+                    )
+        else:
+            notes.append("the Desktop shim has no runtime manifest location")
+    elif shim.state == "npm" and shim.package_dir is not None:
+        carrier = "npm"
+        manifest = shim.package_dir / "package.json"
+        package = _json_file(manifest, notes)
+        if package is not None:
+            identity["dsh_version"] = _version(package.get("version"), "@deepseek-ai/dsh", notes)
+            if identity["dsh_version"]:
+                identity["dsh_version_source"] = f"{manifest} version"
+    else:
+        if shim.state == "not_applicable":
+            carrier = "not_applicable"
+        notes.append(
+            {
+                "not_applicable": "the agent argv does not start the resolved dsh",
+                "not_batch": "only a Windows batch shim's text is classified",
+                "unreadable": f"the dsh shim could not be read ({shim.detail})",
+            }.get(shim.state, "the shim matches neither the Desktop nor the npm layout")
+        )
+    return ClientIdentity(dsh_carrier=carrier, notes=notes, **identity)
+
+
+class DshShim(NamedTuple):
+    """The dsh launcher a launch starts, read and classified once (:func:`read_dsh_shim`).
+
+    ``state`` is ``not_applicable`` (the agent argv does not start the resolved dsh), ``not_batch``
+    (not a Windows batch shim, so its text is not classified), ``unreadable`` (``detail`` says
+    why), ``desktop``, ``npm`` (``package_dir`` names the ``@deepseek-ai/dsh`` package it runs) or
+    ``unknown`` (read, but neither layout). ``text`` is the shim as read, empty unless read.
+    """
+
+    state: Literal["not_applicable", "not_batch", "unreadable", "desktop", "npm", "unknown"]
+    path: Path | None = None
+    text: str = ""
+    detail: str = ""
+    package_dir: Path | None = None
+
+
+def read_dsh_shim(launch: LaunchConfig) -> DshShim:
+    """Read the launch's dsh shim (bounded, through :func:`_read_regular`) and classify it.
+
+    The one classification :func:`observe_client_identity` and :func:`carrier_files` share: the
+    Desktop markers (:data:`DESKTOP_SHIM_MARKERS`) and the npm layouts (:func:`npm_package_dir`),
+    compared after replacing backslashes with forward slashes and casefolding. Runs nothing.
+    """
     dsh = launch.dsh_executable
     if not dsh or dsh not in launch.agent_argv:
-        carrier = "not_applicable"
-        notes.append("the agent argv does not start the resolved dsh")
-    elif Path(dsh).suffix.casefold() not in BATCH_SHIM_SUFFIXES:
-        notes.append("only a Windows batch shim's text is classified")
-    else:
-        data, _size, detail = _read_regular(Path(dsh), MANIFEST_READ_LIMIT_BYTES)
-        if data is None:
-            notes.append(f"the dsh shim could not be read ({detail})")
-        else:
-            text = data.decode("utf-8", "replace").replace("\\", "/").casefold()
-            shim = Path(dsh)
-            if all(marker in text for marker in DESKTOP_SHIM_MARKERS):
-                carrier = "desktop"
-                if len(shim.parents) > 2:
-                    manifest = shim.parents[2] / "primary-runtime" / "runtime.json"
-                    runtime = _json_file(manifest, notes)
-                    if runtime is not None:
-                        # Only desktopVersion is read; payloadDigest is never recorded.
-                        identity["dsh_version"] = _version(
-                            runtime.get("desktopVersion"), "DeepSeek Desktop", notes
-                        )
-                        if identity["dsh_version"]:
-                            identity["dsh_version_source"] = (
-                                f"{manifest} desktopVersion (the Desktop README says the app and "
-                                "@deepseek-ai/dsh share one version: documented, not verified)"
-                            )
-                else:
-                    notes.append("the Desktop shim has no runtime manifest location")
-            elif (package_dir := npm_package_dir(shim, text)) is not None:
-                carrier = "npm"
-                manifest = package_dir / "package.json"
-                package = _json_file(manifest, notes)
-                if package is not None:
-                    identity["dsh_version"] = _version(
-                        package.get("version"), "@deepseek-ai/dsh", notes
-                    )
-                    if identity["dsh_version"]:
-                        identity["dsh_version_source"] = f"{manifest} version"
-            else:
-                notes.append("the shim matches neither the Desktop nor the npm layout")
-    return ClientIdentity(dsh_carrier=carrier, notes=notes, **identity)
+        return DshShim("not_applicable")
+    shim = Path(dsh)
+    if shim.suffix.casefold() not in BATCH_SHIM_SUFFIXES:
+        return DshShim("not_batch", shim)
+    data, _size, detail = _read_regular(shim, MANIFEST_READ_LIMIT_BYTES)
+    if data is None:
+        return DshShim("unreadable", shim, detail=detail)
+    raw = data.decode("utf-8", "replace")
+    folded = raw.replace("\\", "/").casefold()
+    if all(marker in folded for marker in DESKTOP_SHIM_MARKERS):
+        return DshShim("desktop", shim, raw)
+    package_dir = npm_package_dir(shim, folded)
+    if package_dir is not None:
+        return DshShim("npm", shim, raw, package_dir=package_dir)
+    return DshShim("unknown", shim, raw)
 
 
 def sdk_manifest_for(entry: Path) -> Path | None:
@@ -519,14 +565,15 @@ def _enclosing_archive(entry: Path) -> Path | None:
 def carrier_files(launch: LaunchConfig) -> CarrierFiles:
     """Name the carrier entry file and its package.json from the dsh shim's text. Runs nothing.
 
-    Classified the way :func:`observe_client_identity` classifies the carrier (same markers):
+    Classified by :func:`read_dsh_shim`, as :func:`observe_client_identity` classifies it:
     the Desktop shim runs ``DeepSeek Harness.exe`` on a script, the npm shim runs ``node`` on
     ``@deepseek-ai/dsh/...`` (:func:`npm_package_dir`: a global or a local install). The script
     is the one path ending in ``.js``/``.mjs``/``.cjs`` that the shim writes relative to its own
     directory (``%~dp0`` / ``%dp0%``).
     """
-    dsh = launch.dsh_executable
-    if not dsh or dsh not in launch.agent_argv:
+    read = read_dsh_shim(launch)
+    shim = read.path
+    if read.state == "not_applicable" or shim is None:
         return CarrierFiles(
             "not_applicable",
             None,
@@ -536,8 +583,7 @@ def carrier_files(launch: LaunchConfig) -> CarrierFiles:
             ["the agent argv does not start the resolved dsh: no launcher or carrier file is "
              "bound by content"],
         )
-    shim = Path(dsh)
-    if shim.suffix.casefold() not in BATCH_SHIM_SUFFIXES:
+    if read.state == "not_batch":
         return CarrierFiles(
             "unknown",
             shim,
@@ -547,27 +593,11 @@ def carrier_files(launch: LaunchConfig) -> CarrierFiles:
             ["the dsh launcher is not a batch shim: the launcher file itself is bound by "
              "content; whatever it loads is bound by path only"],
         )
-    data, _size, detail = _read_regular(shim, MANIFEST_READ_LIMIT_BYTES)
-    if data is None:
+    if read.state == "unreadable":
         return CarrierFiles(
-            "unknown", shim, None, None, f"the dsh shim {shim} could not be read ({detail})", []
+            "unknown", shim, None, None, f"the dsh shim {shim} could not be read ({read.detail})", []
         )
-    raw = data.decode("utf-8", "replace")
-    text = raw.replace("\\", "/").casefold()
-    carrier: Literal["desktop", "npm"]
-    if all(marker in text for marker in DESKTOP_SHIM_MARKERS):
-        carrier = "desktop"
-        interpreter_note = (
-            "the Desktop shim's DeepSeek Harness.exe (the program that runs the carrier entry) is "
-            "bound by path only"
-        )
-    elif npm_package_dir(shim, text) is not None:
-        carrier = "npm"
-        interpreter_note = (
-            "the npm shim starts node from its own directory or from PATH; that node is bound by "
-            "path only"
-        )
-    else:
+    if read.state == "unknown":
         return CarrierFiles(
             "unknown",
             shim,
@@ -577,8 +607,16 @@ def carrier_files(launch: LaunchConfig) -> CarrierFiles:
             ["the dsh shim matches neither the Desktop nor the npm layout: only the shim itself "
              "is bound by content; what it starts is bound by path only"],
         )
+    carrier: Literal["desktop", "npm"] = "desktop" if read.state == "desktop" else "npm"
+    interpreter_note = (
+        "the Desktop shim's DeepSeek Harness.exe (the program that runs the carrier entry) is "
+        "bound by path only"
+        if carrier == "desktop"
+        else "the npm shim starts node from its own directory or from PATH; that node is bound by "
+        "path only"
+    )
     scripts: dict[str, Path] = {}
-    for match in _SHIM_SCRIPT.finditer(raw):
+    for match in _SHIM_SCRIPT.finditer(read.text):
         relative = match.group(1).strip().replace("\\", "/")
         candidate = Path(os.path.normpath(os.path.join(str(shim.parent), relative)))
         scripts.setdefault(os.path.normcase(str(candidate)), candidate)
@@ -793,6 +831,15 @@ ACP_SANDBOX_MODE_FACT = (
     "an ACP client cannot change it per session: DSH's ACP server offers no session mode, and "
     "session/set_config_option takes only model and reasoning_effort (dsh-v0.2.0-rc.2 and "
     "-alpha.2 source)"
+)
+#: What the mode is not: a boundary for DSH's own file tools. DSH #9693 (documented from
+#: dsh-v0.2.0-rc.2 ``packages/acp/acp/src/index.ts`` L200-203, blob 44ef4741: ACP sessions do no
+#: permission-preset composition; the reporter observed file writes outside the workspace succeed
+#: in ACP sessions; the effect is unconfirmed).
+ACP_FILE_TOOLS_FACT = (
+    "it is the shell runner's mode - DSH's own file tools are not confined by it on the ACP path "
+    "(DSH #9693, unconfirmed), so HFlow's scope check and user-checkout fingerprint are what "
+    "notice a write outside the workspace"
 )
 #: Shell tool calls under the Desktop carrier with the workspace-write sandbox (DSH discussion
 #: #9626, 2026-10-13, three independent reproductions; duplicates #9467, #9507, #9548, #9621,
@@ -1029,8 +1076,8 @@ def sandbox_mode_notes(
     else:
         head = f"DSH sandbox mode: unknown - {finding.source}"
     notes = [
-        f"{head}; {ACP_SANDBOX_MODE_FACT}. Documented from upstream source, not observed; "
-        "recorded, never enforced"
+        f"{head}; {ACP_SANDBOX_MODE_FACT}; {ACP_FILE_TOOLS_FACT}. Documented from upstream "
+        "source, not observed; recorded, never enforced"
     ]
     if carrier == "desktop" and finding.mode in ("", "workspace-write"):
         prefix = (

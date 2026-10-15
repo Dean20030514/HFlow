@@ -207,10 +207,31 @@ def _settlement_lines(settlement: InvocationSettlement) -> list[str]:
 
 
 def _drift_line(inspection: RunInspection) -> str:
-    """Never let a historical ACCEPTED read as verification of the current tree."""
+    """Never let a historical ACCEPTED read as verification of the current tree.
+
+    No comparison (``None``) has three causes, and each is said as what it is: no receipt; a
+    worktree candidate whose worktree is no longer there (``hflow clean --apply`` released it,
+    or it was removed); an in-place candidate whose workspace (``--project-root``) is not there.
+    The last two keep the receipt and are not drift - there is just nothing to compare it with.
+    """
     matches = inspection.run.workspace_matches_receipt
-    if matches is None:
+    receipt = inspection.receipt
+    if matches is None and receipt is None:
         return "candidate     no receipt to compare against the workspace"
+    if matches is None:
+        assert receipt is not None
+        candidate = receipt.candidate
+        if inspection.task_spec.workspace.mode == "worktree":
+            commit = f" (commit {candidate.git_commit})" if candidate.git_commit else ""
+            return (
+                f"candidate     worktree released: {candidate.worktree or 'the run worktree'} is "
+                "no longer there, so there is nothing to compare; the receipt and its frozen "
+                f"candidate{commit} are unchanged"
+            )
+        return (
+            "candidate     workspace not found: the directory to compare against is not there, "
+            "so there is nothing to compare; the receipt is unchanged"
+        )
     if matches:
         return "candidate     workspace still matches the accepted fingerprint"
     return (

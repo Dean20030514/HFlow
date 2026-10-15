@@ -6,8 +6,8 @@ import pytest
 
 from hflow.cli import EXIT_IN_PROGRESS, _outcome_exit_code
 from hflow.contracts import (
-    EffectiveConfig, LaunchConfig, LaunchFileDigest, RoleConfig, RunRequest,
-    TaskState, WorkspaceProvenance,
+    EffectiveConfig, LaunchConfig, LaunchFileDigest, RefusalCode, RefusedError, RoleConfig,
+    RunRequest, TaskState, WorkspaceProvenance,
 )
 from hflow.controller import Controller
 from hflow.drivers.fake import FakeDriver, FakeScript
@@ -246,3 +246,92 @@ def test_fresh_approval_covers_same_execution_without_rebinding(store, run_reque
     assert store.authorization_state("AUTH-fresh")["used_top_level_submissions"] == 2
     assert store.root_budget_view(binding.root_id).used_top_level_submissions == 2
     successor.close()
+
+
+def _rooted(store, request, script, config=None):
+    from .test_batch_e_dispatch import _binding, _limits
+
+    controller = _controller(store, request, script, config)
+    controller.root_binding = _binding(store, request.task, request.project_root)
+    controller.root_limits = _limits()
+    return controller
+
+
+def _approval(controller, request, authorization_id="AUTH-continuation"):
+    from .test_batch_e_dispatch import _authorization
+
+    return _authorization(
+        spec=request.task, binding=controller.root_binding, limits=controller.root_limits,
+        project_root=request.project_root, authorization_id=authorization_id,
+    )
+
+
+def test_a_continuation_runs_the_zero_model_preflight_before_it_claims(store, run_request, fake_script):
+    """A never-dispatched run is continued only through the gates a new run passes."""
+    original = _rooted(store, run_request, fake_script, _config())
+    run_id, _ = _seed(original, run_request)
+    successor = _rooted(store, run_request, fake_script, _config())
+    successor.authorization = _approval(successor, run_request)
+    successor.preflight = lambda: (False, "the client did not answer its metadata query")
+    before = _snapshot(store, run_id)
+    with pytest.raises(RefusedError) as excinfo:
+        successor.run_task(run_request)
+    assert excinfo.value.code is RefusalCode.NOT_IMPLEMENTED, excinfo.value.message
+    assert "zero-model preflight failed" in excinfo.value.message
+    assert _snapshot(store, run_id) == before, "refused before the claim: nothing was written"
+    assert store.get_run(run_id)["claimed_by"] is None
+    assert store.authorization_state(successor.authorization.authorization_id) is None
+    assert store.root_budget_view(successor.root_binding.root_id) is None
+    assert successor.driver.started == []
+
+    successor.preflight = lambda: (True, "ok")
+    accepted = successor.run_task(run_request)
+    assert accepted.run_id == run_id and accepted.task_state is TaskState.ACCEPTED
+    successor.close()
+
+
+def test_a_continuation_refuses_a_failed_dispatch_precondition_before_it_claims(
+    store, run_request, fake_script, monkeypatch
+):
+    original = _controller(store, run_request, fake_script)
+    run_id, _ = _seed(original, run_request)
+    successor = _controller(store, run_request, fake_script)
+
+    def refuse(*_args, **_kwargs):
+        raise RefusedError(RefusalCode.NO_CREDENTIAL_SOURCE, "no credential source is visible")
+
+    monkeypatch.setattr(successor, "_assert_dispatch_preconditions", refuse)
+    before = _snapshot(store, run_id)
+    with pytest.raises(RefusedError) as excinfo:
+        successor.run_task(run_request)
+    assert excinfo.value.code is RefusalCode.NO_CREDENTIAL_SOURCE
+    assert _snapshot(store, run_id) == before and successor.driver.started == []
+    successor.close()
+
+
+@pytest.mark.parametrize("existing", [False, True], ids=["new-run", "continuation"])
+def test_a_reused_authorization_id_with_an_edited_field_is_refused_before_anything_is_written(
+    store, run_request, fake_script, existing
+):
+    """The recorded approval stands; the edited copy is refused with nothing recorded beside it."""
+    controller = _rooted(store, run_request, fake_script)
+    recorded = _approval(controller, run_request, "AUTH-reused")
+    store.register_authorization(recorded.as_store_record())
+    run_id = _seed(controller, run_request)[0] if existing else None
+    before = _snapshot(store, run_id) if run_id else None
+    controller.authorization = recorded.model_copy(
+        update={"user_text": "I approve a different bounded run."}
+    )
+    with pytest.raises(RefusedError) as excinfo:
+        controller.run_task(run_request)
+    assert excinfo.value.code is RefusalCode.INVALID_SPEC, excinfo.value.message
+    assert "immutable" in excinfo.value.message
+    assert store.root_budget_view(controller.root_binding.root_id) is None, "no root row"
+    assert store.authorization_state("AUTH-reused")["user_text"] == recorded.user_text
+    if existing:
+        assert _snapshot(store, run_id) == before
+    else:
+        digest = run_request.task.spec_digest()
+        assert store.find_run_by_spec_digest(run_request.project.project_id, digest) is None
+    assert controller.driver.started == []
+    controller.close()

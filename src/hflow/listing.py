@@ -5,9 +5,10 @@ Neither calls a model, probes a process or writes anything.
 * ``runs`` lists runs from the ledger, newest first, each with the first command ``hints``
   prints for it. Like ``status``, it reads the project contract file a run's admission recorded,
   and only to decide whether a printed ``integrate prepare`` needs ``--project``. ``--needs-you``
-  keeps the runs whose *stored* facts name something for the operator to do (:func:`attention`);
-  there is no default attention, and nothing is inferred from a run that cannot be read: such a
-  run is named, the rest is still listed, and the command exits 6.
+  keeps the runs whose *stored* facts name something for the operator to do (:func:`attention`),
+  judged with the clock and nothing else - no process is probed. Nothing is inferred from a run
+  that cannot be read: such a run is named (in ``--json`` as an entry with an ``error``), the rest
+  is still listed, and the command exits 6.
 * ``diff`` prints the Git change between a run's recorded base commit and its frozen candidate
   commit - two commits in the repository the run recorded, never a working tree. That is the
   candidate's Git identity, not its content fingerprint (AGENTS rule 11), and the header says so.
@@ -15,20 +16,21 @@ Neither calls a model, probes a process or writes anything.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from pydantic import ValidationError
 
 from .contracts import (
     INTEGRATION_ACTIVE_STATES,
-    DeliveryState,
     IntegrationState,
     ResultReceipt,
     TaskState,
 )
-from .hints import RunFacts, named_data_dir, plan_next, run_facts
+from .hints import RunFacts, integrable, recorded_repository, run_facts, steps_for
 from .profiles import summarize_validation_error
 from .store import Store, StoredRecordUnreadable
 
@@ -38,11 +40,14 @@ UNREADABLE_ERRORS = (StoredRecordUnreadable, ValidationError, ValueError)
 
 
 def unreadable_reason(exc: Exception) -> str:
-    """One line naming what could not be read, as ``status`` words it."""
+    """One line naming what could not be read; ``status``, ``report``, ``runs`` and ``diff`` share
+    it."""
     if isinstance(exc, ValidationError):
         return f"invalid {exc.title}: {summarize_validation_error(exc)}"
     if isinstance(exc, StoredRecordUnreadable):
         return str(exc).splitlines()[0]
+    if isinstance(exc, json.JSONDecodeError):
+        return f"not valid JSON: {exc}"
     return f"not valid: {exc}"
 
 
@@ -53,24 +58,61 @@ def unreadable_reason(exc: Exception) -> str:
 
 def _integrable(facts: RunFacts) -> bool:
     """An accepted Git candidate: the only runs an integration is for (as ``plan_next`` says)."""
-    return (
-        facts.task_state is TaskState.ACCEPTED
-        and facts.delivery_state == DeliveryState.LOCAL_CANDIDATE.value
-        and facts.git_candidate
+    return integrable(facts.task_state, facts.delivery_state, facts.git_candidate)
+
+
+def _parse_time(text: str) -> datetime | None:
+    try:
+        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
+def _live_reasons(facts: RunFacts, now: datetime) -> list[str]:
+    """A live run: its recorded owner, and whether the clock is past its recorded deadline.
+
+    Stored facts and the clock only - no process is probed, so "past its deadline" is a
+    likelihood, never a verdict. The deadline is the per-dispatch one the run's admission binding
+    recorded, counted from the last change the run row recorded: no dispatch, check or state
+    change since then for longer than that is what an interrupted controller (killed hard, say,
+    during checks) leaves. ``resume`` decides, and refuses (exit 5) while the owner may be alive.
+    """
+    owner = (
+        f"recorded owner pid {facts.owner_pid} since {facts.owner_since or 'an unrecorded time'}"
+        if facts.owner_pid is not None
+        else "no owner process recorded"
     )
+    reasons = [f"live {facts.task_state.value}, {owner}"]
+    changed = _parse_time(facts.updated_at)
+    if facts.deadline_seconds is not None and changed is not None and (
+        now > changed + timedelta(seconds=facts.deadline_seconds)
+    ):
+        reasons.append(
+            f"past its deadline: nothing recorded since {facts.updated_at}, longer than the "
+            f"{facts.deadline_seconds}s per-dispatch deadline its admission recorded; probably "
+            f"interrupted - `hflow resume {facts.run_id}` decides (exit 5 while the owner may be "
+            "alive)"
+        )
+    return reasons
 
 
-def attention(facts: RunFacts) -> list[str]:
-    """Why a run needs its operator, from explicit stored facts only; empty when nothing does.
+def attention(facts: RunFacts, *, now: datetime | None = None) -> list[str]:
+    """Why a run needs its operator, from stored facts and the clock; empty when nothing does.
 
-    A blocked run (``outcome_unknown`` included: the run's block code says which), ledger entries
+    A live run (``DRAFT``/``READY``/``RUNNING``/``CHECKING``: its recorded owner, and - when the
+    clock is past the deadline its admission recorded - that it was probably interrupted), a
+    blocked run (``outcome_unknown`` included: the run's block code says which), ledger entries
     still open or left ``unknown``/``launch_unknown``, an accepted Git candidate that no
     integration has taken onto a branch (none prepared, one ready to apply or to hand-merge, one
     a process may still be working on, or one that ended without integrating), and a cleanup
-    that was interrupted. A live run, a released or kept worktree and an integrated candidate
-    name nothing.
+    that was interrupted. A released or kept worktree and an integrated candidate name nothing.
     """
     reasons: list[str] = []
+    if facts.task_state in {
+        TaskState.DRAFT, TaskState.READY, TaskState.RUNNING, TaskState.CHECKING,
+    }:
+        reasons += _live_reasons(facts, now or datetime.now(UTC))
     if facts.task_state is TaskState.BLOCKED:
         reasons.append(f"blocked: {facts.block_code or 'no block code recorded'}")
     if facts.open_entries:
@@ -151,15 +193,9 @@ class Unreadable:
     run_id: str
     reason: str
 
-
-def _next_for(store: Store, facts: RunFacts) -> list[str]:
-    """``hints.plan_next`` exactly as ``status`` prints it for this run."""
-    project_default = False
-    if _integrable(facts):
-        from .integrate import recorded_project_file  # integrate imports hints
-
-        project_default = recorded_project_file(store, facts.run_id) is not None
-    return plan_next(facts, data_dir=named_data_dir(store), project_default=project_default)
+    def as_json(self) -> dict[str, object]:
+        """``runs --json``'s entry for it: the id and the error, and nothing guessed."""
+        return {"run_id": self.run_id, "error": f"stored record unreadable: {self.reason}"}
 
 
 def list_runs(
@@ -181,7 +217,7 @@ def list_runs(
             reasons = attention(facts)
             if needs_you and (not reasons or len(lines) >= limit):
                 continue
-            steps = _next_for(store, facts)
+            steps = steps_for(store, facts)
         except UNREADABLE_ERRORS as exc:
             unreadable.append(Unreadable(run_id, unreadable_reason(exc)))
             continue
@@ -249,17 +285,6 @@ class CandidateRange:
     project_root: str
 
 
-def _repository(store: Store, run_id: str) -> tuple[str, str]:
-    """``(git_common_dir, project_root)`` from the run's admission record or worktree record."""
-    binding = store.admission_binding_for(run_id)
-    if binding is not None and binding.git_common_dir:
-        return binding.git_common_dir, binding.project_root
-    provenance = store.workspace_provenance_for(run_id)
-    if provenance is not None:
-        return provenance.git_common_dir, provenance.project_root
-    return "", binding.project_root if binding is not None else ""
-
-
 def candidate_range(store: Store, run_id: str) -> CandidateRange:
     """The base and frozen candidate commits ``run_id`` recorded.
 
@@ -306,7 +331,7 @@ def candidate_range(store: Store, run_id: str) -> CandidateRange:
             raise NoCandidate(
                 f"run {run_id} recorded {label} {value!r}, which is not a Git commit id"
             )
-    git_dir, project_root = _repository(store, run_id)
+    git_dir, project_root = recorded_repository(store, run_id)
     return CandidateRange(
         run_id=run_id,
         base_commit=base,

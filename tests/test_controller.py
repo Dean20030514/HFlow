@@ -38,7 +38,7 @@ from hflow.verify import CheckRunners, FakeCheckRunner
 
 from .conftest import unit_only
 from .owner_exit import owner_exits, successor
-from .store_helpers import claim_run, reserve_turn
+from .store_helpers import claim_run, reserve_turn, turns_remaining
 
 
 # --------------------------------------------------------------------------
@@ -275,7 +275,7 @@ def test_insufficient_budget_blocks_before_the_driver_starts(
     assert driver.started == [], "no worker process may start without reserved budget"
     assert outcome.receipt is None
     assert store.attempts_for(run_id) == []
-    assert store.turns_remaining(run_id) == 0
+    assert turns_remaining(store, run_id) == 0
 
 
 def test_review_is_refused_when_only_the_implementation_turn_fits(
@@ -290,7 +290,7 @@ def test_review_is_refused_when_only_the_implementation_turn_fits(
     assert outcome.block_code is RefusalCode.BUDGET_EXHAUSTED
     # The implementation turn ran; the review turn was never bought.
     assert len(driver.started) == 1
-    assert store.turns_remaining(run_id) == 0
+    assert turns_remaining(store, run_id) == 0
 
 
 # --------------------------------------------------------------------------

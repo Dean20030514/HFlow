@@ -184,19 +184,10 @@ def drain(stream: IO[bytes] | None, sink: BoundedTextSink) -> str:
             )
         if not chunk:
             return "capture_failed" if sink.failed else "eof"
-        try:
-            sink.write(chunk)
-        except (OSError, ValueError) as exc:
-            # A sink implementation that raises instead of recording is treated exactly like one
-            # that records: the capture failed, and the caller must not see a clean end of stream.
-            sink.failed = True
-            sink.failure_reason = sink.failure_reason or f"{type(exc).__name__}: {exc}"
-            continue
-        if sink.failed:
-            # Keep draining rather than returning here: a child that is still writing must not
-            # block on a full pipe while this thread walks away. The failure is recorded and the
-            # caller decides what it means.
-            continue
+        # ``write`` records a failed write instead of raising, and draining goes on after one: a
+        # child that is still writing must not block on a full pipe while this thread walks away.
+        # The failure is recorded and the caller decides what it means.
+        sink.write(chunk)
 
 
 #: Environment variables a child process needs in order to start and to find its runtime. This is
@@ -232,13 +223,17 @@ _BASE_ALLOWED_NAMES = (
     "OS",
     "LANG",
     "LC_ALL",
+    # ``getpass.getuser()`` raises on Windows without it (no ``pwd`` module to fall back on).
+    "USERNAME",
     "PYTHONIOENCODING",
     "PYTHONUTF8",
     "PYTHONHASHSEED",
     "PYTHONDONTWRITEBYTECODE",
-    "PYTHONPATH",
-    "NODE_PATH",
-    "NODE_OPTIONS",
+    # Not PYTHONPATH, NODE_PATH or NODE_OPTIONS: they change *what code* a check loads. An
+    # absolute PYTHONPATH naming the user's checkout makes a check test the checkout instead of
+    # the candidate, and NODE_OPTIONS can preload code into every Node process. Only names are
+    # recorded and no value is in the checks digest, so inheriting them would let the controller's
+    # shell change a verdict invisibly. There is no project field for check variables yet.
     "VIRTUAL_ENV",
     "CONDA_PREFIX",
     "SHELL",

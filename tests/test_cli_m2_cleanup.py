@@ -289,7 +289,7 @@ def test_cli_failed_candidate_is_rejected_and_kept(
 
     # the scene is preserved, and the run's worktree is still registered
     repo = GitRepo.discover(cli_project["repo"])
-    assert len(repo.worktree_list()) >= 4  # the source plus at least one kept candidate
+    assert len(repo.worktree_blocks()) >= 2  # the source plus at least one kept candidate
 
     # a second identical submission does not dispatch again
     code2, _ = _run_cli(cli_project, plan=bad_plan)
@@ -297,8 +297,8 @@ def test_cli_failed_candidate_is_rejected_and_kept(
     second = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert second["run_id"] == payload["run_id"], "the same TaskSpec must reuse the run"
     assert second["implementer_invocations"] == 1, "no second dispatch"
-    assert len(GitRepo.discover(cli_project["repo"]).worktree_list()) == len(
-        repo.worktree_list()
+    assert len(GitRepo.discover(cli_project["repo"]).worktree_blocks()) == len(
+        repo.worktree_blocks()
     ), "no second worktree may be created for the same TaskSpec"
 
 
@@ -451,7 +451,7 @@ def test_clean_preview_changes_nothing(
     assert code == EXIT_OK
     run_id = json.loads(capsys.readouterr().out.strip().splitlines()[-1])["run_id"]
     repo = GitRepo.discover(cli_project["repo"])
-    worktrees_before = repo.worktree_list()
+    worktrees_before = repo.worktree_blocks()
     refs_before = _git(cli_project["repo"], "for-each-ref", "--format=%(refname)")
 
     code, preview = _cli_json(capsys, cli_project, "clean", run_id)
@@ -463,7 +463,7 @@ def test_clean_preview_changes_nothing(
     assert preview["head"] == preview["expected_candidate"]
     assert preview["candidate_ref_target"] == preview["expected_candidate"]
     assert any("candidate commit" in keep for keep in preview["keeps"])
-    assert repo.worktree_list() == worktrees_before, "the preview must not touch git metadata"
+    assert repo.worktree_blocks() == worktrees_before, "the preview must not touch git metadata"
     assert _git(cli_project["repo"], "for-each-ref", "--format=%(refname)") == refs_before, (
         "the preview must not create a ref"
     )
@@ -690,6 +690,15 @@ def test_clean_apply_removes_only_this_runs_worktree_and_keeps_the_delivery(
     code, report = _cli_json(capsys, cli_project, "report", run_id, "--project-root", str(source))
     assert code == EXIT_OK
     assert report["receipt"]["candidate"]["git_commit"] == candidate
+    # ...and the text says the worktree was released - never that there is no receipt
+    for verb in ("status", "report"):
+        assert main([verb, run_id, "--data-dir", str(cli_project["data"])]) == EXIT_OK
+        text = capsys.readouterr().out
+        released = [
+            line for line in text.splitlines() if line.startswith("candidate     worktree released: ")
+        ]
+        assert len(released) == 1 and candidate in released[0], text
+        assert "no receipt" not in text
 
     # applying again is idempotent and does not remove anything else
     code = main(["clean", run_id, "--apply", "--data-dir", str(cli_project["data"]), "--json"])

@@ -30,7 +30,6 @@ from pathlib import Path
 from typing import Protocol
 
 from .artifacts import (
-    DEFAULT_EXCERPT_BYTES,
     DEFAULT_STREAM_LIMIT_BYTES,
     BoundedTextSink,
     StreamCapture,
@@ -54,6 +53,7 @@ from .drivers.winjob import (
     ProcessBoundary,
     popen_in_boundary,
     process_gone,
+    wait_interruptibly,
 )
 from .ids import new_evidence_id
 from .store import Store
@@ -348,7 +348,6 @@ class CommandCheckRunner:
 
     def __init__(
         self,
-        excerpt_limit: int = DEFAULT_EXCERPT_BYTES,
         extra_env: dict[str, str] | None = None,
         *,
         stream_limit_bytes: int = DEFAULT_STREAM_LIMIT_BYTES,
@@ -356,7 +355,6 @@ class CommandCheckRunner:
         reader_timeout_seconds: float = 10.0,
         _observation_override: Callable[[ProcessBoundary], int | None] | None = None,
     ) -> None:
-        self.excerpt_limit = excerpt_limit
         self.extra_env = dict(extra_env or {})
         self.stream_limit_bytes = max(0, int(stream_limit_bytes))
         #: Where this check's captured output and manifest go. ``None`` means a private temporary
@@ -421,34 +419,9 @@ class CommandCheckRunner:
             "stdout": stdout_capture.as_dict(),
             "stderr": stderr_capture.as_dict(),
         }
-        # A capture that did not finish cleanly is never a pass, and it is decided here - after
-        # ``_outcome`` - so no other branch can return PASSED for a stream the runner could not
-        # read. Two distinct endings both count: a reader still running when the wait expired, and
-        # a reader that ended on an error (a failed read, a failed write to the artifact, a failed
-        # flush/close). The second is the one a "did the thread exit?" test misses: the thread
-        # exits, so the run looks complete.
-        capture_failure = ""
-        if result.get("readers_incomplete"):
-            capture_failure = (
-                "the check's output pipes were still held open after it exited, so its captured "
-                "output is incomplete"
-            )
-        else:
-            for name, status in dict(result.get("reader_status") or {}).items():
-                if status != "eof":
-                    capture_failure = (
-                        f"the {name} capture did not finish cleanly ({status}), so its output is "
-                        "incomplete"
-                    )
-                    break
-            if not capture_failure:
-                for name, capture in (("stdout", stdout_capture), ("stderr", stderr_capture)):
-                    if capture.failed:
-                        capture_failure = (
-                            f"the {name} capture ended with an error ({capture.failure_reason}), "
-                            "so its output is incomplete"
-                        )
-                        break
+        # Decided here - after ``_outcome`` - so no other branch can return PASSED for a stream the
+        # runner could not read.
+        capture_failure = self._capture_failure(result, stdout_capture, stderr_capture)
         if capture_failure:
             outcome.status = EvidenceStatus.ERROR
             outcome.exit_reason = REASON_OUTPUT_CAPTURE_ERROR
@@ -487,6 +460,36 @@ class CommandCheckRunner:
             # A private temporary directory; failing to remove it is not a check failure.
             shutil.rmtree(artifact_dir, ignore_errors=True)
         return outcome
+
+    @staticmethod
+    def _capture_failure(
+        result: dict[str, object], stdout: StreamCapture, stderr: StreamCapture
+    ) -> str:
+        """Why this check's captured output is incomplete, or ``""`` when it is not.
+
+        A capture that did not finish cleanly is never a pass. Two distinct endings both count: a
+        reader still running when the wait expired, and a reader that ended on an error (a failed
+        read, a failed write to the artifact, a failed flush/close). The second is the one a "did
+        the thread exit?" test misses: the thread exits, so the run looks complete.
+        """
+        if result.get("readers_incomplete"):
+            return (
+                "the check's output pipes were still held open after it exited, so its captured "
+                "output is incomplete"
+            )
+        for name, status in dict(result.get("reader_status") or {}).items():
+            if status != "eof":
+                return (
+                    f"the {name} capture did not finish cleanly ({status}), so its output is "
+                    "incomplete"
+                )
+        for name, capture in (("stdout", stdout), ("stderr", stderr)):
+            if capture.failed:
+                return (
+                    f"the {name} capture ended with an error ({capture.failure_reason}), "
+                    "so its output is incomplete"
+                )
+        return ""
 
     def _resolve_artifact_dir(self, check: CheckDef) -> tuple[str, Path | None, bool]:
         """``(description, directory, keep)`` for this check's artifacts."""
@@ -557,7 +560,11 @@ class CommandCheckRunner:
 
             timed_out = False
             try:
-                returncode: int | None = child.wait(timeout=max(0.0, deadline - time.monotonic()))
+                # In slices, so a console Ctrl+C reaches this process within one slice instead of
+                # at the check's deadline (``Popen.wait`` blocks it on Windows).
+                returncode: int | None = wait_interruptibly(
+                    child, max(0.0, deadline - time.monotonic())
+                )
             except subprocess.TimeoutExpired:
                 timed_out = True
                 returncode = None
@@ -569,7 +576,7 @@ class CommandCheckRunner:
                     f"({'the OS accepted it' if terminated else 'the request was refused'})"
                 )
 
-            settled = self._settle_descendants(boundary, details, deadline)
+            settled = self._settle_descendants(boundary, details, deadline, timed_out=timed_out)
             if timed_out:
                 # Reap first, then ask whether the direct child is really gone: the question
                 # is answerable only once nothing is holding the process object open.
@@ -602,23 +609,37 @@ class CommandCheckRunner:
                 "readers_incomplete": readers_incomplete,
                 "reader_status": reader_status,
             }
+        except KeyboardInterrupt:
+            # The operator's Ctrl+C. The check runs in its own console process group, so the
+            # interrupt reached only this process: stop what this runner owns before it leaves
+            # (best effort - nothing here may replace the interrupt), then let it propagate. The
+            # block below still reaps the child and closes the boundary.
+            with contextlib.suppress(Exception):
+                boundary.terminate()
+            if child is not None:
+                with contextlib.suppress(Exception):
+                    child.kill()
+            raise
         finally:
             # Everything that holds a pipe or a boundary handle is released here, on every path:
             # a reader left running would keep a pipe open, and on Windows a process still inside
             # the boundary holds its stdout/stderr handles. Closing the boundary also settles
-            # whatever is left in it (kill-on-close). The readers get their bounded wait once: a
-            # path that already waited for them and found a pipe still held open does not wait
-            # a second time, since nothing between the two waits could have released it.
-            if not readers_joined:
-                self._join_readers(readers)
-            with contextlib.suppress(Exception):
-                out_sink.close()
-            with contextlib.suppress(Exception):
-                err_sink.close()
-            if child is not None:
-                self._reap_direct_child(child)
-            with contextlib.suppress(Exception):
-                boundary.close()
+            # whatever is left in it (kill-on-close), so it is closed even when a second Ctrl+C
+            # interrupts the waits before it. The readers get their bounded wait once: a path
+            # that already waited for them and found a pipe still held open does not wait a
+            # second time, since nothing between the two waits could have released it.
+            try:
+                if not readers_joined:
+                    self._join_readers(readers)
+                with contextlib.suppress(Exception):
+                    out_sink.close()
+                with contextlib.suppress(Exception):
+                    err_sink.close()
+                if child is not None:
+                    self._reap_direct_child(child)
+            finally:
+                with contextlib.suppress(Exception):
+                    boundary.close()
 
     def _start_readers(
         self, child: subprocess.Popen, out_sink: BoundedTextSink, err_sink: BoundedTextSink
@@ -645,11 +666,9 @@ class CommandCheckRunner:
         failed write is not a finished capture, and "the thread is gone" must never be read as
         "the output is complete".
         """
-        status = "unknown"
+        status = "unknown"  # what is left if drain itself ever raised: not a clean end
         try:
             status = drain(stream, sink)  # type: ignore[arg-type]
-        except (OSError, ValueError) as exc:  # defensive: drain reports instead of raising
-            status = f"read_failed: {type(exc).__name__}: {exc}"
         finally:
             threading.current_thread()._hflow_status = status  # type: ignore[attr-defined]
 
@@ -665,20 +684,26 @@ class CommandCheckRunner:
         """Wait a bounded time for the direct child, then make sure it is gone.
 
         Called on every path, including the ones that already failed: a launched child must
-        not be left behind because an earlier step went wrong.
+        not be left behind because an earlier step went wrong. Both waits let a console Ctrl+C
+        through (:func:`wait_interruptibly`).
         """
         try:
-            child.wait(timeout=CHILD_REAP_SECONDS)
+            wait_interruptibly(child, CHILD_REAP_SECONDS)
             return
         except subprocess.TimeoutExpired:
             pass
         with contextlib.suppress(Exception):
             child.kill()
         with contextlib.suppress(Exception):
-            child.wait(timeout=CHILD_REAP_SECONDS)
+            wait_interruptibly(child, CHILD_REAP_SECONDS)
 
     def _settle_descendants(
-        self, boundary: ProcessBoundary, details: list[str], deadline: float
+        self,
+        boundary: ProcessBoundary,
+        details: list[str],
+        deadline: float,
+        *,
+        timed_out: bool = False,
     ) -> str:
         """Let a finished check's boundary go quiet.
 
@@ -691,6 +716,12 @@ class CommandCheckRunner:
         leave them running. A boundary that is *known* not to own a tree (``direct_child_only``,
         i.e. no Job Object was created) keeps its documented weaker behaviour: nothing about the
         process tree is claimed there, including by a pass.
+
+        ``timed_out``: the boundary was already terminated at the deadline. Termination is
+        asynchronous, so the processes still counted right after it are not "left running" - the
+        boundary is given :data:`BOUNDARY_EMPTY_SECONDS` (past the deadline, which has passed) to
+        report itself empty, and what remains after that is recorded as
+        ``processes_alive_after_timeout_termination``. The check's reason stays ``timed_out``.
         """
         active = self._observation(boundary)
         if active is None:
@@ -701,7 +732,11 @@ class CommandCheckRunner:
             details.append("boundary_observation=unknown")
             return "unknown"
 
-        settle_budget = min(DESCENDANT_SETTLE_SECONDS, max(0.0, deadline - time.monotonic()))
+        settle_budget = (
+            BOUNDARY_EMPTY_SECONDS
+            if timed_out
+            else min(DESCENDANT_SETTLE_SECONDS, max(0.0, deadline - time.monotonic()))
+        )
         if active > 0 and settle_budget > 0:
             boundary.wait_empty(settle_budget)
             active = self._observation(boundary)
@@ -712,9 +747,13 @@ class CommandCheckRunner:
             details.append("boundary_empty=True")
             return "settled"
 
-        # Descendants outlived the check and the settle window: settle them by force, and say
-        # so. The caller reports this as a lifecycle error, never as a clean pass.
-        details.append(f"descendants_alive_after_settle={active}")
+        # Descendants outlived the check and the settle window (or the timeout's tear-down
+        # window): settle them by force, and say so. The caller reports this as a lifecycle
+        # error, never as a clean pass.
+        if timed_out:
+            details.append(f"processes_alive_after_timeout_termination={active}")
+        else:
+            details.append(f"descendants_alive_after_settle={active}")
         boundary.terminate()
         emptied = boundary.wait_empty(
             min(BOUNDARY_EMPTY_SECONDS, max(0.0, deadline - time.monotonic()))
@@ -780,7 +819,17 @@ class CommandCheckRunner:
                     reason = REASON_NONZERO_EXIT
                 else:
                     reason = f"settlement_{settled}"
-            if settled == "forced":
+            if settled == "forced" and timed_out:
+                # The check did not finish, so it cannot have "left processes after it finished":
+                # these are processes the timeout's own termination had not yet removed. The
+                # reason stays ``timed_out``; the leftover is a separate fact.
+                segments.insert(
+                    0,
+                    "the owned boundary still held processes after it was terminated at the "
+                    "timeout and was terminated again; boundary_empty says whether that was "
+                    "confirmed",
+                )
+            elif settled == "forced":
                 # A zero exit is not completion if the check left processes behind.
                 segments.insert(
                     0,
@@ -797,14 +846,16 @@ class CommandCheckRunner:
                     "the owned boundary could not be observed, so settlement is unconfirmed; an "
                     "unanswered query is not an empty process tree and this is not a clean result",
                 )
-                reason = REASON_SETTLEMENT_UNKNOWN
+                if not timed_out:
+                    reason = REASON_SETTLEMENT_UNKNOWN
             detail += " " + " ".join(segments)
 
         if stderr.total_bytes:
             # The head of the stream, decoded for the evidence row; the retained stream stays in
             # the artifact file this row names.
             # Under a marker that is not a reference spelling: these are the check's bytes.
-            detail += f" {STDERR_EXCERPT_MARKER}" + stderr.head[: self.excerpt_limit]
+            # ``head`` is already bounded (``artifacts.DEFAULT_EXCERPT_BYTES``).
+            detail += f" {STDERR_EXCERPT_MARKER}" + stderr.head
             if stderr.truncated:
                 detail += "… (stderr truncated for display)"
         return CheckOutcome(
@@ -927,7 +978,6 @@ def verify_candidate(
     existing = [dict(r) for r in store.evidence_for(run_id, kind=evidence_kind)]
     evidence_ids: list[str] = []
     failure_details: list[str] = []
-    overall = EvidenceStatus.PASSED
     # One countdown for the whole loop, shared by every check: the root's budget is what the run
     # has left, not what each check may spend on its own.
     budget_deadline = (
@@ -945,6 +995,10 @@ def verify_candidate(
                 f"check {check_id!r} disappeared from the project contract since admission",
             )
         reusable = None
+        # Reachable offline only: the controller verifies a run's candidate once per round and
+        # refreshes a repaired one, and ``hflow integrate`` always refreshes, so a live run holds
+        # no earlier passing row for this candidate here. Kept as the A10 rule for any caller
+        # that verifies the same candidate twice (the tests do).
         if check.cacheable and not force_refresh:
             for row in existing:
                 if (
@@ -970,7 +1024,6 @@ def verify_candidate(
             # with that factory rather than mutated, so a shared runner instance in a registry
             # never carries one run's directory into another run.
             runner = CommandCheckRunner(
-                excerpt_limit=runner.excerpt_limit,
                 extra_env=runner.extra_env,
                 stream_limit_bytes=runner.stream_limit_bytes,
                 artifact_factory=lambda _check, _ignored, _eid=evidence_id: artifact_factory(
@@ -1060,7 +1113,6 @@ def verify_candidate(
         evidence_ids.append(record.evidence_id)
         if outcome.status is not EvidenceStatus.PASSED:
             failure_details.append(f"{check_id}: {outcome.status.value} ({outcome.detail})")
-            overall = EvidenceStatus.FAILED if overall is EvidenceStatus.PASSED else overall
 
     if removed_files:
         store.record_note(
@@ -1201,7 +1253,11 @@ def _stream_reference(detail: str, name: str) -> dict[str, object]:
     ``{}`` means the row holds no usable reference for that stream - reported as "not recorded"
     rather than filled in with zeros a reader could mistake for a real capture.
     """
-    value = _reference_field(detail, name)
+    return _stream_facts(_reference_field(detail, name))
+
+
+def _stream_facts(value: str) -> dict[str, object]:
+    """:func:`_stream_reference` for a reference value already read out of the block."""
     if not value:
         return {}
     match = _STREAM_REFERENCE.match(value)
@@ -1249,6 +1305,7 @@ def failed_check_facts(
         if str(row["status"]) == EvidenceStatus.PASSED.value:
             continue
         detail = str(row["detail"] or "")
+        block = _reference_block(detail)
         facts.append(
             {
                 "check_id": str(row["check_id"] or ""),
@@ -1257,9 +1314,9 @@ def failed_check_facts(
                 "exit_reason": str(row["exit_reason"] or ""),
                 "detail": detail,
                 "evidence_id": str(row["evidence_id"]),
-                "artifact": _reference_field(detail, "artifact"),
-                "stdout": _stream_reference(detail, "stdout"),
-                "stderr": _stream_reference(detail, "stderr"),
+                "artifact": block.get("artifact", ""),
+                "stdout": _stream_facts(block.get("stdout", "")),
+                "stderr": _stream_facts(block.get("stderr", "")),
             }
         )
     return facts

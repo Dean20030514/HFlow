@@ -75,6 +75,19 @@ class TaskState(StrEnum):
     CANCELLED = "CANCELLED"
 
 
+#: The states a run ends in. A run in one of them never dispatches, is never relabelled and is
+#: never revived; every guard that says "terminal" means exactly these three.
+TERMINAL_TASK_STATES: tuple[TaskState, ...] = (
+    TaskState.ACCEPTED,
+    TaskState.BLOCKED,
+    TaskState.CANCELLED,
+)
+#: Every other state: the run may still be driven, claimed, taken over or stopped.
+LIVE_TASK_STATES: tuple[TaskState, ...] = tuple(
+    state for state in TaskState if state not in TERMINAL_TASK_STATES
+)
+
+
 class AttemptState(StrEnum):
     CREATED = "CREATED"
     ACTIVE = "ACTIVE"
@@ -282,6 +295,10 @@ class RepairDecision(StrEnum):
     BUDGET_EXHAUSTED = "budget_exhausted"
     DEADLINE_REACHED = "deadline_reached"
     STOP_REQUESTED = "stop_requested"
+    #: The ledger refused to move the run back to its implementation phase for a reason other
+    #: than a stop - another owner took the run over, or a verdict already ended it - so no
+    #: repair was bought.
+    REOPEN_REFUSED = "reopen_refused"
     NO_CONTENT_CHANGE = "no_content_change"
     #: The worktree is not the frozen candidate a repair would start from (it moved, or files
     #: appeared after the freeze), so the repair was refused before anything was bought.

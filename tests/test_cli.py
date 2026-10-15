@@ -37,6 +37,7 @@ from hflow.verify import CheckRunners, FakeCheckRunner
 
 from .conftest import write_profile, write_project, write_task
 from .owner_exit import owner_exits
+from .store_helpers import pending_invocations
 
 @pytest.fixture()
 def cli_env(tmp_path: Path, project, task_spec) -> dict[str, Path]:
@@ -737,7 +738,6 @@ def test_cli_cancel_never_confirms_a_production_child_it_does_not_own(
             exit_code = main(
                 [
                     "cancel", run_id, "--json",
-                    "--project-root", str(project_root),
                     "--data-dir", str(tmp_path / "data"),
                 ]
             )
@@ -763,7 +763,7 @@ def test_cli_cancel_never_confirms_a_production_child_it_does_not_own(
         assert entry is not None and entry.state is InvocationStartState.STARTED, (
             "an unconfirmed stop settles nothing: the entry stays open and keeps blocking"
         )
-        assert [e.invocation_id for e in store.pending_invocations(binding.root_id)] == [
+        assert [e.invocation_id for e in pending_invocations(store, binding.root_id)] == [
             review_invocation
         ]
         assert store.get_run(run_id)["block_code"] == RefusalCode.OUTCOME_UNKNOWN.value, (
@@ -777,7 +777,7 @@ def test_cli_cancel_never_confirms_a_production_child_it_does_not_own(
         assert after_owner is not None and after_owner.state is InvocationStartState.STARTED, (
             f"the owner's late return closed the entry: {after_owner}"
         )
-        assert [e.invocation_id for e in store.pending_invocations(binding.root_id)] == [
+        assert [e.invocation_id for e in pending_invocations(store, binding.root_id)] == [
             review_invocation
         ]
     finally:
@@ -863,26 +863,63 @@ def test_cli_cancel_text_prints_the_receipt_detail_and_the_next_command(
     assert any(line.startswith(resume) for line in lines), lines
 
 
+_LOOKUPS = [
+    ["status", "R-nope"],
+    ["report", "R-nope"],
+    ["diff", "R-nope"],
+    ["cancel", "R-nope"],
+    ["resume", "R-nope"],
+    ["clean", "R-nope"],
+    ["clean", "R-nope", "--apply"],
+    ["clean", "R-nope", "--reconcile"],
+    ["integrate", "prepare", "R-nope", "--target", "main"],
+    ["integrate", "apply", "G-nope", "--expect-target", "0" * 40],
+    ["integrate", "reconcile", "G-nope"],
+    ["integrate", "show", "G-nope"],
+    ["ledger", "settle", "I-nope", "--attest", "the controller host was rebooted"],
+]
+
+
+def _kind_and_id(argv: list[str]) -> tuple[str, str]:
+    ident = next(word for word in argv if word.endswith("-nope"))
+    return {"R": "run", "G": "integration", "I": "invocation"}[ident[0]], ident
+
+
 @pytest.mark.parametrize(
-    "argv",
-    [
-        ["status", "R-nope"],
-        ["report", "R-nope"],
-        ["cancel", "R-nope"],
-        ["resume", "R-nope"],
-        ["clean", "R-nope"],
-        ["clean", "R-nope", "--apply"],
-        ["clean", "R-nope", "--reconcile"],
-        ["integrate", "prepare", "R-nope", "--target", "main"],
-    ],
-    ids=lambda argv: "-".join(word for word in argv if word != "R-nope"),
+    "argv", _LOOKUPS, ids=lambda argv: "-".join(word for word in argv[:3] if "-nope" not in word)
 )
-def test_every_command_names_an_unknown_run_the_same_way(
+def test_a_lookup_in_a_mistyped_data_dir_names_the_ledger_and_creates_none(
     argv: list[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert main([*argv, "--data-dir", str(tmp_path / "data")]) == EXIT_USAGE
+    """A command that acts on a recorded run, integration or invocation never creates a ledger to
+    look in: a mistyped --data-dir leaves no directory behind, and the one-line answer names the
+    ledger path it looked at and the --data-dir to pass instead."""
+    data_dir = tmp_path / "typo"
+    assert main([*argv, "--data-dir", str(data_dir)]) == EXIT_USAGE
     err = capsys.readouterr().err
-    assert err.strip() == "unknown run R-nope", err
+    kind, ident = _kind_and_id(argv)
+    assert err.startswith(f"unknown {kind} {ident} "), err
+    assert f"there is no ledger at {data_dir / 'hflow.sqlite'}" in err and "--data-dir" in err
+    assert len(err.strip().splitlines()) == 1 and "Traceback" not in err
+    assert not data_dir.exists(), "a lookup created the data directory"
+
+
+@pytest.mark.parametrize(
+    "argv", _LOOKUPS, ids=lambda argv: "-".join(word for word in argv[:3] if "-nope" not in word)
+)
+def test_every_command_names_an_unknown_id_the_same_way(
+    argv: list[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "data"
+    Store(data_dir / "hflow.sqlite").close()
+    assert main([*argv, "--data-dir", str(data_dir)]) == EXIT_USAGE
+    err = capsys.readouterr().err
+    kind, ident = _kind_and_id(argv)
+    assert err.startswith(f"unknown {kind}") and ident in err, err
+    if kind == "run":
+        # The run lookups share one sentence: the ledger they looked in, and --data-dir.
+        assert f"in the ledger {data_dir / 'hflow.sqlite'}" in err and "--data-dir" in err, err
+    assert "Traceback" not in err
 
 
 def test_an_interrupted_controller_leaves_a_run_resume_reconciles(
@@ -1278,3 +1315,195 @@ def test_data_dir_after_the_subcommand_wins_over_one_before_it(tmp_path: Path) -
     assert args.data_dir == "B"
     assert parser.parse_args(["--data-dir", "A", "status", "R"]).data_dir == "A"
     assert parser.parse_args(["status", "R"]).data_dir is None
+
+
+# --------------------------------------------------------------------------
+# batch M: unreadable inputs, ledger errors, --last, doctor's ledger health
+# --------------------------------------------------------------------------
+
+
+def _fake_run(cli_env: dict[str, Path], project_root: Path, capsys, task: Path | None = None) -> str:  # noqa: ANN001
+    assert main(
+        [
+            "run", "--task", str(task or cli_env["task"]), "--project", str(cli_env["project"]),
+            "--project-root", str(project_root), "--driver", "fake", "--json",
+            "--data-dir", str(cli_env["data_dir"]),
+        ]
+    ) == EXIT_OK
+    return json.loads(capsys.readouterr().out)["run_id"]
+
+
+def test_an_input_file_that_cannot_be_read_is_one_refusal_line(
+    cli_env: dict[str, Path], project_root: Path, tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A directory or a UTF-16 file given as the task is refused (exit 2) naming the file, in one
+    line and never as a traceback, before anything is created."""
+    directory = tmp_path / "a-directory"
+    directory.mkdir()
+    wide = tmp_path / "wide.task.json"
+    wide.write_bytes(cli_env["task"].read_text(encoding="utf-8").encode("utf-16"))
+    for task in (directory, wide):
+        for verb in ("prepare", "run"):
+            code = main(
+                [
+                    verb, "--task", str(task), "--project", str(cli_env["project"]),
+                    "--project-root", str(project_root), "--data-dir", str(cli_env["data_dir"]),
+                ]
+            )
+            err = capsys.readouterr().err
+            assert code == EXIT_REFUSED, err
+            assert err.startswith("refused: ") and f"task spec {task} could not be read" in err
+            assert "Traceback" not in err and len(err.strip().splitlines()) == 1, err
+    assert not (cli_env["data_dir"] / "hflow.sqlite").exists()
+
+    # A UTF-8 byte-order mark (Windows PowerShell 5.1's utf8) is read past.
+    bom = tmp_path / "bom.task.json"
+    bom.write_bytes(b"\xef\xbb\xbf" + cli_env["task"].read_bytes())
+    argv = ["prepare", "--project", str(cli_env["project"]), "--project-root", str(project_root)]
+    plain_code = main([*argv, "--task", str(cli_env["task"]), "--json"])
+    plain = json.loads(capsys.readouterr().out)
+    assert main([*argv, "--task", str(bom), "--json"]) == plain_code
+    with_bom = json.loads(capsys.readouterr().out)
+    assert with_bom["admission"] == plain["admission"]
+
+
+def test_a_ledger_this_build_cannot_open_is_one_line_never_a_traceback(
+    cli_env: dict[str, Path], project_root: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import sqlite3
+
+    from hflow.cli import EXIT_RECORD_UNREADABLE
+
+    run_id = _fake_run(cli_env, project_root, capsys)
+    ledger = cli_env["data_dir"] / "hflow.sqlite"
+    conn = sqlite3.connect(ledger)
+    conn.execute("UPDATE schema_meta SET value = '99' WHERE key = 'storage_version'")
+    conn.commit()
+    conn.close()
+    before = ledger.read_bytes()
+    data = ["--data-dir", str(cli_env["data_dir"])]
+    run = [
+        "run", "--task", str(cli_env["task"]), "--project", str(cli_env["project"]),
+        "--project-root", str(project_root), "--driver", "fake",
+    ]
+    for argv in (
+        ["status", run_id], ["report", run_id], ["runs"], ["cancel", run_id], ["diff", run_id],
+        ["resume", run_id], run,
+    ):
+        code = main([*argv, *data])
+        err = capsys.readouterr().err
+        assert code == EXIT_RECORD_UNREADABLE, (argv, err)
+        assert err.startswith("ledger error (StoreError): "), err
+        assert "Traceback" not in err and len(err.strip().splitlines()) == 1, err
+    assert ledger.read_bytes() == before, "nothing was migrated or rewritten"
+
+
+def test_a_locked_ledger_exits_in_progress_and_other_ledger_errors_exit_6(
+    cli_env: dict[str, Path], project_root: Path, capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sqlite3
+
+    import hflow.cli as cli_module
+    from hflow.cli import EXIT_IN_PROGRESS, EXIT_RECORD_UNREADABLE
+
+    run_id = _fake_run(cli_env, project_root, capsys)
+    argv = ["status", run_id, "--data-dir", str(cli_env["data_dir"])]
+
+    def locked(*_args: object, **_kwargs: object) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    def wrapped(*_args: object, **_kwargs: object) -> None:
+        raise StoreError("the write was refused") from sqlite3.OperationalError(
+            "database is locked"
+        )
+
+    def malformed(*_args: object, **_kwargs: object) -> None:
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    for failure, code, start in (
+        (locked, EXIT_IN_PROGRESS, "in progress: the ledger is locked by another process"),
+        (wrapped, EXIT_IN_PROGRESS, "in progress: the ledger is locked by another process"),
+        (malformed, EXIT_RECORD_UNREADABLE, "ledger error (DatabaseError): "),
+    ):
+        monkeypatch.setattr(cli_module, "inspect_run", failure)
+        assert main(argv) == code
+        err = capsys.readouterr().err
+        assert err.startswith(start) and "Traceback" not in err, err
+        assert len(err.strip().splitlines()) == 1
+
+
+def test_last_reads_the_newest_run_on_the_read_only_commands_only(
+    cli_env: dict[str, Path], project_root: Path, task_spec, tmp_path: Path,  # noqa: ANN001
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    data_dir = cli_env["data_dir"]
+    data = ["--data-dir", str(data_dir)]
+    assert main(["status", "--last", *data]) == EXIT_USAGE
+    assert "no run for --last: there is no ledger at" in capsys.readouterr().err
+    assert not data_dir.exists(), "--last created nothing"
+
+    first = _fake_run(cli_env, project_root, capsys)
+    later = write_task(tmp_path / "later.json", task_spec.model_copy(update={"task_id": "T-later"}))
+    second = _fake_run(cli_env, project_root, capsys, task=later)
+    assert first != second
+
+    assert main(["status", "--last", *data]) == EXIT_OK
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == f"run: {second}" and f"run           {second}" in lines
+
+    assert main(["report", "--last", "--json", *data]) == EXIT_OK
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["run"]["run_id"] == second, "stdout stays one document"
+    assert captured.err.strip() == f"run: {second}"
+
+    # An in-place run has no Git candidate: diff refuses, after saying which run it read.
+    assert main(["diff", "--last", *data]) == EXIT_REFUSED
+    captured = capsys.readouterr()
+    assert captured.out.splitlines()[0] == f"run: {second}"
+
+    for argv in (["status", first, "--last"], ["status"], ["resume", "--last"],
+                 ["cancel", "--last"], ["clean", "--last"]):
+        with pytest.raises(SystemExit) as usage:
+            main([*argv, *data])
+        assert usage.value.code == EXIT_USAGE, argv
+        capsys.readouterr()
+
+
+def test_doctor_reports_ledger_health_read_only(
+    cli_env: dict[str, Path], project_root: Path, capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """``PRAGMA quick_check(1)`` over a read-only connection: never a write, never a migration;
+    a check the time bound stops is ``incomplete``, not a finding."""
+    import hflow.cli as cli_module
+    from hflow.migrate import SUPPORTED_STORAGE_VERSION
+
+    def doctor(data_dir: Path) -> dict:
+        assert main(["doctor", "--json", "--data-dir", str(data_dir)]) == EXIT_OK
+        return json.loads(capsys.readouterr().out)["ledger_health"]
+
+    empty = tmp_path / "empty"
+    assert doctor(empty)["status"] == "none" and not empty.exists()
+
+    _fake_run(cli_env, project_root, capsys)
+    ledger = cli_env["data_dir"] / "hflow.sqlite"
+    before = ledger.read_bytes()
+    health = doctor(cli_env["data_dir"])
+    assert (health["status"], health["quick_check"]) == ("ok", "ok"), health
+    assert health["storage_version"] == SUPPORTED_STORAGE_VERSION
+    assert ledger.read_bytes() == before, "doctor wrote nothing"
+    assert main(["doctor", "--data-dir", str(cli_env["data_dir"])]) == EXIT_OK
+    assert "ledger health " in capsys.readouterr().out
+
+    monkeypatch.setattr(cli_module, "DOCTOR_LEDGER_CHECK_SECONDS", -1.0)
+    monkeypatch.setattr(cli_module, "DOCTOR_LEDGER_CHECK_STEPS", 1)
+    stopped = doctor(cli_env["data_dir"])
+    assert stopped["status"] == "incomplete" and "not a finding" in stopped["detail"], stopped
+    monkeypatch.undo()
+
+    garbage = tmp_path / "garbage"
+    garbage.mkdir()
+    (garbage / "hflow.sqlite").write_bytes(b"this is not a database" * 100)
+    assert doctor(garbage)["status"] == "unreadable"

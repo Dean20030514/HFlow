@@ -433,9 +433,11 @@ def test_a_detached_head_is_named_by_its_commit(
     assert main(["init", "project", "--project-root", str(repo), "--check", "u=python -V"]) == 0
     monkeypatch.chdir(tmp_path)
     assert main(["init", "task", "T-7", "--project-root", str(repo)]) == EXIT_OK
-    capsys.readouterr()
+    out = capsys.readouterr().out
     document = json.loads((tmp_path / "T-7.task.json").read_text(encoding="utf-8"))
     assert document["workspace"]["base_commit"] == head
+    assert f"base_commit is the commit {head} (HEAD is detached" in out
+    assert "branch name" not in out
 
 
 def test_init_needs_a_subcommand(capsys: pytest.CaptureFixture[str]) -> None:
@@ -443,3 +445,29 @@ def test_init_needs_a_subcommand(capsys: pytest.CaptureFixture[str]) -> None:
         main(["init"])
     assert usage.value.code == EXIT_USAGE
     capsys.readouterr()
+
+
+def test_the_printed_prepare_names_a_profile_only_when_one_is_unambiguous(
+    scaffolded, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``HFLOW_PROFILE`` when it is set, else the only profile in the data dir; with none or
+    several, choosing is the operator's and the placeholder stays."""
+    repo, work = scaffolded
+
+    def prepare_line(task_id: str) -> str:
+        assert main(["init", "task", task_id, "--project-root", str(repo)]) == EXIT_OK
+        [line] = [
+            line for line in capsys.readouterr().out.splitlines()
+            if line.startswith("next: hflow prepare")
+        ]
+        return line
+
+    assert "--profile <profile-id>" in prepare_line("T-none")
+    assert main(["init", "profile", "only-one"]) == EXIT_OK
+    capsys.readouterr()
+    assert "--profile only-one " in prepare_line("T-one")
+    assert main(["init", "profile", "another"]) == EXIT_OK
+    capsys.readouterr()
+    assert "--profile <profile-id>" in prepare_line("T-two")
+    monkeypatch.setenv("HFLOW_PROFILE", "another")
+    assert "--profile another " in prepare_line("T-env")

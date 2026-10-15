@@ -52,7 +52,7 @@ from hflow.drivers.winjob import process_gone
 from hflow.store import Store
 from hflow.verify import CheckRunners, FakeCheckRunner
 from tests.conftest import STAND_IN_API_KEY
-from tests.store_helpers import claim_run, dispatch_attempt, reserve_turn
+from tests.store_helpers import claim_run, dispatch_attempt, reserve_turn, turns_remaining
 from tests.test_winjob import ERROR_ACCESS_DENIED, kernel32_stand_in
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -343,6 +343,32 @@ def test_ambient_dsh_mode_variables_never_reach_the_child(
     assert removed and "removed" in removed[0] and "DSH_TOOLS_MODE" in removed[0], notes
 
 
+def test_repository_locating_git_variables_never_reach_the_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An inherited ``GIT_DIR``/``GIT_WORK_TREE``/``GIT_INDEX_FILE`` would point DSH's git and the
+    agent's shell at another repository or index - the user's checkout, say. HFlow drops them from
+    its own git calls (``gitworkspace._REPOSITORY_LOCATING_ENV``) and from every agent child, in
+    any spelling on Windows, whether they come from the environment or from ``extra_env``."""
+    from hflow.gitworkspace import _REPOSITORY_LOCATING_ENV
+
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "elsewhere" / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "elsewhere"))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(tmp_path / "elsewhere" / "index"))
+    launch = resolve_launch_config(data_dir=tmp_path, acpx_cli=ENV_REPORT_CLIENT)
+    smuggled = "git_dir" if os.name == "nt" else "GIT_DIR"
+    driver = AcpxDshDriver(
+        data_dir=tmp_path, launch=launch, extra_env={smuggled: "from-extra-env"}
+    )
+
+    env = driver._child_env(tmp_path)
+    assert not [key for key in env if key.upper() in _REPOSITORY_LOCATING_ENV], env
+    assert {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"} <= set(_REPOSITORY_LOCATING_ENV)
+
+    observed = _observe_child_env(driver, tmp_path)
+    assert observed["git_locating_present"] == [], observed
+
+
 @pytest.mark.parametrize("bound", ["", "C:\\bound-dsh-home" if os.name == "nt" else "/bound"])
 def test_an_inherited_dsh_agents_home_and_every_spelling_of_the_dsh_variables_are_removed(
     bound: str,
@@ -402,7 +428,9 @@ def test_the_batch_shim_wrapper_is_the_absolute_system_cmd_exe(tmp_path: Path) -
         env={"SystemRoot": str(system_root)},
     )
     assert launch.resolvable, launch.detail
-    assert launch.agent_argv == [str(cmd), "/c", str(shim), "--profile", "acp"]
+    # /d: cmd.exe's registry AutoRun would otherwise run first, in the workspace, and write into
+    # the ACP stdout stream.
+    assert launch.agent_argv == [str(cmd), "/d", "/c", str(shim), "--profile", "acp"]
     assert Path(launch.agent_argv[0]).is_absolute()
 
     missing = resolve_launch_config(
@@ -415,6 +443,45 @@ def test_the_batch_shim_wrapper_is_the_absolute_system_cmd_exe(tmp_path: Path) -
     assert missing.resolvable is False
     assert "cmd.exe" in missing.detail
     assert "cmd.exe" not in missing.agent_argv, "a bare cmd.exe is never a fallback"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the batch-shim wrapper exists only on Windows")
+@pytest.mark.parametrize(
+    "directory", ["a&b", "a^b", "a%PATH%b", "a!b", "a(b", "a;b", "a,b", "a=b", "with space@x"]
+)
+def test_a_batch_launcher_path_cmd_would_reinterpret_is_not_resolvable(
+    tmp_path: Path, directory: str
+) -> None:
+    """Node quotes the shim path by C runtime rules, not cmd's: an ``&`` in it splits the command,
+    ``^`` and ``%VAR%`` are consumed, an unquoted ``( ; , =`` cuts the path, an ``@`` in a quoted
+    path makes ``/c`` drop the quotes (all observed with ``cmd /d /c``). Refused like any other
+    launch problem, before an argv is built around it. (``| < > "`` cannot occur in a Windows
+    file name; :func:`batch_argument_problem` refuses them too.)"""
+    from hflow.drivers.acpx_dsh import batch_argument_problem
+
+    for char in '|<>"':
+        assert batch_argument_problem(f"C:\\a{char}b\\dsh.cmd"), char
+    shim = _launcher_stand_in(tmp_path / directory, "dsh.CMD")
+    launch = resolve_launch_config(
+        data_dir=tmp_path,
+        acpx_cli=FAKE_CLIENT,
+        dsh_executable=str(shim),
+        python_executable=sys.executable,
+        env={"SystemRoot": os.environ["SystemRoot"]},
+    )
+    assert launch.resolvable is False, launch
+    assert "cmd.exe interprets" in launch.detail, launch.detail
+    assert launch.agent_argv == []
+
+    plain = _launcher_stand_in(tmp_path / "with space", "dsh.CMD")
+    spaced = resolve_launch_config(
+        data_dir=tmp_path,
+        acpx_cli=FAKE_CLIENT,
+        dsh_executable=str(plain),
+        python_executable=sys.executable,
+        env={"SystemRoot": os.environ["SystemRoot"]},
+    )
+    assert spaced.resolvable, "a space alone keeps cmd's quotes: " + spaced.detail
 
 
 #: The launcher's file name as the DSH install has it: an npm batch shim on Windows.
@@ -1063,7 +1130,7 @@ def test_budget_ledger_survives_a_restart(tmp_path: Path, project, task_spec, pr
 
     reopened = Store(tmp_path / "hflow.sqlite")
     try:
-        assert reopened.turns_remaining("R-persist") == 0
+        assert turns_remaining(reopened, "R-persist") == 0
         with pytest.raises(Exception):
             reserve_turn(reopened, "R-persist", "local-controller", turns=1)
     finally:
@@ -2698,3 +2765,22 @@ def test_a_failure_after_the_child_is_published_tears_down_and_never_raises(
     assert result.error_code == "reader_failed"
     assert "RuntimeError" in (result.error_message or "")
     _assert_released(driver, handle.invocation_id)
+
+
+def test_a_spawn_that_fails_closes_the_output_file_it_opened(
+    harness_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No handle is published when the child cannot be created, so nothing would ever release
+    the parent's copy of ``stdout.ndjson``: the failing spawn closes it itself."""
+    harness = harness_factory("cooperative")
+    given: list[object] = []
+
+    def failing_spawn(*_args: object, stdout_handle: object, **_kwargs: object) -> None:
+        given.append(stdout_handle)
+        raise OSError("stand-in for CreateProcess failing")
+
+    monkeypatch.setattr("hflow.drivers.acpx_dsh.popen_in_boundary", failing_spawn)
+    with pytest.raises(OSError, match="stand-in"):
+        harness.start()
+    assert given and getattr(given[0], "closed", False) is True
+    assert harness.driver._handles == {}

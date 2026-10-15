@@ -26,7 +26,7 @@ from typing import Any, Callable, Protocol
 
 from pydantic import ValidationError
 
-from .admission import predictable_dispatch_problems, validate_task_spec
+from .admission import loop_turns_required, predictable_dispatch_problems, validate_task_spec
 from .authorization import AuthorizationRecord, project_contract_digest
 from .contracts import (
     AttemptState,
@@ -72,6 +72,8 @@ from .contracts import (
     SpawnReporter,
     TaskSpec,
     TaskState,
+    LIVE_TASK_STATES,
+    TERMINAL_TASK_STATES,
     UsageFacts,
     VerificationResult,
     WorkspaceProvenance,
@@ -109,6 +111,7 @@ from .gitworkspace import (
     GitMetadataSnapshot,
     GitRepo,
     GitStatusParseError,
+    parse_status_z,
 )
 from .store import (
     INVOCATION_OPEN_STATES,
@@ -116,6 +119,7 @@ from .store import (
     RunNotFound,
     Store,
     StoreError,
+    StoreRefusal,
     StoredRecordUnreadable,
     attestation_bounds_problem,
 )
@@ -186,6 +190,20 @@ def _packet_workspace(packet: RenderedPacket) -> str:
 # The evidence-reference reader is the one ``verify`` defines next to the writer: it reads only
 # HFlow's leading reference block of a row's detail text, never the free text a check printed.
 from .verify import _reference_field, _stream_reference  # noqa: E402
+
+
+def _no_time_left(role: str) -> str:
+    """Why a reserved role was never started: the root's clock ran out during its reservation.
+
+    Timestamps are whole seconds, so the reservation can pass in the root's last second and the
+    deadline read right after it be 0: an invocation given no time could only time out. The
+    submission was reserved before any launch (rule 1), so it stays spent.
+    """
+    return (
+        f"the root's deadline passed while the {role}'s dispatch was being reserved, so it was "
+        "given no time and was never launched: an invocation with a deadline of 0 can only time "
+        "out. The reserved submission stays spent; nothing was accepted"
+    )
 
 
 def _change_list(items: Sequence[str], limit: int = 5) -> str:
@@ -523,9 +541,13 @@ def operator_settle_refusal(
       only when the operator attests that owner is gone (``legacy_owner_gone_attested``,
       ``--legacy-owner-gone``); otherwise it refuses;
     * the entry's own recorded child process (``process_pid`` + ``process_started_at``, probed on
-      the owner's recorded host when there is one) must read ``gone``. ``matching`` and
-      ``unknown`` both refuse. An entry that recorded no pid has nothing to probe and rests on the
-      owner rule alone, as the takeover does.
+      the owner's recorded host) must read ``gone``. ``matching`` and ``unknown`` both refuse. A
+      run with no recorded host (pre-v6, or a label-only claim) cannot have its child judged here
+      - a local lookup of another machine's pid reads ``gone`` - so it reads ``unknown`` and
+      refuses, unless the operator attests (``--legacy-owner-gone``) that the owner is gone: the
+      child ran inside that owner's process boundary, so the attestation covers it, and it is the
+      operator's record, not HFlow's observation. An entry that recorded no pid has nothing to
+      probe and rests on the owner rule alone, as the takeover does.
 
     ``None`` also when the entry is missing, its run is missing or it is not in a settleable state:
     the store's own guards refuse those with their own words. Never calls a model; nothing is
@@ -556,7 +578,8 @@ def operator_settle_refusal(
             "that controller to exit, or stop its process tree yourself, then run "
             f"`hflow resume {run_id}` and settle again; nothing was written"
         )
-    if invocation.process_pid is not None:
+    no_host = row["owner_host"] is None
+    if invocation.process_pid is not None and not (no_host and legacy_owner_gone_attested):
         observed = probe_recorded(
             int(invocation.process_pid), invocation.process_started_at, row["owner_host"]
         )
@@ -565,12 +588,16 @@ def operator_settle_refusal(
                 "may still be running" if observed.verdict == "matching"
                 else "cannot be judged from here"
             )
+            way_out = (
+                "If you know this run's owner and the process tree it launched have exited, "
+                "settle again with --legacy-owner-gone, which records that you attest it"
+                if no_host
+                else "Wait for it to exit, or stop that process tree yourself, then settle again "
+                f"(`hflow resume {run_id}` reconciles the run first if it is still unresolved)"
+            )
             return (
                 f"the child process pid={invocation.process_pid} recorded for invocation "
-                f"{invocation_id} {words} ({observed.detail}). Wait for it to exit, or stop that "
-                "process tree yourself, then settle again (`hflow resume "
-                f"{run_id}` reconciles the run first if it is still unresolved); nothing was "
-                "written"
+                f"{invocation_id} {words} ({observed.detail}). {way_out}; nothing was written"
             )
     return None
 
@@ -626,8 +653,13 @@ def _gone_basis(assessment: OwnerAssessment) -> str:
 
 
 def _nothing_dispatched(store: Store, run_id: str) -> bool:
-    """No attempt and no invocation: nothing of this run was ever in flight."""
-    return not store.attempts_for(run_id) and not store.invocations_for(run_id)
+    """No attempt (so no invocation either): nothing of this run was ever in flight.
+
+    One read is enough: ``invocations.attempt_id`` is a foreign key into ``attempts`` (enforced,
+    ``PRAGMA foreign_keys = ON``), and ``reserve_dispatch`` writes an invocation only against the
+    same run's attempt, in one transaction - so a run with no attempt row has no invocation row.
+    """
+    return not store.attempts_for(run_id)
 
 
 class Controller:
@@ -1100,101 +1132,7 @@ class Controller:
         # outcome even when its authorization has since been used up. (Its own run keeps the
         # budget it was admitted with; nothing here spends anything.)
         if existing is not None:
-            run_id = existing["run_id"]
-            state = TaskState(existing["task_state"])
-            live_attempt = self.store.open_attempt(run_id)
-            if state is TaskState.ACCEPTED:
-                return self._outcome_for(run_id, notes=["identical TaskSpec: returning the existing accepted run"])
-            if state in {TaskState.BLOCKED, TaskState.CANCELLED}:
-                return self._outcome_for(
-                    run_id,
-                    notes=[f"identical TaskSpec: existing run is {state.value}, not re-dispatched"],
-                )
-            if live_attempt is not None:
-                return self._outcome_for(
-                    run_id,
-                    notes=[
-                        "identical TaskSpec already has a live attempt; no second dispatch "
-                        "(explicit new-run override is deferred to M3)"
-                    ],
-                )
-            # Admitted but never dispatched (for example an interrupted controller): continue
-            # the existing run instead of opening a second one. Only the turns this run still
-            # needs are asked for, because its first dispatch may already have been paid for.
-            #
-            # Owner lease, in this order:
-            # (a) a run another owner holds is continued only when that owner is *provably gone*
-            #     (lock free and identity gone) and the run has no attempt and no invocation -
-            #     nothing was in flight, so nothing needs fencing or reconciling. It is adopted by
-            #     one compare-and-set (old token and generation -> this token, generation + 1) and
-            #     keeps its DRAFT/READY state. Any other foreign owner - one that may be alive, one
-            #     never recorded, or a run with anything dispatched - is returned as it stands with
-            #     a note naming that owner (the CLI exits 5): a live owner may be in setup right
-            #     now, and a run with work in flight is resume's to take over (owner_lost);
-            # (b) the authorization check is read-only and runs before this controller claims or
-            #     adopts anything, so its refusal leaves the run exactly as it was and a new
-            #     authorization for this same TaskSpec, submitted by any later process, continues
-            #     it (ending the run here would make the refusal's own advice unusable);
-            # (c) the run is claimed (or adopted), so the repair gate below can end only *this*
-            #     controller's run, never one another controller is driving;
-            # (d) the repair gate; (e) the drive.
-            adopt = False
-            if not self._claimable(existing):
-                assessment = assess_run_owner(self.store, existing)
-                if not (assessment.gone and _nothing_dispatched(self.store, run_id)):
-                    return self._outcome_for(run_id, notes=[self._foreign_owner_note(existing)])
-                adopt = True
-            if not _nothing_dispatched(self.store, run_id):
-                return self._outcome_for(run_id, notes=["this run already dispatched work; use resume to reconcile, never re-dispatch"])
-            problem, binding = self._continuation_problem(run_id, request)
-            if problem:
-                return self._outcome_for(run_id, notes=[
-                    f"continuation refused: {problem}. Nothing was claimed or dispatched and no allowance was consumed. "
-                    "Restore the original binding, or cancel this run and submit a new revision."
-                ])
-            assert binding is not None
-            report = validate_task_spec(spec, project, project_root, allow_fake_checks=self.allow_fake_checks)
-            if not report.ok:
-                return self._outcome_for(run_id, notes=[
-                    "continuation refused before claiming: " + report.issues[0].detail
-                    + ". Restore the original inputs, or cancel this run and submit a new revision."
-                ])
-            request = request.model_copy(update={"project_root": Path(binding.project_root), "base_commit": binding.base_commit})
-            self.project_root = Path(binding.project_root)
-            self._assert_allowance_for(run_id, spec, project)
-            if adopt:
-                if not self._adopt(run_id, existing, assessment):
-                    return self._outcome_for(
-                        run_id,
-                        notes=[
-                            "the run's owner or state changed while it was being assessed "
-                            "(another controller took it, or it moved on); nothing here drives "
-                            "it: " + self._foreign_owner_note(self.store.get_run(run_id))
-                        ],
-                    )
-            elif not self._claim(run_id):
-                return self._outcome_for(
-                    run_id, notes=[self._foreign_owner_note(self.store.get_run(run_id))]
-                )
-            try:
-                self._assert_root_repair_allowance(run_id, spec)
-            except RefusedError as exc:
-                # A root's repair counter is never raised (there is no top-up path), so no later
-                # submission of this TaskSpec could ever pass this gate. Raising would leave the
-                # admitted run DRAFT forever, every resubmission exiting 2 although run state
-                # exists; the run instead ends through the conditional block path, as it did
-                # when the dispatch transaction refused it.
-                return self._blocked(
-                    run_id,
-                    exc.code,
-                    f"{exc.message} (this run was admitted earlier but never dispatched; it ends "
-                    "here because no resubmission of the same TaskSpec can pass this gate)",
-                )
-            if self.authorization is not None:
-                # A fresh approval may cover the same immutable execution. Register it only
-                # after the read-only continuation and allowance checks have passed.
-                self.store.register_authorization(self.authorization.as_store_record())
-            return self._drive(run_id, request)
+            return self._continue_existing_run(request, existing)
 
         # --- a new dispatch: gate everything before the artifact is even registered -------
         # The run id is chosen here, not inside ``create_run``, because the implementer packet
@@ -1206,7 +1144,7 @@ class Controller:
         request = request.model_copy(update={
             "project_root": Path(admission_binding.project_root), "base_commit": admission_binding.base_commit
         })
-        repo, worktree_root = self._worktree_path(run_id, spec, request.base_commit)
+        worktree_root = self._admitted_worktree(admission_binding)
         implementer_packet = self._render_implementer_packet(
             run_id=run_id,
             spec=spec,
@@ -1232,6 +1170,10 @@ class Controller:
         else:
             self._assert_no_root_for_task(spec, project)
         self._assert_root_repair_allowance(run_id, spec)
+        if self.authorization is not None:
+            # An authorization id already recorded with another binding or an edited immutable
+            # field is refused here, before the root row below is written.
+            self._authorization_registration(register=False)
         # The owner lock is taken before anything is written, so a controller that cannot hold
         # one is refused with nothing recorded.
         self._hold_owner_lock()
@@ -1250,20 +1192,8 @@ class Controller:
         # a dispatch is actually certain, so a duplicate submission (which correctly dispatches
         # nothing) cannot consume it.
         if self.authorization is not None:
-            self.store.register_authorization(self.authorization.as_store_record())
-            # The preflight proves that a *launch* works before a submission is spent: it starts
-            # the resolved client with a metadata argument. A driver that starts no process has
-            # no launch binding to prove, so demanding a probe from it would refuse the one path
-            # an offline run has. A driver that *does* offer the check still gets it whatever the
-            # run's production flag says: the gate is about the binding, not about a label.
-            if self._launch_is_probeable():
-                report = self._preflight_report()
-                if not report[0]:
-                    raise RefusedError(
-                        RefusalCode.NOT_IMPLEMENTED,
-                        f"zero-model preflight failed for this execution binding: {report[1]}. "
-                        "No authorization allowance was consumed and nothing was dispatched.",
-                    )
+            self._authorization_registration(register=True)
+            self._assert_preflight()
 
         row = self.store.create_run(
             run_id=run_id,
@@ -1303,6 +1233,155 @@ class Controller:
 
         return self._drive(run_id, request, implementer_packet=implementer_packet)
 
+    def _continue_existing_run(self, request: RunRequest, existing: Any) -> RunOutcome:
+        """An identical TaskSpec: report the recorded run, or continue one never dispatched.
+
+        A run that ended, or has a live attempt, is returned as it stands. A run admitted but
+        never dispatched (for example an interrupted controller) is continued instead of opening a
+        second one, and only the turns it still needs are asked for.
+
+        In this order, and every step before the claim reads only, so a refusal there leaves the
+        run exactly as it was and a later resubmission - with the credential set, a working
+        launch, a fresh authorization - continues it:
+
+        (a) the owner: a run another owner holds is continued only when that owner is *provably
+            gone* (lock free and identity gone) and nothing was dispatched; it is adopted below by
+            one compare-and-set and keeps its DRAFT/READY state. Any other foreign owner - one
+            that may be alive, one never recorded, or a run with anything dispatched - is returned
+            with a note naming it (the CLI exits 5): a live owner may be in setup right now, and a
+            run with work in flight is resume's to take over (owner_lost);
+        (b) the recorded admission binding and the task contract, re-validated (a note, exit 5);
+        (c) the gates a new run passes before anything is written - the dispatch preconditions
+            (a missing credential source, a DSH home inside the workspace, ...), the authorization
+            id's registration, the zero-model preflight - and the allowance; each raises
+            ``RefusedError`` (exit 2);
+        (d) the claim (or adoption), so the repair gate can end only *this* controller's run;
+        (e) the repair gate, the authorization's registration, and the drive.
+        """
+        spec = request.task
+        project = request.project
+        run_id = existing["run_id"]
+        state = TaskState(existing["task_state"])
+        if state is TaskState.ACCEPTED:
+            return self._outcome_for(run_id, notes=["identical TaskSpec: returning the existing accepted run"])
+        if state in TERMINAL_TASK_STATES:
+            return self._outcome_for(
+                run_id,
+                notes=[f"identical TaskSpec: existing run is {state.value}, not re-dispatched"],
+            )
+        if self.store.open_attempt(run_id) is not None:
+            return self._outcome_for(
+                run_id,
+                notes=[
+                    "identical TaskSpec already has a live attempt; no second dispatch "
+                    "(explicit new-run override is deferred to M3)"
+                ],
+            )
+        adopt = False
+        if not self._claimable(existing):
+            assessment = assess_run_owner(self.store, existing)
+            if not (assessment.gone and _nothing_dispatched(self.store, run_id)):
+                return self._outcome_for(run_id, notes=[self._foreign_owner_note(existing)])
+            adopt = True
+        if not _nothing_dispatched(self.store, run_id):
+            return self._outcome_for(run_id, notes=["this run already dispatched work; use resume to reconcile, never re-dispatch"])
+        problem, binding = self._continuation_problem(run_id, request)
+        if problem:
+            return self._outcome_for(run_id, notes=[
+                f"continuation refused: {problem}. Nothing was claimed or dispatched and no allowance was consumed. "
+                "Restore the original binding, or cancel this run and submit a new revision."
+            ])
+        assert binding is not None
+        report = validate_task_spec(
+            spec, project, Path(request.project_root), allow_fake_checks=self.allow_fake_checks
+        )
+        if not report.ok:
+            return self._outcome_for(run_id, notes=[
+                "continuation refused before claiming: " + report.issues[0].detail
+                + ". Restore the original inputs, or cancel this run and submit a new revision."
+            ])
+        request = request.model_copy(update={"project_root": Path(binding.project_root), "base_commit": binding.base_commit})
+        self.project_root = Path(binding.project_root)
+        self._assert_dispatch_preconditions(
+            spec, project, request.deadline_seconds, base_commit=request.base_commit
+        )
+        if self.authorization is not None:
+            self._authorization_registration(register=False)
+            self._assert_preflight()
+        self._assert_allowance_for(run_id, spec, project)
+        if adopt:
+            if not self._adopt(run_id, existing, assessment):
+                return self._outcome_for(
+                    run_id,
+                    notes=[
+                        "the run's owner or state changed while it was being assessed "
+                        "(another controller took it, or it moved on); nothing here drives "
+                        "it: " + self._foreign_owner_note(self.store.get_run(run_id))
+                    ],
+                )
+        elif not self._claim(run_id):
+            return self._outcome_for(
+                run_id, notes=[self._foreign_owner_note(self.store.get_run(run_id))]
+            )
+        try:
+            self._assert_root_repair_allowance(run_id, spec)
+        except RefusedError as exc:
+            # A root's repair counter is never raised (there is no top-up path), so no later
+            # submission of this TaskSpec could ever pass this gate. Raising would leave the
+            # admitted run DRAFT forever, every resubmission exiting 2 although run state
+            # exists; the run instead ends through the conditional block path, as it did
+            # when the dispatch transaction refused it.
+            return self._blocked(
+                run_id,
+                exc.code,
+                f"{exc.message} (this run was admitted earlier but never dispatched; it ends "
+                "here because no resubmission of the same TaskSpec can pass this gate)",
+            )
+        if self.authorization is not None:
+            # A fresh approval may cover the same immutable execution. Registered only after the
+            # read-only gates above passed, and checked there already, so this refuses only
+            # when a conflicting record was registered concurrently.
+            self._authorization_registration(register=True)
+        return self._drive(run_id, request)
+
+    def _authorization_registration(self, *, register: bool) -> None:
+        """Record this run's authorization, or (``register=False``) only check that it can be.
+
+        An id already recorded with another binding or an edited immutable field is an
+        ``invalid_spec`` refusal, not a crash: the recorded approval stands, and the check runs
+        before anything is written so a refused run records nothing beside it.
+        """
+        assert self.authorization is not None
+        record = self.authorization.as_store_record()
+        act = (
+            self.store.register_authorization
+            if register
+            else self.store.check_authorization_registration
+        )
+        try:
+            act(record)
+        except StoreError as exc:
+            raise RefusedError(RefusalCode.INVALID_SPEC, str(exc)) from exc
+
+    def _assert_preflight(self) -> None:
+        """The zero-model preflight, for an authorized run whose launch it can prove.
+
+        The preflight proves that a *launch* works before a submission is spent: it starts the
+        resolved client with a metadata argument. A driver that starts no process has no launch
+        binding to prove, so demanding a probe from it would refuse the one path an offline run
+        has. A driver that *does* offer the check still gets it whatever the run's production
+        flag says: the gate is about the binding, not about a label.
+        """
+        if not self._launch_is_probeable():
+            return
+        ok, detail = self._preflight_report()
+        if not ok:
+            raise RefusedError(
+                RefusalCode.NOT_IMPLEMENTED,
+                f"zero-model preflight failed for this execution binding: {detail}. "
+                "No authorization allowance was consumed and nothing was dispatched.",
+            )
+
     def resume(
         self, run_id: str, *, legacy_owner_gone: LegacyOwnerAttestation | None = None
     ) -> RunOutcome:
@@ -1332,7 +1411,7 @@ class Controller:
         """
         row = self.store.get_run(run_id)
         state = TaskState(row["task_state"])
-        if state in {TaskState.DRAFT, TaskState.READY, TaskState.RUNNING, TaskState.CHECKING}:
+        if state in LIVE_TASK_STATES:
             # A live run: take it over only from a provably gone owner (owner lease), which
             # blocks it owner_lost; otherwise change nothing.
             return self._attestation_unused(self._take_over(run_id, row), legacy_owner_gone)
@@ -1765,11 +1844,7 @@ class Controller:
         intent_at, existing_receipt = self.store.cancel_state(run_id)
         if existing_receipt is not None:
             recorded_row = self.store.get_run(run_id)
-            if TaskState(recorded_row["task_state"]) in {
-                TaskState.ACCEPTED,
-                TaskState.BLOCKED,
-                TaskState.CANCELLED,
-            }:
+            if TaskState(recorded_row["task_state"]) in TERMINAL_TASK_STATES:
                 return existing_receipt
             return self._reapply_recorded_stop(run_id, recorded_row, existing_receipt)
         row = self.store.get_run(run_id)
@@ -1783,7 +1858,7 @@ class Controller:
         state = TaskState(row["task_state"])
         if state is TaskState.ACCEPTED:
             return self._stop_after_acceptance(run_id)
-        ended = state in {TaskState.BLOCKED, TaskState.CANCELLED}
+        ended = state in TERMINAL_TASK_STATES  # ACCEPTED returned above
 
         attempt = self.store.open_attempt(run_id)
         role, driver, active_invocation = self._active_invocation(row, attempt)
@@ -2334,22 +2409,6 @@ class Controller:
         directory.mkdir(parents=True, exist_ok=True)
         return directory
 
-    def _loop_turns_required(self, spec: TaskSpec, project: ProjectConfig) -> int:
-        """How many top-level invocations this run may need, worst case.
-
-        Without a repair policy it is the fixed loop: implementer (+ reviewer). With one, the
-        worst case is the plan's four - I1 + R1 + I2 + R2 - because a repair can follow a reviewer
-        rejection, and that is the number the root, the run and the authorization all have to
-        cover before the first dispatch. An attempt that is never needed simply is not bought:
-        this is a ceiling, not a quota.
-        """
-        review_turns = 1 if spec.needs_review(project) else 0
-        if spec.repair_policy is None:
-            return 1 + review_turns
-        # I1 + (R1) + I2 + (R2): the repair attempt and the review that must follow it are the
-        # ones the first attempt cannot know about, so they are priced up front.
-        return 2 * (1 + review_turns)
-
     def _assert_allowance_for(
         self, run_id: str, spec: TaskSpec, project: ProjectConfig
     ) -> None:
@@ -2376,7 +2435,7 @@ class Controller:
             limit = int(state["max_top_level_submissions"])
             remaining = limit - int(state["used_top_level_submissions"])
 
-        required = self._loop_turns_required(spec, project)
+        required = loop_turns_required(spec, project)
         needed = max(0, required - sum(self.store.invocation_counts(run_id)))
         if needed > remaining:
             raise RefusedError(
@@ -2450,49 +2509,35 @@ class Controller:
                 f"{remedy}.",
             )
 
-    def _worktree_path(
-        self, run_id: str, spec: TaskSpec, resolved_base: str = ""
-    ) -> tuple[GitRepo | None, Path | None]:
-        """Where this run's isolated worktree *would* go, without creating anything.
+    def _admitted_worktree(self, binding: RunAdmissionBinding) -> Path | None:
+        """Where this run's isolated worktree *will* go, from its admission binding.
 
         The implementer packet contains the workspace path, and on Windows a worktree path is
-        long enough to change whether the packet fits its bound. The path is therefore derived
-        here - from the run id and the repository root, the same inputs ``create_worktree`` uses
-        - so the packet that is checked is the packet that will be sent.
-
-        Refusals that a worktree run cannot survive are raised here, before the run row exists:
-        a repository that cannot be discovered, and a base commit that does not exist. Both are
-        knowable without side effects, and both used to be discovered after the run (and, with
-        an authorization, after a claim). ``resolved_base`` is the commit the caller already
-        resolved the task's base to (``RunRequest.base_commit``); it is checked the same way.
+        long enough to change whether the packet fits its bound, so the packet is rendered with
+        the path ``_admission_binding`` derived - from the run id and the repository root, the
+        inputs ``create_worktree`` uses - and the packet that is checked is the one sent. The
+        binding already discovered the repository and resolved the base; what is asked here,
+        before the run row exists, is only that the base commit is an object in it.
         """
-        if spec.workspace.mode != "worktree":
-            return None, None
-        assert self.project_root is not None
+        if not binding.worktree_path:
+            return None
         try:
-            repo = GitRepo.discover(self.project_root)
+            present = GitRepo.discover(Path(binding.project_root)).commit_exists(
+                binding.base_commit
+            )
         except GitError as exc:
             raise RefusedError(
                 RefusalCode.SCOPE_VIOLATION,
                 f"this task requires an isolated worktree but the repository could not be "
                 f"discovered: {exc}. Nothing was dispatched and no allowance was consumed.",
             ) from exc
-        try:
-            base_commit = (
-                resolved_base or spec.workspace.base_commit or repo.resolve_commit("HEAD")
-            )
-        except GitError as exc:
+        if not present:
             raise RefusedError(
                 RefusalCode.SCOPE_VIOLATION,
-                f"the base commit for this worktree run could not be resolved: {exc}",
-            ) from exc
-        if not repo.commit_exists(base_commit):
-            raise RefusedError(
-                RefusalCode.SCOPE_VIOLATION,
-                f"base commit {base_commit!r} does not exist in {repo.root}. Nothing was "
-                "dispatched and no allowance was consumed.",
+                f"base commit {binding.base_commit!r} does not exist in {binding.project_root}. "
+                "Nothing was dispatched and no allowance was consumed.",
             )
-        return repo, repo.worktree_parent() / run_id
+        return Path(binding.worktree_path)
 
     def _render_implementer_packet(
         self,
@@ -2636,7 +2681,7 @@ class Controller:
         """
         expires_at = add_seconds(utc_now(), self.reservation_ttl_seconds)
         already_paid = sum(self.store.invocation_counts(run_id))
-        needed = max(1, self._loop_turns_required(spec, project) - already_paid)
+        needed = max(1, loop_turns_required(spec, project) - already_paid)
         try:
             reservation = self.store.reserve_dispatch(
                 run_id=run_id,
@@ -2665,7 +2710,9 @@ class Controller:
                 fence=self._fence(run_id),
             )
         except StoreError as exc:
-            raise RefusedError(self._dispatch_refusal_code(str(exc)), str(exc)) from exc
+            # ``from exc`` is load-bearing: ``_lost_dispatch_race`` reads the store's typed
+            # refusal back from ``__cause__``.
+            raise RefusedError(self._dispatch_refusal_code(exc), str(exc)) from exc
         self._held_attempts.setdefault(run_id, set()).add(str(reservation.attempt_id))
         if self.authorization is not None:
             self.store.record_note(
@@ -2687,41 +2734,26 @@ class Controller:
         return reservation
 
     @staticmethod
-    def _lost_dispatch_race(message: str) -> bool:
+    def _lost_dispatch_race(exc: RefusedError) -> bool:
         """Is this refused reservation another controller's run, not a failure of this one?
 
-        The two store refusals that only a concurrent dispatch on the same run produces: a live
-        attempt that is not the one being reserved, and a run that already reached a terminal
-        state. Neither may be written over the run as this controller's ``internal_error``.
+        The store marks the refusals only concurrent work on the same run produces
+        (``StoreRefusal.concurrent``): a live attempt that is not the one being reserved, a run
+        that already reached a terminal state, and a takeover that superseded this controller.
+        None may be written over the run as this controller's ``internal_error``.
         """
-        return (
-            "refusing a second live attempt" in message
-            or "a terminal run never dispatches again" in message
-            # A takeover superseded this controller: the run is the successor's to record.
-            or "owner_lost:" in message
-        )
+        cause = exc.__cause__
+        return isinstance(cause, StoreRefusal) and cause.concurrent
 
-    def _dispatch_refusal_code(self, message: str) -> RefusalCode:
-        """Which refusal a refused reservation is, read from the store's own wording.
+    @staticmethod
+    def _dispatch_refusal_code(exc: BaseException) -> RefusalCode:
+        """Which refusal a refused store write is: the code the store's guard gave it.
 
-        Deliberately narrow: only the cases the store states explicitly are re-labelled, so an
-        unexpected failure keeps its own message and is not dressed up as a budget decision.
+        Deliberately narrow: only a :class:`StoreRefusal` carries a code, so an unexpected
+        failure keeps its own message as ``internal_error`` and is not dressed up as a budget
+        decision.
         """
-        if "cancellation intent" in message:
-            return RefusalCode.CANCELLED_BY_OPERATOR
-        if message.startswith("owner_lost:"):
-            return RefusalCode.OWNER_LOST
-        if (
-            "unresolved invocation" in message
-            or "deadline" in message
-            or "exhausted" in message
-            or "cannot complete this run's loop" in message
-            or "is owned by run" in message
-            or "repair attempt(s)" in message
-            or "pass --root-budget-file" in message
-        ):
-            return RefusalCode.BUDGET_EXHAUSTED
-        return RefusalCode.INTERNAL_ERROR
+        return exc.code if isinstance(exc, StoreRefusal) else RefusalCode.INTERNAL_ERROR
 
     def _spawn_reporter(self, reservation: DispatchReservation) -> SpawnReporter:
         """The callback a driver uses to report what it observed at its spawn decision.
@@ -3180,14 +3212,8 @@ class Controller:
                     if note:
                         cycle.outcome.notes.append(note)
                 return cycle.outcome
-            if round_number > 1:
-                # A second repair is not a thing this build does. The cycle only asks for a repair
-                # when it is allowed one, so this is a guard against the loop, not a policy.
-                return self._blocked(
-                    run_id,
-                    RefusalCode.BUDGET_EXHAUSTED,
-                    "the run already used its single repair; there is no second one",
-                )
+            # A second repair is never asked for: ``_repairable_failure`` refuses one in any round
+            # after the first (``already_repaired``) before it returns a repair context.
             previous = cycle.identity
             trigger = cycle.repair.trigger
             repair_context = cycle.repair
@@ -3861,15 +3887,23 @@ class Controller:
                     run_id, self.controller_id, fence=self._fence(run_id)
                 )
             except StoreError as exc:
+                # A stop is recorded as one; any other refusal (a takeover superseded this
+                # controller, a verdict already ended the run) is not, and keeps its own code.
                 self._record_repair(
                     run_id,
-                    RepairDecision.STOP_REQUESTED,
+                    (
+                        RepairDecision.STOP_REQUESTED
+                        if self._stop_recorded(run_id)
+                        else RepairDecision.REOPEN_REFUSED
+                    ),
                     trigger=trigger,
                     reason=str(exc),
                     policy=policy,
                     round_number=round_number,
                 )
-                return _CycleResult(outcome=self._blocked(run_id, RefusalCode.BUDGET_EXHAUSTED, str(exc)))
+                return _CycleResult(
+                    outcome=self._blocked(run_id, self._dispatch_refusal_code(exc), str(exc))
+                )
 
         # The structured input of a repair attempt: the context the decision that allowed it
         # recorded. ``None`` for a first attempt, which is why the first attempt's packet is
@@ -3948,7 +3982,7 @@ class Controller:
                 is_repair=previous is not None,
             )
         except RefusedError as exc:
-            if self._lost_dispatch_race(str(exc)):
+            if self._lost_dispatch_race(exc):
                 # Another controller's attempt is live on this run, or the run already ended:
                 # that is a concurrent identical submission's run, and this refusal is not its
                 # outcome. Nothing is written; the existing run is reported, as the insert race
@@ -4003,6 +4037,17 @@ class Controller:
         deadline_seconds = min(
             prepared.deadline_seconds, self._capped_deadline(request.deadline_seconds)
         )
+        if deadline_seconds <= 0:
+            # The clock ran out while the dispatch was being reserved. The submission stays spent
+            # (rule 1: it was reserved before any launch), and no driver is asked to start
+            # something that could only time out.
+            reason = _no_time_left("implementer")
+            self._mark_invocation_not_started(dispatch, f"refused before launch: {reason}")
+            return _CycleResult(
+                outcome=self._block_attempt(
+                    run_id, attempt_id, RefusalCode.BUDGET_EXHAUSTED, reason
+                )
+            )
         if deadline_seconds != prepared.deadline_seconds:
             try:
                 prepared = self._render_implementer_packet(
@@ -4618,7 +4663,7 @@ class Controller:
             project_write_deny=list(project.write_deny),
             git_metadata_before=git_metadata_before,
         )
-        return _CycleResult(outcome=accepted, identity=identity, review=review, accepted=True)
+        return _CycleResult(outcome=accepted, identity=identity)
 
     # -- review ----------------------------------------------------------------
 
@@ -4886,6 +4931,15 @@ class Controller:
         # agreement with it - never sent stating more time than the invocation is given. The value
         # can only shrink, so the re-rendered packet is never larger than the one already checked.
         deadline_seconds = min(stated_deadline, self._capped_deadline(900))
+        if deadline_seconds <= 0:
+            # As for the implementer: the clock ran out during the reservation. The review turn
+            # stays spent, and no reviewer is started that could only time out.
+            reason = _no_time_left("reviewer")
+            self._mark_invocation_not_started(dispatch, f"refused before launch: {reason}")
+            self.store.attach_review_result(
+                attempt_id, {"error": reason, "invocation_id": invocation_id}
+            )
+            raise RefusedError(RefusalCode.BUDGET_EXHAUSTED, reason)
         if deadline_seconds != stated_deadline:
             try:
                 reviewer_packet = render_packet(deadline_seconds)
@@ -5260,6 +5314,10 @@ class Controller:
             )
             if metadata is not None:
                 return self._blocked(run_id, *metadata)
+            if freeze is not None:
+                moved = self._worktree_left_candidate(repo, project_root, freeze)
+                if moved is not None:
+                    return self._blocked(run_id, RefusalCode.EVIDENCE_STALE, moved)
 
         try:
             fresh_fingerprint = candidate_fingerprint(project_root, spec.scope)
@@ -5458,6 +5516,50 @@ class Controller:
                 )
         return self._outcome_for(run_id)
 
+    @staticmethod
+    def _worktree_left_candidate(
+        repo: GitRepo, worktree: Path, freeze: CandidateFreeze
+    ) -> str | None:
+        """Why the worktree is no longer the frozen candidate the checks were to run on, or ``None``.
+
+        The scoped fingerprint sees only the declared scope, so a check that rewrote a tracked
+        file outside it (or committed, reset or checked out) left every later check and the
+        review running on a tree that is not the candidate while the evidence still matched.
+        Asked once at acceptance - after the shared metadata comparison, because a status read
+        runs filters - with the same read-only query ``hflow integrate`` makes of its integration
+        worktree: ``HEAD`` must still be the candidate commit and no tracked file may differ.
+        Untracked files are not this question: the freeze and the repair reconcile judge those.
+        """
+        try:
+            head = repo.worktree_commit(worktree)
+            tracked = parse_status_z(
+                repo.run(
+                    "--no-optional-locks", "status", "--porcelain=v1", "-z",
+                    "--untracked-files=no", cwd=worktree,
+                )
+            )
+        except GitError as exc:
+            return (
+                f"the worktree could not be read at acceptance ({exc}), so the checks cannot be "
+                "shown to have run on the frozen candidate; no receipt was written"
+            )
+        if head != freeze.candidate_commit:
+            return (
+                f"the worktree's HEAD moved from the frozen candidate {freeze.candidate_commit} "
+                f"to {head} after the freeze, so the checks and the review did not run on the "
+                "candidate; no receipt was written"
+            )
+        changed = [*tracked.changed, *tracked.unsupported]
+        if changed:
+            return (
+                "tracked file(s) changed in the worktree after the candidate was frozen ("
+                + _change_list(changed)
+                + "), for example by an approved check: the checks after it and the review ran "
+                "on a tree that is not the frozen candidate, so the evidence does not describe "
+                "it and no receipt was written"
+            )
+        return None
+
     # -- helpers -------------------------------------------------------------
 
     def _block_attempt(
@@ -5606,11 +5708,7 @@ class Controller:
                 f"the {code.value} block was not recorded: a stop had already decided this run's "
                 "state, which no later failure relabels"
             )
-        elif row["task_state"] in {
-            TaskState.ACCEPTED.value,
-            TaskState.BLOCKED.value,
-            TaskState.CANCELLED.value,
-        } or row["receipt_json"]:
+        elif TaskState(row["task_state"]) in TERMINAL_TASK_STATES or row["receipt_json"]:
             note = (
                 f"the {code.value} block was not recorded: the run had already ended "
                 f"{row['task_state']}"
@@ -5743,7 +5841,7 @@ class _CycleResult:
     "the run is over" and "the run may continue" from being inferred from a null somewhere.
     """
 
-    __slots__ = ("accepted", "identity", "outcome", "repair", "review")
+    __slots__ = ("identity", "outcome", "repair")
 
     def __init__(
         self,
@@ -5751,14 +5849,10 @@ class _CycleResult:
         outcome: RunOutcome | None = None,
         repair: RepairContext | None = None,
         identity: CandidateIdentity | None = None,
-        review: ReviewResult | None = None,
-        accepted: bool = False,
     ) -> None:
         self.outcome = outcome
         self.repair = repair
         self.identity = identity
-        self.review = review
-        self.accepted = accepted
 
 
 def _stored_result_facts(row: Any, column: str, prefix: str) -> dict[str, Any]:
@@ -5898,9 +5992,7 @@ def _run_owner(store: Store, row: Any) -> RunOwner:
         host=row["owner_host"],
         generation=int(row["claim_generation"] or 0),
     )
-    if TaskState(row["task_state"]) not in {
-        TaskState.DRAFT, TaskState.READY, TaskState.RUNNING, TaskState.CHECKING
-    }:
+    if TaskState(row["task_state"]) not in LIVE_TASK_STATES:
         return owner.model_copy(
             update={"liveness": "not_probed", "lock": "not_probed",
                     "detail": "the run is terminal; its owner is not probed"}

@@ -119,7 +119,7 @@ def test_a_file_spelled_like_the_delivery_range_does_not_break_the_diff(repo: Pa
 
 
 def test_a_worker_file_named_head_does_not_break_the_freeze(repo: Path) -> None:
-    """``rev-list --count HEAD`` (the freeze's serial) needs ``--`` once a file is named ``HEAD``."""
+    """A revision ``HEAD`` is ambiguous once a file is named ``HEAD``, unless git is told which."""
     git = GitRepo(repo)
     worktree = git.create_worktree("R-head-file", git.head)
     (worktree / "HEAD").write_text("a worker's file\n", encoding="utf-8")
@@ -129,7 +129,6 @@ def test_a_worker_file_named_head_does_not_break_the_freeze(repo: Path) -> None:
     freeze = git.freeze_candidate(worktree, ["HEAD"], expected_head=git.head)
 
     assert freeze.paths == ("HEAD",)
-    assert freeze.serial == 3
     assert git.worktree_commit(worktree) == freeze.candidate_commit
     assert git.diff_paths(git.head, freeze.candidate_commit, cwd=worktree) == ["HEAD"]
 

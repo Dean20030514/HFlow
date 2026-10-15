@@ -998,7 +998,21 @@ def migrate(
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
-            current = version
+            # Read again under the write lock: the version above was read before it, and another
+            # process opening the same ledger may have migrated it in between. Migrating from the
+            # stale number would re-run steps that already ran (``ALTER TABLE ADD COLUMN`` has no
+            # ``IF NOT EXISTS``) and fail on a ledger that is already current.
+            current = effective_version(conn)
+            if current > supported:
+                raise MigrationError(
+                    f"{database} was migrated to storage version {current} by another process "
+                    f"while this one waited; this build understands at most {supported}. Nothing "
+                    "was changed here."
+                )
+            if current >= supported:
+                conn.execute("ROLLBACK")
+                return current, current, None
+            version = current
             while current < supported:
                 migration = _MIGRATIONS.get(current + 1)
                 if migration is None:

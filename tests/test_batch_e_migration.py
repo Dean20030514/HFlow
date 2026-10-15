@@ -318,6 +318,34 @@ def test_reopening_a_migrated_file_is_idempotent(
     assert _backups_next_to(path) == [backup.name], "exactly one pre-migration snapshot exists"
 
 
+def test_a_ledger_another_process_migrated_while_this_one_waited_is_not_migrated_twice(
+    tmp_path: Path, task_spec: TaskSpec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The version is read again under the write lock; a stale read never re-runs a step."""
+    path = tmp_path / "data" / "hflow.sqlite"
+    _build_v1_database(path, task_spec, record_version=True)
+    original_backup = migrate._backup  # noqa: SLF001
+
+    def backup_then_lose_the_race(conn, database, from_version):  # noqa: ANN001, ANN202
+        snapshot = original_backup(conn, database, from_version)
+        # Between this connection's version read and its BEGIN IMMEDIATE, another one migrates
+        # the same file to the current version and commits.
+        monkeypatch.setattr(migrate, "_backup", original_backup)
+        other = Store(path)
+        assert other.migrated_from == 1
+        other.close()
+        return snapshot
+
+    monkeypatch.setattr(migrate, "_backup", backup_then_lose_the_race)
+    late = Store(path)
+    try:
+        assert late.storage_version == migrate.STORAGE_VERSION
+        assert late.migrated_from is None, "this connection migrated nothing"
+        _assert_legacy_rows_are_readable(late, task_spec)
+    finally:
+        late.close()
+
+
 # --------------------------------------------------------------------------
 # 2. a newer storage version is refused before anything is written
 # --------------------------------------------------------------------------

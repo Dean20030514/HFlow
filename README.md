@@ -181,8 +181,10 @@ hflow run      --task t.json --profile dsh-local --authorization-file auth.json 
 hflow prepare  --task t.json --profile dsh-local --repair-policy-file repair.json
 hflow run      --task t.json --profile dsh-local --authorization-file auth.json \
                --repair-policy-file repair.json      # opt in to ONE bounded repair (batch E2)
-hflow runs     [--needs-you] [--json]     # every run, newest first, with its first next: line
+hflow runs     [--needs-you] [--json]     # every run, newest first, with its first next: line;
+                                          # --needs-you adds live runs (owner, passed deadline)
 hflow status   R-xxxxxxxxxx               # pure SQLite read, zero model calls
+hflow status   --last                     # the newest run (status, report and diff only)
 hflow diff     R-xxxxxxxxxx [--stat]      # the recorded base..candidate commits (Git identity,
                                           # not the content fingerprint); never a working tree
 hflow report   R-xxxxxxxxxx --json        # receipt + evidence + the config it ran under
@@ -253,7 +255,12 @@ whole (an ended run's entry closure and the attestation it records commit togeth
 can be run again.
 `6`: `status`/`report` found the run but a stored record it needs no longer validates
 (`StoredRecordUnreadable`); one line names the record and no replacement record is inferred.
-`cancel`/`resume` can still work from the run row without those presentation records.
+`cancel`/`resume` can still work from the run row without those presentation records. Any
+command that hits a ledger error it does not map itself prints one line instead of a traceback:
+`5` when the ledger is locked by another process (run it again), `6` otherwise (a storage version
+newer than this build, a file that is not a ledger, a write the ledger refused). A lookup
+(`status`, `report`, `diff`, `cancel`, `resume`, `clean`, `integrate`, `ledger settle`) never
+creates a ledger: an unknown id exits `4`, naming the ledger file it looked in and `--data-dir`.
 A `CANCELLED` task state, which this build never writes, would exit `3`. `hflow integrate` uses the
 same codes for its own record: `0` when the subcommand did what it was asked (`prepare` ready,
 `apply` integrated, `reconcile` ready or integrated), `2` refused (nothing written), `3` a state
@@ -268,9 +275,10 @@ was and retried nothing; what it recorded before the interrupt is authoritative,
 `2` when a named profile cannot be used; its readiness lines - whether `hflow integrate` can run
 with the Git on PATH (it needs Git 2.40), where the acpx entry resolves from (never PATH:
 `HFLOW_ACPX_CLI`, then `<data-dir>/m0/acpx`, then the checkout's `.probe/acpx`; a profile cannot
-name it), where `dsh` is (path only, never run; with none on PATH on Windows, the DSH Desktop shim
-under `%LOCALAPPDATA%\Programs\DeepSeek Harness\resources\runtime\cli\bin` if it exists, which you
-prepend to PATH yourself) and the credential sources a child could have (`DEEPSEEK_API_KEY` by name,
+name it), where `dsh` is (path only, never run: PATH, else the npm CLI `@deepseek-ai/dsh@0.2.0-rc.2`
+under `<data-dir>/dsh/0.2.0-rc.2`; with neither, the `npm install --prefix ... --ignore-scripts`
+command that puts it there - a DSH Desktop shim is named but not recommended, because of DSH #9626)
+and the credential sources a child could have (`DEEPSEEK_API_KEY` by name,
 a bound `DSH_HOME`'s `.credentials.yaml` and `.env` by stat), saying plainly when a real launch
 would be refused for having none (`no_credential_source`) - never change it.
 
@@ -448,6 +456,9 @@ Each item below is absent from this tree, not merely untested:
   `pyproject.toml`/`pytest.ini`/`setup.cfg`/`tox.ini` (pytest) and a real `package.json` test
   script. No `--format markdown` handoff renderer.
 - **No reuse-research automation and no metrics against a direct-DSH baseline.**
+- **No project-declared check environment.** A check sees an allowlist plus HFlow's fixed
+  variables; `PYTHONPATH`, `NODE_PATH` and `NODE_OPTIONS` are not inherited, and there is no
+  project or check field to declare them, so a check that needs one sets it inside its own argv.
 - **No operator attestation for an owner this build recorded that reads `unknown`** (another host,
   elevated or another user, every owner off Windows): its run's open entries and an
   `outcome_unknown` reconcile wait for an owner HFlow can never prove gone; `--legacy-owner-gone`

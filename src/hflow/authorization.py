@@ -18,11 +18,10 @@ said yes" distinguishable from "the model said yes".
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .contracts import (
     EffectiveConfig,
@@ -37,7 +36,7 @@ from .contracts import (
     canonical_json,
     digest_of,
 )
-from .profiles import summarize_validation_error
+from .profiles import load_model
 
 SCHEMA_VERSION = 1
 #: Only this provenance may authorize a real model run. A model-authored note is refused.
@@ -257,23 +256,22 @@ class AuthorizationRecord(BaseModel):
 
 
 def load_authorization(path: Path) -> AuthorizationRecord:
-    try:
-        document = json.loads(Path(path).read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise RefusedError(
-            RefusalCode.NOT_IMPLEMENTED,
-            f"authorization file not found: {path}. A real Harness run needs an explicit, "
-            "bound user authorization; there is no flag that substitutes for one.",
-        ) from exc
-    except json.JSONDecodeError as exc:
-        raise RefusedError(RefusalCode.INVALID_SPEC, f"{path} is not valid JSON: {exc}") from exc
-    try:
-        record = AuthorizationRecord.model_validate(document)
-    except ValidationError as exc:
-        raise RefusedError(
-            RefusalCode.INVALID_SPEC,
-            f"{path} is not a valid authorization: {summarize_validation_error(exc)}",
-        ) from exc
+    """Read one authorization file (``profiles.load_model``, the one input-file reader).
+
+    A missing file is ``not_implemented`` - a real run without an approval - and anything else
+    that keeps it from being read or validated is ``invalid_spec``, never a traceback.
+    """
+    record = load_model(
+        Path(path),
+        AuthorizationRecord,
+        what="authorization file",
+        invalid=f"{path} is not a valid authorization",
+        missing_hint=(
+            "A real Harness run needs an explicit, bound user authorization; there is no flag "
+            "that substitutes for one."
+        ),
+        missing_code=RefusalCode.NOT_IMPLEMENTED,
+    )
     if not record.user_text.strip():
         raise RefusedError(
             RefusalCode.RISK_DOWNGRADE,
@@ -586,15 +584,3 @@ def _verify_effective_config(actual: AuthorizationBinding, expected: Authorizati
             f"digest={expected.effective_config_digest}. Switching profile, model selection "
             "or write permission after approval does not extend the approval.",
         )
-
-
-def describe(record: AuthorizationRecord) -> str:
-    return canonical_json(
-        {
-            "authorization_id": record.authorization_id,
-            "mode": record.binding.mode,
-            "max_top_level_submissions": record.max_top_level_submissions,
-            "binding_digest": record.binding_digest(),
-            "user_text": record.user_text,
-        }
-    )

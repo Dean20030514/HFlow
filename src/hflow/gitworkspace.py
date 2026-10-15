@@ -18,19 +18,17 @@ branches, remotes, publishing, and any "generic git platform" behaviour.
 
 from __future__ import annotations
 
-import atexit
 import hashlib
-import locale
 import os
 import re
-import shutil
+import secrets
 import stat
 import subprocess
-import sys
 import tempfile
 import threading
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 
 from .contracts import RefusalCode, RefusedError, digest_of
@@ -44,6 +42,32 @@ UNSUPPORTED_STATUS_CODES = frozenset({"U", "DD", "AU", "UD", "UA", "DU", "AA", "
 
 class GitStatusParseError(RuntimeError):
     """A porcelain record this module will not guess about."""
+
+
+def brief_list(items: Sequence[str], limit: int = 5, separator: str = ", ") -> str:
+    """The first ``limit`` items joined, with ``(+N more)`` when there are more."""
+    shown = separator.join(items[:limit])
+    return shown + (f" (+{len(items) - limit} more)" if len(items) > limit else "")
+
+
+def _status_records(raw: str) -> Iterator[tuple[str, str, str, str | None]]:
+    """``(record, code, path, source)`` per ``status --porcelain=v1 -z`` record, never trimmed.
+
+    A record is ``XY<space><path>``. A rename or copy (``X`` is ``R`` or ``C``) is followed by a
+    second NUL-terminated field, its source path: ``source`` is that path, or ``""`` when git
+    printed none; it is ``None`` for every other record. A record shorter than four characters
+    takes no source; the caller decides what it means.
+    """
+    fields = [field for field in raw.split("\0") if field]
+    index = 0
+    while index < len(fields):
+        record = fields[index]
+        index += 1
+        source: str | None = None
+        if len(record) >= 4 and record[0] in {"R", "C"}:
+            source = fields[index] if index < len(fields) else ""
+            index += 1
+        yield record, record[:2], record[3:], source
 
 
 @dataclass(frozen=True)
@@ -83,28 +107,20 @@ def parse_status_z(raw: str) -> StatusReport:
     ignored: list[str] = []
     unsupported: list[str] = []
 
-    records = [record for record in raw.split("\0") if record]
-    index = 0
-    while index < len(records):
-        record = records[index]
-        index += 1
+    for record, code, path, source in _status_records(raw):
         if len(record) < 4:
             unsupported.append(record[:40])
             continue
-        code = record[:2]
-        path = record[3:]
         if code == "!!":
             ignored.append(path)
             continue
         if code in UNSUPPORTED_STATUS_CODES or "U" in code:
             unsupported.append(f"{code} {path}"[:80])
             continue
-        if code[0] in {"R", "C"}:  # rename/copy: the old path is the next record
+        if source is not None:  # rename/copy: the old path is the next field
             changed.append(path)
-            if index < len(records):
-                old = records[index]
-                index += 1
-                changed.append(old)
+            if source:
+                changed.append(source)
                 if "S" in code or "N" in code:
                     unsupported.append(f"{code} {path} (submodule)")
             else:
@@ -197,9 +213,11 @@ def _merge_tree_result(stdout: str, *, clean: bool, args: tuple[str, ...]) -> Me
     return MergeTreeResult(clean=clean, tree=tree, conflicts=tuple(sorted(set(paths))))
 
 
-def _output_encoding() -> str:
-    """The encoding ``subprocess`` text mode decodes git's output with, for every other call here."""
-    return "utf-8" if sys.flags.utf8_mode else locale.getencoding()
+#: How git's output is decoded, on every platform. Git stores paths, ref names and configuration as
+#: bytes and prints them as they are, and Git for Windows keeps them in UTF-8 whatever the ANSI
+#: code page - which is what ``subprocess`` text mode would otherwise decode with, turning
+#: ``naïve.txt`` into ``naÃ¯ve.txt`` (or an error) on a Western or Chinese Windows.
+GIT_OUTPUT_ENCODING = "utf-8"
 
 
 def _path_key(path: str | os.PathLike[str]) -> str:
@@ -218,7 +236,7 @@ def _read_state_file(path: Path) -> str | None:
         return None
     except OSError as exc:
         raise GitError(f"cannot read {path}: {exc}") from exc
-    text = data.decode(_output_encoding(), errors="surrogateescape").rstrip("\r\n")
+    text = data.decode(GIT_OUTPUT_ENCODING, errors="surrogateescape").rstrip("\r\n")
     return text or None
 
 
@@ -281,10 +299,13 @@ def _worktree_state_holds(admin: Path, ref: str) -> bool:
 
 #: Ignored paths a *check* may legitimately leave behind in a run worktree. Naming them is
 #: the point: "ignored" alone never authorizes deletion, and anything not on this list makes
-#: a freeze or a cleanup refuse. Deliberately narrow - a bytecode cache and a test runner's
-#: cache. User-owned ignored files (``.env``, local data, notes) are not on it.
+#: a freeze or a cleanup refuse. Deliberately narrow - bytecode and a test runner's cache.
+#: User-owned ignored files (``.env``, local data, notes) are not on it, and neither is anything
+#: else under ``__pycache__``: Python imports ``__pycache__/helper.py`` (a namespace package),
+#: and an ignored file is neither committed nor fingerprinted. ``**/*.pyc`` matches bytecode in
+#: a ``__pycache__`` directory at any depth; bytecode outside one is refused by the freeze on its
+#: own (:func:`is_sourceless_bytecode`).
 IGNORED_ARTIFACT_ALLOWLIST = (
-    "**/__pycache__/**",
     "**/*.pyc",
     ".pytest_cache/**",
     "**/.pytest_cache/**",
@@ -313,8 +334,6 @@ class CandidateFreeze:
     candidate_commit: str
     tree: str
     paths: tuple[str, ...]
-    serial: int
-    tree_digest: str
 
 
 #: How a block reason that refuses on changed shared Git metadata begins (see
@@ -427,21 +446,40 @@ def _file_digest(path: Path) -> str:
         raise GitError(f"cannot read {path}: {exc}") from exc
 
 
-_EMPTY_HOOKS_DIR: str | None = None
+@cache
+def _never_a_directory() -> str:
+    """An existing file no worker can replace: nothing below it can ever be a directory or a file.
 
+    ``core.hooksPath`` and ``GIT_GRAFT_FILE`` name paths below it. An empty directory of HFlow's
+    own would not do: a worker runs as the same user, so it could write into one in the user's
+    temporary directory - a ``post-commit`` or ``reference-transaction`` hook (``--no-verify`` stops
+    neither), or a graft file. Below this file git finds no hook and no graft file, and says
+    nothing about either (opening a path below a file fails with ``ENOENT`` / ``ENOTDIR``, which
+    git takes for "absent").
 
-def _empty_hooks_dir() -> str:
-    """An empty, HFlow-owned directory that ``core.hooksPath`` names for every git call.
-
-    Created once per process with :func:`tempfile.mkdtemp` (private to the user, never inside a
-    repository or a worktree, so no worker can put a hook in it) and removed at exit. It also
-    holds the never-created path ``GIT_GRAFT_FILE`` names (:func:`_absent_graft_file`).
+    Windows: ``ntdll.dll`` in the system directory, which every process has loaded and only
+    TrustedInstaller may replace. Elsewhere: ``/dev/null``, a device in a directory only root
+    writes. Refuses (:class:`GitError`) when it is missing or a directory, rather than run git
+    with hooks the forced configuration was meant to switch off.
     """
-    global _EMPTY_HOOKS_DIR
-    if _EMPTY_HOOKS_DIR is None or not os.path.isdir(_EMPTY_HOOKS_DIR):
-        _EMPTY_HOOKS_DIR = tempfile.mkdtemp(prefix="hflow-no-hooks-")
-        atexit.register(shutil.rmtree, _EMPTY_HOOKS_DIR, ignore_errors=True)
-    return _EMPTY_HOOKS_DIR
+    if os.name == "nt":
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = ctypes.windll.kernel32.GetSystemDirectoryW(buffer, len(buffer))
+        anchor = os.path.join(buffer.value, "ntdll.dll") if 0 < length < len(buffer) else ""
+    else:
+        anchor = os.devnull
+    try:
+        is_directory = stat.S_ISDIR(os.stat(anchor).st_mode) if anchor else True
+    except OSError:
+        is_directory = True
+    if is_directory:
+        raise GitError(
+            f"no system file to anchor git's hooks path below ({anchor or 'system directory unknown'}"
+            "); refusing to run git with hooks enabled"
+        )
+    return Path(anchor).as_posix()
 
 
 def _forced_config() -> tuple[tuple[str, str], ...]:
@@ -451,9 +489,13 @@ def _forced_config() -> tuple[tuple[str, str], ...]:
     worktree config files, so neither the user's global config nor a value a worker wrote into
     the shared ``.git/config`` from inside its worktree overrides it:
 
-    * ``core.hooksPath`` names an empty directory, so no hook runs - not ``post-checkout`` on
-      ``worktree add``, not ``pre-commit`` / ``commit-msg`` / ``post-commit`` on the freeze, not
-      ``reference-transaction`` on any ref write;
+    * ``core.hooksPath`` names a path below a system file (:func:`_never_a_directory`), so no hook
+      runs - not ``post-checkout`` on ``worktree add``, not ``pre-commit`` / ``commit-msg`` /
+      ``post-commit`` on the freeze, not ``reference-transaction`` on any ref write - and no
+      worker can create one there;
+    * ``maintenance.auto`` is off and ``gc.auto`` is ``0``: ``git commit`` (the freeze) otherwise
+      starts ``git maintenance run --auto``, which Windows cannot detach, so a repack or a gc
+      could run in the foreground of a freeze;
     * ``core.fsmonitor`` is off, so a status read never runs a configured monitor command;
     * ``commit.gpgsign`` is off, so a freeze never waits on gpg;
     * ``core.ignoreStat`` and ``core.sparseCheckout`` are off, so HFlow's own ``worktree add``
@@ -479,7 +521,9 @@ def _forced_config() -> tuple[tuple[str, str], ...]:
     reads after ``GIT_CONFIG_COUNT``, so a caller's ``git -c`` cannot override them either.
     """
     return (
-        ("core.hooksPath", _empty_hooks_dir()),
+        ("core.hooksPath", f"{_never_a_directory()}/hflow-no-hooks"),
+        ("maintenance.auto", "false"),
+        ("gc.auto", "0"),
         ("core.fsmonitor", "false"),
         ("commit.gpgsign", "false"),
         ("core.ignoreStat", "false"),
@@ -489,13 +533,13 @@ def _forced_config() -> tuple[tuple[str, str], ...]:
 
 
 def _absent_graft_file() -> str:
-    """A path that never exists, for ``GIT_GRAFT_FILE``: git then reads no graft file at all.
+    """A path that can never exist, for ``GIT_GRAFT_FILE``: git then reads no graft file at all.
 
-    Inside the HFlow-owned directory of :func:`_empty_hooks_dir`, which nothing ever writes to.
-    A missing graft file is skipped silently; an existing empty one (``os.devnull``) would make
-    git print its grafts deprecation hint on every call.
+    Below the file of :func:`_never_a_directory`, so no worker can create it. A missing graft file
+    is skipped silently; an existing empty one (``os.devnull``) would make git print its grafts
+    deprecation hint on every call.
     """
-    return os.path.join(_empty_hooks_dir(), "no-graft-file")
+    return f"{_never_a_directory()}/hflow-no-graft-file"
 
 
 #: Variables that point git at a repository, index or object store other than the one the
@@ -577,7 +621,12 @@ def _base_env() -> dict[str, str]:
     # another), no grafts, no inherited repository-locating or content-redirecting variables, and
     # the forced configuration above: no hooks (the repository's, the user's, a worker's or a
     # caller's ``git -c``), no fsmonitor command, no signing, no flagged checkout, no implicitly
-    # bare repository. The user's global config is still read for everything else.
+    # bare repository, no automatic maintenance. The user's global config is still read for
+    # everything else.
+    #
+    # ``GIT_NO_LAZY_FETCH``: in a partial clone a missing object is fetched from the promisor
+    # remote on demand - a network call any read (``cat-file``, ``diff``, ``merge-tree``) could
+    # make. HFlow reaches no remote: a missing object is an error instead.
     #
     # Grafts: ``GIT_NO_REPLACE_OBJECTS`` does not switch them off. Git reads ``GIT_GRAFT_FILE``,
     # else ``info/grafts`` in the common git directory - which a worker can write from its
@@ -594,6 +643,7 @@ def _base_env() -> dict[str, str]:
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_NO_LAZY_FETCH": "1",
             "GIT_GRAFT_FILE": _absent_graft_file(),
         }
     )
@@ -644,20 +694,26 @@ def _run_git(
 ) -> subprocess.CompletedProcess[str]:
     """``git <args>`` in text mode; the caller interprets the exit code.
 
-    Every text-mode git call in HFlow goes through here, so each reader gets the same guards: a
-    timeout raises :class:`GitError`, and so does standard output that cannot be decoded - on
-    POSIX ``subprocess`` raises the ``UnicodeDecodeError`` in this thread, on Windows it decodes in
-    a reader thread whose failure comes back as ``None``. Reading either as empty would make
-    "unreadable" look like "nothing there" (a configuration value is raw bytes, so a worker can
-    write any). Standard error is only ever quoted in a message, so an undecodable one reads as
-    empty instead of failing a call that succeeded. ``env`` defaults to :func:`_base_env`.
+    Every text-mode git call in HFlow goes through here, so each reader gets the same guards: git
+    that cannot start (a missing ``cwd``, no ``git`` at all) and a timeout raise
+    :class:`GitError`, and so does standard output that is not UTF-8 (:data:`GIT_OUTPUT_ENCODING`,
+    strict) - on POSIX ``subprocess`` raises the ``UnicodeDecodeError`` in this thread, on Windows
+    it decodes in a reader thread whose failure comes back as ``None``. Reading either as empty
+    would make "unreadable" look like "nothing there" (a configuration value is raw bytes, so a
+    worker can write any). Standard error is only ever quoted in a message, so on Windows an
+    undecodable one reads as empty instead of failing a call that succeeded. Git reads no standard
+    input: Git for Windows would otherwise ask "Should I try again? (y/n)" on the operator's
+    terminal when it cannot delete a file. ``env`` defaults to :func:`_base_env`.
     """
     try:
         completed = subprocess.run(  # noqa: S603,S607 - fixed argv, no shell
             ["git", *args],
             cwd=None if cwd is None else str(cwd),
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            encoding=GIT_OUTPUT_ENCODING,
+            errors="strict",
             timeout=timeout,
             check=False,
             env=_base_env() if env is None else env,
@@ -666,6 +722,8 @@ def _run_git(
         raise GitError(f"git {' '.join(args)} timed out after {exc.timeout}s") from exc
     except UnicodeDecodeError as exc:
         raise GitError(_undecodable(tuple(args), exc.reason)) from exc
+    except OSError as exc:
+        raise GitError(f"git {' '.join(args)} could not start: {exc}") from exc
     if completed.stdout is None:
         raise GitError(_undecodable(tuple(args), "decoding failed"))
     if completed.stderr is None:
@@ -673,11 +731,89 @@ def _run_git(
     return completed
 
 
-def _git_failure(args: Sequence[str], completed: subprocess.CompletedProcess[str]) -> GitError:
+def _git_bytes(
+    args: Sequence[str],
+    *,
+    cwd: str | os.PathLike[str] | None,
+    stdin: bytes | None = None,
+    timeout: float = 300.0,
+) -> tuple[int, str, str]:
+    """``git <args>`` with binary pipes; ``(returncode, stdout, stderr)``.
+
+    For callers that read the exit code themselves or feed stdin, and for ``-z`` output. The pipes
+    are binary: input reaches git byte for byte (a text-mode stdin on Windows writes ``\\r\\n``
+    for ``\\n``), and stdout is decoded strictly as :data:`GIT_OUTPUT_ENCODING` without newline
+    translation, so a path holding ``\\r`` arrives as git printed it. The guards of
+    :func:`_run_git` apply: git that cannot start, a timeout and output that is not text raise
+    :class:`GitError` on every platform - unreadable must never look like empty.
+    """
+    try:
+        completed = subprocess.run(  # noqa: S603,S607 - fixed argv, no shell
+            ["git", *args],
+            cwd=None if cwd is None else str(cwd),
+            input=stdin,
+            # Nothing to feed: git reads no terminal and no inherited pipe.
+            stdin=subprocess.DEVNULL if stdin is None else None,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+            env=_base_env(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise GitError(f"git {' '.join(args)} timed out after {exc.timeout}s") from exc
+    except UnicodeDecodeError as exc:
+        raise GitError(_undecodable(tuple(args), exc.reason)) from exc
+    except OSError as exc:
+        raise GitError(f"git {' '.join(args)} could not start: {exc}") from exc
+    if completed.stdout is None:
+        raise GitError(_undecodable(tuple(args), "decoding failed"))
+    try:
+        stdout = completed.stdout.decode(GIT_OUTPUT_ENCODING)
+    except UnicodeDecodeError as exc:
+        raise GitError(_undecodable(tuple(args), exc.reason)) from exc
+    stderr = (completed.stderr or b"").decode(GIT_OUTPUT_ENCODING, errors="replace")
+    return completed.returncode, stdout, stderr
+
+
+def _git_failure(args: Sequence[str], returncode: int, stderr: str) -> GitError:
     """The error for a git call that exited non-zero: the exit status and git's own words."""
-    detail = completed.stderr.strip()[:300] or "no message"
-    status = exit_status(completed.returncode)
-    return GitError(f"git {' '.join(args)} failed (exit {status}): {detail}")
+    detail = stderr.strip()[:300] or "no message"
+    return GitError(f"git {' '.join(args)} failed (exit {exit_status(returncode)}): {detail}")
+
+
+def _worktree_list_records(listing: str) -> list[dict[str, str]]:
+    """``git worktree list --porcelain -z`` output as one dict per worktree, in git's order.
+
+    ``-z`` (Git 2.36) prints every path raw and NUL-terminated, so a worktree path holding a
+    space, a non-ASCII letter or a line break is read as git holds it. A record is its
+    ``key value`` fields, each NUL-terminated, and ends with an empty field.
+    """
+    records: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    for line in listing.split("\0"):
+        if not line:
+            if current:
+                records.append(current)
+                current = {}
+            continue
+        key, _, value = line.partition(" ")
+        current[key] = value
+    if current:
+        records.append(current)
+    return records
+
+
+def registered_worktrees(common_dir: str) -> list[dict[str, str]]:
+    """Every worktree registered in the git directory ``common_dir``, as git lists it.
+
+    Named by ``--git-dir`` - explicit, so a bare repository is read too - and asked from inside that
+    directory, so the answer never depends on any worktree, the one being removed included.
+    """
+    args = ("--git-dir", common_dir, "worktree", "list", "--porcelain", "-z")
+    returncode, stdout, stderr = _git_bytes(args, cwd=common_dir, timeout=60)
+    if returncode != 0:
+        raise _git_failure(args, returncode, stderr)
+    return _worktree_list_records(stdout)
 
 
 #: How git says "there is no repository here" (``setup.c``), read with git's messages untranslated.
@@ -736,7 +872,7 @@ class GitRepo:
                 f"{cwd} is not inside a git repository: {completed.stderr.strip()[:200]}",
             )
         if completed.returncode != 0:
-            raise _git_failure(args, completed)
+            raise _git_failure(args, completed.returncode, completed.stderr)
         values = completed.stdout.splitlines()
         expected = 3 if discovering else 2
         if len(values) != expected or not all(values) or not is_full_oid(values[-1]):
@@ -780,7 +916,7 @@ class GitRepo:
             env["GIT_LITERAL_PATHSPECS"] = "1"
         completed = _run_git(args, cwd=cwd or self.root, timeout=300, env=env)
         if completed.returncode != 0:
-            raise _git_failure(args, completed)
+            raise _git_failure(args, completed.returncode, completed.stderr)
         return completed.stdout
 
     def status_report(self, cwd: Path | None = None) -> StatusReport:
@@ -796,17 +932,9 @@ class GitRepo:
         )
         return parse_status_z(raw)
 
-    def status_porcelain(self, cwd: Path | None = None) -> list[str]:
-        """Changed paths (never ignored, never unsupported)."""
-        return list(self.status_report(cwd).changed)
-
-    def ignored_artifacts(self, cwd: Path) -> list[str]:
-        """Paths git ignores here. Ignored does not mean disposable - see the clean policy."""
-        return list(self.status_report(cwd).ignored)
-
     def is_dirty(self) -> bool:
         """Does the user's own checkout have changes? Read-only: nothing is touched."""
-        return bool(self.status_porcelain())
+        return bool(self.status_report().changed)
 
     def user_change_fingerprint(self, exclude: Iterable[Path] = ()) -> str:
         """A stat-level digest of the user's checkout, compared before and after a run.
@@ -847,17 +975,9 @@ class GitRepo:
             "--untracked-files=normal",
             "--ignored",
         )
-        records = [record for record in raw.split("\0") if record]
         entries: list[list[object]] = []
-        position = 0
-        while position < len(records):
-            record = records[position]
-            position += 1
-            code, paths = record[:2], [record[3:]]
-            if code[:1] in {"R", "C"} and position < len(records):
-                paths.append(records[position])
-                position += 1
-            for path in paths:
+        for _record, code, new_path, source in _status_records(raw):
+            for path in (new_path, source) if source else (new_path,):
                 key = path.rstrip("/").casefold() if fold_case else path.rstrip("/")
                 if any(key == prefix or key.startswith(prefix + "/") for prefix in excluded):
                     continue
@@ -919,27 +1039,54 @@ class GitRepo:
         Created beside the repository rather than inside it, so the user's working tree never
         contains run scaffolding and a candidate snapshot cannot accidentally include it.
 
-        The worktree is added at a staging path and then moved into place, and git is asked to
-        repair the moved worktree: ``mv`` alone would leave the administrative files pointing
-        at the staging path (``git status`` then reports the worktree as prunable), so the
-        repair is part of creating it, not an optional extra.
+        The worktree is added at a staging path - ``<run>.staging-<pid>-<random>``, so neither a
+        reused process id nor a leftover from a crashed process collides with it - and then
+        ``git worktree move`` puts it in place: a rename of a complete checkout, so the target is
+        never half made, and git updates that one worktree's administrative files. Never
+        ``git worktree repair``, which rewrites *every* linked worktree's ``.git`` file - the
+        user's own included, absolute to relative under ``worktree.useRelativePaths`` (rule 12).
+
+        Any failure, an ``OSError`` from the file system included (an antivirus or indexer holding
+        the staging directory), raises :class:`GitError`; the staging worktree is then removed
+        through git, without force, and named in the error when it could not be.
         """
         parent = self.worktree_parent()
-        if parent.is_symlink() or parent.is_junction():
-            raise GitError(f"worktree creation refused: linked parent {parent}")
-        parent.mkdir(parents=True, exist_ok=True)
         target = parent / run_id
-        if target.exists() or target.is_symlink():
-            self.validate_reusable_worktree(target, base_commit)
-            return target
-        staging = parent / f"{run_id}.staging-{os.getpid()}"
-        if staging.exists():
-            raise GitError(f"worktree creation refused: staging path already exists: {staging}")
-        # ``--`` ends the options, so neither the path nor the commit can read as one.
-        self.run("worktree", "add", "--detach", "--", str(staging), _revision(base_commit, "base"))
-        staging.replace(target)
-        self.run("worktree", "repair", str(target))
+        try:
+            if parent.is_symlink() or parent.is_junction():
+                raise GitError(f"worktree creation refused: linked parent {parent}")
+            parent.mkdir(parents=True, exist_ok=True)
+            if target.exists() or target.is_symlink():
+                self.validate_reusable_worktree(target, base_commit)
+                return target
+            staging = parent / f"{run_id}.staging-{os.getpid()}-{secrets.token_hex(4)}"
+            if os.path.lexists(staging):
+                raise GitError(f"worktree creation refused: staging path already exists: {staging}")
+        except OSError as exc:
+            raise GitError(f"worktree creation failed: {exc}") from exc
+        revision = _revision(base_commit, "base")
+        try:
+            # ``--`` ends the options, so neither a path nor the commit can read as one.
+            self.run("worktree", "add", "--detach", "--", str(staging), revision)
+            self.run("worktree", "move", "--", str(staging), str(target))
+        except GitError as exc:
+            raise GitError(f"worktree creation failed: {exc}{self._discard_staging(staging)}") from exc
         return target
+
+    def _discard_staging(self, staging: Path) -> str:
+        """Remove a staging worktree a failed :meth:`create_worktree` left, through git only.
+
+        Best effort and never forced: ``git worktree remove`` refuses anything but a clean
+        checkout. Returns ``""`` when nothing is left, else a note for the error message.
+        """
+        try:
+            if self.worktree_registration(staging) is not None:
+                self.run("worktree", "remove", "--", str(staging))
+            if not os.path.lexists(staging):
+                return ""
+            return f"; the staging directory {staging} was left in place"
+        except (GitError, OSError) as exc:
+            return f"; the staging worktree {staging} could not be removed: {exc}"
 
     def worktree_commit(self, worktree: Path) -> str:
         return self._verified_revision("HEAD", cwd=worktree)
@@ -1035,14 +1182,17 @@ class GitRepo:
         env["GIT_LITERAL_PATHSPECS"] = "1"
         limit = max(int(max_bytes), 0)
         with tempfile.TemporaryFile() as stderr_file:
-            proc = subprocess.Popen(  # noqa: S603,S607 - fixed argv, no shell
-                ["git", *args],
-                cwd=str(cwd or self.root),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=stderr_file,
-                env=env,
-            )
+            try:
+                proc = subprocess.Popen(  # noqa: S603,S607 - fixed argv, no shell
+                    ["git", *args],
+                    cwd=str(cwd or self.root),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=stderr_file,
+                    env=env,
+                )
+            except OSError as exc:
+                raise GitError(f"git {' '.join(args[:-2])} could not start: {exc}") from exc
             timer_fired: list[bool] = []
 
             def _expire() -> None:
@@ -1160,9 +1310,8 @@ class GitRepo:
         ``git rev-parse --git-path`` and the global attributes file, present or not. Read-only:
         none of these commands runs a filter. Any failure, a timeout included, raises
         :class:`GitError` - and so does output that is not text (a configuration value is raw
-        bytes a worker can write): ``run`` and ``_git_query`` convert the decode failure on both
-        platforms, and the ``UnicodeDecodeError`` branch below keeps the contract if a read
-        bypasses them.
+        bytes a worker can write): every read goes through ``run`` or ``_git_query``, which
+        convert both on either platform (:func:`_run_git`).
 
         Needs Git 2.31+ (``rev-parse --path-format=absolute``; ``--show-scope`` is 2.26). The
         global attributes file comes from ``git var GIT_ATTR_GLOBAL`` on Git 2.42+ and from git's
@@ -1170,42 +1319,32 @@ class GitRepo:
         """
         entries: dict[str, str] = {}
         files: set[str] = set()
-        try:
-            for context, cwd in (("checkout", self.root), ("worktree", Path(worktree))):
-                by_key: dict[str, list[list[str | None]]] = {}
-                listing = self.run("config", "--list", "-z", "--show-scope", "--show-origin", cwd=cwd)
-                for scope, origin, key, value in _config_records(listing):
-                    if scope == "command":
-                        continue
-                    by_key.setdefault(key, []).append([scope, origin, value])
-                    if origin.startswith("file:"):
-                        files.add(_metadata_path(cwd, origin[len("file:") :]))
-                for key, records in by_key.items():
-                    entries[f"config@{context}:{key}"] = digest_of(records)
-                located = self.run(
-                    "rev-parse",
-                    "--path-format=absolute",
-                    "--git-path",
-                    "config",
-                    "--git-path",
-                    "config.worktree",
-                    "--git-path",
-                    "info/attributes",
-                    cwd=cwd,
-                )
-                files.update(_metadata_path(cwd, line) for line in located.splitlines() if line.strip())
-                attributes = self._global_attributes_file(cwd)
-                if attributes:
-                    files.add(_metadata_path(cwd, attributes))
-        except subprocess.TimeoutExpired as exc:
-            # A hung read fails closed like any unreadable metadata.
-            raise GitError(
-                f"git {' '.join(str(part) for part in exc.cmd[1:4])} timed out after {exc.timeout}s"
-            ) from exc
-        except UnicodeDecodeError as exc:
-            # Not ``surrogateescape``: a lone surrogate would only move the failure into
-            # ``digest_of`` and the note writes, which encode as strict UTF-8.
-            raise GitError(f"git metadata output is not decodable as text ({exc.reason})") from exc
+        for context, cwd in (("checkout", self.root), ("worktree", Path(worktree))):
+            by_key: dict[str, list[list[str | None]]] = {}
+            listing = self.run("config", "--list", "-z", "--show-scope", "--show-origin", cwd=cwd)
+            for scope, origin, key, value in _config_records(listing):
+                if scope == "command":
+                    continue
+                by_key.setdefault(key, []).append([scope, origin, value])
+                if origin.startswith("file:"):
+                    files.add(_metadata_path(cwd, origin[len("file:") :]))
+            for key, records in by_key.items():
+                entries[f"config@{context}:{key}"] = digest_of(records)
+            located = self.run(
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "config",
+                "--git-path",
+                "config.worktree",
+                "--git-path",
+                "info/attributes",
+                cwd=cwd,
+            )
+            files.update(_metadata_path(cwd, line) for line in located.splitlines() if line.strip())
+            attributes = self._global_attributes_file(cwd)
+            if attributes:
+                files.add(_metadata_path(cwd, attributes))
         for path in files:
             entries[f"file:{path}"] = _file_digest(Path(path))
         return GitMetadataSnapshot(tuple(sorted(entries.items())))
@@ -1271,9 +1410,7 @@ class GitRepo:
         if flagged:
             raise GitStatusParseError(
                 "index flags hide worktree changes from the freeze (assume-unchanged or "
-                "skip-worktree): "
-                + ", ".join(flagged[:5])
-                + (f" (+{len(flagged) - 5} more)" if len(flagged) > 5 else "")
+                "skip-worktree): " + brief_list(flagged)
             )
         report = self.status_report(worktree)
         if report.unsupported:
@@ -1286,8 +1423,7 @@ class GitRepo:
         ]
         if unexpected_ignored:
             raise GitStatusParseError(
-                "refusing to freeze with unrecognised ignored paths: "
-                + ", ".join(unexpected_ignored[:5])
+                "refusing to freeze with unrecognised ignored paths: " + brief_list(unexpected_ignored)
             )
         # An allowlisted ignored file is never staged. Inside the scoped fingerprint it would be
         # hashed and checked without any candidate commit holding it.
@@ -1295,32 +1431,28 @@ class GitRepo:
         covered = [path for path in report.ignored if path in fingerprinted_set]
         if covered:
             raise GitStatusParseError(
-                "ignored file(s) inside write_allow ("
-                + ", ".join(covered[:5])
-                + (f" (+{len(covered) - 5} more)" if len(covered) > 5 else "")
-                + "); the scoped fingerprint would cover bytes no candidate commit holds, so the "
-                "freeze is refused rather than deleting them"
+                f"ignored file(s) inside write_allow ({brief_list(covered)}); the scoped "
+                "fingerprint would cover bytes no candidate commit holds, so the freeze is refused "
+                "rather than deleting them"
             )
         # Bytecode outside ``__pycache__`` is imported in place of a missing source file, and
         # CPython 3 never writes it there itself: it is a worker's file, not a check byproduct.
         sourceless = [path for path in report.ignored if is_sourceless_bytecode(path)]
         if sourceless:
             raise GitStatusParseError(
-                "ignored sourceless bytecode outside __pycache__ ("
-                + ", ".join(sourceless[:5])
-                + (f" (+{len(sourceless) - 5} more)" if len(sourceless) > 5 else "")
-                + "); Python imports it in place of a missing source file and no candidate commit "
+                f"ignored sourceless bytecode outside __pycache__ ({brief_list(sourceless)}); "
+                "Python imports it in place of a missing source file and no candidate commit "
                 "holds it, so the freeze is refused rather than deleting it"
             )
         outside = [path for path in report.changed if not matches_pattern(path, allow)]
         if outside:
             raise GitStatusParseError(
-                "worker changed unauthorised paths: " + ", ".join(outside[:5])
+                "worker changed unauthorised paths: " + brief_list(outside)
             )
         deny_rules = [*(deny or []), *BUILTIN_WRITE_DENY]
         denied = [path for path in report.changed if matches_pattern(path, deny_rules)]
         if denied:
-            raise GitStatusParseError("worker changed denied paths: " + ", ".join(denied[:5]))
+            raise GitStatusParseError("worker changed denied paths: " + brief_list(denied))
         for entry in allow:
             # git refuses a pathspec that matches nothing, so an entry the worker never created
             # (absent on disk and unknown to the index) has nothing to stage. A tracked file that
@@ -1354,7 +1486,7 @@ class GitRepo:
         ]
         if stray:
             raise GitStatusParseError(
-                "refusing to commit paths outside the write scope: " + ", ".join(stray[:5])
+                "refusing to commit paths outside the write scope: " + brief_list(stray)
             )
         if staged:
             # ``--no-verify`` on top of the empty ``core.hooksPath``: no pre-commit or commit-msg
@@ -1364,22 +1496,14 @@ class GitRepo:
         if leftover.changed or leftover.unsupported:
             raise GitError(
                 "freeze incomplete: the worktree still has changes the candidate commit does not "
-                "hold: " + ", ".join([*leftover.changed, *leftover.unsupported][:5])
+                "hold: " + brief_list([*leftover.changed, *leftover.unsupported])
             )
-        candidate_commit = self.worktree_commit(worktree)
-        tree = self.worktree_tree(worktree)
         return CandidateFreeze(
             base_commit=base_commit,
-            candidate_commit=candidate_commit,
-            tree=tree,
+            candidate_commit=self.worktree_commit(worktree),
+            tree=self.worktree_tree(worktree),
             paths=tuple(sorted(staged)),
-            # ``--``: a worker's file named ``HEAD`` would otherwise make the revision ambiguous.
-            serial=int(self.run("rev-list", "--count", "HEAD", "--", cwd=worktree).strip()),
-            tree_digest=digest_of({"base": base_commit, "staged": sorted(staged)}),
         )
-
-    def worktree_list(self) -> list[str]:
-        return [line for line in self.run("worktree", "list", "--porcelain").splitlines() if line.strip()]
 
     # -- refs -----------------------------------------------------------------
 
@@ -1421,7 +1545,7 @@ class GitRepo:
         if completed.returncode == 1 and not target:
             return None
         if completed.returncode != 0:
-            raise _git_failure(args, completed)
+            raise _git_failure(args, completed.returncode, completed.stderr)
         if not is_full_oid(target):
             raise GitError(
                 f"git {' '.join(args)} printed {target[:80]!r} where an object id belongs"
@@ -1479,42 +1603,18 @@ class GitRepo:
     def _git_call(
         self, *args: str, stdin: bytes | None = None, timeout: float = 300.0
     ) -> tuple[int, str, str]:
-        """Run ``git <args>`` in the repository root; ``(returncode, stdout, stderr)``.
+        """:func:`_git_bytes` in the repository root: binary pipes, ``(returncode, stdout, stderr)``.
 
-        For callers that read the exit code themselves (``run`` raises on any non-zero) or feed
-        stdin. The pipes are binary: input reaches git byte for byte (a text-mode stdin on Windows
-        writes ``\\r\\n`` for ``\\n``), and stdout is decoded strictly with the encoding the
-        module's text-mode calls use, without newline translation, so a path holding ``\\r``
-        arrives as git printed it. Output that is not text raises :class:`GitError` on every
-        platform - the caveat in ``run``: unreadable must never look like empty.
+        For callers that read the exit code themselves (``run`` raises on any non-zero), feed
+        stdin, or read ``-z`` output that must keep a ``\\r`` in a path.
         """
-        try:
-            completed = subprocess.run(  # noqa: S603,S607 - fixed argv, no shell
-                ["git", *args],
-                cwd=str(self.root),
-                input=stdin,
-                # Nothing to feed: git reads no terminal and no inherited pipe.
-                stdin=subprocess.DEVNULL if stdin is None else None,
-                capture_output=True,
-                timeout=timeout,
-                check=False,
-                env=_base_env(),
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise GitError(f"git {' '.join(args)} timed out after {exc.timeout}s") from exc
-        encoding = _output_encoding()
-        try:
-            stdout = completed.stdout.decode(encoding)
-        except UnicodeDecodeError as exc:
-            raise GitError(_undecodable(args, exc.reason)) from exc
-        stderr = completed.stderr.decode(encoding, errors="replace")
-        return completed.returncode, stdout, stderr
+        return _git_bytes(args, cwd=self.root, stdin=stdin, timeout=timeout)
 
     def _git_checked(self, *args: str, stdin: bytes | None = None) -> str:
         """:meth:`_git_call` that raises :class:`GitError`, with git's words, on a non-zero exit."""
         returncode, stdout, stderr = self._git_call(*args, stdin=stdin)
         if returncode != 0:
-            raise GitError(f"git {' '.join(args)} failed ({returncode}): {stderr.strip()[:300]}")
+            raise _git_failure(args, returncode, stderr)
         return stdout
 
     @staticmethod
@@ -1543,7 +1643,7 @@ class GitRepo:
         returncode, _, stderr = self._git_call(*args)
         if returncode in (0, 1):
             return returncode == 0
-        raise GitError(f"git {' '.join(args)} failed ({returncode}): {stderr.strip()[:300]}")
+        raise _git_failure(args, returncode, stderr)
 
     def branch_ref(self, branch: str) -> str:
         """``refs/heads/<branch>`` for a plain branch name, validated by git itself.
@@ -1595,7 +1695,7 @@ class GitRepo:
         )
         returncode, stdout, stderr = self._git_call(*args)
         if returncode not in (0, 1):
-            raise GitError(f"git {' '.join(args)} failed ({returncode}): {stderr.strip()[:300]}")
+            raise _git_failure(args, returncode, stderr)
         return _merge_tree_result(stdout, clean=returncode == 0, args=args)
 
     def commit_tree(self, tree: str, *, parents: Sequence[str], message: str) -> str:
@@ -1647,32 +1747,21 @@ class GitRepo:
                 raise GitError(f"refusing to update {ref}: {label} value {value!r} is not a full object id")
         if not isinstance(reason, str) or not reason.strip() or any(c in reason for c in "\0\n\r"):
             raise GitError(f"refusing to update {ref}: the reflog reason must be one non-empty line")
-        returncode, stdout, stderr = self._git_call("symbolic-ref", "-q", ref)
+        args = ("symbolic-ref", "-q", ref)
+        returncode, stdout, stderr = self._git_call(*args)
         if returncode == 0:
             raise GitError(f"refusing to update {ref}: it is a symbolic ref to {stdout.strip()}")
         if returncode != 1:
-            raise GitError(f"git symbolic-ref -q {ref} failed ({returncode}): {stderr.strip()[:300]}")
+            raise _git_failure(args, returncode, stderr)
         self._git_checked("update-ref", "--no-deref", "-m", reason, ref, new, expected_old)
 
-    def _worktree_records(self) -> list[dict[str, str]]:
-        """``git worktree list --porcelain -z`` as one dict per worktree, in git's order.
+    def worktree_blocks(self) -> list[dict[str, str]]:
+        """All worktree registrations, in git's order (the main worktree comes first).
 
-        ``-z`` (Git 2.36) prints every path raw and NUL-terminated, so a worktree path holding a
-        space, a non-ASCII letter or a line break is read as git holds it.
+        One dict per worktree from ``git worktree list --porcelain -z``
+        (:func:`_worktree_list_records`).
         """
-        records: list[dict[str, str]] = []
-        current: dict[str, str] = {}
-        for line in self._git_checked("worktree", "list", "--porcelain", "-z").split("\0"):
-            if not line:
-                if current:
-                    records.append(current)
-                    current = {}
-                continue
-            key, _, value = line.partition(" ")
-            current[key] = value
-        if current:
-            records.append(current)
-        return records
+        return _worktree_list_records(self._git_checked("worktree", "list", "--porcelain", "-z"))
 
     def checked_out_at(self, ref: str) -> list[Path]:
         """Every worktree that holds ``ref`` checked out, as git itself counts it.
@@ -1689,7 +1778,7 @@ class GitRepo:
         Returns resolved paths, deduplicated, in ``git worktree list`` order; a worktree whose
         state names the branch but that the listing does not show comes last. Read-only.
         """
-        records = self._worktree_records()
+        records = self.worktree_blocks()
         common = Path(
             self._git_checked("rev-parse", "--path-format=absolute", "--git-common-dir").strip()
         )
@@ -1743,22 +1832,6 @@ class GitRepo:
 
     # -- cleanup helpers ------------------------------------------------------
 
-    def worktree_blocks(self) -> list[dict[str, str]]:
-        """All worktree registrations, in git's order (the main worktree comes first)."""
-        blocks: list[dict[str, str]] = []
-        current: dict[str, str] = {}
-        for line in self.run("worktree", "list", "--porcelain").splitlines():
-            if not line.strip():
-                if current:
-                    blocks.append(current)
-                    current = {}
-                continue
-            key, _, value = line.partition(" ")
-            current[key] = value
-        if current:
-            blocks.append(current)
-        return blocks
-
     def main_worktree(self) -> Path | None:
         """The repository's main worktree.
 
@@ -1786,5 +1859,10 @@ class GitRepo:
         return None
 
     def remove_worktree_checked(self, worktree: Path) -> None:
-        """``git worktree remove`` with no force and no fallback deletion."""
-        self.run("worktree", "remove", str(worktree))
+        """``git worktree remove`` with no force and no fallback deletion.
+
+        Git deletes the directory first and the registration after it, the registration even when
+        the directory could not be deleted (Windows keeps an open file undeletable): a failure can
+        leave a directory git no longer knows, with its ``.git`` file gone too.
+        """
+        self.run("worktree", "remove", "--", str(worktree))

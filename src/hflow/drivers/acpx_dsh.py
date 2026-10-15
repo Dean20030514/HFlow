@@ -11,8 +11,9 @@ Facts baked in from the M0 probe and the installed acpx 0.17.1 bundle (not assum
   structured argv in acpx's config file, so the driver writes a per-invocation config
   instead of passing ``--agent``.
 * ``dsh`` resolves to a ``.CMD`` shim, which ``CreateProcess`` cannot launch; the agent argv
-  is ``[<SystemRoot>\\System32\\cmd.exe, /c, <dsh>, --profile, acp]`` - one wrapper, absolute,
-  so a ``cmd.exe`` in the workspace is never picked up. acpx sees an ``.exe`` as the command
+  is ``[<SystemRoot>\\System32\\cmd.exe, /d, /c, <dsh>, --profile, acp]`` - one wrapper, absolute,
+  so a ``cmd.exe`` in the workspace is never picked up, and ``/d`` so no registry AutoRun command
+  runs before it; a shim path cmd.exe would reinterpret is refused. acpx sees an ``.exe`` as the command
   and spawns it directly (its own batch-shell wrapping applies only to a ``.cmd``/``.bat``
   command), so no second ``cmd.exe /c`` is added. The wrapper never carries task text, nonce,
   prompt or credentials - only the fixed launcher path and profile flag.
@@ -102,6 +103,7 @@ from ..contracts import (
 )
 from ..ids import utc_now
 from ..artifacts import BoundedTextSink, StreamCapture
+from ..gitworkspace import _REPOSITORY_LOCATING_ENV
 from ..packet import packet_digest
 from ..paths import ENV_ALLOW_WRITES  # noqa: F401 - re-exported for existing importers
 from ..review import (
@@ -115,7 +117,13 @@ from ..review import (
 )
 from ..workspace import DSH_WORKSPACE_ENV_FILE
 from .acp_events import V1_STOP_REASONS, project_line
-from .winjob import ProcessBoundary, close_output_handles, popen_in_boundary, process_gone
+from .winjob import (
+    ProcessBoundary,
+    close_output_handles,
+    popen_in_boundary,
+    process_gone,
+    wait_interruptibly,
+)
 
 DRIVER_ID = "acpx-dsh-acp"
 DRIVER_VERSION = "0.1.0"
@@ -138,6 +146,15 @@ PROBED_CAPABILITIES: Mapping[str, CapabilityState] = MappingProxyType(
         "readonly_enforcement": CapabilityState.UNSUPPORTED,
         "native_subagents": CapabilityState.UNSUPPORTED,
     }
+)
+
+#: Why the ``cancel`` capability is ``unsupported`` (see the module docstring), in the words the
+#: probe, a forced stop's receipt and ``selected.local_probe`` all use.
+NO_COOPERATIVE_CANCEL = (
+    "cooperative cancel is unavailable for this launcher (acpx cancel targets a persisted "
+    "session's queue owner; exec sends session/cancel only on SIGINT/SIGTERM/SIGHUP, which HFlow "
+    "cannot deliver to its CREATE_NEW_PROCESS_GROUP child on Windows - Ctrl+Break arrives as "
+    "SIGBREAK, which acpx does not handle)"
 )
 
 ENV_ACPX_CLI = "HFLOW_ACPX_CLI"
@@ -204,6 +221,15 @@ _NEW_REVISION_STEP = (
     "a root budget the new revision's first implementer counts as a repair, so it needs a repair "
     "attempt left on the root."
 )
+
+
+def _found_at_launch(starts_with: str) -> str:
+    """The refusal sentence for a cause admission refuses too, found at the spawn gate instead."""
+    return (
+        f"(A run that starts {starts_with} is refused at admission, before anything is reserved; "
+        "this one was found at launch, when the dispatch was already reserved, so the run stays "
+        "blocked.)"
+    )
 #: Where ``GitRepo.worktree_parent`` puts a run's worktrees: ``<checkout>.hflow-worktrees`` beside
 #: the checkout. The spawn gate uses it to name the user's checkout from a worktree's path.
 WORKTREE_PARENT_SUFFIX = ".hflow-worktrees"
@@ -352,6 +378,22 @@ def find_on_path(name: str, env: Mapping[str, str]) -> str:
     that a child would resolve against its own cwd - for the agent, the workspace. On Windows the
     name is tried with each ``PATHEXT`` extension unless it already carries one.
     """
+    path = env_key(env, "PATH")
+    for entry in (env[path] if path is not None else "").split(os.pathsep):
+        found = find_in_directory(name, entry.strip().strip('"'), env)
+        if found:
+            return found
+    return ""
+
+
+def find_in_directory(name: str, directory: str | Path, env: Mapping[str, str]) -> str:
+    """The file ``name`` names in one absolute ``directory``, by :func:`find_on_path`'s rules.
+
+    ``""`` for a relative or empty directory and when nothing matches: on Windows each ``PATHEXT``
+    extension is tried unless ``name`` carries one, elsewhere the file must be executable.
+    """
+    if not str(directory) or not Path(directory).is_absolute():
+        return ""
     if os.name == "nt":
         pathext = env_key(env, "PATHEXT")
         listed = env[pathext] if pathext is not None else ""
@@ -363,21 +405,92 @@ def find_on_path(name: str, env: Mapping[str, str]) -> str:
         )
     else:
         names = [name]
-    path = env_key(env, "PATH")
-    for entry in (env[path] if path is not None else "").split(os.pathsep):
-        entry = entry.strip().strip('"')
-        if not entry or not Path(entry).is_absolute():
-            continue
-        for candidate_name in names:
-            candidate = Path(entry) / candidate_name
-            if candidate.is_file() and (os.name == "nt" or os.access(candidate, os.X_OK)):
-                return str(candidate)
+    for candidate_name in names:
+        candidate = Path(directory) / candidate_name
+        if candidate.is_file() and (os.name == "nt" or os.access(candidate, os.X_OK)):
+            return str(candidate)
     return ""
+
+
+#: Where a launch found its ``dsh`` (:func:`resolve_dsh`), as its ``content_notes`` record it
+#: (:data:`DSH_SOURCE_NOTE_PREFIX`) and ``prepare``/``doctor`` show it: ``dsh=<source>``.
+DSH_SOURCE_PATH = "PATH"
+DSH_SOURCE_DATA_DIR = "npm (data dir)"
+DSH_SOURCE_EXPLICIT = "explicit"
+DSH_SOURCE_NOTE_PREFIX = "dsh="
+
+
+def resolve_dsh(data_dir: Path, env: Mapping[str, str]) -> tuple[str, str]:
+    """``(absolute dsh, source)`` as a launch finds it, or ``("", "")``. Names and stat only.
+
+    PATH first - what the operator put there is their choice - then exactly the npm CLI HFlow
+    looks for under its data directory (``dsh_surfaces.dsh_npm_bin_dir``), by the same lookup
+    rules. Nothing else: no other version, no Desktop shim, never a bare name.
+    """
+    found = find_on_path("dsh", env)
+    if found:
+        return found, DSH_SOURCE_PATH
+    from .dsh_surfaces import dsh_npm_bin_dir
+
+    found = find_in_directory("dsh", dsh_npm_bin_dir(data_dir), env)
+    return (found, DSH_SOURCE_DATA_DIR) if found else ("", "")
+
+
+def _dsh_source_note(source: str, data_dir: Path) -> str:
+    """The ``content_notes`` entry that records where the launch found its dsh."""
+    from .dsh_surfaces import DSH_NPM_PACKAGE, RECORDED_DSH_NPM_VERSION, dsh_npm_prefix
+
+    why = {
+        DSH_SOURCE_PATH: "the first absolute PATH entry that holds a dsh",
+        DSH_SOURCE_DATA_DIR: (
+            f"PATH has no dsh, so the {DSH_NPM_PACKAGE}@{RECORDED_DSH_NPM_VERSION} install under "
+            f"the data directory ({dsh_npm_prefix(data_dir)}) is the launcher; its shim, carrier "
+            "entry and package.json are bound by content like a PATH-found one"
+        ),
+        DSH_SOURCE_EXPLICIT: "named by the caller, not looked up",
+    }[source]
+    return f"{DSH_SOURCE_NOTE_PREFIX}{source}: {why}"
+
+
+def dsh_not_found_problem(data_dir: Path) -> str:
+    """Why a launch has no dsh, naming both places it looked and the npm install that fixes it."""
+    from .dsh_surfaces import dsh_npm_bin_dir, dsh_npm_install_command
+
+    return (
+        "dsh was not found on PATH (only absolute PATH entries are searched, never the current "
+        f"directory) or in {dsh_npm_bin_dir(data_dir)}, where HFlow looks for the npm CLI under "
+        "its data directory. A bare name would be looked up in the workspace first, so it is "
+        f"never a fallback. Install the npm CLI there - `{dsh_npm_install_command(data_dir)}` - "
+        "or put a dsh on PATH."
+    )
 
 
 def _inside_any(program: str, roots: Sequence[Path]) -> Path | None:
     """The first of ``roots`` that contains ``program`` (:func:`path_inside`)."""
     return next((Path(root) for root in roots if path_inside(program, root)), None)
+
+
+#: Characters cmd.exe may act on in a ``/c`` command line. Node quotes an argument by C runtime
+#: rules (only when it holds a space, a tab or a quote), not by cmd's, so a batch launcher argument
+#: holding one of them is refused. Observed with ``cmd /d /c <shim> --profile acp`` (Windows 11,
+#: 2026-10-14): ``&`` splits the command, ``^`` and ``%VAR%`` are consumed, an unquoted ``(``, ``;``,
+#: ``,`` or ``=`` cuts the path there, and an ``@`` in a quoted path makes ``/c`` drop the quotes
+#: and cut it at its first space. ``| < > "`` cannot be in a Windows file name, ``!`` expands under
+#: delayed expansion (a registry default ``/d`` does not turn off), and ``)`` closes a block. One
+#: set, whatever the quoting: some of these were harmless in some positions, which is not a rule.
+CMD_METACHARACTERS = frozenset('&|<>^%!"()@;,=')
+
+
+def batch_argument_problem(argument: str) -> str:
+    """Why ``argument`` cannot go on a ``cmd.exe /c`` command line unchanged, or ``""``."""
+    found = sorted(set(argument) & CMD_METACHARACTERS)
+    if not found:
+        return ""
+    return (
+        f"{argument!r} holds {' '.join(found)}, which cmd.exe interprets in the batch shim's "
+        "command line (Node quotes arguments by C runtime rules, not cmd's), so the agent "
+        "command would not be the one approved; install the launcher under a path without them"
+    )
 
 
 def build_agent_argv(
@@ -391,7 +504,10 @@ def build_agent_argv(
 
     Only the launcher path and the fixed profile flag live here: no task text, no nonce, no
     user content, no credentials. A batch shim is wrapped in ``command_processor`` - the
-    absolute ``cmd.exe`` from :func:`system_command_processor` - and refused without one.
+    absolute ``cmd.exe`` from :func:`system_command_processor` - and refused without one. The
+    wrapper runs ``/d``: cmd.exe's registry AutoRun commands would otherwise run first, in the
+    workspace, and write into the ACP stdout stream. An argument cmd.exe would reinterpret
+    (:func:`batch_argument_problem`) is refused.
     """
     if override is not None:
         return list(override)
@@ -403,7 +519,11 @@ def build_agent_argv(
                 "processor (<SystemRoot>\\System32\\cmd.exe), which was not found; a bare "
                 "cmd.exe would be searched for in the workspace first"
             )
-        return [command_processor, "/c", *argv]
+        for argument in argv:
+            problem = batch_argument_problem(argument)
+            if problem:
+                raise DriverSetupError(f"the batch launcher argument {problem}")
+        return [command_processor, "/d", "/c", *argv]
     return argv
 
 
@@ -432,7 +552,9 @@ def resolve_launch_config(
     object, so nothing can re-select a different interpreter after an approval was checked.
 
     Every program is an absolute path. ``dsh``, ``node`` and ``python`` are looked up in the
-    absolute entries of PATH only (:func:`find_on_path`), and an explicit program (an argument,
+    absolute entries of PATH only (:func:`find_on_path`) - ``dsh`` then in exactly one more place,
+    the npm CLI under the data directory (:func:`resolve_dsh`), and where it came from is recorded
+    as the first content note - and an explicit program (an argument,
     ``HFLOW_ACPX_NODE``, the first word of ``agent_argv_override``) must already be absolute: acpx
     starts the agent with the workspace as its cwd, where a bare or relative name would be
     resolved - so a file in the worktree could run as the agent. A program that is not found is
@@ -495,9 +617,14 @@ def resolve_launch_config(
         return final_path(found) if found else found
 
     suffix = entry.suffix.lower() if entry is not None else ""
-    resolved_dsh = program(
-        "dsh", dsh_executable, "dsh", needed=agent_argv_override is None
-    )
+    if dsh_executable:
+        resolved_dsh = program("dsh", dsh_executable, "dsh", needed=agent_argv_override is None)
+        dsh_source = DSH_SOURCE_EXPLICIT
+    else:
+        found_dsh, dsh_source = resolve_dsh(resolved_data_dir, source)
+        resolved_dsh = final_path(found_dsh) if found_dsh else ""
+        if not resolved_dsh and agent_argv_override is None:
+            problems.append(dsh_not_found_problem(resolved_data_dir))
     resolved_python = program(
         "python", python_executable, "python", needed=suffix == ".py"
     )
@@ -589,6 +716,10 @@ def resolve_launch_config(
         return launch.model_copy(
             update={"resolvable": False, "detail": " ".join(content_problems)}
         )
+    if resolved_dsh and resolved_dsh in agent_argv:
+        # Recorded where prepare and the probe already show the launch's binding notes; outside
+        # the effective-configuration digest, like every content note (the path itself is in it).
+        content_notes = [_dsh_source_note(dsh_source, resolved_data_dir), *content_notes]
     return launch.model_copy(
         update={"content_digests": digests, "content_notes": content_notes}
     )
@@ -688,8 +819,13 @@ def child_environment(
     binds. Without it DSH falls back to ``~/.agents/AGENTS.md`` under the child's home - the
     per-invocation home the driver points USERPROFILE/HOME at, created empty.
 
-    These DSH variables are removed in every spelling on Windows, which reads variable names
-    case-insensitively (:func:`env_keys`), and by their exact name elsewhere; a bound
+    The Git variables that locate a repository (``GIT_DIR``, ``GIT_WORK_TREE``, ``GIT_INDEX_FILE``
+    and the rest of ``gitworkspace._REPOSITORY_LOCATING_ENV``) are removed too, as HFlow removes
+    them from its own git calls: inherited, they would point DSH's git and the agent's shell at
+    another repository or index - the user's checkout, say - instead of the workspace's.
+
+    These DSH and Git variables are removed in every spelling on Windows, which reads variable
+    names case-insensitively (:func:`env_keys`), and by their exact name elsewhere; a bound
     ``DSH_HOME`` is then set in exactly that spelling.
 
     ``NoDefaultCurrentDirectoryInExePath=1`` is always set, in exactly that spelling, after
@@ -702,7 +838,7 @@ def child_environment(
     """
     env = dict(source)
     env.update(extra_env)
-    for name in ("DSH_HOME", *STRIPPED_DSH_ENV, DSH_AGENTS_HOME_ENV):
+    for name in ("DSH_HOME", *STRIPPED_DSH_ENV, DSH_AGENTS_HOME_ENV, *_REPOSITORY_LOCATING_ENV):
         for key in env_keys(env, name) if os.name == "nt" else [name]:
             env.pop(key, None)
     if dsh_home:
@@ -965,19 +1101,12 @@ class _ModelWatch:
 
 
 def _workspace_client_config(workspace: Path) -> Path | None:
-    """The workspace's acpx project config if any entry by that name exists, else ``None``.
-
-    See :func:`_workspace_root_entry` for how the entry is found.
-    """
+    """:func:`_workspace_root_entry` for acpx's project config (an alias ``prepare`` imports)."""
     return _workspace_root_entry(workspace, WORKSPACE_CLIENT_CONFIG_NAME)
 
 
 def _workspace_env_file(workspace: Path) -> Path | None:
-    """The workspace's ``.env`` if any root entry by that name exists, else ``None``.
-
-    Found by listing and ``lstat`` only (:func:`_workspace_root_entry`): the file may hold
-    credentials and is never opened, so what it sets is unknown and any entry refuses.
-    """
+    """:func:`_workspace_root_entry` for DSH's ``.env`` (an alias ``prepare`` imports)."""
     return _workspace_root_entry(workspace, WORKSPACE_ENV_FILE_NAME)
 
 
@@ -1228,13 +1357,11 @@ class AcpxDshDriver:
         self.max_raw_log_bytes = max(0, int(max_raw_log_bytes))
         self._handles: dict[str, DriverHandle] = {}
         #: Serializes "publish the handle and create the child" against "a stop arrived". Held
-        #: for the spawn only, never across the wait for a result. A ``Condition`` rather than a
-        #: lock because a stop that finds a spawn already in flight must *wait for that spawn to
-        #: publish* - "no handle yet" is not an answer while a child is being created.
-        self._gate = threading.Condition()
-        #: Invocations whose spawn is inside the gate right now. A stop that arrives for one of
-        #: these waits for the publication instead of reporting that nothing was found.
-        self._spawn_pending: set[str] = set()
+        #: for the spawn only, never across the wait for a result. The spawn holds it from its stop
+        #: check until the child is published (or refused), so a stop that arrives meanwhile blocks
+        #: on it and then finds the published child - "no handle yet" is never an answer it reads
+        #: while a child is being created.
+        self._gate = threading.Lock()
         #: Invocations a stop has been requested for. A spawn that has not created its child yet
         #: refuses, so the stop wins the handoff; it says nothing about a child that exists.
         self._stop_requests: dict[str, bool] = {}
@@ -1407,10 +1534,7 @@ class AcpxDshDriver:
             "probe is static: no prompt, no session, no model request",
             f"acpx CLI: {self.acpx_cli}",
             f"agent argv: {self._agent_argv()}",
-            "cooperative protocol cancel: unsupported for this launcher (acpx cancel targets "
-            "a persisted session's queue owner; exec sends session/cancel only on "
-            "SIGINT/SIGTERM/SIGHUP, which HFlow cannot deliver to its CREATE_NEW_PROCESS_GROUP "
-            "child on Windows - Ctrl+Break arrives as SIGBREAK, which acpx does not handle)",
+            NO_COOPERATIVE_CANCEL,
             "stopReason=end_turn is turn settlement, not success: acceptance is decided by "
             "checks and review",
             (
@@ -1544,12 +1668,14 @@ class AcpxDshDriver:
                 # A metadata probe takes no stdin: close it so the client cannot wait on us.
                 if child.stdin is not None:
                     child.stdin.close()
+                # Waited in slices, so a Ctrl+C reaches this thread at once; the ``finally``
+                # below then closes the boundary, which kills the client.
                 try:
-                    returncode = child.wait(timeout=timeout_seconds)
+                    returncode = wait_interruptibly(child, timeout_seconds)
                     timed_out = False
                 except subprocess.TimeoutExpired:
                     boundary.terminate()
-                    returncode = child.wait(timeout=10)
+                    returncode = wait_interruptibly(child, 10)
                     timed_out = True
             emptied = boundary.wait_empty(10.0)
             # True only for an observed exit. None (unanswered) fails the preflight exactly as
@@ -1708,158 +1834,149 @@ class AcpxDshDriver:
         # across ``collect`` would make cancellation block on the whole invocation, which is the
         # opposite of what a stop is for.
         with self._gate:
-            # Claimed before the spawn decision, so a stop that takes the gate during this spawn
-            # knows to wait for the publication below instead of finding "no handle yet".
-            self._spawn_pending.add(request.invocation_id)
-            try:
-                if self._stop_requests.get(request.invocation_id) or (
-                    request.stop_requested is not None and request.stop_requested()
-                ):
-                    # Nothing was created and nothing will be. The invocation is reported as
-                    # cancelled without a process, so the controller's stop wins the handoff.
-                    self._handles[request.invocation_id] = handle
-                    handle.start_cancelled = True
-                    handle.finished = True
-                    boundary.close()
-                    self._report_spawn(
-                        request,
-                        created=False,
-                        pid=None,
-                        detail=(
-                            "a recorded stop won the spawn gate: no client process was created"
-                        ),
-                    )
-                    return handle
-                client_config = _workspace_client_config(workspace)
-                if client_config is not None:
-                    # Checked here, at the last moment before the process exists, for every
-                    # invocation and both roles: the reviewer runs on the worktree the implementer
-                    # wrote. Nothing is created and no handle is published, so a later stop or
-                    # reconcile of this id truthfully finds that nothing was started. A file that
-                    # is already in the starting workspace is refused earlier, by admission
-                    # (``prepare.start_workspace_client_config``), while nothing is spent; one that
-                    # appears later is caught here, when this dispatch is already reserved - so the
-                    # message names the step that works then, not "submit again".
-                    self._refuse_spawn(
-                        request,
-                        boundary,
-                        RefusalCode.WORKSPACE_CLIENT_CONFIG,
-                        f"{client_config} exists in the workspace. acpx always loads it and lets "
-                        "it override HFlow's launch, including the agent command, so no client "
-                        "process was started. (A run that starts with one is refused at admission, "
-                        "before anything is reserved; this one was found at launch, when the "
-                        "dispatch was already reserved, so the run stays blocked.) Remove "
-                        "the file (or directory), then " + _NEW_REVISION_STEP,
-                    )
-                env_file = _workspace_env_file(workspace)
-                if env_file is not None:
-                    # The same gate and the same reasoning as the client config above: DSH loads
-                    # ``<cwd>/.env`` at launch. Listed and lstat'ed only - never opened, so what
-                    # it sets is unknown and any entry by that name refuses. One already in the
-                    # starting workspace is refused at admission
-                    # (``prepare.start_workspace_env_file``).
-                    self._refuse_spawn(
-                        request,
-                        boundary,
-                        RefusalCode.WORKSPACE_ENV_FILE,
-                        f"{env_file} exists in the workspace. DSH loads <cwd>/.env at launch "
-                        "into its own environment and its tool processes (documented upstream, "
-                        "not observed); HFlow never opens it, so no client process was started. "
-                        "(A run that starts with one is refused at admission, before anything is "
-                        "reserved; this one was found at launch, when the dispatch was already "
-                        "reserved, so the run stays blocked.) Remove or rename the file (or "
-                        "directory), then " + _NEW_REVISION_STEP,
-                    )
-                home_problem = dsh_home_workspace_problem(
-                    self.launch.dsh_home, spawn_workspaces(workspace)
-                )
-                if home_problem:
-                    # Admission refuses this against the project root and the worktree directory
-                    # (``prepare.launch_dsh_home_problem``); checked again here against the
-                    # role's actual cwd, for every invocation, before any process exists.
-                    self._refuse_spawn(
-                        request,
-                        boundary,
-                        RefusalCode.DSH_HOME_IN_WORKSPACE,
-                        f"{home_problem}. No client process was started. Point DSH_HOME at an "
-                        "absolute directory outside the project, its worktrees and this "
-                        "workspace (or unset it, so each invocation gets its own home), then "
-                        "prepare again: DSH_HOME is part of the approved launch, so a real run "
-                        "needs an authorization for the new binding, and since this dispatch "
-                        "was already reserved the run stays blocked - submit a new revision.",
-                    )
-                home_kind, dsh_home = effective_dsh_home(self.launch, child_home=child_home)
-                credential_problem = credential_source_problem(
-                    env, dsh_home_kind=home_kind, dsh_home=dsh_home
-                )
-                if credential_problem:
-                    # Judged on the environment this child is about to be given and the home it
-                    # would use, for every invocation - a repair round's included - so a variable
-                    # removed, or a home file deleted, after admission is caught here. Admission
-                    # refuses the same rule before anything is reserved
-                    # (``prepare.launch_credential_problem``). Names and stat only.
-                    self._refuse_spawn(
-                        request,
-                        boundary,
-                        RefusalCode.NO_CREDENTIAL_SOURCE,
-                        f"{credential_problem}. No client process was started: without a "
-                        "credential DSH fails with a no-API-key error before any model work "
-                        "(observed in M0). (A run that starts without one is refused at "
-                        "admission, before anything is reserved; this one was found at launch, "
-                        "when the dispatch was already reserved, so the run stays blocked.) Make "
-                        "a credential visible - DEEPSEEK_API_KEY in the environment hflow runs "
-                        "in, or a .credentials.yaml or .env in a bound DSH home - then "
-                        + _NEW_REVISION_STEP
-                        + " This is a presence check: it does not prove a credential is valid.",
-                    )
-                content_refusal = self._launch_content_refusal()
-                if content_refusal:
-                    # The last check before the process exists: the entry files are hashed again
-                    # and compared with what the launch recorded. Nothing is created and no handle
-                    # is published, as for the workspace config above.
-                    self._refuse_spawn(
-                        request,
-                        boundary,
-                        RefusalCode.LAUNCH_CONTENT_CHANGED,
-                        f"{content_refusal} No client process was started; the run stays "
-                        "blocked. Run `hflow prepare` again to see the files' current digests and "
-                        "re-issue the authorization for them.",
-                    )
-                try:
-                    stdout_handle = stdout_path.open("wb")
-                    child = popen_in_boundary(
-                        argv,
-                        cwd=str(invocation_dir),
-                        env=env,
-                        boundary=boundary,
-                        stdout_handle=stdout_handle,
-                        # stderr travels on a pipe this driver owns, so what is retained is genuinely
-                        # bounded and the reader has a stream to read. Giving the child a file instead
-                        # meant the reader had nothing to drain (`process.stderr` was ``None``) while the
-                        # child wrote 2 MiB HFlow never noticed.
-                        stderr_handle=subprocess.PIPE,
-                    )
-                except BaseException:
-                    boundary.close()
-                    raise
-                handle.pid = child.pid
-                # Published while the gate is still held: a stop waiting on this publication wakes
-                # up to a handle it can act on, not to an empty map.
+            if self._stop_requests.get(request.invocation_id) or (
+                request.stop_requested is not None and request.stop_requested()
+            ):
+                # Nothing was created and nothing will be. The invocation is reported as
+                # cancelled without a process, so the controller's stop wins the handoff.
                 self._handles[request.invocation_id] = handle
-                self._processes[request.invocation_id] = child
-                self._boundaries[request.invocation_id] = boundary
-                # Reported inside the same gate, right after the process exists: the controller's
-                # ledger learns "a child was created" as an observation, not as an assumption made
-                # from the fact that it asked for a launch.
+                handle.start_cancelled = True
+                handle.finished = True
+                boundary.close()
                 self._report_spawn(
                     request,
-                    created=True,
-                    pid=child.pid,
-                    detail=f"client process {child.pid} created inside the managed boundary",
+                    created=False,
+                    pid=None,
+                    detail=(
+                        "a recorded stop won the spawn gate: no client process was created"
+                    ),
                 )
-            finally:
-                self._spawn_pending.discard(request.invocation_id)
-                self._gate.notify_all()
+                return handle
+            client_config = _workspace_root_entry(workspace, WORKSPACE_CLIENT_CONFIG_NAME)
+            if client_config is not None:
+                # Checked here, at the last moment before the process exists, for every
+                # invocation and both roles: the reviewer runs on the worktree the implementer
+                # wrote. Nothing is created and no handle is published, so a later stop or
+                # reconcile of this id truthfully finds that nothing was started. A file that
+                # is already in the starting workspace is refused earlier, by admission
+                # (``prepare.start_workspace_client_config``), while nothing is spent; one that
+                # appears later is caught here, when this dispatch is already reserved - so the
+                # message names the step that works then, not "submit again".
+                self._refuse_spawn(
+                    request,
+                    boundary,
+                    RefusalCode.WORKSPACE_CLIENT_CONFIG,
+                    f"{client_config} exists in the workspace. acpx always loads it and lets "
+                    "it override HFlow's launch, including the agent command, so no client "
+                    f"process was started. {_found_at_launch('with one')} Remove the file (or "
+                    "directory), then " + _NEW_REVISION_STEP,
+                )
+            env_file = _workspace_root_entry(workspace, WORKSPACE_ENV_FILE_NAME)
+            if env_file is not None:
+                # The same gate and the same reasoning as the client config above: DSH loads
+                # ``<cwd>/.env`` at launch. Listed and lstat'ed only - never opened, so what
+                # it sets is unknown and any entry by that name refuses. One already in the
+                # starting workspace is refused at admission
+                # (``prepare.start_workspace_env_file``).
+                self._refuse_spawn(
+                    request,
+                    boundary,
+                    RefusalCode.WORKSPACE_ENV_FILE,
+                    f"{env_file} exists in the workspace. DSH loads <cwd>/.env at launch "
+                    "into its own environment and its tool processes (documented upstream, "
+                    "not observed); HFlow never opens it, so no client process was started. "
+                    f"{_found_at_launch('with one')} Remove or rename the file (or directory), "
+                    "then " + _NEW_REVISION_STEP,
+                )
+            home_problem = dsh_home_workspace_problem(
+                self.launch.dsh_home, spawn_workspaces(workspace)
+            )
+            if home_problem:
+                # Admission refuses this against the project root and the worktree directory
+                # (``prepare.launch_dsh_home_problem``); checked again here against the
+                # role's actual cwd, for every invocation, before any process exists.
+                self._refuse_spawn(
+                    request,
+                    boundary,
+                    RefusalCode.DSH_HOME_IN_WORKSPACE,
+                    f"{home_problem}. No client process was started. Point DSH_HOME at an "
+                    "absolute directory outside the project, its worktrees and this "
+                    "workspace (or unset it, so each invocation gets its own home), then "
+                    "prepare again: DSH_HOME is part of the approved launch, so a real run "
+                    "needs an authorization for the new binding, and since this dispatch "
+                    "was already reserved the run stays blocked - submit a new revision.",
+                )
+            home_kind, dsh_home = effective_dsh_home(self.launch, child_home=child_home)
+            credential_problem = credential_source_problem(
+                env, dsh_home_kind=home_kind, dsh_home=dsh_home
+            )
+            if credential_problem:
+                # Judged on the environment this child is about to be given and the home it
+                # would use, for every invocation - a repair round's included - so a variable
+                # removed, or a home file deleted, after admission is caught here. Admission
+                # refuses the same rule before anything is reserved
+                # (``prepare.launch_credential_problem``). Names and stat only.
+                self._refuse_spawn(
+                    request,
+                    boundary,
+                    RefusalCode.NO_CREDENTIAL_SOURCE,
+                    f"{credential_problem}. No client process was started: without a "
+                    "credential DSH fails with a no-API-key error before any model work "
+                    f"(observed in M0). {_found_at_launch('without one')} Make "
+                    "a credential visible - DEEPSEEK_API_KEY in the environment hflow runs "
+                    "in, or a .credentials.yaml or .env in a bound DSH home - then "
+                    + _NEW_REVISION_STEP
+                    + " This is a presence check: it does not prove a credential is valid.",
+                )
+            content_refusal = self._launch_content_refusal()
+            if content_refusal:
+                # The last check before the process exists: the entry files are hashed again
+                # and compared with what the launch recorded. Nothing is created and no handle
+                # is published, as for the workspace config above.
+                self._refuse_spawn(
+                    request,
+                    boundary,
+                    RefusalCode.LAUNCH_CONTENT_CHANGED,
+                    f"{content_refusal} No client process was started; the run stays "
+                    "blocked. Run `hflow prepare` again to see the files' current digests and "
+                    "re-issue the authorization for them.",
+                )
+            stdout_handle = None
+            try:
+                stdout_handle = stdout_path.open("wb")
+                child = popen_in_boundary(
+                    argv,
+                    cwd=str(invocation_dir),
+                    env=env,
+                    boundary=boundary,
+                    stdout_handle=stdout_handle,
+                    # stderr travels on a pipe this driver owns, so what is retained is genuinely
+                    # bounded and the reader has a stream to read. Giving the child a file instead
+                    # meant the reader had nothing to drain (`process.stderr` was ``None``) while the
+                    # child wrote 2 MiB HFlow never noticed.
+                    stderr_handle=subprocess.PIPE,
+                )
+            except BaseException:
+                # Nothing will collect or release this invocation: close what was opened.
+                if stdout_handle is not None:
+                    stdout_handle.close()
+                boundary.close()
+                raise
+            handle.pid = child.pid
+            # Published while the gate is still held: a stop blocked on the gate gets it next and
+            # finds a handle it can act on, not an empty map.
+            self._handles[request.invocation_id] = handle
+            self._processes[request.invocation_id] = child
+            self._boundaries[request.invocation_id] = boundary
+            # Reported inside the same gate, right after the process exists: the controller's
+            # ledger learns "a child was created" as an observation, not as an assumption made
+            # from the fact that it asked for a launch.
+            self._report_spawn(
+                request,
+                created=True,
+                pid=child.pid,
+                detail=f"client process {child.pid} created inside the managed boundary",
+            )
 
         # The child is published and reported. From here on start_handle never raises: a failure
         # would leave a published process, its boundary and the parent's file handles with nobody
@@ -2488,53 +2605,14 @@ class AcpxDshDriver:
         if invocation_deadline is not None:
             wait_seconds = min(wait_seconds, max(0.0, invocation_deadline - time.monotonic()))
         try:
-            process.wait(timeout=wait_seconds)
+            # In slices: a console Ctrl+C does not interrupt one long ``Popen.wait`` on Windows, so
+            # it would reach this thread only at the deadline (``winjob.wait_interruptibly``).
+            wait_interruptibly(process, wait_seconds)
         except subprocess.TimeoutExpired:
-            # The deadline is what ran out, so the client is stopped through the managed process
-            # boundary rather than left running: the allowance is already spent, and an orphaned
-            # client would keep working on a run that has stopped waiting for it. The result stays
-            # OUTCOME_UNKNOWN - what the client might yet have produced is not observed, and calling
-            # it a failure would be as invented as calling it a success. The job is closed after the
-            # teardown whatever it reported: what it held is recorded first, and a job left open
-            # would only keep its handle - and anything the teardown missed - for the controller's
-            # whole lifetime.
-            with self._teardown_lock(invocation_id):
-                stopped, emptied, stop_detail = self._force_stop_client(process, handle)
-                self._close_boundary(
-                    invocation_id, ExitBoundary(emptied=emptied, left_behind=None, detail=stop_detail)
-                )
-            close_output_handles(process)
-            observation, applied = self._model_facts(invocation_id, rejected=False, complete=False)
-            timeout_limitations = [
-                "the invocation deadline was reached while waiting for the client; the "
-                "managed process boundary was used to stop it",
-                stop_detail,
-            ]
-            if self._surface_notes.get(invocation_id):
-                timeout_limitations.append(self._surface_notes[invocation_id])
-            _delivered, stdin_note = self._stdin_state(
-                invocation_id, join_seconds=STDIN_WRITER_JOIN_SECONDS
-            )
-            if stdin_note:
-                timeout_limitations.append(stdin_note)
-            result = InvocationResult(
-                invocation_id=invocation_id,
-                outcome=InvocationOutcome.OUTCOME_UNKNOWN,
-                prompt_digest=self._prompt_digests.get(invocation_id, ""),
-                agent_turns=None,
-                limitations=timeout_limitations,
-                error_code="completion_timeout",
-                error_message=(
-                    "the client did not exit before the invocation deadline "
-                    f"({wait_seconds:.3f}s of waiting); stopped={stopped}"
-                ),
-                raw_ref=str(handle.event_log),
-                model_observation=observation,
-                model_applied=applied,
-                launch_surfaces=self._launch_surfaces.get(invocation_id),
-            )
-            self._results[invocation_id] = result
-            return result
+            return self._collect_after_deadline(handle, process, wait_seconds)
+        except KeyboardInterrupt:
+            self._stop_tree_on_interrupt(invocation_id, process)
+            raise
 
         # The process can exit a moment before the reader thread has consumed its final
         # output. Judging the run at that instant would drop the stop reason and misreport a
@@ -2843,6 +2921,82 @@ class AcpxDshDriver:
         self._results[invocation_id] = result
         return result
 
+    def _collect_after_deadline(
+        self, handle: DriverHandle, process: subprocess.Popen, wait_seconds: float
+    ) -> InvocationResult:
+        """``collect`` once the deadline ran out with the client still running.
+
+        The client is stopped through the managed process boundary rather than left running: the
+        allowance is already spent, and an orphaned client would keep working on a run that has
+        stopped waiting for it. The result stays OUTCOME_UNKNOWN - what the client might yet have
+        produced is not observed, and calling it a failure would be as invented as calling it a
+        success. The job is closed after the teardown whatever it reported: what it held is
+        recorded first, and a job left open would only keep its handle - and anything the teardown
+        missed - for the controller's whole lifetime.
+        """
+        invocation_id = handle.invocation_id
+        with self._teardown_lock(invocation_id):
+            stopped, emptied, stop_detail = self._force_stop_client(process, handle)
+            self._close_boundary(
+                invocation_id, ExitBoundary(emptied=emptied, left_behind=None, detail=stop_detail)
+            )
+        close_output_handles(process)
+        observation, applied = self._model_facts(invocation_id, rejected=False, complete=False)
+        limitations = [
+            "the invocation deadline was reached while waiting for the client; the "
+            "managed process boundary was used to stop it",
+            stop_detail,
+        ]
+        if self._surface_notes.get(invocation_id):
+            limitations.append(self._surface_notes[invocation_id])
+        _delivered, stdin_note = self._stdin_state(
+            invocation_id, join_seconds=STDIN_WRITER_JOIN_SECONDS
+        )
+        if stdin_note:
+            limitations.append(stdin_note)
+        result = InvocationResult(
+            invocation_id=invocation_id,
+            outcome=InvocationOutcome.OUTCOME_UNKNOWN,
+            prompt_digest=self._prompt_digests.get(invocation_id, ""),
+            agent_turns=None,
+            limitations=limitations,
+            error_code="completion_timeout",
+            error_message=(
+                "the client did not exit before the invocation deadline "
+                f"({wait_seconds:.3f}s of waiting); stopped={stopped}"
+            ),
+            raw_ref=str(handle.event_log),
+            model_observation=observation,
+            model_applied=applied,
+            launch_surfaces=self._launch_surfaces.get(invocation_id),
+        )
+        self._results[invocation_id] = result
+        return result
+
+    def _stop_tree_on_interrupt(self, invocation_id: str, process: subprocess.Popen) -> None:
+        """A Ctrl+C reached ``collect``'s wait: stop the client's tree now. Best effort.
+
+        Nothing is recorded or claimed - no receipt, no boundary record, no result: the controller
+        records the interruption itself (the run blocks ``outcome_unknown`` for ``resume``), and an
+        unconfirmed teardown is not a stop. Without this the tree would keep running until this
+        process exits and its kill-on-close boundary goes with it, which an owner that survives the
+        interrupt never does. The boundary is terminated, not closed, so a later stop or release
+        can still ask it. A stop that holds the teardown lock is tearing the same tree down already,
+        so this does not wait for it.
+        """
+        lock = self._teardown_lock(invocation_id)
+        if not lock.acquire(blocking=False):
+            return
+        try:
+            boundary = self._boundaries.get(invocation_id)
+            terminated = boundary is not None and boundary.terminate()
+            if not terminated and process.poll() is None:
+                process.kill()  # no Job Object (or it refused): the direct child at least
+        except Exception:  # noqa: BLE001 - the interrupt is what the caller must see
+            pass
+        finally:
+            lock.release()
+
     def _model_rejected_before_prompt(
         self, invocation_id: str, handle: DriverHandle, process: subprocess.Popen, drained: bool
     ) -> bool:
@@ -3079,72 +3233,39 @@ class AcpxDshDriver:
 
     # -- stop ----------------------------------------------------------------
 
-    def _stop_state(self, invocation_id: str) -> str:
-        """Where this invocation is, as one answer taken under the gate.
-
-        ``"live"`` - a process exists (published) and the caller may act on it outside the gate;
-        ``"pending"`` - a spawn holds the gate right now, so "no handle" is not yet an answer;
-        ``"stopped_before_start"`` - no process exists and the stop is recorded, so none will be
-        created.
-
-        The process is checked **first**: once a child exists, a recorded stop does not make it
-        disappear - it is the thing the stop still has to terminate. Asking about the stop flag
-        first would report a confirmed stop of an invocation that is in fact running.
-        """
-        if invocation_id in self._processes:
-            return "live"
-        if invocation_id in self._spawn_pending:
-            return "pending"
-        if self._stop_requests.get(invocation_id):
-            return "stopped_before_start"
-        return "absent"
-
-    def _await_spawn_publication(self, invocation_id: str) -> None:
-        """Wait, outside the held gate, for an in-flight spawn to publish or to be cancelled.
-
-        Called with the gate held and returns with it held. ``Condition.wait`` releases the gate
-        while waiting, so the spawning thread finishes its publication and wakes this thread up;
-        there is no path here that holds the gate across the wait, and no re-entrant acquisition
-        that could deadlock on it.
-        """
-        deadline = time.monotonic() + BOUNDARY_EMPTY_TIMEOUT_SECONDS
-        while self._stop_state(invocation_id) == "pending":
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return
-            self._gate.wait(timeout=remaining)
-
     def cancel_handle(self, handle: DriverHandle) -> CancellationReceipt:
         """Request a stop and report facts. Idempotent; never sends another prompt.
 
-        The request is recorded under the same gate the spawn uses, and a stop that arrives while
-        a spawn is in flight waits for that spawn to publish instead of concluding that there is
-        nothing to stop. Whichever side takes the gate first decides:
+        The request is recorded under the same gate the spawn uses. A spawn holds that gate from
+        its stop check until its child is published, so a stop that arrives while a spawn is in
+        flight blocks on the gate and never concludes that there is nothing to stop. Whichever side
+        takes the gate first decides:
 
         * the stop first - ``_stop_requests`` is set, the spawn refuses, and this reports a
           confirmed stop of an invocation that never had a process;
-        * the spawn first - this waits outside the held lock for the publication, then terminates
-          the process it finds, reporting ``mechanism=forced``.
+        * the spawn first - this finds the published process once the gate is free, then
+          terminates it outside the gate, reporting ``mechanism=forced``.
+
+        The process is checked, not the stop flag: once a child exists, a recorded stop does not
+        make it disappear - it is the thing the stop still has to terminate.
 
         A client that had already exited is not a stopped invocation either: what it started can
         still be running in the boundary, so the boundary is asked, not the client (see
         ``_stop_exited_client``).
 
-        The wait happens with the gate released and never covers the invocation's result: a stop
-        is not blocked by the work it is stopping.
+        The gate is held for the spawn only, never across the invocation's result: a stop is not
+        blocked by the work it is stopping.
         """
         invocation_id = handle.invocation_id
         previous = self._receipts.get(invocation_id)
         if previous is not None:
             return previous
 
-        # Declared before taking the gate: a spawn that is already inside it re-reads this and
-        # refuses to create a process, which is the whole point of recording it first.
+        # Declared under the gate: a spawn that takes it next reads this and refuses to create a
+        # process, which is the whole point of recording it first.
         with self._gate:
             self._stop_requests[invocation_id] = True
-            self._await_spawn_publication(invocation_id)
-            state = self._stop_state(invocation_id)
-            if state != "live":
+            if invocation_id not in self._processes:
                 receipt = CancellationReceipt(
                     invocation_id=invocation_id,
                     status="confirmed_stopped",
@@ -3179,15 +3300,8 @@ class AcpxDshDriver:
     ) -> CancellationReceipt:
         """Stop a running client through its boundary. Called with the teardown lock held."""
         invocation_id = handle.invocation_id
-        # The pinned exec sends session/cancel only on SIGINT/SIGTERM/SIGHUP, none of which HFlow
-        # can deliver to this client, so the only mechanism available is the managed process
-        # boundary. Stated, not implied.
-        detail_prefix = (
-            "cooperative cancel is unavailable for this launcher (acpx cancel targets a "
-            "persisted session's queue owner; exec cancels only on SIGINT/SIGTERM/SIGHUP, which "
-            "HFlow cannot deliver to its CREATE_NEW_PROCESS_GROUP child - Ctrl+Break arrives as "
-            "SIGBREAK, which acpx does not handle); the managed process boundary was terminated"
-        )
+        # The only mechanism available is the managed process boundary. Stated, not implied.
+        detail_prefix = f"{NO_COOPERATIVE_CANCEL}; the managed process boundary was terminated"
         stopped, emptied, detail = self._force_stop_client(process, handle)
         # The three-way status is the *boundary's* answer, not a simplification of it: an emptied
         # boundary means the managed process tree is gone, `still_running` means it is not, and
@@ -3357,9 +3471,13 @@ class AcpxDshDriver:
             # and is skipped while the writer still owns it.
             self._close_client_stdin(process, invocation_id)
             try:
-                process.wait(timeout=FORCE_STOP_GRACE_SECONDS)
+                wait_interruptibly(process, FORCE_STOP_GRACE_SECONDS)
             except subprocess.TimeoutExpired:
                 pass
+            except KeyboardInterrupt:
+                # The teardown below was the next step anyway; nothing is recorded for it.
+                boundary.terminate()
+                raise
 
         # Always ask the boundary, even when the parent is already gone: a descendant can outlive
         # it, and the job is the only thing that knows.
@@ -3523,14 +3641,13 @@ class AcpxDshDriver:
         - bypassing the gate and forgetting the stop - which let a child be created after the
         controller had already recorded that the run was stopped.
 
-        So the request is recorded first, under the gate, and only then is the handle looked up.
-        No handle *and* no spawn in flight means nothing was ever started for this id, which is
-        still reported as ``unknown``: that is a real fact about an unknown invocation, not a
-        stop that was dropped.
+        So the request is recorded first, under the gate - which a spawn in flight holds until it
+        has published or refused - and only then is the handle looked up. No handle once the gate
+        is free means nothing was ever started for this id, which is still reported as
+        ``unknown``: that is a real fact about an unknown invocation, not a stop that was dropped.
         """
         with self._gate:
             self._stop_requests[invocation_id] = True
-            self._await_spawn_publication(invocation_id)
             handle = self._handles.get(invocation_id)
         if handle is None:
             return CancellationReceipt(

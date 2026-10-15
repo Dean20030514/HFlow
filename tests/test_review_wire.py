@@ -38,6 +38,7 @@ from hflow.store import Store
 from hflow.verify import CheckRunners, FakeCheckRunner
 
 from . import test_batch_e_dispatch as dispatch_helpers
+from .store_helpers import pending_invocations
 from .test_driver_acpx_dsh import DriverHarness
 
 #: The reviewer's answer as the recorded live reviewer wrote it: prose, a code sample, then
@@ -1063,10 +1064,10 @@ def test_an_unbound_review_keeps_the_root_blocked_for_the_next_revision(
         "the ledger must record the controller's classification, not the driver's raw outcome"
     )
     assert reviewer_rows[0].outcome is InvocationOutcome.OUTCOME_UNKNOWN
-    assert [row.role for row in store.pending_invocations(binding.root_id)] == ["reviewer"]
+    assert [row.role for row in pending_invocations(store, binding.root_id)] == ["reviewer"]
 
     first.resume(outcome.run_id)
-    assert [row.role for row in store.pending_invocations(binding.root_id)] == ["reviewer"], (
+    assert [row.role for row in pending_invocations(store, binding.root_id)] == ["reviewer"], (
         "reconciling observes the unknown turn; it does not resolve it"
     )
 

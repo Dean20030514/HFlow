@@ -63,6 +63,7 @@ from .contracts import (
     SpawnKind,
     TaskSpec,
     TaskState,
+    TERMINAL_TASK_STATES,
     WorkspaceProvenance,
     canonical_json,
     digest_of,
@@ -154,11 +155,7 @@ INVOCATION_OPERATOR_SETTLEABLE_STATES: tuple[str, ...] = (
 #: The bound on an operator's attestation text, in characters.
 ATTESTATION_MAX_CHARS = 2000
 
-_TERMINAL_STATES: tuple[str, ...] = (
-    TaskState.ACCEPTED.value,
-    TaskState.BLOCKED.value,
-    TaskState.CANCELLED.value,
-)
+_TERMINAL_STATES: tuple[str, ...] = tuple(state.value for state in TERMINAL_TASK_STATES)
 #: The guard every writer that sets ``BLOCKED`` carries: an outcome already recorded - a terminal
 #: state, or a delivery receipt - is never relabelled. Its three placeholders take
 #: ``_TERMINAL_STATES``.
@@ -221,8 +218,41 @@ class RunNotFound(StoreError):
     pass
 
 
-class OwnerLostError(StoreError):
+class StoreRefusal(StoreError):
+    """A guard's refusal that names its own :class:`RefusalCode`; nothing was written.
+
+    A caller reads ``code`` instead of matching the wording, so rewording a message can never
+    turn a budget refusal into an ``internal_error``. ``concurrent`` marks the refusals only
+    another controller's work on the same run produces - a second live attempt, a run that
+    already ended, a takeover - whose outcome is that run's to record, not this caller's.
+    """
+
+    code: RefusalCode = RefusalCode.INTERNAL_ERROR
+    concurrent: bool = False
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: RefusalCode | None = None,
+        concurrent: bool | None = None,
+    ) -> None:
+        super().__init__(message)
+        if code is not None:
+            self.code = code
+        if concurrent is not None:
+            self.concurrent = concurrent
+
+
+class OwnerLostError(StoreRefusal):
     """A guarded write by a controller that no longer owns the run (a takeover superseded it)."""
+
+    code = RefusalCode.OWNER_LOST
+    concurrent = True
+
+
+class AuthorizationConflict(StoreError):
+    """An authorization id is already recorded with a different binding or immutable field."""
 
 
 class SettlementRefused(StoreError):
@@ -770,18 +800,8 @@ class Store:
                     AttemptState.ACTIVE.value,
                 ),
             ).rowcount
-            blocked = conn.execute(
-                f"""
-                UPDATE runs
-                   SET task_state = ?, block_code = ?, block_reason = ?, updated_at = ?
-                 WHERE run_id = ? AND {_LIVE_RUN_GUARD}
-                """,
-                (
-                    TaskState.BLOCKED.value, RefusalCode.OWNER_LOST.value, reason, now, run_id,
-                    *_TERMINAL_STATES,
-                ),
-            )
-            if blocked.rowcount != 1:  # pragma: no cover - the CAS above holds the same guard
+            blocked = self._block_locked(conn, run_id, RefusalCode.OWNER_LOST, reason, now=now)
+            if not blocked:  # pragma: no cover - the CAS above holds the same guard
                 raise StoreError(f"run {run_id} left its live state during the takeover")
             self._record_note_locked(conn, run_id, reason)
             return self._claim_generation_locked(conn, run_id), int(closed), int(attempts)
@@ -841,20 +861,46 @@ class Store:
         never relabelled. The stored row is returned either way, so a caller can see which of the
         two happened.
         """
-        now = utc_now()
         with self.transaction() as conn:
-            conn.execute(
-                f"""
-                UPDATE runs
-                   SET task_state = ?, block_code = ?, block_reason = ?, updated_at = ?
-                 WHERE run_id = ? AND {_LIVE_RUN_GUARD}
-                """,
-                (TaskState.BLOCKED.value, code.value, reason, now, run_id, *_TERMINAL_STATES),
-            )
+            self._block_locked(conn, run_id, code, reason)
             row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
             if row is None:
                 raise RunNotFound(run_id)
             return row
+
+    @staticmethod
+    def _block_locked(
+        conn: sqlite3.Connection,
+        run_id: str,
+        code: RefusalCode,
+        reason: str,
+        *,
+        extra_set: Sequence[tuple[str, Any]] = (),
+        extra_where: str = "",
+        extra_params: Sequence[Any] = (),
+        now: str | None = None,
+    ) -> bool:
+        """The one ``BLOCKED`` write: a live run with no receipt becomes ``BLOCKED``; ``True`` if so.
+
+        Every writer that blocks a run goes through this, so the terminal guard
+        (``_LIVE_RUN_GUARD``) cannot be forgotten by one of them. ``extra_set`` adds
+        ``(column, value)`` pairs written in the same statement; ``extra_where`` (with its
+        ``extra_params``) adds conditions after the guard. Both come from this module, never from
+        a caller's input.
+        """
+        assignments = [
+            ("task_state", TaskState.BLOCKED.value),
+            ("block_code", code.value),
+            ("block_reason", reason),
+            ("updated_at", now or utc_now()),
+            *extra_set,
+        ]
+        cur = conn.execute(
+            f"UPDATE runs SET {', '.join(f'{column} = ?' for column, _ in assignments)} "
+            f"WHERE run_id = ? AND {_LIVE_RUN_GUARD} {extra_where}",
+            (*(value for _, value in assignments), run_id, *_TERMINAL_STATES, *extra_params),
+        )
+        return cur.rowcount == 1
 
     def block_unless_stopped(
         self,
@@ -887,28 +933,19 @@ class Store:
 
         ``False`` means nothing was written; the caller reads the row to say which guard held.
         """
-        now = utc_now()
-        params: list[Any] = [TaskState.BLOCKED.value, code.value, reason, now, run_id]
-        params.extend(_TERMINAL_STATES)
-        foreign = ""
+        where = "AND cancel_intent_at IS NULL"
+        params: list[Any] = []
         if held_attempts is not None:
             held = list(held_attempts)
-            foreign = "AND NOT EXISTS (SELECT 1 FROM attempts WHERE attempts.run_id = runs.run_id"
+            where += " AND NOT EXISTS (SELECT 1 FROM attempts WHERE attempts.run_id = runs.run_id"
             if held:
-                foreign += f" AND attempts.attempt_id NOT IN ({','.join('?' for _ in held)})"
+                where += f" AND attempts.attempt_id NOT IN ({','.join('?' for _ in held)})"
                 params.extend(held)
-            foreign += ")"
+            where += ")"
         with self.transaction() as conn:
-            cur = conn.execute(
-                f"""
-                UPDATE runs
-                   SET task_state = ?, block_code = ?, block_reason = ?, updated_at = ?
-                 WHERE run_id = ? AND cancel_intent_at IS NULL AND {_LIVE_RUN_GUARD}
-                   {foreign}
-                """,
-                params,
+            return self._block_locked(
+                conn, run_id, code, reason, extra_where=where, extra_params=params
             )
-            return cur.rowcount == 1
 
     def register_attempt_invocation_unless_stopped(
         self, run_id: str, attempt_id: str, *, column: str, invocation_id: str
@@ -1191,13 +1228,11 @@ class Store:
                 f"cannot reserve budget for {run_id}: claimed by {row['claimed_by']!r}, "
                 f"not {controller_id!r}"
             )
-        raise StoreError(
-            f"budget exhausted for {run_id}: {row['turns_reserved']}/{row['turn_limit']} turns reserved"
+        raise StoreRefusal(
+            f"budget exhausted for {run_id}: {row['turns_reserved']}/{row['turn_limit']} turns "
+            "reserved",
+            code=RefusalCode.BUDGET_EXHAUSTED,
         )
-
-    def turns_remaining(self, run_id: str) -> int:
-        row = self.get_run(run_id)
-        return int(row["turns_remaining"])
 
     # -- root budget ledger (batch E1) ---------------------------------------
 
@@ -1242,7 +1277,8 @@ class Store:
 
         Refused: a new root id for a task that already has a root (the unique index would raise a
         bare ``sqlite3.IntegrityError`` at the insert instead), and a recorded root whose ceilings
-        or binding differ from the ones just presented.
+        or binding differ from the ones just presented. Each refusal is ``budget_exhausted``: the
+        allowance belongs to the recorded root, and this run may not spend beside it.
         """
         row = conn.execute(
             "SELECT * FROM root_budgets WHERE root_id = ?", (binding.root_id,)
@@ -1254,25 +1290,28 @@ class Store:
                 (binding.project_id, binding.repo_path, binding.task_id),
             ).fetchone()
             if clash is not None:
-                raise StoreError(
+                raise StoreRefusal(
                     f"the task {binding.task_id} of {binding.project_id} at {binding.repo_path} "
                     f"already has root {clash['root_id']}; this run resolves {binding.root_id} "
-                    "for the same task, and a second root would hand it a second allowance"
+                    "for the same task, and a second root would hand it a second allowance",
+                    code=RefusalCode.BUDGET_EXHAUSTED,
                 )
             return None
         recorded = _limits_from_row(row)
         if recorded.digest() != limits.digest():
-            raise StoreError(
+            raise StoreRefusal(
                 f"root {row['root_id']} is recorded with limits {recorded.model_dump(mode='json')} "
                 f"but this run presents {limits.model_dump(mode='json')}. A root's ceiling is part "
                 "of the approval that opened it; changing it later is not something a run may do, "
-                "and there is no top-up path in this build."
+                "and there is no top-up path in this build.",
+                code=RefusalCode.BUDGET_EXHAUSTED,
             )
         if row["binding_digest"] != digest_of(binding.model_dump(mode="json")):
-            raise StoreError(
+            raise StoreRefusal(
                 f"root {binding.root_id} is already recorded against a different binding "
                 f"(recorded ledger {row['ledger_path']}, this run resolves "
-                f"{binding.ledger_path}); the recorded root stands"
+                f"{binding.ledger_path}); the recorded root stands",
+                code=RefusalCode.BUDGET_EXHAUSTED,
             )
         return row
 
@@ -1476,7 +1515,7 @@ class Store:
                     # (``root_ids_for_task``), so reaching it here means the root was registered
                     # after that check - a race. This run's row already exists, and an identical
                     # resubmission only returns it.
-                    raise StoreError(
+                    raise StoreRefusal(
                         f"the task {row['task_id']} of {row['project_id']} has root "
                         f"{task_roots[0]} in this ledger, and this run has no root binding: a "
                         "dispatch outside the root would step around its unresolved invocations, "
@@ -1484,7 +1523,8 @@ class Store:
                         "registered after this run was admitted, so this run is blocked and "
                         "resubmitting the same TaskSpec only returns it: submit a new revision "
                         "with --root-budget-file (and an authorization covering that root) to run "
-                        "this task against its root."
+                        "this task against its root.",
+                        code=RefusalCode.BUDGET_EXHAUSTED,
                     )
             if authorization_id:
                 self._check_authorization_locked(conn, authorization_id, authorization_max)
@@ -1588,32 +1628,22 @@ class Store:
         role: str,
     ) -> sqlite3.Row:
         """Ownership, liveness, stop and role/phase checks, all inside the transaction."""
-        row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
-        if row is None:
-            raise RunNotFound(run_id)
-        if row["claimed_by"] != controller_id:
-            raise StoreError(
-                f"cannot dispatch for {run_id}: claimed by {row['claimed_by']!r}, "
-                f"not {controller_id!r}"
-            )
-        if row["cancel_intent_at"]:
-            raise StoreError(
-                f"run {run_id} has a cancellation intent recorded at {row['cancel_intent_at']}; "
-                "no dispatch is reserved for a stopped run and no counter moves"
-            )
-        state = TaskState(row["task_state"])
-        if state in {TaskState.ACCEPTED, TaskState.BLOCKED, TaskState.CANCELLED}:
-            raise StoreError(
-                f"run {run_id} is {state.value}; a terminal run never dispatches again"
-            )
+        row = self._require_live_owned_locked(
+            conn,
+            run_id,
+            controller_id,
+            what=f"reserve a dispatch for {run_id}",
+            stop_tail="no dispatch is reserved for a stopped run and no counter moves",
+            terminal_tail="a terminal run never dispatches again",
+        )
         phase = row["phase"]
         if role == "reviewer" and phase != CheckPhase.REVIEW.value:
-            raise StoreError(
+            raise StoreRefusal(
                 f"run {run_id} is in phase {phase!r}, not {CheckPhase.REVIEW.value!r}: a review "
                 "dispatch is only reserved once the run has entered review"
             )
         if role == "implementer" and phase is not None:
-            raise StoreError(
+            raise StoreRefusal(
                 f"run {run_id} is already in phase {phase!r}: an implementer dispatch is only "
                 "reserved before the candidate is checked"
             )
@@ -1625,7 +1655,47 @@ class Store:
             str(entry["attempt_id"]) != attempt_id for entry in live
         ):
             others = ", ".join(str(entry["attempt_id"]) for entry in live)
-            raise StoreError(f"refusing a second live attempt for {run_id}: {others} is active")
+            raise StoreRefusal(
+                f"refusing a second live attempt for {run_id}: {others} is active",
+                concurrent=True,
+            )
+        return row
+
+    @staticmethod
+    def _require_live_owned_locked(
+        conn: sqlite3.Connection,
+        run_id: str,
+        controller_id: str,
+        *,
+        what: str,
+        stop_tail: str,
+        terminal_tail: str,
+    ) -> sqlite3.Row:
+        """The run, when ``controller_id`` holds it, no stop is recorded and it has not ended.
+
+        Shared by the two transactions that may move a run toward another implementer
+        (:meth:`reserve_dispatch` and :meth:`reopen_for_repair`), so they cannot disagree about
+        who may act on a run. ``what`` names the refused action in the message; each tail says
+        why that refusal matters for it. Every refusal is a :class:`StoreRefusal` with its code.
+        """
+        row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        if row is None:
+            raise RunNotFound(run_id)
+        if row["claimed_by"] != controller_id:
+            raise StoreRefusal(
+                f"cannot {what}: it is claimed by {row['claimed_by']!r}, not {controller_id!r}"
+            )
+        if row["cancel_intent_at"]:
+            raise StoreRefusal(
+                f"cannot {what}: a cancellation intent was recorded at "
+                f"{row['cancel_intent_at']}; {stop_tail}",
+                code=RefusalCode.CANCELLED_BY_OPERATOR,
+            )
+        state = TaskState(row["task_state"])
+        if state in TERMINAL_TASK_STATES:
+            raise StoreRefusal(
+                f"cannot {what}: the run is {state.value}; {terminal_tail}", concurrent=True
+            )
         return row
 
     def _check_authorization_locked(
@@ -1636,20 +1706,21 @@ class Store:
             "SELECT * FROM authorizations WHERE authorization_id = ?", (authorization_id,)
         ).fetchone()
         if row is None:
-            raise StoreError(f"unknown authorization {authorization_id}")
+            raise StoreRefusal(f"unknown authorization {authorization_id}")
         if authorization_max is not None and int(row["max_top_level_submissions"]) != int(
             authorization_max
         ):
-            raise StoreError(
+            raise StoreRefusal(
                 f"authorization {authorization_id} is recorded with a ceiling of "
                 f"{row['max_top_level_submissions']} but this run presents {authorization_max}; "
                 "the recorded approval stands"
             )
         if int(row["used_top_level_submissions"]) + 1 > int(row["max_top_level_submissions"]):
-            raise StoreError(
+            raise StoreRefusal(
                 f"authorization {authorization_id} is exhausted: "
                 f"{row['used_top_level_submissions']}/{row['max_top_level_submissions']} "
-                "top-level submissions used"
+                "top-level submissions used",
+                code=RefusalCode.BUDGET_EXHAUSTED,
             )
 
     def _claim_authorization_locked(self, conn: sqlite3.Connection, authorization_id: str) -> None:
@@ -1857,11 +1928,12 @@ class Store:
         ).fetchall()
         if pending:
             first = pending[0]
-            raise StoreError(
+            raise StoreRefusal(
                 f"root {root_binding.root_id} still has {len(pending)} unresolved invocation(s); "
                 f"the earliest is {first['invocation_id']} ({first['role']}, "
                 f"{first['state']}). No dispatch is reserved for this root until it is settled - "
-                "an unknown outcome is reconciled by an operator, never re-dispatched."
+                "an unknown outcome is reconciled by an operator, never re-dispatched.",
+                code=RefusalCode.BUDGET_EXHAUSTED,
             )
 
         # --- the root's active run owns it exclusively -----------------------------------
@@ -1879,29 +1951,25 @@ class Store:
                AND task_state NOT IN (?, ?, ?)
              ORDER BY created_at
             """,
-            (
-                root_binding.root_id,
-                run_id,
-                TaskState.ACCEPTED.value,
-                TaskState.BLOCKED.value,
-                TaskState.CANCELLED.value,
-            ),
+            (root_binding.root_id, run_id, *_TERMINAL_STATES),
         ).fetchall()
         if other_live:
             other = other_live[0]
-            raise StoreError(
+            raise StoreRefusal(
                 f"root {root_binding.root_id} is owned by run {other['run_id']} "
                 f"(revision {other['task_revision']}, state {other['task_state']}); that run has "
                 f"not reached a terminal state, so no dispatch is reserved for this root from run "
                 f"{run_id}. One root runs one task at a time - wait for the active run to finish, "
-                "be stopped, or be cancelled."
+                "be stopped, or be cancelled.",
+                code=RefusalCode.BUDGET_EXHAUSTED,
             )
 
         deadline_at = row["deadline_at"]
         if deadline_at and parse_ts(str(deadline_at)) <= parse_ts(now):
-            raise StoreError(
+            raise StoreRefusal(
                 f"root {root_binding.root_id} reached its deadline at {deadline_at}; no further "
-                "dispatch is reserved for this root"
+                "dispatch is reserved for this root",
+                code=RefusalCode.BUDGET_EXHAUSTED,
             )
         # --- the whole remaining loop has to fit, not just this dispatch -------------------
         # Admitting a revision that can afford its implementer but not its reviewer buys an
@@ -1913,13 +1981,14 @@ class Store:
         if int(row["used_top_level_submissions"]) + remaining_loop > int(
             row["max_top_level_submissions"]
         ):
-            raise StoreError(
+            raise StoreRefusal(
                 f"root {root_binding.root_id} cannot complete this run's loop: "
                 f"{row['used_top_level_submissions']}/{row['max_top_level_submissions']} "
                 f"top-level submissions are used and this run still needs {remaining_loop} more "
                 f"(this {role} dispatch plus the rest of the loop). No dispatch is reserved and no "
                 "counter moves - obtain a root budget large enough for the whole loop, or stop "
-                "here. There is no top-up path in this build."
+                "here. There is no top-up path in this build.",
+                code=RefusalCode.BUDGET_EXHAUSTED,
             )
 
         # The recorded run and authorization lists are facts: an unreadable one raises, and the
@@ -1943,10 +2012,11 @@ class Store:
         implementers_before = self._charged_implementer_rows_locked(conn, root_binding.root_id)
         is_repair = bool(is_repair) or (role == "implementer" and bool(implementers_before))
         if is_repair and int(row["used_repairs"]) + 1 > int(row["max_repairs"]):
-            raise StoreError(
+            raise StoreRefusal(
                 f"root {root_binding.root_id} has used its {row['max_repairs']} repair attempt(s); "
                 "this build does not buy another implementation attempt, and changing the "
-                "revision does not reset the count"
+                "revision does not reset the count",
+                code=RefusalCode.BUDGET_EXHAUSTED,
             )
         first_dispatch_at = row["first_dispatch_at"] or now
         conn.execute(
@@ -2082,9 +2152,6 @@ class Store:
                 _invocation_from_row(row)
                 for row in self._charged_implementer_rows_locked(self.conn, root_id)
             ]
-
-    def pending_invocations(self, root_id: str) -> list[InvocationIntent]:
-        return [entry for entry in self.invocations_for_root(root_id) if entry.pending]
 
     def mark_invocation_launch_requested(self, invocation_id: str) -> bool:
         """Record that the controller is about to ask a driver to launch this invocation.
@@ -2644,24 +2711,15 @@ class Store:
         written.
         """
         with self.transaction() as conn:
-            cur = conn.execute(
-                f"""
-                UPDATE runs
-                   SET cancel_receipt_json = ?, task_state = ?, block_code = ?,
-                       block_reason = ?, updated_at = ?
-                 WHERE run_id = ? AND {_LIVE_RUN_GUARD}
-                """,
-                (
-                    canonical_json(receipt.model_dump(mode="json")),
-                    TaskState.BLOCKED.value,
-                    code.value,
-                    reason,
-                    utc_now(),
-                    run_id,
-                    *_TERMINAL_STATES,
-                ),
-            )
-            if cur.rowcount == 1:
+            if self._block_locked(
+                conn,
+                run_id,
+                code,
+                reason,
+                extra_set=[
+                    ("cancel_receipt_json", canonical_json(receipt.model_dump(mode="json")))
+                ],
+            ):
                 return True
             if conn.execute("SELECT 1 FROM runs WHERE run_id = ?", (run_id,)).fetchone() is None:
                 raise RunNotFound(run_id)
@@ -2729,19 +2787,6 @@ class Store:
         return [row["note"] for row in self._fetchall(
             "SELECT note FROM run_notes WHERE run_id = ? ORDER BY created_at, rowid", (run_id,)
         )]
-
-    def record_effective_config(self, run_id: str, config: EffectiveConfig) -> None:
-        """Record the configuration this run executes under, once, verbatim.
-
-        Kept in ``run_notes`` as one canonical-JSON line rather than in a new column: it needs
-        the same durability as every other audit fact (a terminal transition must not erase it)
-        and none of the columns in ``runs`` are read as a document. The stored text *is* the
-        ``EffectiveConfig`` document - not a paraphrase with a digest bolted on - so a reader
-        re-derives the same identity from the same contract. Written only when absent: a run's
-        recorded configuration is part of its identity and is never rewritten.
-        """
-        with self.transaction() as conn:
-            self._record_structured_note_locked(conn, run_id, _EFFECTIVE_CONFIG_PREFIX, config)
 
     def _structured_note_locked(
         self, conn: sqlite3.Connection, run_id: str, prefix: str, model: Any
@@ -2965,30 +3010,12 @@ class Store:
         Re-using an ``authorization_id`` is only allowed when nothing that defines the approval
         changed - not only the binding digest but the verbatim user text, the provenance, the
         timestamp and the ceiling. The existing row is never overwritten, so a consumed
-        authorization cannot be revived by editing its file.
+        authorization cannot be revived by editing its file. A conflict raises
+        :class:`AuthorizationConflict`.
         """
         with self.transaction() as conn:
-            existing = conn.execute(
-                "SELECT * FROM authorizations WHERE authorization_id = ?",
-                (record["authorization_id"],),
-            ).fetchone()
+            existing = self._authorization_registration_row_locked(conn, record)
             if existing is not None:
-                if existing["binding_digest"] != record["binding_digest"]:
-                    raise StoreError(
-                        f"authorization {record['authorization_id']} already exists bound to a "
-                        "different target; refusing to reuse it"
-                    )
-                changed = [
-                    field
-                    for field in self._AUTHORIZATION_IMMUTABLE_FIELDS
-                    if field in existing.keys() and existing[field] != record.get(field)
-                ]
-                if changed:
-                    raise StoreError(
-                        f"authorization {record['authorization_id']} already exists with different "
-                        f"immutable field(s) {changed}; an approval is not edited in place - the "
-                        "recorded one stands"
-                    )
                 return existing
             conn.execute(
                 """
@@ -3021,6 +3048,45 @@ class Store:
                 "SELECT * FROM authorizations WHERE authorization_id = ?",
                 (record["authorization_id"],),
             ).fetchone()
+
+    def check_authorization_registration(self, record: dict[str, Any]) -> None:
+        """Raise the conflict ``register_authorization`` would raise, without writing.
+
+        The controller asks this before its first write, so an authorization id reused with an
+        edited immutable field is refused while nothing - no root row, no run row, no claim - is
+        recorded. ``register_authorization`` repeats the check inside its transaction, which
+        stays the gate.
+        """
+        with self._lock:
+            self._authorization_registration_row_locked(self.conn, record)
+
+    def _authorization_registration_row_locked(
+        self, conn: sqlite3.Connection, record: dict[str, Any]
+    ) -> sqlite3.Row | None:
+        """The recorded row this authorization agrees with, ``None`` when it is new."""
+        existing = conn.execute(
+            "SELECT * FROM authorizations WHERE authorization_id = ?",
+            (record["authorization_id"],),
+        ).fetchone()
+        if existing is None:
+            return None
+        if existing["binding_digest"] != record["binding_digest"]:
+            raise AuthorizationConflict(
+                f"authorization {record['authorization_id']} already exists bound to a "
+                "different target; refusing to reuse it"
+            )
+        changed = [
+            field
+            for field in self._AUTHORIZATION_IMMUTABLE_FIELDS
+            if field in existing.keys() and existing[field] != record.get(field)
+        ]
+        if changed:
+            raise AuthorizationConflict(
+                f"authorization {record['authorization_id']} already exists with different "
+                f"immutable field(s) {changed}; an approval is not edited in place - the "
+                "recorded one stands"
+            )
+        return existing
 
     def authorization_state(self, authorization_id: str) -> dict[str, Any] | None:
         row = self._fetchone(
@@ -3170,26 +3236,17 @@ class Store:
         """
         with self.transaction() as conn:
             self._check_fence_locked(conn, run_id, fence)
-            row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
-            if row is None:
-                raise RunNotFound(run_id)
-            if row["claimed_by"] != controller_id:
-                raise StoreError(
-                    f"cannot reopen {run_id} for a repair: it is claimed by {row['claimed_by']!r}, "
-                    f"not {controller_id!r}"
-                )
-            if row["cancel_intent_at"]:
-                raise StoreError(
-                    f"cannot reopen {run_id} for a repair: a cancellation intent was recorded at "
-                    f"{row['cancel_intent_at']}, and a repair never overrides a stop"
-                )
-            state = TaskState(row["task_state"])
-            if state in {TaskState.ACCEPTED, TaskState.BLOCKED, TaskState.CANCELLED}:
-                raise StoreError(
-                    f"cannot reopen {run_id} for a repair: the run is {state.value}, and a repair "
-                    "is only ever a decision taken inside a live run - it does not revive a run an "
-                    "acceptance, a block or a stop already ended"
-                )
+            self._require_live_owned_locked(
+                conn,
+                run_id,
+                controller_id,
+                what=f"reopen {run_id} for a repair",
+                stop_tail="a repair never overrides a stop",
+                terminal_tail=(
+                    "a repair is only ever a decision taken inside a live run - it does not "
+                    "revive a run an acceptance, a block or a stop already ended"
+                ),
+            )
             cur = conn.execute(
                 """
                 UPDATE runs
@@ -3198,14 +3255,7 @@ class Store:
                    AND cancel_intent_at IS NULL
                    AND task_state NOT IN (?, ?, ?)
                 """,
-                (
-                    TaskState.RUNNING.value,
-                    utc_now(),
-                    run_id,
-                    TaskState.ACCEPTED.value,
-                    TaskState.BLOCKED.value,
-                    TaskState.CANCELLED.value,
-                ),
+                (TaskState.RUNNING.value, utc_now(), run_id, *_TERMINAL_STATES),
             )
             if cur.rowcount != 1:  # pragma: no cover - the checks above hold the same transaction
                 raise StoreError(

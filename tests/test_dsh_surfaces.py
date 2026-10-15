@@ -818,6 +818,9 @@ def test_a_bound_workspace_write_home_under_the_desktop_shim_cites_dsh_9626(
     ), mode
     assert "session/set_config_option takes only model and reasoning_effort" in mode
     assert "never enforced" in mode
+    # Not a file-tool boundary (DSH #9693): what notices an outside write is HFlow's own check.
+    assert "it is the shell runner's mode" in mode and "DSH #9693" in mode
+    assert "scope check and user-checkout fingerprint" in mode
     assert cited.startswith("the dsh carrier is the Desktop shim and the DSH sandbox mode is "
                             "workspace-write: DSH #9626")
     for fact in (

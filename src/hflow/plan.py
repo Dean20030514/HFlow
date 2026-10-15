@@ -48,8 +48,13 @@ from .contracts import (
     RunPlan,
 )
 from .paths import ENV_ALLOW_WRITES
-from .prepare import Resolution, load_json_file, pending_binding, root_binding_for
-from .profiles import ENV_PROFILE, requested_profile_id, summarize_validation_error
+from .prepare import Resolution, pending_binding, root_binding_for
+from .profiles import (
+    ENV_PROFILE,
+    load_json_file,
+    requested_profile_id,
+    summarize_validation_error,
+)
 
 if TYPE_CHECKING:  # annotations only
     from .authorization import AuthorizationBinding, AuthorizationRecord
@@ -57,6 +62,47 @@ if TYPE_CHECKING:  # annotations only
 #: The stem suffix a plan file conventionally carries (``task.plan.json``); dropped from the
 #: default authorization file name so that reads ``task.<digest>.authorization.json``.
 PLAN_STEM_SUFFIX = ".plan"
+
+#: ``(PlanArguments field, flag)`` of every input ``prepare`` and ``run`` resolve a task from - the
+#: CLI's resolution flags, in its order. With ``run --plan`` they come from the plan, never the
+#: command line, and :func:`prepare_command` prints them back from a plan.
+RESOLUTION_FLAGS = (
+    ("task", "--task"),
+    ("project", "--project"),
+    ("project_root", "--project-root"),
+    ("profile", "--profile"),
+    ("driver", "--driver"),
+    ("base_commit", "--base-commit"),
+    ("workspace", "--workspace"),
+    ("authorization_mode", "--authorization-mode"),
+    ("root_budget_file", "--root-budget-file"),
+    ("repair_policy_file", "--repair-policy-file"),
+)
+DEFAULT_PROJECT_ROOT = "."
+DEFAULT_AUTHORIZATION_MODE = "m2-live-change"
+
+
+def prepare_command(arguments: PlanArguments, plan_path: Path) -> str:
+    """The ``hflow prepare ... --plan-out PLAN`` that writes this plan again, ready to paste.
+
+    Rebuilt from the inputs the plan recorded (absolute paths, the profile it named), so
+    re-preparing a stale plan does not mean retyping every flag. A profile the plan did not name
+    is left out, so ``HFLOW_PROFILE`` decides again, as it did the first time; the default
+    authorization mode is left out too, and ``--data-dir`` is added when the plan's data
+    directory is not the default one. It resolves afresh: what it prints is a new plan to review.
+    """
+    from .hints import command, data_dir_word, word
+
+    words = ["prepare"]
+    for field, flag in RESOLUTION_FLAGS:
+        value = getattr(arguments, field)
+        if value is None or (
+            field == "authorization_mode" and value == DEFAULT_AUTHORIZATION_MODE
+        ):
+            continue
+        words += [flag, word(str(value))]
+    words += ["--plan-out", word(os.path.abspath(plan_path))]
+    return command(data_dir_word(arguments.data_dir), *words)
 
 
 def frozen_arguments(
@@ -150,7 +196,7 @@ def check_plan_target(path: Path) -> Path:
     if target.is_dir():
         raise refused("is a directory")
     try:
-        raw = json.loads(target.read_text(encoding="utf-8"))
+        raw = json.loads(target.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeDecodeError, ValueError) as exc:
         raise refused(
             f"exists and could not be read as an HFlow plan ({type(exc).__name__})"
@@ -222,7 +268,8 @@ def _environment_sources(plan: RunPlan) -> dict[str, str]:
     plan turns stale with only a digest to show for it. Leaf field name -> the variables it is
     read from: ``prepare.resolve_permissions`` (the write opt-in) and
     ``acpx_dsh.resolve_launch_config`` (a real role's launch: ``dsh``/``python``/``node`` are
-    looked up on ``PATH``, ``cmd.exe`` under ``SystemRoot``). The profile is read from
+    looked up on ``PATH`` - ``dsh`` then in the data directory's npm install - and ``cmd.exe``
+    under ``SystemRoot``). The profile is read from
     ``HFLOW_PROFILE`` only while the plan names none (:func:`frozen_arguments`).
     """
     from .drivers.acpx_dsh import ENV_ACPX_CLI, ENV_ACPX_NODE
@@ -234,8 +281,8 @@ def _environment_sources(plan: RunPlan) -> dict[str, str]:
         "node": f"{ENV_ACPX_NODE}, PATH",
         "client_argv_prefix": f"{ENV_ACPX_NODE}, PATH",
         "python": "PATH",
-        "dsh_executable": "PATH",
-        "agent_argv": "PATH, SystemRoot",
+        "dsh_executable": "PATH, the data directory's npm DSH install",
+        "agent_argv": "PATH, the data directory's npm DSH install, SystemRoot",
     }
     if plan.arguments.profile is None:
         sources.update(source=ENV_PROFILE, profile_id=ENV_PROFILE, profile_digest=ENV_PROFILE)
@@ -371,21 +418,27 @@ def require_current(
         effective=resolution.resolved.effective,
     )
     if differences:
-        raise stale_plan_error(plan_path, differences, approved=approved)
+        raise stale_plan_error(plan, plan_path, differences, approved=approved)
 
 
-def stale_plan_error(plan_path: Path, differences: list[str], *, approved: bool) -> RefusedError:
-    """The refusal for a plan whose inputs no longer resolve to what was planned."""
+def stale_plan_error(
+    plan: RunPlan, plan_path: Path, differences: list[str], *, approved: bool
+) -> RefusedError:
+    """The refusal for a plan whose inputs no longer resolve to what was planned.
+
+    It ends with the ``prepare`` command that writes the plan again (:func:`prepare_command`).
+    """
     again = (
-        "re-run `hflow prepare ... --plan-out` and `hflow approve --plan` for the new resolution"
+        "re-prepare it, review the new plan and `hflow approve --plan` it"
         if approved
-        else "re-run `hflow prepare ... --plan-out` and review the new plan"
+        else "re-prepare it and review the new plan"
     )
     return RefusedError(
         RefusalCode.RISK_DOWNGRADE,
         f"plan {plan_path} is stale: its inputs no longer resolve to what was prepared ("
         + "; ".join(differences)
-        + f"). Nothing was written or dispatched; {again}.",
+        + f"). Nothing was written or dispatched; {again}: "
+        + prepare_command(plan.arguments, plan_path),
     )
 
 

@@ -64,7 +64,7 @@ from hflow.store import Store, StoreError
 from hflow.verify import CheckRunners, FakeCheckRunner
 from tests import test_batch_e_dispatch as helpers
 from tests import test_batch_e_migration as migration_helpers
-from tests.store_helpers import mark_invocation_started
+from tests.store_helpers import mark_invocation_started, pending_invocations
 from tests.test_driver_acpx_dsh import FAKE_CLIENT, STUB_AGENT
 
 
@@ -150,7 +150,7 @@ def test_a_checking_run_keeps_exclusive_ownership_of_its_root(
             assert entered.wait(15), "the first run never reached verification"
             first_run = store.list_runs()[0]["run_id"]
             assert store.get_run(first_run)["task_state"] == TaskState.CHECKING.value
-            assert store.pending_invocations(binding.root_id) == [], (
+            assert pending_invocations(store, binding.root_id) == [], (
                 "the probe is only meaningful while nothing is unresolved"
             )
 

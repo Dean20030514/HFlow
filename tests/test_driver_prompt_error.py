@@ -41,6 +41,7 @@ from hflow.verify import CheckRunners, FakeCheckRunner
 
 from . import test_batch_e_dispatch as dispatch_helpers
 from .owner_exit import owner_exits, successor
+from .store_helpers import pending_invocations
 from .test_driver_mid_turn_death import _chunk_texts, _wire_messages
 from .test_review_wire import GOALS, _run, run_invocation, structured_harness
 
@@ -176,7 +177,7 @@ def test_a_run_whose_prompt_is_rejected_blocks_unknown_keeps_its_spend_and_is_no
         after = store.invocations_for(run_id)
         attempts_after = len(store.attempts_for(run_id))
         used_after = store.root_budget_view(binding.root_id).used_top_level_submissions
-        pending = [entry.role for entry in store.pending_invocations(binding.root_id)]
+        pending = [entry.role for entry in pending_invocations(store, binding.root_id)]
     finally:
         for invocation_id in list(harness.driver._handles):
             harness.driver.release(invocation_id)

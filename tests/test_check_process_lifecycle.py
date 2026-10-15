@@ -29,7 +29,7 @@ import pytest
 
 from hflow.contracts import CheckDef, EvidenceStatus
 from hflow.drivers import winjob
-from hflow.verify import CommandCheckRunner
+from hflow.verify import REASON_TIMED_OUT, CommandCheckRunner
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 CHECK_HELPER = FIXTURES / "check_helper.py"
@@ -213,8 +213,153 @@ def test_an_unconfirmed_teardown_is_reported_as_unconfirmed(tmp_path: Path, monk
         # confirmed whole-boundary stop.
         assert "boundary_terminated_by_this_runner=True" in outcome.detail
         assert "boundary_empty=False" in outcome.detail
+        # ...and the check still timed out: an unconfirmed tear-down does not rename that.
+        assert outcome.exit_reason == REASON_TIMED_OUT, outcome.detail
+        assert "processes_alive_after_timeout_termination=" in outcome.detail
+        assert "left processes running after it finished" not in outcome.detail
     finally:
         _retire(markers, pids)
+
+
+def test_a_timeout_stays_timed_out_when_the_boundary_is_slow_to_empty(tmp_path: Path) -> None:
+    """Termination is asynchronous: processes counted right after it are not "left running".
+
+    The observation is held at two processes, as a boundary that has not finished tearing down
+    reports. The runner used to overwrite ``timed_out`` with ``settlement_forced`` and say the
+    check "left processes running after it finished" - about a check that never finished.
+    """
+    seen: list[int] = []
+
+    def still_tearing_down(boundary: winjob.ProcessBoundary) -> int | None:
+        seen.append(2)
+        return 2
+
+    outcome = CommandCheckRunner(_observation_override=still_tearing_down).run(
+        _check([sys.executable, "-c", "import time; time.sleep(60)"], check_id="slow", timeout=1),
+        tmp_path,
+        1,
+    )
+
+    assert seen, "the boundary was observed after the timeout"
+    assert outcome.status is EvidenceStatus.ERROR
+    assert outcome.exit_reason == REASON_TIMED_OUT, outcome.detail
+    assert outcome.timed_out is True
+    assert "(timeout after 1s)" in outcome.detail
+    assert "processes_alive_after_timeout_termination=2" in outcome.detail
+    assert "left processes running after it finished" not in outcome.detail
+    assert "descendants_alive_after_settle" not in outcome.detail
+
+
+# --------------------------------------------------------------------------
+# 4b: a console Ctrl+C during a check stops the check and reaches the operator
+# --------------------------------------------------------------------------
+
+
+def test_an_interrupt_during_the_wait_terminates_the_check_and_propagates(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """KeyboardInterrupt in the wait: the boundary is terminated, the child reaped, and re-raised."""
+    import hflow.verify as verify_module
+
+    real_wait = verify_module.wait_interruptibly
+    children: list[subprocess.Popen] = []
+    terminations: list[bool] = []
+    real_terminate = winjob.ProcessBoundary.terminate
+
+    def interrupted_once(child: subprocess.Popen, timeout: float | None) -> int:
+        if not children:
+            children.append(child)
+            raise KeyboardInterrupt
+        return real_wait(child, timeout)
+
+    def recording_terminate(self, exit_code: int = 1) -> bool:
+        terminations.append(True)
+        return real_terminate(self, exit_code)
+
+    monkeypatch.setattr(verify_module, "wait_interruptibly", interrupted_once)
+    monkeypatch.setattr(winjob.ProcessBoundary, "terminate", recording_terminate)
+    started = time.monotonic()
+    with pytest.raises(KeyboardInterrupt):
+        CommandCheckRunner().run(
+            _check([sys.executable, "-c", "import time; time.sleep(60)"], timeout=60),
+            tmp_path,
+            60,
+        )
+
+    assert time.monotonic() - started < 20.0
+    assert terminations, "the check's boundary was terminated before the interrupt left"
+    (child,) = children
+    assert child.poll() is not None, "the check process is gone, not left to its deadline"
+
+
+_CTRL_C_INNER = """
+import ctypes, os, sys, threading, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[2])
+from hflow.contracts import CheckDef
+from hflow.drivers.winjob import process_gone
+from hflow.verify import CommandCheckRunner
+
+result, pidfile, workdir = sys.argv[1], sys.argv[3], Path(sys.argv[4])
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+kernel32.SetConsoleCtrlHandler(None, False)  # this console may start with Ctrl+C ignored
+body = f"import os, time; open({pidfile!r}, 'w').write(str(os.getpid())); time.sleep(60)"
+check = CheckDef(id="slow", kind="command", argv=[sys.executable, "-c", body], timeout_seconds=30)
+
+
+def fire():
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline and not os.path.exists(pidfile):
+        time.sleep(0.05)
+    time.sleep(0.5)
+    kernel32.GenerateConsoleCtrlEvent(0, 0)  # CTRL_C_EVENT to this console
+
+
+threading.Thread(target=fire, daemon=True).start()
+with open(result, "w", encoding="utf-8") as out:
+    try:
+        outcome = CommandCheckRunner().run(check, workdir, 30)
+        out.write("returned " + outcome.exit_reason)
+    except KeyboardInterrupt:
+        pid = int(Path(pidfile).read_text(encoding="utf-8"))
+        out.write(f"interrupted {process_gone(pid, 5.0)}")
+"""
+
+
+@requires_job_object
+def test_a_console_ctrl_c_during_a_check_stops_it_promptly(tmp_path: Path) -> None:
+    """A real console Ctrl+C: the check (in its own process group) is stopped, not left running.
+
+    ``Popen.wait`` blocks a console Ctrl+C on Windows until it returns, so the operator's Ctrl+C
+    used to wait for the check's deadline; and the check, in its own process group, never sees the
+    Ctrl+C itself. The interrupt must reach the controller and the check must be gone.
+    """
+    inner = tmp_path / "inner.py"
+    inner.write_text(_CTRL_C_INNER, encoding="utf-8")
+    result = tmp_path / "result.txt"
+    pidfile = tmp_path / "check.pid"
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    src = Path(__file__).resolve().parents[1] / "src"
+    started = time.monotonic()
+    # CREATE_NO_WINDOW: the inner process gets a hidden console of its own, so the Ctrl+C it
+    # sends never reaches this test runner's console.
+    outer = subprocess.run(
+        [sys.executable, "-I", str(inner), str(result), str(src), str(pidfile), str(workdir)],
+        creationflags=0x08000000,
+        timeout=90,
+        check=False,
+    )
+    elapsed = time.monotonic() - started
+    text = result.read_text(encoding="utf-8") if result.exists() else f"no result ({outer.returncode})"
+    try:
+        assert text == "interrupted True", text
+        assert elapsed < 25.0, elapsed  # the check's own deadline is 30 s
+    finally:
+        if pidfile.exists() and pidfile.read_text(encoding="utf-8").strip():
+            pid = int(pidfile.read_text(encoding="utf-8"))
+            if not _gone(pid, 0.5):
+                _force_kill(pid)
 
 
 def _blind_boundary(boundary):

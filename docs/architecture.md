@@ -213,8 +213,8 @@ usable finding. The rules, the triggers and everything that stops a repair are i
   shown the same cumulative diff plus a labelled "this round's change";
 - every decision, refusals included, is one `RepairRecord` row in `run_repair_records`
   (`allowed`, `not_enabled`, `not_a_business_failure`, `no_findings`, `already_repaired`,
-  `budget_exhausted`, `deadline_reached`, `stop_requested`, `no_content_change`,
-  `workspace_drift`);
+  `budget_exhausted`, `deadline_reached`, `stop_requested`, `reopen_refused`,
+  `no_content_change`, `workspace_drift`);
 - the repair round reuses the first round's worktree only while it is exactly the previous
   candidate (HEAD, tree, a clean status and no index entry flagged assume-unchanged or
   skip-worktree), and only while the shared Git metadata still matches the pre-dispatch
@@ -292,12 +292,14 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
   that goes through `GitRepo` runs with forced configuration (`_base_env`: `GIT_CONFIG_COUNT`,
   applied after the global, repository and worktree files, and appended to an inherited
   `GIT_CONFIG_PARAMETERS`, which git reads after that list, so a caller's `git -c` cannot override
-  it): `core.hooksPath` set to an empty, HFlow-owned temporary directory, `core.fsmonitor=false`,
+  it): `core.hooksPath` set to a path below an existing system file (no worker can create a hook
+  there), `maintenance.auto=false`, `gc.auto=0`, `core.fsmonitor=false`,
   `commit.gpgsign=false`, `core.ignoreStat=false` and `core.sparseCheckout=false` (so HFlow's own
   `worktree add` never checks an entry out flagged assume-unchanged or skip-worktree) and
   `safe.bareRepository=explicit` (a directory git would only implicitly take for a bare
   repository, such as a worktree root a worker turned into one, is refused rather than read),
-  plus `GIT_CONFIG_NOSYSTEM=1`, `GIT_NO_REPLACE_OBJECTS=1`, a `GIT_GRAFT_FILE` that never exists
+  plus `GIT_CONFIG_NOSYSTEM=1`, `GIT_NO_REPLACE_OBJECTS=1`, `GIT_NO_LAZY_FETCH=1`, a
+  `GIT_GRAFT_FILE` below the same system file, which can never exist
   (no grafts, inherited or written into `.git/info/grafts`) and a fixed identity. Inherited
   repository-locating variables (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_IMPLICIT_WORK_TREE`,
   `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_COMMON_DIR`,

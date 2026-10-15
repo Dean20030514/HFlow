@@ -64,6 +64,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from .contracts import RecordedUntypedReview, ReviewOutput
+from .profiles import summarize_validation_error
 
 #: Bound on retained assistant text for one invocation. A looping agent must not be able
 #: to grow driver memory without limit, and a verdict read from a truncated answer is not
@@ -596,10 +597,17 @@ def _fenced_spans(text: str) -> list[_FenceSpan]:
         if open_fence is None:
             if marker is not None:
                 info = stripped[len(marker) :].strip()
-                open_fence = (marker[0], info, offset + len(line), offset)
+                open_fence = (marker, info, offset + len(line), offset)
         else:
-            closing, info, body_start, opened_at = open_fence
-            if marker is not None and marker[0] == closing and stripped.strip() == marker:
+            opening, info, body_start, opened_at = open_fence
+            # A closing fence is the opening's character, at least as many of them, and nothing
+            # else on the line: a ``` line inside a ```` block is body text (CommonMark).
+            if (
+                marker is not None
+                and marker[0] == opening[0]
+                and len(marker) >= len(opening)
+                and stripped.strip() == marker
+            ):
                 spans.append(
                     _FenceSpan(
                         info=info.strip(),
@@ -756,9 +764,8 @@ def _loads_object(text: str, *, where: str) -> Any:
 
 
 def _describe(payload: dict[str, Any], exc: ValidationError) -> str:
-    problems = []
-    for error in exc.errors()[:4]:
-        location = ".".join(str(part) for part in error.get("loc", ())) or "<root>"
-        problems.append(f"{location}: {error.get('msg')}")
     keys = ", ".join(sorted(str(key) for key in payload)) or "<none>"
-    return "the review object does not satisfy the contract (" + "; ".join(problems) + f"); keys: {keys}"
+    return (
+        f"the review object does not satisfy the contract ({summarize_validation_error(exc)}); "
+        f"keys: {keys}"
+    )

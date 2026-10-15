@@ -24,6 +24,10 @@ operator-approved delivery: ``prepare`` builds and checks one commit without mov
 ``apply`` moves the branch by compare-and-set only (never a branch some worktree has checked out),
 ``reconcile`` settles an interrupted record from what Git shows. It never calls a model.
 
+``status``, ``report`` and ``diff`` read one run: its id, or ``--last`` for the most recently
+created one (named first as ``run: <id>``); a command that acts on a run always takes its id. A
+command that looks a run, integration or invocation up never creates a ledger to look in.
+
 ``doctor``, ``prepare``, ``approve``, ``status``, ``report``, ``schema``, ``clean``, ``init``,
 ``runs`` and ``diff`` never call a model; ``doctor`` never boots a DSH profile or runs ``dsh``: it
 reports what is *known* locally, marks the rest ``unknown``. ``resume`` reconciles and never
@@ -43,9 +47,11 @@ Exit codes: 0 accepted (or the command succeeded), 2 refused at admission (no ru
 own state, a ``resume`` that refused on the owner rule and wrote nothing (an ``outcome_unknown``
 run whose owner may still be alive, or an ended run whose open ledger entries it may not close
 yet: an owner that may be alive, or a pre-v6 owner nobody attested gone) or whose store write
-failed, never the 3 or 0 that would read as done - 6 status/report found the run but a stored
-record of it no longer validates, 130 interrupted (Ctrl+C): what was recorded before the
-interrupt is authoritative - read it with ``hflow status``.
+failed, never the 3 or 0 that would read as done - and any command whose ledger is locked by
+another process, 6 status/report found the run but a stored record of it no longer validates, or
+any command hit a ledger error it does not map itself (a storage version newer than this build, a
+file that is not a ledger, a write the ledger refused), 130 interrupted (Ctrl+C): what was
+recorded before the interrupt is authoritative - read it with ``hflow status``.
 """
 
 from __future__ import annotations
@@ -53,11 +59,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NoReturn
+from typing import TYPE_CHECKING, Any, Literal, NoReturn
 
 from pydantic import ValidationError
 
@@ -80,10 +88,17 @@ from .contracts import (
 )
 
 from .contracts import PlanArguments
+from .plan import DEFAULT_AUTHORIZATION_MODE, DEFAULT_PROJECT_ROOT, RESOLUTION_FLAGS
 
-if TYPE_CHECKING:  # imported for annotations only: authorization.py is not a CLI dependency
+if TYPE_CHECKING:  # imported for annotations only
     from .authorization import AuthorizationBinding, AuthorizationRecord
-    from .contracts import PrepareReport, RootBudgetLimits, RootBudgetPlan, RunPlan
+    from .contracts import (
+        PrepareReport,
+        RootBudgetBinding,
+        RootBudgetLimits,
+        RootBudgetPlan,
+        RunPlan,
+    )
     from .prepare import Resolution, ResolvedRun
 
 from .controller import Controller, RunOutcome, inspect_run
@@ -102,7 +117,7 @@ from . import profiles
 from .profiles import ENV_PROFILE
 from .report import report_json, report_text
 from .runtime import controller_build
-from .store import RunNotFound, Store, StoredRecordUnreadable
+from .store import RunNotFound, Store, StoredRecordUnreadable, StoreError
 from .verify import CheckRunners
 
 EXIT_OK = 0
@@ -115,12 +130,13 @@ EXIT_USAGE = 4
 #: on an ended run because its owner is not proven gone (``RunOutcome.waiting_on_owner``: the
 #: reconcile of an ``outcome_unknown`` run, the closure of an ended run's open ledger entries) -
 #: that owner and its agent may still be working on it - and a ``resume`` whose store write failed
-#: (rolled back; run it again). Never ``EXIT_REFUSED``, which promises that no run state was
-#: created.
+#: (rolled back; run it again), and any command whose ledger another process holds locked
+#: (:func:`_ledger_failure`). Never ``EXIT_REFUSED``, which promises that no run state was created.
 EXIT_IN_PROGRESS = 5
 #: ``status`` / ``report`` found the run but one of its stored records no longer validates (it was
-#: written under another build's contracts, or edited). The run exists, so this is never
-#: ``EXIT_REFUSED``; nothing is repaired or rewritten.
+#: written under another build's contracts, or edited); or any command hit a ledger error it does
+#: not map itself - the ledger cannot be used as this build reads it (:func:`_ledger_failure`).
+#: Never ``EXIT_REFUSED``; nothing is repaired or rewritten.
 EXIT_RECORD_UNREADABLE = 6
 #: Ctrl+C reached the command (a ``KeyboardInterrupt`` at the top level): 128 + SIGINT, the shell
 #: convention. Not ``EXIT_USAGE`` - the arguments were fine - and not a run outcome: whatever the
@@ -162,13 +178,60 @@ def _write_out(payload: object, as_json: bool, path: Path | None = None) -> None
         print(str(path))
 
 
+def _given_data_dir(args: argparse.Namespace) -> Path | None:
+    """``--data-dir`` when it was given (before or after the verb), else ``None``."""
+    return Path(args.data_dir) if getattr(args, "data_dir", None) else None
+
+
 def _data_dir(args: argparse.Namespace) -> Path:
     """``--data-dir`` when it was given, else the default data directory."""
-    return Path(args.data_dir) if getattr(args, "data_dir", None) else default_data_dir()
+    return _given_data_dir(args) or default_data_dir()
 
 
 def _open_store(args: argparse.Namespace) -> Store:
+    """The ledger, created (or migrated) when needed: for ``run``, which records a new run."""
     return Store(database_path(_data_dir(args)))
+
+
+def _existing_store(args: argparse.Namespace) -> Store | None:
+    """The ledger, or ``None`` when there is none yet: a read-only view never creates one."""
+    path = database_path(_data_dir(args))
+    return Store(path) if path.is_file() else None
+
+
+class UnknownTarget(Exception):
+    """A command named a run, integration or invocation the ledger it looked in does not hold.
+
+    Exit :data:`EXIT_USAGE`. The message names the ledger file that was looked in - and whether it
+    exists at all - because the usual cause is a ``--data-dir`` that was mistyped or left out, and
+    a lookup never creates a ledger to look in.
+    """
+
+
+def unknown_target_message(kind: str, ident: str, ledger: Path) -> str:
+    """``unknown <kind> <id>``, the ledger it was looked for in, and the ``--data-dir`` hint."""
+    where = (
+        f"in the ledger {ledger}"
+        if ledger.is_file()
+        else f"- there is no ledger at {ledger} (nothing was created)"
+    )
+    return (
+        f"unknown {kind} {ident} {where}. If it was recorded under another data directory, pass "
+        "--data-dir <that directory>"
+    )
+
+
+def _lookup_store(args: argparse.Namespace, kind: str, ident: str) -> Store:
+    """The existing ledger a lookup command reads, or :class:`UnknownTarget`; never creates one.
+
+    ``status``, ``report``, ``cancel``, ``resume``, ``clean``, ``integrate`` and ``ledger settle``
+    act on something a ledger already records, so a mistyped ``--data-dir`` must not leave an
+    empty ledger (and its directory) behind and then report the id as unknown in it.
+    """
+    store = _existing_store(args)
+    if store is None:
+        raise UnknownTarget(unknown_target_message(kind, ident, database_path(_data_dir(args))))
+    return store
 
 
 def _os_user() -> str:
@@ -390,8 +453,6 @@ def _doctor_ledger_settlements(data_dir: Path) -> dict[str, object]:
     Opened with SQLite's read-only URI mode so doctor neither creates nor migrates a ledger; a
     file it cannot read that way is reported as such rather than opened read-write.
     """
-    import sqlite3
-
     path = database_path(data_dir)
     result: dict[str, object] = {"consumed": None, "void": None}
     if not path.exists():
@@ -427,6 +488,97 @@ def _doctor_ledger_settlements(data_dir: Path) -> dict[str, object]:
         "(not observed); billed usage for those entries stays unknown"
     )
     return result
+
+
+#: How long doctor's ledger integrity check may run before it stops and reports "incomplete",
+#: and every how many SQLite steps the clock is read.
+DOCTOR_LEDGER_CHECK_SECONDS = 10.0
+DOCTOR_LEDGER_CHECK_STEPS = 1000
+
+
+def _doctor_ledger_health(data_dir: Path) -> dict[str, object]:
+    """The ledger's storage version and a bounded integrity check, read-only. Never repairs.
+
+    Opened with SQLite's read-only URI mode, so doctor never creates, migrates or rebuilds a
+    ledger. ``PRAGMA quick_check(1)`` stops at its first finding, and a progress handler stops it
+    after :data:`DOCTOR_LEDGER_CHECK_SECONDS`; a check a lock or that bound cut short is
+    ``incomplete`` - never read as corruption. ``status`` is ``none`` (no ledger), ``ok``,
+    ``problem`` (the first finding is shown), ``incomplete`` or ``unreadable`` (not opened
+    read-only, or not a SQLite database). A fact line: it never changes doctor's exit code.
+    """
+    import time
+
+    from .migrate import SUPPORTED_STORAGE_VERSION
+
+    path = database_path(data_dir)
+    section: dict[str, object] = {
+        "path": str(path),
+        "status": "none",
+        "storage_version": None,
+        "build_storage_version": SUPPORTED_STORAGE_VERSION,
+        "quick_check": None,
+    }
+    if not path.exists():
+        section["detail"] = "no ledger file in this data dir"
+        return section
+    deadline = time.monotonic() + DOCTOR_LEDGER_CHECK_SECONDS
+    stopped = False
+
+    def past_deadline() -> int:
+        nonlocal stopped
+        stopped = stopped or time.monotonic() > deadline
+        return 1 if stopped else 0
+
+    try:
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0)
+    except sqlite3.Error as exc:
+        section.update(status="unreadable", detail=f"not opened read-only ({exc})")
+        return section
+    try:
+        conn.set_progress_handler(past_deadline, DOCTOR_LEDGER_CHECK_STEPS)
+        try:
+            row = conn.execute(
+                "SELECT value FROM schema_meta WHERE key = 'storage_version'"
+            ).fetchone()
+            section["storage_version"] = int(row[0]) if row is not None else None
+        except (sqlite3.Error, ValueError):
+            section["storage_version"] = None
+        findings = [str(item[0]) for item in conn.execute("PRAGMA quick_check(1)").fetchall()]
+    except sqlite3.Error as exc:
+        if stopped or _is_locked(exc) or "interrupt" in str(exc).lower():
+            why = "locked by another process" if _is_locked(exc) else (
+                f"stopped after {DOCTOR_LEDGER_CHECK_SECONDS:g}s"
+            )
+            section.update(
+                status="incomplete",
+                detail=f"{path}: integrity check incomplete ({why}); not a finding - run doctor "
+                "again later",
+            )
+        else:
+            section.update(status="unreadable", detail=f"{path}: unreadable read-only ({exc})")
+        return section
+    finally:
+        conn.close()
+    version = section["storage_version"]
+    version_text = (
+        f"storage version {version}" if version is not None else "storage version not recorded"
+    )
+    if isinstance(version, int) and version > SUPPORTED_STORAGE_VERSION:
+        version_text += (
+            f", newer than this build's {SUPPORTED_STORAGE_VERSION}: this build refuses to open it"
+        )
+    section["quick_check"] = findings[0] if findings else ""
+    if findings == ["ok"]:
+        section.update(status="ok", detail=f"{path}: quick_check ok, {version_text}")
+    else:
+        section.update(
+            status="problem",
+            detail=(
+                f"{path}: quick_check found a problem ({section['quick_check'] or 'no answer'}), "
+                f"{version_text}. Nothing was repaired; keep a copy before anything touches it"
+            ),
+        )
+    return section
 
 
 #: Executables doctor runs, with ``--version`` only and always from the absolute path PATH lookup
@@ -574,18 +726,52 @@ def _doctor_acpx_readiness(
     return section
 
 
-def _doctor_dsh_readiness(on_path: dict[str, object]) -> dict[str, object]:
-    """The ``dsh`` PATH lookup found, or where the Desktop shim is when it found none."""
-    section: dict[str, object] = {"on_path": on_path.get("path"), "desktop_shim": None}
+def _doctor_dsh_readiness(on_path: dict[str, object], data_dir: Path) -> dict[str, object]:
+    """Where a launch finds ``dsh``: PATH first, then the npm CLI under the data directory.
+
+    The same lookup a launch makes (``acpx_dsh.resolve_dsh``). With neither, the detail names both
+    places and prints the npm install (user ruling 2026-10-14). A DSH Desktop shim is reported
+    with DSH #9626 and never recommended. Path and stat only: doctor never runs dsh.
+    """
+    from .drivers.acpx_dsh import DSH_SOURCE_DATA_DIR, DSH_SOURCE_PATH, find_in_directory
+    from .drivers.dsh_surfaces import (
+        DSH_NPM_PACKAGE,
+        RECORDED_DSH_NPM_VERSION,
+        dsh_npm_bin_dir,
+        dsh_npm_install_command,
+    )
+
+    bin_dir = dsh_npm_bin_dir(data_dir)
+    installed = find_in_directory("dsh", bin_dir, os.environ)
+    section: dict[str, object] = {
+        "on_path": on_path.get("path"),
+        "data_dir_install": installed or None,
+        "source": None,
+        "desktop_shim": None,
+    }
+    never_run = "path only: doctor never runs dsh, which may start the DSH Desktop app"
     if on_path.get("path"):
-        section["detail"] = (
-            f"{on_path['path']} (path only: doctor never runs dsh, which may start the DSH "
-            "Desktop app)"
+        section["source"] = DSH_SOURCE_PATH
+        section["detail"] = f"{on_path['path']} (dsh={DSH_SOURCE_PATH}; {never_run})" + (
+            f"; the npm CLI under the data dir ({installed}) is not used while PATH has a dsh"
+            if installed
+            else ""
         )
         return section
+    if installed:
+        section["source"] = DSH_SOURCE_DATA_DIR
+        section["detail"] = (
+            f"{installed} (dsh={DSH_SOURCE_DATA_DIR}: PATH has no dsh, so a launch uses the "
+            f"{DSH_NPM_PACKAGE}@{RECORDED_DSH_NPM_VERSION} install under the data directory; "
+            f"{never_run})"
+        )
+        return section
+    install = dsh_npm_install_command(data_dir)
+    section["install_command"] = install
     detail = (
         "NOT FOUND on PATH (only absolute PATH entries are searched, never the current "
-        "directory): a real launch is not resolvable without it"
+        f"directory) or in {bin_dir}: a real launch is not resolvable without one. Install the "
+        f"npm CLI where HFlow looks: `{install}`"
     )
     local = os.environ.get("LOCALAPPDATA") if os.name == "nt" else None
     if local:
@@ -593,8 +779,9 @@ def _doctor_dsh_readiness(on_path: dict[str, object]) -> dict[str, object]:
         if shim.is_file():  # stat only: the shim is never read or run here
             section["desktop_shim"] = str(shim)
             detail += (
-                f". The DSH Desktop shim exists at {shim}: prepend {shim.parent} to PATH in the "
-                "shell that runs hflow. A machine profile cannot name the dsh path in this build"
+                f". The DSH Desktop shim at {shim} is not that route: DSH #9626 (community "
+                "reports, unconfirmed) makes its workspace-write sandbox - DSH's default - fail "
+                "every shell tool call, while the npm CLI's sandbox runner is node.exe"
             )
     section["detail"] = detail
     return section
@@ -703,6 +890,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             entry["version"] = _doctor_version(found)
         elif found and name == "dsh":
             entry["note"] = "not run: doctor never starts dsh (it may be the DSH Desktop app)"
+        elif name == "dsh":
+            # A launch also looks in the data directory's npm install: see the launcher line.
+            entry["note"] = "not on PATH; the dsh launcher line says what a launch uses"
         executables[name] = entry
 
     dsh_home = Path(os.environ.get("DSH_HOME") or Path.home() / ".dsh")
@@ -737,13 +927,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         ),
     }
 
+    report["ledger_health"] = _doctor_ledger_health(data_dir)
     report["ledger_settlements"] = _doctor_ledger_settlements(data_dir)
     # Facts an operator needs before a first real run or an integration. None of them changes
     # the exit code: they are reported, and `prepare` / the run gates still decide.
     report["readiness"] = {
         "integrate": _doctor_integrate_readiness(executables["git"]),
         "acpx": _doctor_acpx_readiness(ambient_launch, executables["acpx"], data_dir),
-        "dsh": _doctor_dsh_readiness(executables["dsh"]),
+        "dsh": _doctor_dsh_readiness(executables["dsh"], data_dir),
         "credentials": _doctor_credentials(child_kind, child_home),
     }
 
@@ -790,74 +981,62 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if args.json:
         print(canonical_json(report))
     else:
-        print(f"python        {report['python']}")
-        for name, entry in executables.items():  # type: ignore[union-attr]
-            version = entry.get("version", "")
-            note = entry.get("note", "")
-            suffix = f"  {version}" if version else (f"  ({note})" if note else "")
-            print(f"{name:<13} {entry['path'] or 'NOT FOUND'}{suffix}")
-        print(f"your dsh home {report.get('dsh_home', 'not found')}")
-        child = report["child_dsh_home"]
-        print(f"child dsh home {child['kind']} {child['path']}")  # type: ignore[index]
-        print(f"dsh profiles  {', '.join(report['dsh_profiles']) or 'none'}")  # type: ignore[arg-type]
-        print(f"data dir      {report['data_dir']} (writable={report['data_dir_writable']})")
-        print(f"ledger settle {report['ledger_settlements']['detail']}")  # type: ignore[index]
-        readiness = report["readiness"]
-        print(f"integrate     {readiness['integrate']['detail']}")  # type: ignore[index]
-        print(f"acpx client   {readiness['acpx']['detail']}")  # type: ignore[index]
-        print(f"dsh launcher  {readiness['dsh']['detail']}")  # type: ignore[index]
-        print(f"credentials   {readiness['credentials']['detail']}")  # type: ignore[index]
-        print(
-            f"profile       {profile_section['requested'] or '(none selected)'} "
-            f"[via {profile_section['requested_via']}] "
-            f"{'usable' if profile_section['usable'] else 'NOT USABLE'}"
-        )
-        if not profile_section["usable"]:
-            print(f"  detail      {profile_section['detail']}")
-        for role, entry in (profile_section.get("roles") or {}).items():  # type: ignore[union-attr]
-            state = "usable" if entry.get("usable") else "NOT USABLE"
-            print(
-                f"  {role:<11} agent={entry.get('agent')} driver={entry.get('driver')} "
-                f"-> {entry.get('driver_id') or 'unresolved'} [{state}]"
-            )
-            if entry.get("detail"):
-                print(f"               {entry['detail']}")
-            launch = entry.get("launch")
-            if launch:
-                print(
-                    f"               launch acpx={launch['client_entry'] or 'NOT FOUND'} "
-                    f"(acpx {launch['acpx_version'] or 'version unknown'}) "
-                    f"dsh={launch['dsh_executable'] or 'NOT FOUND'}"
-                )
-            for dependency in entry.get("dependencies") or []:
-                print(f"               dep  {dependency}")
-        print(f"driver        {report['selected_driver']} [{report['driver_status']}]")
-        capability_states = report["capabilities"]["states"]  # type: ignore[index]
-        for state in ("probed", "enforced", "documented", "unsupported", "unknown"):
-            names = ", ".join(capability_states[state]) or "-"
-            print(f"cap {state:<11} {names}")
-        for note in report["notes"]:  # type: ignore[union-attr]
-            print(f"note          {note}")
+        print("\n".join(_doctor_text_lines(report)))
     return profile_exit
 
 
-#: ``(dest, flag)`` of every input `prepare` and `run` resolve a task from
-#: (:func:`_add_resolution_args`). With ``run --plan`` they come from the plan, never the command
-#: line.
-_RESOLUTION_FLAGS = (
-    ("task", "--task"),
-    ("project", "--project"),
-    ("project_root", "--project-root"),
-    ("profile", "--profile"),
-    ("driver", "--driver"),
-    ("base_commit", "--base-commit"),
-    ("workspace", "--workspace"),
-    ("authorization_mode", "--authorization-mode"),
-    ("root_budget_file", "--root-budget-file"),
-    ("repair_policy_file", "--repair-policy-file"),
-)
-_DEFAULT_PROJECT_ROOT = "."
-_DEFAULT_AUTHORIZATION_MODE = "m2-live-change"
+def _doctor_text_lines(report: dict[str, Any]) -> list[str]:
+    """``doctor``'s text form: the facts ``--json`` prints, one labelled line each."""
+    lines = [f"python        {report['python']}"]
+    for name, entry in report["executables"].items():
+        version = entry.get("version", "")
+        note = entry.get("note", "")
+        suffix = f"  {version}" if version else (f"  ({note})" if note else "")
+        lines.append(f"{name:<13} {entry['path'] or 'NOT FOUND'}{suffix}")
+    child = report["child_dsh_home"]
+    readiness = report["readiness"]
+    lines += [
+        f"your dsh home {report.get('dsh_home', 'not found')}",
+        f"child dsh home {child['kind']} {child['path']}",
+        f"dsh profiles  {', '.join(report['dsh_profiles']) or 'none'}",
+        f"data dir      {report['data_dir']} (writable={report['data_dir_writable']})",
+        f"ledger health {report['ledger_health']['detail']}",
+        f"ledger settle {report['ledger_settlements']['detail']}",
+        f"integrate     {readiness['integrate']['detail']}",
+        f"acpx client   {readiness['acpx']['detail']}",
+        f"dsh launcher  {readiness['dsh']['detail']}",
+        f"credentials   {readiness['credentials']['detail']}",
+    ]
+    profile = report["profile"]
+    lines.append(
+        f"profile       {profile['requested'] or '(none selected)'} "
+        f"[via {profile['requested_via']}] "
+        f"{'usable' if profile['usable'] else 'NOT USABLE'}"
+    )
+    if not profile["usable"]:
+        lines.append(f"  detail      {profile['detail']}")
+    for role, entry in (profile.get("roles") or {}).items():
+        state = "usable" if entry.get("usable") else "NOT USABLE"
+        lines.append(
+            f"  {role:<11} agent={entry.get('agent')} driver={entry.get('driver')} "
+            f"-> {entry.get('driver_id') or 'unresolved'} [{state}]"
+        )
+        if entry.get("detail"):
+            lines.append(f"               {entry['detail']}")
+        launch = entry.get("launch")
+        if launch:
+            lines.append(
+                f"               launch acpx={launch['client_entry'] or 'NOT FOUND'} "
+                f"(acpx {launch['acpx_version'] or 'version unknown'}) "
+                f"dsh={launch['dsh_executable'] or 'NOT FOUND'}"
+            )
+        lines += [f"               dep  {item}" for item in entry.get("dependencies") or []]
+    lines.append(f"driver        {report['selected_driver']} [{report['driver_status']}]")
+    capability_states = report["capabilities"]["states"]
+    for state in ("probed", "enforced", "documented", "unsupported", "unknown"):
+        lines.append(f"cap {state:<11} {', '.join(capability_states[state]) or '-'}")
+    lines += [f"note          {note}" for note in report["notes"]]
+    return lines
 
 
 def _resolution_arguments(args: argparse.Namespace) -> PlanArguments:
@@ -865,14 +1044,13 @@ def _resolution_arguments(args: argparse.Namespace) -> PlanArguments:
 
     The parser leaves every resolution flag ``None`` when it is absent (so ``run --plan`` can tell
     a flag that was given from a default); the defaults are applied here, once, for both commands.
-    The fields are :data:`_RESOLUTION_FLAGS`' dests plus the data directory - one list, so a flag
+    The fields are :data:`RESOLUTION_FLAGS`' dests plus the data directory - one list, so a flag
     cannot be added to one and forgotten in the other.
     """
-    values = {dest: getattr(args, dest, None) for dest, _flag in _RESOLUTION_FLAGS}
-    values["project_root"] = values["project_root"] or _DEFAULT_PROJECT_ROOT
-    values["authorization_mode"] = values["authorization_mode"] or _DEFAULT_AUTHORIZATION_MODE
-    data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
-    return PlanArguments.model_validate({**values, "data_dir": str(data_dir)})
+    values = {dest: getattr(args, dest, None) for dest, _flag in RESOLUTION_FLAGS}
+    values["project_root"] = values["project_root"] or DEFAULT_PROJECT_ROOT
+    values["authorization_mode"] = values["authorization_mode"] or DEFAULT_AUTHORIZATION_MODE
+    return PlanArguments.model_validate({**values, "data_dir": str(_data_dir(args))})
 
 
 def _usage_error(command: str, message: str) -> int:
@@ -971,7 +1149,22 @@ def _write_prepared_plan(
     )
     path = write_plan(Path(args.plan_out), plan)
     print(f"plan          {path}", file=stream)
-    if plan.prepare_report.authorization.required:
+    if plan.prepare_report.authorization.required and not resolution.resolved.is_real_driver:
+        # An offline plan with a root budget: `run --plan` needs no approval file - it charges
+        # the root to a CLI-minted record that says it is not a user approval
+        # (offline_root_authorization). `approve` would record the user's own instead.
+        print(
+            "plan          offline root run: it reaches no model, so `run --plan` can run it "
+            "directly, charging the root to a CLI-minted record labelled as not a user approval",
+            file=stream,
+        )
+        print(f"next: hflow run --plan {_shell_word(str(path))}", file=stream)
+        print(
+            f"next: hflow approve --plan {_shell_word(str(path))}  # optional, instead: charge "
+            "the root to your own approval, then run --plan",
+            file=stream,
+        )
+    elif plan.prepare_report.authorization.required:
         print(f"next: hflow approve --plan {_shell_word(str(path))}", file=stream)
     else:
         print(
@@ -1052,22 +1245,34 @@ def cmd_approve(args: argparse.Namespace) -> int:
     if not resolution.resolved.ready_to_dispatch:
         # An approval nobody can spend is not worth asking for. The issues are the run's own
         # gates, printed the way `prepare` prints them.
+        from .plan import prepare_command
+
         print(render_prepare_text(report), file=summary_stream)
         raise RefusedError(
             RefusalCode.INVALID_SPEC,
             "`hflow run` would refuse this plan's task (admission or dispatch gate, listed "
-            "above). Nothing was written; fix it and re-run `hflow prepare ... --plan-out`",
+            "above). Nothing was written; fix it and prepare the plan again: "
+            + prepare_command(arguments, plan_path),
         )
     default_target = default_authorization_path(plan_path, plan.binding_digest)
     target = Path(os.path.abspath(args.out)) if args.out else default_target
     if target.exists():
         # Checked before asking, so nobody types an approval that cannot be stored; the write
-        # itself is still an exclusive create.
-        raise RefusedError(
-            RefusalCode.INVALID_SPEC,
-            f"{target} already exists and an authorization file is never overwritten. Nothing "
-            "was written; pass --out with a new path, or run with the existing approval",
+        # itself is still an exclusive create. The existing file may be this plan's approval
+        # already (the default name carries the binding digest), so the run that would use it
+        # is printed; `run` verifies it like any other and refuses one that does not fit.
+        existing = run_command
+        if not same_directory(target, default_target):
+            existing += f" --authorization-file {_shell_word(str(target))}"
+        # Both lines on stderr: a refusal puts nothing on stdout (`approve --run` least of all).
+        print(
+            f"refused: {target} already exists and an authorization file is never overwritten. "
+            "Nothing was written; pass --out with a new path, or run with the existing approval\n"
+            f"next: {existing}  # with the existing approval; the run verifies it and refuses "
+            "one that does not fit this plan",
+            file=sys.stderr,
         )
+        return EXIT_REFUSED
     # A person at a terminal, or nothing: piped input is refused before it is read and before the
     # summary or the code is shown.
     require_terminal(sys.stdin)
@@ -1105,16 +1310,21 @@ def cmd_approve(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _approve_result_lines(payload: dict[str, object]) -> list[str]:
+    """What ``approve`` wrote (or that it needed nothing), as text lines."""
+    if payload["written"]:
+        return [
+            f"authorization {payload['authorization_file']}",
+            f"id            {payload['authorization_id']}",
+        ]
+    return [f"authorization not needed: {payload['detail']}"]
+
+
 def _print_approve_result(payload: dict[str, object], as_json: bool) -> None:
     if as_json:
         print(canonical_json(payload))
         return
-    if payload["written"]:
-        print(f"authorization {payload['authorization_file']}")
-        print(f"id            {payload['authorization_id']}")
-    else:
-        print(f"authorization not needed: {payload['detail']}")
-    print(f"next: {payload['next']}")
+    print("\n".join([*_approve_result_lines(payload), f"next: {payload['next']}"]))
 
 
 #: Recorded on the in-memory artifact an offline root run charges its dispatches to. It is
@@ -1316,14 +1526,26 @@ def _run_plan_inputs(
     """
     if not args.plan:  # the parser requires exactly one of --task and --plan
         return _resolution_arguments(args), None, None, args.authorization_file
-    from .plan import default_authorization_path
+    from .plan import default_authorization_path, prepare_command
 
-    given = [flag for dest, flag in _RESOLUTION_FLAGS if getattr(args, dest, None) is not None]
+    given = [flag for dest, flag in RESOLUTION_FLAGS if getattr(args, dest, None) is not None]
     if given:
+        # Named before the plan is opened, so even an unreadable plan gets this answer; the
+        # command to change an input is printed when the plan can be read.
+        try:
+            from .plan import load_plan
+
+            plan = load_plan(Path(os.path.abspath(args.plan)))
+            again = (
+                ". To change one, prepare the plan again with it changed: "
+                + prepare_command(plan.arguments, Path(os.path.abspath(args.plan)))
+            )
+        except RefusedError:
+            again = ". Re-run `hflow prepare ... --plan-out` to change one"
         return _usage_error(
             "run",
             f"{', '.join(given)} cannot be combined with --plan: every resolution input comes "
-            "from the plan. Re-run `hflow prepare ... --plan-out` to change one",
+            f"from the plan{again}",
         )
     opened = _open_plan(args, "run")
     if isinstance(opened, int):
@@ -1387,12 +1609,7 @@ def _approve_then_run(
     if args.json:
         print(canonical_json(result))
     else:
-        if result["written"]:
-            print(f"authorization {result['authorization_file']}")
-            print(f"id            {result['authorization_id']}")
-        else:
-            print(f"authorization not needed: {result['detail']}")
-        print(f"running       {command}")
+        print("\n".join([*_approve_result_lines(result), f"running       {command}"]))
     sys.stdout.flush()
     argv = ["--data-dir", args.data_dir] if args.data_dir else []
     argv += ["run", "--plan", str(plan_path)]
@@ -1404,8 +1621,155 @@ def _approve_then_run(
     return cmd_run(run_args)
 
 
+@dataclass(frozen=True)
+class _RunApproval:
+    """What a run is charged to: the approval, the root it is spent against, and its ceilings.
+
+    All ``None`` (and no note) for a rootless offline run, which needs no authorization.
+    """
+
+    authorization: AuthorizationRecord | None = None
+    root_binding: RootBudgetBinding | None = None
+    root_limits: RootBudgetLimits | None = None
+    #: Said in the run's output when the run charges a root to a CLI-minted offline record.
+    offline_root_note: str = ""
+
+
+def _run_authorization(
+    resolution: Resolution,
+    arguments: PlanArguments,
+    *,
+    authorization_file: str | None,
+    plan_path: Path | None,
+    is_real_driver: bool,
+) -> _RunApproval:
+    """The approval a run is charged to, checked before anything is created; or a refusal.
+
+    A real Harness run needs an explicit, bound, single-use authorization artifact. This is
+    checked before any credential is read, any workspace is created and any budget or submission
+    allowance is consumed, and it refuses rather than falling back to the fake driver. A bare flag
+    is deliberately not accepted: the same process that would run the task must not be able to
+    authorize itself with a word. The binding covers the *effective configuration*, so approving
+    one profile does not approve another. A root budget file extends the same artifact: the
+    binding covers the root too, so the ledger records which approval bought each dispatch. An
+    offline root run with no artifact is charged to a CLI-minted record that says it is not an
+    approval (:func:`offline_root_authorization`).
+    """
+    resolved, root_plan = resolution.resolved, resolution.root_plan
+    if not (is_real_driver or root_plan is not None):
+        return _RunApproval()
+    from .authorization import load_authorization, verify_authorization
+    from .prepare import pending_binding, root_binding_for
+
+    # Derived, not created: the binding names the ledger, and the store creates or migrates it
+    # only when the dispatch transaction actually runs.
+    root_binding = root_binding_for(resolved) if root_plan is not None else None
+    # The same call `prepare` makes for the binding it prints.
+    authorization_binding = pending_binding(
+        resolved, authorization_mode=arguments.authorization_mode, root_binding=root_binding
+    )
+    authorization = None
+    if authorization_file:
+        authorization = load_authorization(Path(authorization_file))
+        # Refuses with a specific mismatch list when the artifact covers a different task,
+        # project, base commit, driver, execution mode, configuration or root.
+        try:
+            verify_authorization(authorization, expected=authorization_binding)
+        except RefusedError as exc:
+            if plan_path is None:
+                raise
+            # The plan itself is current (checked before), so this approval was written for
+            # another plan, or for this one before its inputs changed and it was re-prepared.
+            raise RefusedError(
+                exc.code,
+                f"{exc.message} - this authorization was not issued for plan {plan_path} as "
+                "it resolves now. Nothing was dispatched; approve this plan with `hflow "
+                f"approve --plan {_shell_word(str(plan_path))}`",
+            ) from exc
+    if root_plan is None:
+        return _RunApproval(authorization=authorization)
+    if authorization is None:
+        # Offline only: a real driver without an artifact was refused before this point. The
+        # fake driver reaches no model, so there is no approval to ask for - but the ledger
+        # still refuses to charge a root without naming the artifact that bought it, so the run
+        # mints one that says exactly what it is.
+        minted = offline_root_authorization(binding=authorization_binding, limits=root_plan.limits)
+        return _RunApproval(
+            authorization=minted,
+            root_binding=root_binding,
+            root_limits=root_plan.limits,
+            offline_root_note=(
+                "offline root run: no --authorization-file was given, so this run charged "
+                "its dispatches to a CLI-minted record "
+                f"({minted.authorization_id}) whose text says it is not a user "
+                "approval. It binds the offline fake driver and cannot authorize a real one"
+            ),
+        )
+    root_limits = authorization.root_limits
+    # verify_authorization refused unless the artifact carries this exact root, and the
+    # contract refuses a root artifact without its ceilings, so this is never None here.
+    assert root_limits is not None
+    if root_limits != root_plan.limits:
+        raise RefusedError(
+            RefusalCode.RISK_DOWNGRADE,
+            "the root budget file and the authorization disagree about this root's "
+            f"ceilings: the file says top-level submissions "
+            f"{root_plan.limits.max_top_level_submissions}, repairs "
+            f"{root_plan.limits.max_repairs}, deadline "
+            f"{root_plan.limits.deadline_seconds}s, while the authorization says "
+            f"{root_limits.max_top_level_submissions}, {root_limits.max_repairs}, "
+            f"{root_limits.deadline_seconds}s. One of the two files is wrong; nothing "
+            "was dispatched and no allowance was consumed.",
+        )
+    return _RunApproval(
+        authorization=authorization, root_binding=root_binding, root_limits=root_limits
+    )
+
+
+def _run_drivers(
+    args: argparse.Namespace, resolved: ResolvedRun, *, is_real_driver: bool
+) -> dict[str, object]:
+    """The driver each role is dispatched to: ``{"implementer": ..., "reviewer": ...}``.
+
+    The fake driver is a scripted stand-in for tests and examples. Its change comes from a plan
+    file (``--fake-write-plan``) so an offline run is reproducible from the CLI alone, without a
+    test harness. It is explicitly the test driver: it never pretends to be a real Harness
+    delivery. Both roles share it, because there is nothing per-role to distinguish offline. A
+    real configuration gets each role's own driver, and a launcher that cannot be resolved is a
+    refusal with a reason, not a traceback.
+    """
+    if not is_real_driver:
+        script = FakeScript(outcome=InvocationOutcome.COMPLETED, agent_turns=1)
+        if args.fake_write_plan:
+            writes = profiles.load_json_file(Path(args.fake_write_plan), what="fake write plan")
+            if not isinstance(writes, dict):
+                raise RefusedError(
+                    RefusalCode.INVALID_SPEC,
+                    "--fake-write-plan must be a JSON object of path -> text",
+                )
+            script.write_plan = {str(key): str(value) for key, value in writes.items()}
+            script.limitations = [
+                "fake driver: no model was invoked; change came from a plan file"
+            ]
+        offline = FakeDriver(resolved.project_root, script)
+        return {"implementer": offline, "reviewer": offline}
+    from .prepare import role_drivers
+
+    try:
+        return dict(role_drivers(resolved))
+    except DriverSetupError as exc:
+        # Knowable before anything is claimed, and `prepare` reports the same condition as a
+        # dispatch precondition.
+        raise RefusedError(
+            RefusalCode.NOT_IMPLEMENTED,
+            f"the launch for this configuration could not be resolved: {exc}. Nothing "
+            "was dispatched and no allowance was consumed.",
+        ) from exc
+
+
 def cmd_run(args: argparse.Namespace) -> int:
-    from .prepare import resolve_arguments, resolve_machine_bindings, role_drivers
+    from .plan import require_current
+    from .prepare import resolve_arguments, resolve_machine_bindings
 
     inputs = _run_plan_inputs(args)
     if isinstance(inputs, int):
@@ -1424,6 +1788,17 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
     is_real_driver = machine.is_real_driver
     if is_real_driver and not authorization_file:
+        if plan is not None:
+            # A plan whose inputs moved (an edited task, a profile now set in the environment)
+            # is named stale before anything says "approve it": approving a stale plan would only
+            # be refused again. Resolving writes nothing.
+            assert plan_path is not None
+            require_current(
+                plan,
+                plan_path,
+                resolve_arguments(arguments, machine=machine),
+                approved=plan.prepare_report.authorization.required,
+            )
         message = (
             "this run resolves to a real Harness driver and needs an explicit, bound user "
             "authorization file (--authorization-file). There is no flag that substitutes for "
@@ -1442,12 +1817,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     # unsupported document refuses before a run row, a workspace or an allowance exists.
     resolution = resolve_arguments(arguments, machine=machine)
     resolved = resolution.resolved
-    root_plan = resolution.root_plan
-    spec = resolved.spec
-    project = resolved.project
-    project_root = resolved.project_root
 
-    continuation = _continuation_before_admission(resolved, data_dir=data_dir, root_plan=root_plan)
+    continuation = _continuation_before_admission(
+        resolved, data_dir=data_dir, root_plan=resolution.root_plan
+    )
     if continuation is not None:
         return _write_run_outcome(continuation, args)
 
@@ -1455,8 +1828,6 @@ def cmd_run(args: argparse.Namespace) -> int:
         # A plan runs what it planned, or nothing: inputs that now resolve to another binding (an
         # edited task or contract, a moved branch, another configuration) refuse here. This is
         # in addition to every check below, not instead of one.
-        from .plan import require_current
-
         assert plan_path is not None
         require_current(
             plan, plan_path, resolution, approved=plan.prepare_report.authorization.required
@@ -1475,121 +1846,20 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
         return EXIT_REFUSED
 
-    # A real Harness run needs an explicit, bound, single-use authorization artifact. This is
-    # checked before any credential is read, any workspace is created and any budget or
-    # submission allowance is consumed, and it refuses rather than falling back to the fake
-    # driver. A bare flag is deliberately not accepted: the same process that would run the
-    # task must not be able to authorize itself with a word. The binding now covers the
-    # *effective configuration*, so approving one profile does not approve another. A root
-    # budget file extends the same artifact: the binding covers the root too, so the ledger
-    # records which approval bought each dispatch.
-    authorization = None
-    authorization_binding = None
-    root_binding = None
-    root_limits = None
-    offline_root_note = ""
-    if is_real_driver or root_plan is not None:
-        from .authorization import load_authorization, verify_authorization
-        from .prepare import pending_binding, root_binding_for
-
-        if root_plan is not None:
-            # Derived, not created: the binding names the ledger, and the store creates or
-            # migrates it only when the dispatch transaction actually runs.
-            root_binding = root_binding_for(resolved)
-        # The same call `prepare` makes for the binding it prints.
-        authorization_binding = pending_binding(
-            resolved, authorization_mode=arguments.authorization_mode, root_binding=root_binding
-        )
-        if authorization_file:
-            authorization = load_authorization(Path(authorization_file))
-            # Refuses with a specific mismatch list when the artifact covers a different task,
-            # project, base commit, driver, execution mode, configuration or root.
-            try:
-                verify_authorization(authorization, expected=authorization_binding)
-            except RefusedError as exc:
-                if plan_path is None:
-                    raise
-                # The plan itself is current (checked above), so this approval was written for
-                # another plan, or for this one before its inputs changed and it was re-prepared.
-                raise RefusedError(
-                    exc.code,
-                    f"{exc.message} - this authorization was not issued for plan {plan_path} as "
-                    "it resolves now. Nothing was dispatched; approve this plan with `hflow "
-                    f"approve --plan {_shell_word(str(plan_path))}`",
-                ) from exc
-        if root_plan is not None:
-            if authorization is not None:
-                root_limits = authorization.root_limits
-                # verify_authorization refused unless the artifact carries this exact root, and
-                # the contract refuses a root artifact without its ceilings, so this is never
-                # None here.
-                assert root_limits is not None
-                if root_limits != root_plan.limits:
-                    raise RefusedError(
-                        RefusalCode.RISK_DOWNGRADE,
-                        "the root budget file and the authorization disagree about this root's "
-                        f"ceilings: the file says top-level submissions "
-                        f"{root_plan.limits.max_top_level_submissions}, repairs "
-                        f"{root_plan.limits.max_repairs}, deadline "
-                        f"{root_plan.limits.deadline_seconds}s, while the authorization says "
-                        f"{root_limits.max_top_level_submissions}, {root_limits.max_repairs}, "
-                        f"{root_limits.deadline_seconds}s. One of the two files is wrong; nothing "
-                        "was dispatched and no allowance was consumed.",
-                    )
-            else:
-                # Offline only: a real driver without an artifact was refused before this point.
-                # The fake driver reaches no model, so there is no approval to ask for - but the
-                # ledger still refuses to charge a root without naming the artifact that bought
-                # it, so the run mints one that says exactly what it is.
-                root_limits = root_plan.limits
-                authorization = offline_root_authorization(
-                    binding=authorization_binding, limits=root_limits
-                )
-                offline_root_note = (
-                    "offline root run: no --authorization-file was given, so this run charged "
-                    "its dispatches to a CLI-minted record "
-                    f"({authorization.authorization_id}) whose text says it is not a user "
-                    "approval. It binds the offline fake driver and cannot authorize a real one"
-                )
+    approval = _run_authorization(
+        resolution,
+        arguments,
+        authorization_file=authorization_file,
+        plan_path=plan_path,
+        is_real_driver=is_real_driver,
+    )
 
     store = _open_store(args)
     try:
-        if not is_real_driver:
-            # The fake driver is a scripted stand-in for tests and examples. Its change comes
-            # from a plan file so an offline run is reproducible from the CLI alone, without a
-            # test harness. It is explicitly the test driver: it never pretends to be a real
-            # Harness delivery. Both roles share it when a profile binds them to the same
-            # offline agent, because there is nothing per-role to distinguish offline.
-            script = FakeScript(outcome=InvocationOutcome.COMPLETED, agent_turns=1)
-            if args.fake_write_plan:
-                from .prepare import load_json_file
-
-                writes = load_json_file(Path(args.fake_write_plan), what="fake write plan")
-                if not isinstance(writes, dict):
-                    raise RefusedError(
-                        RefusalCode.INVALID_SPEC, "--fake-write-plan must be a JSON object of path -> text"
-                    )
-                script.write_plan = {str(key): str(value) for key, value in writes.items()}
-                script.limitations = ["fake driver: no model was invoked; change came from a plan file"]
-            implementer_driver: object = FakeDriver(project_root, script)
-            drivers = {"implementer": implementer_driver, "reviewer": implementer_driver}
-        else:
-            try:
-                drivers = role_drivers(resolved)
-            except DriverSetupError as exc:
-                # A launcher that cannot be resolved is a refusal with a reason, not a
-                # traceback: it is knowable before anything is claimed, and `prepare` reports
-                # the same condition as a dispatch precondition.
-                raise RefusedError(
-                    RefusalCode.NOT_IMPLEMENTED,
-                    f"the launch for this configuration could not be resolved: {exc}. Nothing "
-                    "was dispatched and no allowance was consumed.",
-                ) from exc
-            implementer_driver = drivers["implementer"]
-
+        drivers = _run_drivers(args, resolved, is_real_driver=is_real_driver)
         controller = Controller(
             store,
-            implementer_driver,  # type: ignore[arg-type]
+            drivers["implementer"],  # type: ignore[arg-type]
             reviewer_driver=drivers["reviewer"],  # type: ignore[arg-type]
             controller_build=controller_build(),
             # Keep approved checks from scattering caches into the workspace under test: a
@@ -1598,14 +1868,14 @@ def cmd_run(args: argparse.Namespace) -> int:
             runners=CheckRunners.offline_default(extra_env=CHECK_ENV),
             controller_id=args.controller_id,
             data_dir=data_dir,
-            authorization=authorization,
+            authorization=approval.authorization,
             # Batch E1: the root this run is spent against, and the ceilings the approval
             # carried. Both are None for a run with no root budget file, which is the legacy
             # path. The dispatch transaction is what charges them.
-            root_binding=root_binding,
-            root_limits=root_limits,
+            root_binding=approval.root_binding,
+            root_limits=approval.root_limits,
             preflight=(
-                _zero_model_preflight(drivers) if authorization is not None else None
+                _zero_model_preflight(drivers) if approval.authorization is not None else None
             ),
             # `--driver fake` is the offline driver: it scripts its own change and its checks
             # are fake by construction. Everything else is a real delivery, and a real delivery
@@ -1616,10 +1886,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
         outcome = controller.run_task(
             RunRequest(
-                task=spec,
-                project=project,
-                project_root=project_root,
-                workspace_root=project_root,
+                task=resolved.spec,
+                project=resolved.project,
+                project_root=resolved.project_root,
+                workspace_root=resolved.project_root,
                 controller_id=args.controller_id,
                 # The commit this command resolved the base to, once, and checked the approval
                 # against: the controller starts the worktree from it instead of resolving the
@@ -1635,7 +1905,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     finally:
         store.close()
 
-    return _write_run_outcome(outcome, args, offline_root_note=offline_root_note, steps=steps)
+    return _write_run_outcome(
+        outcome, args, offline_root_note=approval.offline_root_note, steps=steps
+    )
 
 
 def _unreadable_record(run_id: str, exc: ValueError | StoredRecordUnreadable) -> int:
@@ -1645,14 +1917,40 @@ def _unreadable_record(run_id: str, exc: ValueError | StoredRecordUnreadable) ->
     charges, so the answer is :data:`EXIT_RECORD_UNREADABLE`. ``cancel`` and ``resume`` read the
     run row instead and keep working on such a run.
     """
-    if isinstance(exc, StoredRecordUnreadable):
-        reason = str(exc).splitlines()[0]
-    elif isinstance(exc, ValidationError):
-        reason = f"invalid {exc.title}: {profiles.summarize_validation_error(exc)}"
-    else:
-        reason = f"not valid JSON: {exc}"
-    print(f"stored record unreadable for run {run_id}: {reason}", file=sys.stderr)
+    from .listing import unreadable_reason
+
+    print(f"stored record unreadable for run {run_id}: {unreadable_reason(exc)}", file=sys.stderr)
     return EXIT_RECORD_UNREADABLE
+
+
+def _read_store(args: argparse.Namespace) -> Store:
+    """The existing ledger a read-only command reads, with ``args.run_id`` set for ``--last``.
+
+    ``--last`` is the most recently created run in that ledger, and the command says which one
+    (``run: <id>``, first - on stderr with ``--json``, so stdout stays one document). Only the
+    read-only commands take it: a command that acts on a run is always given its id.
+    """
+    if not args.last:
+        return _lookup_store(args, "run", args.run_id)
+    store = _existing_store(args)
+    ledger = database_path(_data_dir(args))
+    if store is None:
+        raise UnknownTarget(
+            f"no run for --last: there is no ledger at {ledger} (nothing was created). If runs "
+            "were recorded under another data directory, pass --data-dir <that directory>"
+        )
+    try:
+        rows = store.list_runs(limit=1)
+    except BaseException:
+        store.close()
+        raise
+    if not rows:
+        store.close()
+        raise UnknownTarget(f"no run for --last: the ledger {ledger} records no run")
+    args.run_id = str(rows[0]["run_id"])
+    print(f"run: {args.run_id}", file=sys.stderr if getattr(args, "json", False) else sys.stdout)
+    sys.stdout.flush()
+    return store
 
 
 def _drift_root(store: Store, args: argparse.Namespace) -> Path:
@@ -1689,7 +1987,7 @@ def _inspect_command(args: argparse.Namespace, render: Callable[[RunInspection],
     from .hints import next_lines, next_steps
     from .report import integration_lines
 
-    store = _open_store(args)
+    store = _read_store(args)
     try:
         inspection = inspect_run(store, args.run_id, project_root=_drift_root(store, args))
         integrations = store.integrations_for(inspection.run.run_id)
@@ -1842,7 +2140,7 @@ def cmd_integrate_prepare(args: argparse.Namespace) -> int:
     from .prepare import load_project_contract
 
     data_dir = _data_dir(args)
-    store = Store(database_path(data_dir))
+    store = _lookup_store(args, "run", args.run_id)
     try:
         # An unknown run is named as one (by `main`), never as a missing --project.
         store.get_run(args.run_id)
@@ -1881,7 +2179,7 @@ def cmd_integrate_prepare(args: argparse.Namespace) -> int:
 def cmd_integrate_apply(args: argparse.Namespace) -> int:
     """The operator's approval: move the target branch by compare-and-set, or hand off."""
     applied_by = _os_user()
-    store = _open_store(args)
+    store = _lookup_store(args, "integration", args.integration_id)
     try:
         return _run_integration(
             store,
@@ -1899,24 +2197,35 @@ def cmd_integrate_apply(args: argparse.Namespace) -> int:
         store.close()
 
 
+#: The longest ``integrate reconcile --owner-gone --attest`` text: it is recorded inside the run's
+#: audit note (``store.record_note``, 1000 characters with the note's own words), so a longer one
+#: is refused rather than cut.
+INTEGRATION_ATTEST_MAX_CHARS = 500
+
+
 def cmd_integrate_reconcile(args: argparse.Namespace) -> int:
     """Settle an integration record from what Git shows; never re-runs an update or a check."""
     from .controller import attestation_problem
 
     attestation = (args.attest or "").strip()
     if args.owner_gone:
-        problem = (
-            "--owner-gone needs --attest with what you know and why"
-            if not attestation
-            else attestation_problem(args.attest)
-        )
+        if not attestation:
+            problem: str | None = "--owner-gone needs --attest with what you know and why"
+        elif len(attestation) > INTEGRATION_ATTEST_MAX_CHARS:
+            problem = (
+                f"the attestation is {len(attestation)} characters; integrate reconcile records "
+                f"at most {INTEGRATION_ATTEST_MAX_CHARS} (in the run's audit note). Shorten it - "
+                "nothing is ever cut to fit"
+            )
+        else:
+            problem = attestation_problem(args.attest)
         if problem is not None:
             print(f"refusing: {problem}", file=sys.stderr)
             return EXIT_USAGE
     attested_by = _os_user()
     if args.owner_gone:
-        attested_by = f"{attested_by}: {attestation[:500]}"
-    store = _open_store(args)
+        attested_by = f"{attested_by}: {attestation}"
+    store = _lookup_store(args, "integration", args.integration_id)
     try:
         return _run_integration(
             store,
@@ -1936,7 +2245,7 @@ def cmd_integrate_reconcile(args: argparse.Namespace) -> int:
 
 def cmd_integrate_show(args: argparse.Namespace) -> int:
     """Print one integration record and its receipt. Read-only."""
-    store = _open_store(args)
+    store = _lookup_store(args, "integration", args.integration_id)
     try:
         record = store.integration(args.integration_id)
         receipt = store.integration_receipt(args.integration_id) if record is not None else None
@@ -1949,7 +2258,12 @@ def cmd_integrate_show(args: argparse.Namespace) -> int:
     finally:
         store.close()
     if outcome is None:
-        print(f"unknown integration {args.integration_id}", file=sys.stderr)
+        print(
+            unknown_target_message(
+                "integration", args.integration_id, database_path(_data_dir(args))
+            ),
+            file=sys.stderr,
+        )
         return EXIT_USAGE
     _print_integration(outcome, args.json, steps)
     return EXIT_OK
@@ -2028,17 +2342,18 @@ def _observer(store: Store, args: argparse.Namespace, run_id: str) -> tuple[Cont
     was never recorded - gets :class:`_NotOwnedDriver`. Neither can confirm a stop of a process
     another controller owns, which is the point.
 
-    Writes nothing to the store. The second value says the stored configuration could not be
-    decoded, which the caller records (:func:`_note_stored_config_unreadable`) when it acts.
+    Writes nothing to the store and reads no workspace: the offline driver here only answers
+    ``unknown`` for invocations it did not start, so it is given no project root to work in. The
+    second value says the stored configuration could not be decoded, which the caller records
+    (:func:`_note_stored_config_unreadable`) when it acts.
     """
-    project_root = Path(args.project_root).resolve()
     config_unreadable = False
     try:
         effective = store.effective_config_for(run_id)
     except StoredRecordUnreadable:
         effective = None
         config_unreadable = True
-    offline = FakeDriver(project_root)
+    offline = FakeDriver(Path("."))  # never reads it: it starts nothing from this process
     drivers: dict[str, object] = {}
     for role in ("implementer", "reviewer"):
         bound = effective.role(role) if effective is not None else None
@@ -2065,7 +2380,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     """
     from .hints import next_lines, next_steps
 
-    store = _open_store(args)
+    store = _lookup_store(args, "run", args.run_id)
     try:
         # The run row, not the read projection: a stored record status/report cannot read (a
         # malformed dsh_context or repair note) must not stop a run from being stopped.
@@ -2113,11 +2428,8 @@ def cmd_resume(args: argparse.Namespace) -> int:
     when this resume wrote something itself: a resume that wrote nothing - a refusal on the owner
     rule says "Nothing was written" - leaves the run's notes as they were.
     """
-    import sqlite3
-
     from .controller import LegacyOwnerAttestation, attestation_problem
     from .hints import next_lines, next_steps
-    from .store import StoreError
 
     legacy_owner_gone: LegacyOwnerAttestation | None = None
     if args.attest is not None and not args.legacy_owner_gone:
@@ -2138,7 +2450,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
         legacy_owner_gone = LegacyOwnerAttestation(
             attested_by=_os_user().strip() or "unknown", attestation=args.attest
         )
-    store = _open_store(args)
+    store = _lookup_store(args, "run", args.run_id)
     try:
         # As in ``cmd_cancel``: resolved from the run row, so an unreadable stored record fails
         # status/report only and never keeps a run from being reconciled.
@@ -2150,7 +2462,10 @@ def cmd_resume(args: argparse.Namespace) -> int:
             _note_stored_config_unreadable(store, run_id)
         steps = [] if args.json else next_steps(store, run_id)
     except RunNotFound:
-        print(f"unknown run {args.run_id}", file=sys.stderr)
+        print(
+            unknown_target_message("run", args.run_id, database_path(_data_dir(args))),
+            file=sys.stderr,
+        )
         return EXIT_USAGE
     except (StoreError, sqlite3.Error) as exc:
         print(
@@ -2171,6 +2486,25 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return _outcome_exit_code(outcome)
 
 
+#: What ``ledger settle --legacy-owner-gone`` appends to the operator's attestation.
+LEGACY_OWNER_GONE_SUFFIX = " [operator attests the pre-v6 owner of this run is gone]"
+
+
+def _stored_attestation_problem(text: str, *, suffix: str) -> str | None:
+    """The store's bounds on the attestation as stored, worded for what the operator typed."""
+    from .store import ATTESTATION_MAX_CHARS, attestation_bounds_problem
+
+    problem = attestation_bounds_problem(text)
+    if problem is None or len(text) <= ATTESTATION_MAX_CHARS or not suffix:
+        return problem
+    return (
+        f"the attestation is {len(text) - len(suffix)} characters and --legacy-owner-gone adds "
+        f"{len(suffix)} more; the bound on the stored text is {ATTESTATION_MAX_CHARS}. Shorten it "
+        f"to at most {ATTESTATION_MAX_CHARS - len(suffix)} characters (it is a statement, not a "
+        "log)"
+    )
+
+
 def cmd_ledger_settle(args: argparse.Namespace) -> int:
     """Close one ``unknown`` / ``launch_unknown`` ledger entry by operator attestation.
 
@@ -2181,30 +2515,28 @@ def cmd_ledger_settle(args: argparse.Namespace) -> int:
     """
     from .controller import attestation_problem, operator_settle_refusal
     from .hints import next_lines, next_steps
-    from .store import InvocationNotFound, SettlementRefused, StoreError
+    from .store import InvocationNotFound, SettlementRefused
 
     attested_by = _os_user()
-    try:
-        store = _open_store(args)
-    except StoreError as exc:
-        print(f"refused: {exc}", file=sys.stderr)
-        return EXIT_REFUSED
+    store = _lookup_store(args, "invocation", args.invocation_id)
     try:
         alive = operator_settle_refusal(
             store, args.invocation_id, legacy_owner_gone_attested=args.legacy_owner_gone
         )
         if alive is not None:
             raise SettlementRefused(alive)
-        # Before the flag's suffix is added: a pasted placeholder plus that suffix is still not
-        # the operator's own words.
-        problem = attestation_problem(args.attest)
-        if problem is not None:
-            raise SettlementRefused(problem)
+        # The placeholder rule reads the operator's own words, before the flag's suffix is added
+        # (a pasted placeholder plus that suffix is still not their words); the bounds read the
+        # text that is stored, suffix included, so a text within them is never refused later by
+        # the store for a length the operator did not type.
         attestation = args.attest
         if args.legacy_owner_gone:
-            attestation = (
-                f"{attestation} [operator attests the pre-v6 owner of this run is gone]"
-            )
+            attestation = f"{attestation}{LEGACY_OWNER_GONE_SUFFIX}"
+        problem = attestation_problem(args.attest) or _stored_attestation_problem(
+            attestation, suffix=LEGACY_OWNER_GONE_SUFFIX if args.legacy_owner_gone else ""
+        )
+        if problem is not None:
+            raise SettlementRefused(problem)
         settlement = store.settle_by_operator(
             args.invocation_id,
             settled_as=args.settled_as,
@@ -2270,7 +2602,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
         return EXIT_USAGE
     from .cleanup import apply_cleanup, plan_cleanup, reconcile_cleanup
 
-    store = _open_store(args)
+    store = _lookup_store(args, "run", args.run_id)
     try:
         if args.reconcile:
             result = reconcile_cleanup(store, args.run_id)
@@ -2504,10 +2836,6 @@ def _print_scaffold(scaffold) -> int:  # noqa: ANN001 - a scaffold.Scaffold
     return EXIT_OK
 
 
-def _given_data_dir(args: argparse.Namespace) -> Path | None:
-    return Path(args.data_dir) if getattr(args, "data_dir", None) else None
-
-
 def cmd_init_project(args: argparse.Namespace) -> int:
     """Write ``<project-root>/.hflow/project.json``; never overwrites, never a ``fake`` check."""
     from .scaffold import init_project
@@ -2546,13 +2874,6 @@ def cmd_init_task(args: argparse.Namespace) -> int:
     )
 
 
-def _existing_store(args: argparse.Namespace) -> Store | None:
-    """The ledger, or ``None`` when there is none yet: a read-only view never creates one."""
-    data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
-    path = database_path(data_dir)
-    return Store(path) if path.is_file() else None
-
-
 def cmd_runs(args: argparse.Namespace) -> int:
     """List runs with their first ``next:`` command, from SQLite only; no model, no probe."""
     from .listing import list_runs, render_runs
@@ -2566,7 +2887,10 @@ def cmd_runs(args: argparse.Namespace) -> int:
         finally:
             store.close()
     if args.json:
-        print(canonical_json([line.as_json() for line in lines]))
+        # A run that cannot be read is an entry too (``run_id`` and ``error``), not only a
+        # stderr line: a script reading stdout must not take "not listed" for "not there".
+        entries = [line.as_json() for line in lines] + [item.as_json() for item in unreadable]
+        print(canonical_json(entries))
     else:
         print(render_runs(lines, needs_you=args.needs_you, unreadable=bool(unreadable)))
     for item in unreadable:
@@ -2585,15 +2909,9 @@ def cmd_diff(args: argparse.Namespace) -> int:
         unreadable_reason,
     )
 
-    store = _existing_store(args)
-    if store is None:
-        print(f"unknown run {args.run_id}", file=sys.stderr)
-        return EXIT_USAGE
+    store = _read_store(args)
     try:
         rng = candidate_range(store, args.run_id)
-    except RunNotFound:
-        print(f"unknown run {args.run_id}", file=sys.stderr)
-        return EXIT_USAGE
     except NoCandidate as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return EXIT_REFUSED
@@ -2636,6 +2954,20 @@ def _positive_int(text: str) -> int:
     if value < 1:
         raise argparse.ArgumentTypeError(f"{text!r} is not a whole number of at least 1")
     return value
+
+
+def _add_read_target(parser: argparse.ArgumentParser) -> None:
+    """A read-only command's run: an id, or ``--last`` - exactly one (checked in :func:`main`)."""
+    parser.add_argument("run_id", nargs="?", default=None)
+    parser.set_defaults(read_parser=parser)
+    parser.add_argument(
+        "--last",
+        action="store_true",
+        help=(
+            "read the most recently created run (printed first as `run: <id>`) instead of "
+            "naming one"
+        ),
+    )
 
 
 def _verb(
@@ -2741,18 +3073,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     status = _verb(sub, "status", cmd_status, "show a run's state from SQLite (no model calls)")
-    status.add_argument("run_id")
+    _add_read_target(status)
     status.add_argument("--project-root", default=None, help=_DRIFT_ROOT_HELP)
 
     report = _verb(
         sub, "report", cmd_report, "render a run's receipt and evidence (no model calls)"
     )
-    report.add_argument("run_id")
+    _add_read_target(report)
     report.add_argument("--project-root", default=None, help=_DRIFT_ROOT_HELP)
 
     cancel = _verb(sub, "cancel", cmd_cancel, "cancel a run's live attempt", controller_id=True)
     cancel.add_argument("run_id")
-    cancel.add_argument("--project-root", default=".")
 
     resume = _verb(
         sub, "resume", cmd_resume,
@@ -2760,7 +3091,6 @@ def build_parser() -> argparse.ArgumentParser:
         controller_id=True,
     )
     resume.add_argument("run_id")
-    resume.add_argument("--project-root", default=".")
     resume.add_argument(
         "--legacy-owner-gone",
         action="store_true",
@@ -2882,7 +3212,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     integrate_reconcile.add_argument(
-        "--attest", default="", help="what you know and why (required with --owner-gone)"
+        "--attest",
+        default="",
+        help="what you know and why (required with --owner-gone, at most 500 characters)",
     )
     integrate_show = _verb(
         integrate_sub, "show", cmd_integrate_show, "print one integration record"
@@ -2971,7 +3303,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--needs-you",
         action="store_true",
         help=(
-            "only runs whose stored facts name something for you to do: blocked, open or "
+            "only runs whose stored facts name something for you to do: live (its recorded "
+            "owner, and whether the clock is past its recorded deadline), blocked, open or "
             "unresolved ledger entries, an accepted candidate not integrated, an interrupted "
             "cleanup"
         ),
@@ -2983,7 +3316,7 @@ def build_parser() -> argparse.ArgumentParser:
         "(never a working tree; the Git identity, not the content fingerprint)",
         json=False,
     )
-    diff.add_argument("run_id")
+    _add_read_target(diff)
     diff.add_argument("--stat", action="store_true", help="print git's --stat summary instead")
 
     return parser
@@ -3026,20 +3359,65 @@ def main(argv: list[str] | None = None) -> int:
     forbid_current_directory_program_search()
     parser = build_parser()
     args = parser.parse_args(argv)
+    if hasattr(args, "last") and (args.run_id is None) == (not args.last):
+        # status / report / diff read one run: an id or --last, exactly one. A usage error like
+        # any other argument error (exit 4, with the subcommand's usage), before anything opens.
+        args.read_parser.error("name a run id, or pass --last for the newest run (not both)")
     try:
         return int(args.func(args))
     except RefusedError as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return EXIT_REFUSED
-    except RunNotFound as exc:  # every command but `resume`, which maps it before StoreError
-        print(f"unknown run {exc}", file=sys.stderr)
+    except UnknownTarget as exc:
+        print(str(exc), file=sys.stderr)
         return EXIT_USAGE
+    except RunNotFound as exc:  # every command but `resume`, which maps it before StoreError
+        ledger = database_path(_data_dir(args))
+        print(unknown_target_message("run", str(exc), ledger), file=sys.stderr)
+        return EXIT_USAGE
+    except (StoreError, sqlite3.Error) as exc:
+        return _ledger_failure(exc)
     except KeyboardInterrupt:
         print(INTERRUPTED_MESSAGE, file=sys.stderr)
         return EXIT_INTERRUPTED
     # No catch-all for pydantic's ValidationError here: the input loaders raise RefusedError
     # themselves, and mapping any other one to EXIT_REFUSED would tell a caller "no run state"
     # about a run that exists (review G, R12). status/report handle an unreadable stored record.
+
+
+def _is_locked(exc: BaseException) -> bool:
+    """Whether ``exc`` (or what it wraps) is SQLite's "database is locked" / busy answer."""
+    seen: BaseException | None = exc
+    while seen is not None:
+        if isinstance(seen, sqlite3.OperationalError) and "locked" in str(seen).lower():
+            return True
+        seen = seen.__cause__ or seen.__context__
+    return False
+
+
+def _ledger_failure(exc: StoreError | sqlite3.Error) -> int:
+    """One stderr line for a ledger error no command mapped itself; never a traceback.
+
+    ``database is locked``: another process holds the ledger - :data:`EXIT_IN_PROGRESS`, as
+    ``resume`` answers it; run the command again. Anything else - a storage version newer than
+    this build, a file that is not a ledger, a write the ledger refused (an authorization id
+    already recorded with another binding) - is :data:`EXIT_RECORD_UNREADABLE`: what is stored
+    cannot be used as this build reads it, and nothing was repaired. A failed transaction is
+    rolled back whole, so what was recorded before it stands.
+    """
+    if _is_locked(exc):
+        print(
+            f"in progress: the ledger is locked by another process ({type(exc).__name__}: {exc}). "
+            "Nothing more was written; run the command again once that process is done",
+            file=sys.stderr,
+        )
+        return EXIT_IN_PROGRESS
+    print(
+        f"ledger error ({type(exc).__name__}): {str(exc).splitlines()[0] if str(exc) else exc!r}. "
+        "Any write it interrupted was rolled back whole; what was recorded before it stands",
+        file=sys.stderr,
+    )
+    return EXIT_RECORD_UNREADABLE
 
 
 if __name__ == "__main__":

@@ -382,7 +382,7 @@ def test_a_run_killed_mid_dispatch_is_taken_over_never_redispatched_and_settled(
     attempts_before = len(status["attempts"])
     assert attempts_before == 1
 
-    resumed = project.hflow("resume", run_id, "--project-root", str(project.repo), "--json")
+    resumed = project.hflow("resume", run_id, "--json")
     if not IS_WINDOWS:
         # Off Windows the dead owner reads unknown, so it is never proven gone: nothing changes.
         assert resumed.returncode == 5, resumed
@@ -419,7 +419,7 @@ def test_a_run_killed_mid_dispatch_is_taken_over_never_redispatched_and_settled(
     assert settlement["prior_state"] == "unknown"
 
     # A second resume reconciles the blocked run and still dispatches nothing.
-    again = project.hflow("resume", run_id, "--project-root", str(project.repo), "--json")
+    again = project.hflow("resume", run_id, "--json")
     assert again.returncode == 3, again
     final = project.status_json(run_id)
     assert final["run"]["task_state"] == "BLOCKED"

@@ -75,7 +75,7 @@ from .test_batch_e_ledger import (
     _seed_ready_run,
 )
 from .owner_exit import owner_exits
-from .store_helpers import mark_invocation_started
+from .store_helpers import mark_invocation_started, pending_invocations
 from .test_owner_lease import _controller, windows_only
 
 ATTEST = "Checked the provider console: no request from this launch appears."
@@ -292,7 +292,7 @@ def test_a_driver_failure_entry_is_closed_by_resume_and_then_voided_by_ledger_se
     assert closed is not None and closed.state is InvocationStartState.LAUNCH_UNKNOWN
     assert "closed by `hflow resume`" in closed.detail and "proven gone" in closed.detail
     assert closed.pending, "launch_unknown still blocks the root until an operator settles it"
-    assert [e.invocation_id for e in store.pending_invocations(root_id)] == [entry.invocation_id]
+    assert [e.invocation_id for e in pending_invocations(store, root_id)] == [entry.invocation_id]
     (note,) = [n for n in store.notes_for(run_id) if n.startswith(f"{NOTE_DISPATCH}: resume closed")]
     assert note in resumed.notes
     assert f"{entry.invocation_id} requested->launch_unknown" in note, note
@@ -313,7 +313,7 @@ def test_a_driver_failure_entry_is_closed_by_resume_and_then_voided_by_ledger_se
     assert _cli_settle(store, entry.invocation_id, "void") == EXIT_OK, capsys.readouterr().err
     assert store.invocation(entry.invocation_id).state is InvocationStartState.OPERATOR_SETTLED
     assert store.root_budget_view(root_id).used_top_level_submissions == used - 1
-    assert store.pending_invocations(root_id) == []
+    assert pending_invocations(store, root_id) == []
     assert _frozen(store, run_id) == frozen
 
 
@@ -367,8 +367,7 @@ def test_a_reviewer_driver_failure_entry_is_closed_by_cli_resume(
     _owner_exits(store, owner, run_id, monkeypatch)
     capsys.readouterr()
     code = main([
-        "resume", run_id, "--project-root", str(project_root),
-        "--data-dir", str(store.path.parent),
+        "resume", run_id, "--data-dir", str(store.path.parent),
     ])
     out = capsys.readouterr().out
 
@@ -380,7 +379,7 @@ def test_a_reviewer_driver_failure_entry_is_closed_by_cli_resume(
         reviewer.invocation_id: InvocationStartState.LAUNCH_UNKNOWN,
     }, "a settled entry is never reopened or relabelled"
     assert _cli_settle(store, reviewer.invocation_id) == EXIT_OK, capsys.readouterr().err
-    assert store.pending_invocations(root_id) == []
+    assert pending_invocations(store, root_id) == []
     assert store.get_run(run_id)["block_code"] == RefusalCode.REVIEW_PROTOCOL_ERROR.value
 
 
@@ -448,7 +447,7 @@ def test_a_confirmed_stop_whose_ledger_write_failed_is_closed_from_the_stop_fact
         assert closed.state is InvocationStartState.SETTLED
         assert closed.outcome is InvocationOutcome.CANCELLED
         assert closed.detail == f"stop confirmed (forced) for run {run_id}"
-        assert store.pending_invocations(root_id) == []
+        assert pending_invocations(store, root_id) == []
         capsys.readouterr()
         assert _cli_settle(store, entry.invocation_id) == EXIT_REFUSED
         assert "already records its final fact" in capsys.readouterr().err
@@ -460,7 +459,7 @@ def test_a_confirmed_stop_whose_ledger_write_failed_is_closed_from_the_stop_fact
         assert _cli_settle(store, entry.invocation_id, "void") == EXIT_OK, (
             capsys.readouterr().err
         )
-        assert store.pending_invocations(root_id) == []
+        assert pending_invocations(store, root_id) == []
 
 
 @pytest.mark.parametrize(
@@ -561,7 +560,7 @@ def test_a_confirmed_stop_of_a_still_reserved_entry_closes_it_not_started_and_fr
         invocation_id="I-stop-reserved", shape="reserved",
         block=RefusalCode.CANCELLED_BY_OPERATOR, stop=_confirmed_stop("I-stop-reserved"),
     )
-    assert [e.invocation_id for e in store.pending_invocations(root_id)] == ["I-stop-reserved"]
+    assert [e.invocation_id for e in pending_invocations(store, root_id)] == ["I-stop-reserved"]
     used = store.root_budget_view(root_id).used_top_level_submissions
     frozen = _frozen(store, "R-stop-reserved")
     successor = _controller(store, project_root, fake_script)
@@ -573,7 +572,7 @@ def test_a_confirmed_stop_of_a_still_reserved_entry_closes_it_not_started_and_fr
     assert entry.detail.startswith("a confirmed stop (forced) ended run R-stop-reserved before"), (
         entry.detail
     )
-    assert store.pending_invocations(root_id) == [], "a not_started entry releases the root"
+    assert pending_invocations(store, root_id) == [], "a not_started entry releases the root"
     assert store.root_budget_view(root_id).used_top_level_submissions == used, "never refunded"
     assert _frozen(store, "R-stop-reserved") == frozen
     _no_driver_call(successor)
@@ -622,7 +621,7 @@ def test_a_confirmed_stop_on_a_run_blocked_for_another_reason_is_not_used(
     notes = " ".join(resumed.notes)
     assert "recorded confirmed stop" not in notes, notes
     assert f"I-other-block {shape}->{expected.value}" in notes, notes
-    assert [e.invocation_id for e in store.pending_invocations(root_id)] == ["I-other-block"]
+    assert [e.invocation_id for e in pending_invocations(store, root_id)] == ["I-other-block"]
     assert resumed.block_code is RefusalCode.INTERNAL_ERROR
 
 
@@ -855,8 +854,7 @@ def test_an_accepted_runs_unsettled_entry_is_closed_without_touching_the_receipt
     _owner_exits(store, owner, run_id, monkeypatch)
     capsys.readouterr()
     code = main([
-        "resume", run_id, "--project-root", str(project_root),
-        "--data-dir", str(store.path.parent),
+        "resume", run_id, "--data-dir", str(store.path.parent),
     ])
     assert code == EXIT_OK, capsys.readouterr()
     assert _frozen(store, run_id) == frozen, "the receipt and the acceptance are untouched"
@@ -866,7 +864,7 @@ def test_an_accepted_runs_unsettled_entry_is_closed_without_touching_the_receipt
     )
     assert _cli_settle(store, reviewer.invocation_id, "void") == EXIT_REFUSED
     assert _cli_settle(store, reviewer.invocation_id) == EXIT_OK, capsys.readouterr().err
-    assert store.pending_invocations(root_id) == []
+    assert pending_invocations(store, root_id) == []
 
 
 # --------------------------------------------------------------------------

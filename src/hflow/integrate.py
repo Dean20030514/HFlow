@@ -49,7 +49,7 @@ from .contracts import (
     TaskState,
     VerificationResult,
 )
-from .gitworkspace import MIN_INTEGRATION_GIT, GitError, GitRepo
+from .gitworkspace import MIN_INTEGRATION_GIT, GitError, GitRepo, brief_list
 from .hints import hflow_command, shell_word
 from .ids import new_integration_id, utc_now
 from .ownership import ProcessIdentity, current_identity, probe
@@ -502,8 +502,7 @@ def _build_and_check(
             repo,
             integration_id,
             "the integration commit changes paths the accepted delivery did not, or that the "
-            "task's scope does not allow: " + ", ".join(named[:5])
-            + (f" (+{len(named) - 5} more)" if len(named) > 5 else ""),
+            "task's scope does not allow: " + brief_list(named),
         )
     integration_ref = repo.integration_ref(record.run_id, integration_id)
     repo.ensure_ref(integration_ref, commit)
@@ -610,8 +609,8 @@ def _build_and_check(
 def _integration_worktrees(repo: GitRepo, record: IntegrationRecord) -> list[Path]:
     """Registered worktrees this integration may have created, including a staging path.
 
-    ``create_worktree`` adds ``<id>.staging-<pid>`` and then renames it to ``<id>``, so a process
-    that died in between leaves a registration under the staging name.
+    ``create_worktree`` adds ``<id>.staging-<pid>-<random>`` and then moves it to ``<id>``, so a
+    process that died in between leaves a registration under the staging name.
     """
     parent = repo.worktree_parent().resolve()
     found: list[Path] = []
@@ -626,6 +625,20 @@ def _integration_worktrees(repo: GitRepo, record: IntegrationRecord) -> list[Pat
         ):
             found.append(path)
     return found
+
+
+def _half_removed(repo: GitRepo, path: Path) -> str:
+    """A note when a failed ``git worktree remove`` still deleted the registration, else ``""``.
+
+    Git deletes the directory, then the registration - the registration even when the directory
+    could not be deleted (an open file on Windows) - so what is left is no longer a worktree.
+    """
+    try:
+        if path.exists() and repo.worktree_registration(path) is None:
+            return "; git no longer registers it, and the directory with what it could not delete remains"
+    except (GitError, OSError):
+        pass  # unknown: the failure itself is reported
+    return ""
 
 
 def _release_worktree(repo: GitRepo, record: IntegrationRecord) -> tuple[str, str]:
@@ -653,11 +666,11 @@ def _release_worktree(repo: GitRepo, record: IntegrationRecord) -> tuple[str, st
         try:
             repo.remove_worktree_checked(path)
         except GitError as exc:
-            left.append(f"{path} ({exc})")
+            left.append(f"{path} ({exc}{_half_removed(repo, path)})")
     if left:
         return "LEFT", (
             "the integration worktree was left in place: `git worktree remove` (without --force) "
-            "refused " + "; ".join(left) + ". It holds no delivery - the integration commit is "
+            "failed for " + "; ".join(left) + ". It holds no delivery - the integration commit is "
             "kept by its ref - so it can be removed by hand once inspected"
         )
     return "REMOVED", ""

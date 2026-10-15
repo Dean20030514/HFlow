@@ -36,6 +36,7 @@ from hflow.cli import (
 )
 from hflow.contracts import MachineProfile, canonical_json
 from hflow.drivers.acpx_dsh import NO_CWD_EXE_SEARCH_ENV, find_on_path
+from hflow.drivers.dsh_surfaces import dsh_npm_bin_dir, dsh_npm_install_command
 from hflow.hints import shell_word
 
 from .conftest import write_profile, write_project, write_task
@@ -259,7 +260,8 @@ def test_doctor_never_takes_a_program_from_the_current_directory_or_a_relative_e
 
     assert code == EXIT_OK
     for name in ("acpx", "git", "node", "dsh"):
-        assert payload["executables"][name] == {"path": None, "available": False}, name
+        entry = payload["executables"][name]
+        assert (entry["path"], entry["available"]) == (None, False), name
     assert not marker.exists(), "a planted program ran"
     integrate = payload["readiness"]["integrate"]
     assert integrate["usable"] is False
@@ -426,16 +428,50 @@ def test_doctor_points_at_the_desktop_dsh_shim_when_dsh_is_not_on_path(
 
     assert code == EXIT_OK
     dsh = payload["readiness"]["dsh"]
-    assert dsh["on_path"] is None
+    assert dsh["on_path"] is None and dsh["data_dir_install"] is None and dsh["source"] is None
     assert dsh["detail"].startswith("NOT FOUND on PATH")
+    # Both places a launch looks, and the npm install that fixes it (user ruling 2026-10-14).
+    assert str(dsh_npm_bin_dir(tmp_path / "data")) in dsh["detail"]
+    assert dsh["install_command"] == dsh_npm_install_command(tmp_path / "data")
+    assert f"`{dsh['install_command']}`" in dsh["detail"]
+    assert "prepend" not in dsh["detail"], "the Desktop shim is never the recommended route"
     if installed:
         assert dsh["desktop_shim"] == str(shim)
-        assert f"prepend {shim.parent} to PATH" in dsh["detail"]
-        assert "A machine profile cannot name the dsh path" in dsh["detail"]
+        assert "DSH #9626" in dsh["detail"] and "workspace-write" in dsh["detail"]
     else:
         assert dsh["desktop_shim"] is None
         assert "Desktop shim" not in dsh["detail"]
     assert not marker.exists(), "doctor ran the Desktop shim"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the npm shim is a Windows batch file")
+def test_doctor_reports_the_npm_cli_under_the_data_dir_when_path_has_no_dsh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_dir = tmp_path / "data"
+    marker = tmp_path / "npm-shim-ran.txt"
+    shim = _program(dsh_npm_bin_dir(data_dir), "dsh", marker)
+    system32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+    monkeypatch.setenv("PATH", str(system32))  # no dsh, no conftest stand-in
+
+    code, payload = _doctor(data_dir, capsys)
+
+    assert code == EXIT_OK
+    dsh = payload["readiness"]["dsh"]
+    assert dsh["on_path"] is None
+    assert os.path.normcase(dsh["data_dir_install"]) == os.path.normcase(str(shim))
+    assert dsh["source"] == "npm (data dir)"
+    assert "dsh=npm (data dir): PATH has no dsh" in dsh["detail"]
+    assert "install_command" not in dsh
+
+    # With a dsh on PATH as well, PATH wins and the data-dir install is named as unused.
+    on_path = _program(tmp_path / "bin", "dsh", marker)
+    monkeypatch.setenv("PATH", f"{on_path.parent}{os.pathsep}{system32}")
+    _code, payload = _doctor(data_dir, capsys)
+    dsh = payload["readiness"]["dsh"]
+    assert dsh["source"] == "PATH" and "dsh=PATH" in dsh["detail"]
+    assert "is not used while PATH has a dsh" in dsh["detail"]
+    assert not marker.exists(), "doctor ran a dsh"
 
 
 # --------------------------------------------------------------------------
@@ -524,3 +560,19 @@ def test_doctor_names_the_launch_environment_as_the_only_source_without_a_bound_
     assert found["dsh_home_files"] == {}
     assert "the launch environment is its only credential source" in found["detail"]
     assert "not observed" in found["detail"]
+
+
+def test_doctor_names_a_dsh_missing_from_path_without_calling_it_unfound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A launch also looks in the data directory, so PATH alone is not "NOT FOUND"."""
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+
+    code, payload = _doctor(tmp_path / "data", capsys)
+
+    assert code == EXIT_OK
+    entry = payload["executables"]["dsh"]
+    assert entry["path"] is None
+    assert "not on PATH" in entry["note"]
+    assert main(["doctor", "--data-dir", str(tmp_path / "data")]) == EXIT_OK
+    assert "dsh launcher line" in capsys.readouterr().out

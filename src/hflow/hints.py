@@ -8,9 +8,12 @@ come next, ready to paste; ``status``, ``resume``, ``ledger settle`` and ``integ
 as ``next: <command>`` lines in their text output (never in ``--json``).
 
 What this module never does: call a model, probe a process, run Git, read a project file or
-write anything. A command whose effect depends on something only the command itself can observe
-(an owner that may still be alive, a branch some worktree has checked out) is printed with a
-trailing ``# ...`` comment saying so - the command decides, the hint does not.
+write anything. Besides the ledger it reads one thing, for an accepted Git candidate: whether the
+task's base branch still exists, from the ref files of the Git directory the run recorded
+(:func:`existing_branch`), so ``integrate prepare --target`` can name it. A command whose effect
+depends on something only the command itself can observe (an owner that may still be alive, a
+branch some worktree has checked out) is printed with a trailing ``# ...`` comment saying so - the
+command decides, the hint does not.
 
 What it never suggests: running a task again, re-using an authorization, or a new revision. Each
 of those needs the user's own new approval (AGENTS rules 5 and 10); an ended run's way forward
@@ -105,6 +108,11 @@ def shell_word(text: str, *, windows: bool = os.name == "nt") -> str:
     return "'" + "".join(doubled) + "'"
 
 
+def _is_default_ledger(ledger: str | Path) -> bool:
+    default = database_path(default_data_dir())
+    return os.path.normcase(os.path.abspath(ledger)) == os.path.normcase(os.path.abspath(default))
+
+
 def named_data_dir(store: Store) -> str | None:
     """The data directory a printed command must name, or ``None`` when the default reaches it.
 
@@ -115,16 +123,21 @@ def named_data_dir(store: Store) -> str | None:
     any working directory.
     """
     path = getattr(store, "path", None)
-    if path is None or str(path) == ":memory:":
-        return None
-    ledger = os.path.normcase(os.path.abspath(path))
-    if ledger == os.path.normcase(os.path.abspath(database_path(default_data_dir()))):
+    if path is None or str(path) == ":memory:" or _is_default_ledger(path):
         return None
     return os.path.dirname(os.path.abspath(path))
 
 
-def _word(text: str) -> str:
-    """An id, a commit or a branch name as one word: as it is when plain, else quoted."""
+def data_dir_word(data_dir: str | Path | None) -> str | None:
+    """:func:`named_data_dir` for a data directory rather than an open ledger: ``data_dir``
+    absolute, or ``None`` when it was not given or the default reaches it."""
+    if data_dir is None or _is_default_ledger(database_path(Path(data_dir))):
+        return None
+    return os.path.abspath(data_dir)
+
+
+def word(text: str) -> str:
+    """An id, a commit, a branch name or a path as one word: as it is when plain, else quoted."""
     return text if _PLAIN_WORD.fullmatch(text) else shell_word(text)
 
 
@@ -181,6 +194,86 @@ class RunFacts:
     #: No owner token, and an attempt recorded a controller pid (no host): a pre-v6 owner that
     #: HFlow can never prove gone, so closing the run's entries needs ``--legacy-owner-gone``.
     legacy_owner: bool = False
+    #: The task's ``workspace.base_commit`` when it names a local branch that exists in the
+    #: repository the run recorded (:func:`existing_branch`); ``""`` otherwise. Read for an
+    #: accepted Git candidate only: it prefills ``integrate prepare --target``.
+    base_branch: str = ""
+    #: A live run's recorded owner process (``runs.owner_pid``) and since when it holds the run
+    #: (``claimed_at``, else ``created_at``); ``None`` / ``""`` when not recorded.
+    owner_pid: int | None = None
+    owner_since: str = ""
+    #: When the run row last changed, and the per-dispatch deadline its admission binding
+    #: recorded (``None`` when there is no readable binding). Read for a live run only.
+    updated_at: str = ""
+    deadline_seconds: int | None = None
+
+
+#: A branch name a hint may prefill: plain path segments - nothing Git would read as a revision
+#: expression or an option, and nothing that leaves ``refs/heads`` when joined to it.
+_BRANCH_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*(?:/[A-Za-z0-9_][A-Za-z0-9._-]*)*")
+#: What reads as a commit id rather than a branch name.
+_HEX_OBJECT_ID = re.compile(r"[0-9a-fA-F]{7,64}")
+
+
+def recorded_repository(store: Store, run_id: str) -> tuple[str, str]:
+    """``(git_common_dir, project_root)`` from the run's admission record or worktree record."""
+    binding = store.admission_binding_for(run_id)
+    if binding is not None and binding.git_common_dir:
+        return binding.git_common_dir, binding.project_root
+    provenance = store.workspace_provenance_for(run_id)
+    if provenance is not None:
+        return provenance.git_common_dir, provenance.project_root
+    return "", binding.project_root if binding is not None else ""
+
+
+def existing_branch(base: str, git_common_dir: str) -> str:
+    """``base`` as a local branch name when that branch exists in ``git_common_dir``, else ``""``.
+
+    Existence is read from the ref files - a loose ``refs/heads/<name>`` or a ``packed-refs``
+    line - never by running Git. A repository whose refs are stored otherwise (reftable), a name
+    that is a commit id or not a plain branch name, or a directory that cannot be read gives
+    ``""``: the hint keeps its placeholder, and ``integrate prepare`` checks the branch itself.
+    """
+    name = base.removeprefix("refs/heads/")
+    if (
+        not git_common_dir
+        or not _BRANCH_NAME.fullmatch(name)
+        or _HEX_OBJECT_ID.fullmatch(name)
+        or ".." in name
+        or name.endswith((".lock", "."))
+        or name == "HEAD"
+    ):
+        return ""
+    common = Path(git_common_dir)
+    ref = f"refs/heads/{name}"
+    try:
+        if (common / ref).is_file():
+            return name
+        with open(common / "packed-refs", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                fields = line.split()
+                if len(fields) == 2 and fields[1] == ref and not line.startswith(("#", "^")):
+                    return name
+    except OSError:
+        return ""
+    return ""
+
+
+def _base_branch(store: Store, run_id: str, task_spec_json: str) -> str:
+    """:attr:`RunFacts.base_branch`; ``""`` whenever it cannot be read (a hint never fails)."""
+    try:
+        base = (json.loads(task_spec_json).get("workspace") or {}).get("base_commit") or ""
+        return existing_branch(str(base), recorded_repository(store, run_id)[0])
+    except Exception:  # noqa: BLE001 - an unreadable record means no prefill, not a failure
+        return ""
+
+
+def _deadline_seconds(store: Store, run_id: str) -> int | None:
+    try:
+        binding = store.admission_binding_for(run_id)
+    except Exception:  # noqa: BLE001 - an unreadable binding records no deadline here
+        return None
+    return int(binding.deadline_seconds) if binding is not None else None
 
 
 def run_facts(store: Store, run_id: str) -> RunFacts:
@@ -202,11 +295,15 @@ def run_facts(store: Store, run_id: str) -> RunFacts:
     owner_token = row["owner_token"] if "owner_token" in keys else None
     legacy = owner_token is None and any(a["process_id"] is not None for a in attempts)
     entries = store.invocations_for(run_id)
+    task_state = TaskState(row["task_state"])
+    delivery_state = str(row["delivery_state"] or DeliveryState.NONE.value)
+    live = task_state in _LIVE_STATES
+    owner_pid = row["owner_pid"] if live and "owner_pid" in keys else None
     return RunFacts(
         run_id=run_id,
-        task_state=TaskState(row["task_state"]),
+        task_state=task_state,
         block_code=row["block_code"],
-        delivery_state=str(row["delivery_state"] or DeliveryState.NONE.value),
+        delivery_state=delivery_state,
         git_candidate=git_candidate,
         worktree_state=str(row["worktree_state"] or "NONE"),
         worktree_path=str(row["worktree_path"] or ""),
@@ -221,6 +318,24 @@ def run_facts(store: Store, run_id: str) -> RunFacts:
         ),
         unreconciled=unreconciled,
         legacy_owner=legacy,
+        base_branch=(
+            _base_branch(store, run_id, str(row["task_spec_json"] or ""))
+            if integrable(task_state, delivery_state, git_candidate)
+            else ""
+        ),
+        owner_pid=int(owner_pid) if owner_pid is not None else None,
+        owner_since=str((row["claimed_at"] or row["created_at"]) or "") if live else "",
+        updated_at=str(row["updated_at"] or "") if live else "",
+        deadline_seconds=_deadline_seconds(store, run_id) if live else None,
+    )
+
+
+def integrable(task_state: TaskState, delivery_state: str, git_candidate: bool) -> bool:
+    """An accepted Git candidate: the only runs an integration is for."""
+    return (
+        task_state is TaskState.ACCEPTED
+        and delivery_state == DeliveryState.LOCAL_CANDIDATE.value
+        and git_candidate
     )
 
 
@@ -234,7 +349,7 @@ def _branch(target_ref: str) -> str:
 
 
 def _prepare(facts: RunFacts, data_dir: str | None, target: str, project: str | None) -> str:
-    words = ["integrate", "prepare", _word(facts.run_id), "--target", target]
+    words = ["integrate", "prepare", word(facts.run_id), "--target", target]
     if project is not None:
         words += ["--project", project]
     return command(data_dir, *words)
@@ -256,21 +371,30 @@ def _integration_steps(
     if active:
         return [
             _with_comment(
-                command(data_dir, "integrate", "reconcile", _word(record.integration_id)),
+                command(data_dir, "integrate", "reconcile", word(record.integration_id)),
                 f"{record.state.value}: settles it once the process working on it has exited "
                 "(exit 5 while it may still run)",
             )
             for record in active
         ], False
     if not records:
+        if facts.base_branch:
+            # The branch the task was based on, read from stored facts and the ref files: the
+            # usual target. Another branch is the operator's to name; prepare checks it either way.
+            return [
+                _with_comment(
+                    _prepare(facts, data_dir, word(facts.base_branch), project),
+                    "from the task's base",
+                )
+            ], False
         return [_prepare(facts, data_dir, BRANCH_PLACEHOLDER, project)], False
     latest = records[-1]
     if latest.state is IntegrationState.READY:
         return [
             _with_comment(
                 command(
-                    data_dir, "integrate", "apply", _word(latest.integration_id),
-                    "--expect-target", _word(latest.target_tip),
+                    data_dir, "integrate", "apply", word(latest.integration_id),
+                    "--expect-target", word(latest.target_tip),
                 ),
                 "a checked-out branch is never moved: apply then prints the merge to run "
                 "yourself and the reconcile that records it",
@@ -279,7 +403,7 @@ def _integration_steps(
     if latest.state in _PREPARE_AGAIN:
         return [
             _with_comment(
-                _prepare(facts, data_dir, _word(_branch(latest.target_ref)), project),
+                _prepare(facts, data_dir, word(_branch(latest.target_ref)), project),
                 f"the last integration ended {latest.state.value}; prepare against the "
                 "branch's current tip",
             )
@@ -308,7 +432,7 @@ def plan_next(
     left out when ``project_default`` says ``integrate prepare``'s own default resolves the run's
     contract, and is otherwise the placeholder :data:`PROJECT_PLACEHOLDER`.
     """
-    run = _word(facts.run_id)
+    run = word(facts.run_id)
     if project_file:
         project: str | None = shell_word(os.path.abspath(project_file))
     else:
@@ -357,7 +481,7 @@ def plan_next(
         # stop closes it); those are what an operator then settles.
         settle += [(entry, "") for entry in facts.open_entries]
     for invocation_id, state in settle:
-        words = ["ledger", "settle", _word(invocation_id), "--attest", ATTEST_PLACEHOLDER]
+        words = ["ledger", "settle", word(invocation_id), "--attest", ATTEST_PLACEHOLDER]
         if facts.legacy_owner:
             words.append("--legacy-owner-gone")
         text = command(data_dir, *words)
@@ -369,11 +493,7 @@ def plan_next(
     if needs_resume:
         return steps  # releasing the workspace waits until the interrupted attempt is reconciled
 
-    if (
-        facts.task_state is TaskState.ACCEPTED
-        and facts.delivery_state == DeliveryState.LOCAL_CANDIDATE.value
-        and facts.git_candidate
-    ):
+    if integrable(facts.task_state, facts.delivery_state, facts.git_candidate):
         integration, finished = _integration_steps(facts, data_dir, project)
         steps += integration
         if not finished:
@@ -403,18 +523,34 @@ def next_steps(
     and a hint must never change its outcome or exit code. ``project_file``: see :func:`plan_next`.
     """
     try:
-        from .integrate import recorded_project_file  # integrate imports this module
-
-        facts = run_facts(store, run_id)
-        project_default = project_file is None and recorded_project_file(store, run_id) is not None
-        return plan_next(
-            facts,
-            data_dir=named_data_dir(store),
-            project_file=str(project_file) if project_file is not None else None,
-            project_default=project_default,
-        )
+        return steps_for(store, run_facts(store, run_id), project_file=project_file)
     except Exception:  # noqa: BLE001 - a hint must never change the command's outcome
         return []
+
+
+def steps_for(
+    store: Store, facts: RunFacts, *, project_file: str | Path | None = None
+) -> list[str]:
+    """:func:`plan_next` for facts already read from ``store``, with its ``--data-dir``.
+
+    ``--project`` is left out of a printed ``integrate prepare`` when the run's own contract is
+    still where its admission recorded it (``integrate.recorded_project_file``) - looked up only
+    for an accepted Git candidate, the one run a ``--project`` is printed for. ``hflow runs`` and
+    every ``next:`` line share this, so they cannot disagree.
+    """
+    project_default = False
+    if project_file is None and integrable(
+        facts.task_state, facts.delivery_state, facts.git_candidate
+    ):
+        from .integrate import recorded_project_file  # integrate imports this module
+
+        project_default = recorded_project_file(store, facts.run_id) is not None
+    return plan_next(
+        facts,
+        data_dir=named_data_dir(store),
+        project_file=str(project_file) if project_file is not None else None,
+        project_default=project_default,
+    )
 
 
 def next_lines(steps: list[str]) -> list[str]:

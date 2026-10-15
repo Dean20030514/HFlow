@@ -26,7 +26,9 @@ Anything unclear refuses and keeps the scene, which is the correct outcome.
 from __future__ import annotations
 
 import json
+import os
 import re
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,10 +41,12 @@ from .gitworkspace import (
     IGNORED_ARTIFACT_ALLOWLIST,
     GitError,
     GitRepo,
-    _git_failure,
-    _run_git,
+    StatusReport,
+    brief_list,
     is_full_oid,
+    registered_worktrees,
 )
+from .hints import hflow_command, shell_word
 from .store import Store, StoreError
 from .workspace import matches_pattern
 
@@ -80,6 +84,10 @@ class CleanPlan:
     retained_by: list[str] = field(default_factory=list)
     provenance: WorkspaceProvenance | None = None
     root_repository: str | None = None
+    #: The recorded source repository, opened from the user's checkout (or a legacy run's root
+    #: repository): ``git worktree remove`` runs there, never inside the worktree being removed and
+    #: never from the main worktree, which is the git directory itself for a bare repository.
+    source: GitRepo | None = field(default=None, repr=False, compare=False)
 
     def as_dict(self) -> dict:
         return {
@@ -111,11 +119,19 @@ def _refuse(plan: CleanPlan, code: str, detail: str) -> None:
     plan.refusals.append({"reason": code, "detail": detail})
 
 
+def _inspect(worktree: str, *commands: str) -> str:
+    """Read-only git commands, pasteable, that show what a refusal is about. Never a removal."""
+    where = shell_word(worktree)
+    return "; inspect (read-only): " + "; ".join(f"git -C {where} {command}" for command in commands)
+
+
 #: The note the controller writes when it resolves the task's base name to a commit.
 _BASE_NOTE = re.compile(r"base .+ -> (?P<commit>[0-9a-f]{40}(?:[0-9a-f]{24})?)")
 #: The namespaces whose refs count as keeping a commit: a branch, a tag, or an HFlow ref. A
 #: remote-tracking ref is not one - a fetch may prune it - and neither is a worktree's own HEAD.
 _RETAINING_NAMESPACES = ("refs/heads", "refs/tags", "refs/hflow")
+#: What shows a moved HEAD: the commits it now names, and anything uncommitted on top.
+_HEAD_DRIFT_INSPECT = ("log --oneline -5", "status --short --ignored")
 
 
 def _recorded_base_commit(store: Store, run_id: str, spec: TaskSpec) -> str:
@@ -155,17 +171,17 @@ def _recorded_frozen_commit(store: Store, run_id: str, attempt_id: str) -> str:
     return frozen[-1] if frozen else ""
 
 
-def _rootless_source(store: Store, run_id: str) -> tuple[str, str] | None:
-    """``(repository path, absolute Git common dir)`` for a run recorded without provenance.
+def _rootless_source(store: Store, run_id: str) -> tuple[str, GitRepo] | None:
+    """``(repository path, the repository it opens)`` for a run recorded without provenance.
 
     Such a (legacy) run names its repository only on its root budget; ``None`` when it has none.
-    The common directory is what that repository resolves to now.
+    The repository is what that path resolves to now.
     """
     root = store.root_budget_for_run(run_id)
     if root is None:
         return None
     path = str(root["repo_path"])
-    return path, GitRepo.discover(Path(path)).absolute_common_dir
+    return path, GitRepo.discover(Path(path))
 
 
 def _read_candidate_ref(plan: CleanPlan, repo: GitRepo, run_id: str, attempt_id: str) -> bool:
@@ -217,10 +233,8 @@ def _check_head_retained(plan: CleanPlan, repo: GitRepo, base_commit: str) -> No
     if refs:
         plan.retained_by = refs
         plan.reasons.append(
-            f"no receipt: HEAD {head[:12]} is not the run's base, but "
-            + ", ".join(refs[:3])
-            + (f" (+{len(refs) - 3} more)" if len(refs) > 3 else "")
-            + " contains it, so the commit stays reachable after the worktree is removed"
+            f"no receipt: HEAD {head[:12]} is not the run's base, but {brief_list(refs, 3)} "
+            "contains it, so the commit stays reachable after the worktree is removed"
         )
         return
     _refuse(
@@ -228,8 +242,8 @@ def _check_head_retained(plan: CleanPlan, repo: GitRepo, base_commit: str) -> No
         "unretained_commit",
         f"HEAD {head} is not the run's base commit ({base_commit[:12] or 'not recorded'}) and no "
         "branch, tag or HFlow ref contains it, so removing the worktree would leave that commit "
-        f"unreferenced. Inspect it (git -C \"{plan.path}\" show {head[:12]}); to keep it, create "
-        f"a ref (for example git branch <name> {head}), then run clean again",
+        f"unreferenced. Inspect it (git -C {shell_word(plan.path)} show {head[:12]}); to keep it, "
+        f"create a ref (for example git branch <name> {head}), then run clean again",
     )
 
 
@@ -274,34 +288,67 @@ def plan_cleanup(store: Store, run_id: str) -> CleanPlan:
 
     worktree = Path(recorded_path)
     plan.path = str(worktree)
+    source_common = _open_recorded_source(plan, store, worktree)
+    if source_common is None:
+        return plan
+    repo = _open_owned_worktree(plan, worktree, source_common)
+    if repo is None:
+        return plan
+    attempt = _check_execution_state(plan, store, run_id, str(row["task_state"]))
+    base_commit = _check_head(plan, store, repo, worktree, receipt=receipt, spec=spec, attempt=attempt)
+    if base_commit is None:
+        return plan
     try:
-        plan.provenance = store.workspace_provenance_for(run_id)
+        status = repo.status_report(worktree)
+        flagged = repo.index_flagged_paths(worktree)
+    except Exception as exc:  # noqa: BLE001 - a failed read must refuse, not guess
+        _refuse(plan, "status_failed", repr(exc))
+        return plan
+    _check_status(plan, status, flagged)
+    _check_retention(plan, repo, receipt, base_commit)
+    _check_ignored(plan, status)
+    if plan.allowed and not plan.reasons:
+        plan.reasons.append("the worktree is registered, clean, at the frozen candidate, and its ref resolves")
+    return plan
+
+
+def _open_recorded_source(plan: CleanPlan, store: Store, worktree: Path) -> str | None:
+    """The recorded source repository (``plan.source``) and its common directory, or ``None``.
+
+    From the run's workspace provenance, else a legacy run's root ledger repository; never from
+    notes or receipt paths. ``None`` when that cannot be established - the plan then refuses.
+    """
+    try:
+        plan.provenance = store.workspace_provenance_for(plan.run_id)
     except StoreError as exc:
         _refuse(plan, "provenance_unreadable", str(exc))
-        return plan
+        return None
     if plan.provenance is not None and (
         str(worktree) != plan.provenance.worktree_path
         or worktree.resolve() != Path(plan.provenance.worktree_path)
     ):
         _refuse(plan, "provenance_mismatch", "the workspace path differs from its recorded source")
-        return plan
+        return None
     try:
         if plan.provenance is not None:
-            source_common = GitRepo.discover(Path(plan.provenance.project_root)).absolute_common_dir
-            if source_common != plan.provenance.git_common_dir:
+            plan.source = GitRepo.discover(Path(plan.provenance.project_root))
+            if plan.source.absolute_common_dir != plan.provenance.git_common_dir:
                 _refuse(plan, "provenance_mismatch", "recorded repository now has a different Git common directory")
-                return plan
+                return None
         else:
-            source = _rootless_source(store, run_id)
+            source = _rootless_source(store, plan.run_id)
             if source is None:
                 _refuse(plan, "workspace_provenance_missing", "legacy rootless run has no reliable recorded repository source")
-                return plan
-            plan.root_repository, source_common = source
+                return None
+            plan.root_repository, plan.source = source
+        return plan.source.absolute_common_dir
     except (GitError, RefusedError, OSError) as exc:
         _refuse(plan, "provenance_unreadable", f"recorded repository source cannot be checked: {exc}")
-        return plan
+        return None
 
-    # --- 1. ownership: the real registration, not a string comparison
+
+def _open_owned_worktree(plan: CleanPlan, worktree: Path, source_common: str) -> GitRepo | None:
+    """1. Ownership: the real registration, not a string comparison. ``None`` when refused."""
     if not worktree.exists():
         plan.allowed = False
         plan.reasons.append(
@@ -309,28 +356,28 @@ def plan_cleanup(store: Store, run_id: str) -> CleanPlan:
             "reporting MISSING rather than claiming a successful cleanup"
         )
         plan.workspace_state = WORKSPACE_MISSING
-        return plan
+        return None
     try:
         repo = GitRepo.discover(worktree)
     except RefusedError as exc:
         _refuse(plan, "not_a_worktree", str(exc))
-        return plan
+        return None
     except GitError as exc:
         _refuse(plan, "git_query_failed", str(exc))
-        return plan
+        return None
     plan.common_dir = repo.absolute_common_dir
     if plan.common_dir != source_common:
         _refuse(plan, "provenance_mismatch", "Git common directory differs from its recorded source")
-        return plan
+        return None
     try:
         registration = repo.worktree_registration(worktree)
         is_main = registration is not None and repo.is_main_worktree(worktree)
     except GitError as exc:
         _refuse(plan, "git_query_failed", str(exc))
-        return plan
+        return None
     if registration is None:
         _refuse(plan, "not_registered", "git does not have this path registered as a worktree")
-        return plan
+        return None
     plan.registered = True
     if is_main:
         _refuse(
@@ -338,17 +385,14 @@ def plan_cleanup(store: Store, run_id: str) -> CleanPlan:
             "is_source_repository",
             "this path is the repository's main worktree, not a run worktree",
         )
-        return plan
-    registered_common = registration.get("worktree")
-    if registered_common and Path(registered_common).resolve() != worktree.resolve():
-        _refuse(
-            plan,
-            "registration_mismatch",
-            f"git registers {registered_common} for this entry, not {worktree}",
-        )
-        return plan
+        return None
+    return repo
 
-    # --- 2. execution state: a name is not proof that a process stopped
+
+def _check_execution_state(
+    plan: CleanPlan, store: Store, run_id: str, task_state: str
+) -> sqlite3.Row | None:
+    """2. Execution state: a name is not proof that a process stopped. Returns the open attempt."""
     attempt = store.open_attempt(run_id)
     if attempt is not None and str(attempt["state"]) in {
         AttemptState.ACTIVE.value,
@@ -386,30 +430,45 @@ def plan_cleanup(store: Store, run_id: str) -> CleanPlan:
             "from the stopping process; it decided nothing about the run, so cleanup applies the "
             "same gates as before the stop"
         )
-    if str(row["task_state"]) in {TaskState.RUNNING.value, TaskState.CHECKING.value}:
+    if task_state in {TaskState.RUNNING.value, TaskState.CHECKING.value}:
         _refuse(
             plan,
             "run_in_flight",
-            f"the run is {row['task_state']}; only a settled run's workspace may be released",
+            f"the run is {task_state}; only a settled run's workspace may be released",
         )
+    return attempt
 
-    # --- 3. HEAD must still be the frozen candidate, with nothing unfrozen
+
+def _check_head(
+    plan: CleanPlan,
+    store: Store,
+    repo: GitRepo,
+    worktree: Path,
+    *,
+    receipt: ResultReceipt | None,
+    spec: TaskSpec,
+    attempt: sqlite3.Row | None,
+) -> str | None:
+    """3. HEAD must still be the frozen candidate. Returns the run's recorded base commit (``""``
+    when there is a receipt or none was recorded), or ``None`` when a read failed and planning
+    stops there."""
+    run_id = plan.run_id
     try:
         plan.head = repo.worktree_commit(worktree)
     except GitError as exc:
         _refuse(plan, "git_query_failed", f"could not read the worktree's HEAD: {exc}")
-        return plan
+        return None
     base_commit = ""
     if receipt is not None:
         plan.expected_candidate = receipt.candidate.git_commit
         if not _read_candidate_ref(plan, repo, run_id, receipt.attempt_id):
-            return plan
+            return None
         if plan.expected_candidate and plan.head != plan.expected_candidate:
             _refuse(
                 plan,
                 "head_drift",
                 f"HEAD is {plan.head[:12]} but the frozen candidate is "
-                f"{plan.expected_candidate[:12]}",
+                f"{plan.expected_candidate[:12]}" + _inspect(plan.path, *_HEAD_DRIFT_INSPECT),
             )
     else:
         # No receipt: the expected HEAD comes from stored facts - the latest attempt's frozen
@@ -420,21 +479,20 @@ def plan_cleanup(store: Store, run_id: str) -> CleanPlan:
             if frozen:
                 plan.expected_candidate = frozen
                 if not _read_candidate_ref(plan, repo, run_id, str(attempt["attempt_id"])):
-                    return plan
+                    return None
         if plan.expected_candidate and plan.head not in {plan.expected_candidate, base_commit}:
             _refuse(
                 plan,
                 "head_drift",
                 f"HEAD is {plan.head[:12]} but the latest attempt's frozen candidate is "
                 f"{plan.expected_candidate[:12]} and the run's base is "
-                f"{base_commit[:12] or 'not recorded'}",
+                f"{base_commit[:12] or 'not recorded'}" + _inspect(plan.path, *_HEAD_DRIFT_INSPECT),
             )
-    try:
-        status = repo.status_report(worktree)
-        flagged = repo.index_flagged_paths(worktree)
-    except Exception as exc:  # noqa: BLE001 - a failed read must refuse, not guess
-        _refuse(plan, "status_failed", repr(exc))
-        return plan
+    return base_commit
+
+
+def _check_status(plan: CleanPlan, status: StatusReport, flagged: list[str]) -> None:
+    """3, continued. Nothing unfrozen: no change, no flag that hides one, nothing uninterpretable."""
     plan.tracked_changes = list(status.changed)
     plan.ignored_paths = list(status.ignored)
     plan.unsupported = list(status.unsupported)
@@ -442,19 +500,25 @@ def plan_cleanup(store: Store, run_id: str) -> CleanPlan:
         _refuse(
             plan, "index_flags_hide_changes",
             "Git index flags may hide uncommitted worktree bytes (assume-unchanged or "
-            "skip-worktree): " + ", ".join(flagged[:5]),
+            f"skip-worktree): {brief_list(flagged)}"
+            # ``ls-files -v`` tags a flagged entry (lowercase letter or ``S``); status cannot see it.
+            + _inspect(plan.path, "ls-files -v", "status --short --ignored"),
         )
     if status.changed:
         _refuse(
             plan,
             "unfrozen_changes",
-            "the worktree has changes that were never frozen: "
-            + ", ".join(status.changed[:5]),
+            f"the worktree has changes that were never frozen: {brief_list(status.changed)}"
+            + _inspect(plan.path, "status --short --ignored", "diff --stat"),
         )
     if status.unsupported:
         _refuse(plan, "unsupported_status", "; ".join(status.unsupported[:3]))
 
-    # --- 4. the candidate must outlive the worktree
+
+def _check_retention(
+    plan: CleanPlan, repo: GitRepo, receipt: ResultReceipt | None, base_commit: str
+) -> None:
+    """4. The candidate must outlive the worktree; what it is kept by goes into ``keeps``."""
     if receipt is not None and receipt.candidate.git_commit:
         if not plan.candidate_ref:
             _refuse(plan, "no_candidate_ref", "the receipt has no candidate ref to check")
@@ -478,13 +542,12 @@ def plan_cleanup(store: Store, run_id: str) -> CleanPlan:
     other_refs = [ref for ref in plan.retained_by if ref != plan.candidate_ref]
     if other_refs:
         plan.keeps.insert(
-            0,
-            f"the commit at HEAD {plan.head[:12]}, reachable through "
-            + ", ".join(other_refs[:3])
-            + (f" (+{len(other_refs) - 3} more)" if len(other_refs) > 3 else ""),
+            0, f"the commit at HEAD {plan.head[:12]}, reachable through {brief_list(other_refs, 3)}"
         )
 
-    # --- 5. ignored is not disposable
+
+def _check_ignored(plan: CleanPlan, status: StatusReport) -> None:
+    """5. Ignored is not disposable: only the known artifacts go with the worktree."""
     unowned_ignored = [
         path for path in status.ignored if not matches_pattern(path, IGNORED_ARTIFACT_ALLOWLIST)
     ]
@@ -493,17 +556,14 @@ def plan_cleanup(store: Store, run_id: str) -> CleanPlan:
             plan,
             "unknown_ignored_files",
             "the worktree contains ignored files that are not known build artifacts and may be "
-            "the user's: " + ", ".join(unowned_ignored[:5]),
+            f"the user's: {brief_list(unowned_ignored)}"
+            + _inspect(plan.path, "status --short --ignored"),
         )
     if status.ignored:
         plan.reasons.append(
             "known artifacts inside the worktree will be removed with it: "
-            + ", ".join(status.ignored[:5])
+            + brief_list(status.ignored)
         )
-
-    if plan.allowed and not plan.reasons:
-        plan.reasons.append("the worktree is registered, clean, at the frozen candidate, and its ref resolves")
-    return plan
 
 
 def _recheck_cleanup_claim(store: Store, claimed: CleanPlan) -> dict | None:
@@ -535,12 +595,16 @@ def apply_cleanup(store: Store, run_id: str, *, operator: str = "local-controlle
     intent transactionally, run git, then confirm the filesystem *and* the registration
     before recording the outcome. Git and SQLite cannot be one transaction, so both results
     are verified separately. A partial or unverifiable removal keeps its cleanup intent for
-    reconciliation instead of recording completion.
+    reconciliation instead of recording completion - and a later call reports that removal
+    (:func:`_unfinished_removal`) rather than refusing the directory it left as "not a worktree".
     """
     plan = plan_cleanup(store, run_id)
     if plan.already_removed:
         return {"applied": False, "status": WORKSPACE_REMOVED, "detail": "already removed (idempotent)"}
     if not plan.allowed:
+        unfinished = _unfinished_removal(store, run_id)
+        if unfinished is not None:
+            return {"applied": False, **unfinished}
         return {
             "applied": False, "status": "REFUSED", "plan": plan.as_dict(),
             "detail": "the cleanup guards refused; the workspace is untouched",
@@ -564,56 +628,49 @@ def apply_cleanup(store: Store, run_id: str, *, operator: str = "local-controlle
         }
 
     worktree = Path(plan.path)
+    assert plan.source is not None  # an allowed plan opened its recorded source repository
     # A check's child process may still be closing its last handles when the run settles
     # (Windows keeps a directory undeletable until the last handle goes). One bounded retry
     # distinguishes "not yet released" from "someone is holding this open".
     #
-    # The retry calls git from the *main worktree*, not from inside the target: a failed
-    # `worktree remove` may already have deleted the target's `.git` file, after which
-    # discovering a repository through that path fails and would report a misleading
-    # "not a git repository" instead of the real reason. So the main worktree is found once,
-    # before the first removal - and only after the first recheck, which settles a path that
-    # vanished after the claim and releases a claim whose guards no longer hold.
-    command_root: Path | None = None
+    # Git runs in the recorded source repository - never inside the target, whose `.git` file a
+    # failed `worktree remove` may already have deleted, and never from the main worktree, which
+    # for a bare repository is the git directory itself (`safe.bareRepository=explicit` refuses
+    # it). A failed attempt is judged by the registration in the common directory alone
+    # (:func:`_after_failed_removal`): git deletes it even when it could not delete the directory.
     attempts: list[str] = []
     for attempt in range(2):
+        if attempts:
+            settled = _after_failed_removal(store, plan, worktree)
+            if settled is not None:
+                return {**settled, "attempts": attempts}
+            time.sleep(1.5)
         refused = _recheck_cleanup_claim(store, plan)
         if refused is not None:
             return {**refused, "attempts": attempts} if attempts else refused
-        if command_root is None:
-            try:
-                driver_repo = GitRepo.discover(worktree)
-                command_root = driver_repo.main_worktree() or driver_repo.root
-            except (RefusedError, GitError) as exc:
-                return {
-                    "applied": False, "status": "REGISTRATION_UNKNOWN", "path": str(worktree),
-                    "detail": (
-                        f"workspace repository could not be checked: {exc}; cleanup intent kept"
-                    ),
-                }
         try:
-            GitRepo(command_root).remove_worktree_checked(worktree)
-            attempts.append(f"attempt {attempt + 1}: removed")
-            break
+            plan.source.remove_worktree_checked(worktree)
         except (GitError, RefusedError) as exc:
             attempts.append(f"attempt {attempt + 1}: {exc}")
-            if attempt == 0:
-                time.sleep(1.5)
-                continue
-            if not worktree.exists():
-                reconciled = reconcile_cleanup(store, run_id)
-                return {"applied": False, **reconciled, "attempts": attempts, "path": str(worktree)}
-            store.finish_cleanup(run_id, error=f"git worktree remove failed: {exc}")
-            return {
-                "applied": False,
-                "status": "FAILED",
-                "detail": (
-                    f"git refused to remove the worktree: {exc}. HFlow does not force removal; "
-                    "close anything using that directory and re-run the same command."
-                ),
-                "attempts": attempts,
-                "path": str(worktree),
-            }
+            continue
+        attempts.append(f"attempt {attempt + 1}: removed")
+        break
+    else:
+        settled = _after_failed_removal(store, plan, worktree)
+        if settled is not None:
+            return {**settled, "attempts": attempts}
+        store.finish_cleanup(run_id, error=f"git worktree remove failed: {attempts[-1]}")
+        return {
+            "applied": False,
+            "status": "FAILED",
+            "detail": (
+                f"git refused to remove the worktree ({attempts[-1]}) and removed nothing. HFlow "
+                "does not force removal; close anything using that directory and re-run the same "
+                "command."
+            ),
+            "attempts": attempts,
+            "path": str(worktree),
+        }
 
     # Both facts are checked independently: the directory, and git's registration.
     gone = not worktree.exists()
@@ -624,6 +681,8 @@ def apply_cleanup(store: Store, run_id: str, *, operator: str = "local-controlle
             "applied": False, "status": "REGISTRATION_UNKNOWN", "path": str(worktree),
             "detail": f"Git registration could not be checked: {exc}; cleanup intent kept",
         }
+    if not gone and not still_registered:
+        return {"applied": False, **_partial_removal(store, run_id, worktree), "attempts": attempts}
     if gone and not still_registered:
         store.finish_cleanup(run_id)
         # Only what exists is named: a run without a receipt has no receipt to keep, and a run
@@ -653,14 +712,81 @@ def apply_cleanup(store: Store, run_id: str, *, operator: str = "local-controlle
 
 def git_registration_exists(common_dir: str, worktree: Path) -> bool:
     """Is this path still registered, judged from the repository's own metadata?"""
-    args = ("--git-dir", common_dir, "worktree", "list", "--porcelain")
-    completed = _run_git(args, cwd=None, timeout=60)
-    if completed.returncode != 0:
-        raise _git_failure(args, completed)
-    for line in completed.stdout.splitlines():
-        if line.startswith("worktree ") and Path(line.split(" ", 1)[1]).resolve() == worktree.resolve():
-            return True
-    return False
+    target = worktree.resolve()
+    return any(
+        record.get("worktree") and Path(record["worktree"]).resolve() == target
+        for record in registered_worktrees(common_dir)
+    )
+
+
+def _left_behind(worktree: Path) -> str:
+    """What a removal git could not finish left in ``worktree``: its entries' names, read only."""
+    try:
+        names = sorted(entry.name for entry in os.scandir(worktree))
+    except OSError as exc:
+        return f"what it holds could not be listed ({exc})"
+    if not names:
+        return "it is empty"
+    return f"it still holds {len(names)} entr{'y' if len(names) == 1 else 'ies'}: {brief_list(names)}"
+
+
+def _partial_removal(store: Store, run_id: str, worktree: Path) -> dict:
+    """``PARTIAL``: git dropped the registration but the directory remains. The intent stays.
+
+    Git deletes a worktree's directory, then its registration - the registration even when the
+    directory could not be deleted - so what remains is no longer a worktree to git, and the
+    guards cannot be applied to it again. HFlow never deletes a directory itself (no ``rmtree``),
+    so removing it is the operator's, and ``clean --reconcile`` then records the removal.
+    """
+    return {
+        "status": "PARTIAL",
+        "path": str(worktree),
+        "detail": (
+            f"git removed this worktree's registration but could not delete the directory "
+            f"{worktree} (on Windows, typically a file something still holds open); "
+            f"{_left_behind(worktree)}. Git no longer knows it as a worktree and HFlow never "
+            "deletes a directory itself, so removing what is left by hand is yours to do once "
+            "nothing uses it - what clean keeps (refs, receipt, evidence) lives outside it. Then "
+            f"{hflow_command(store, 'clean', run_id, '--reconcile')} records the removal; the "
+            "cleanup intent is kept until then"
+        ),
+    }
+
+
+def _after_failed_removal(store: Store, plan: CleanPlan, worktree: Path) -> dict | None:
+    """Where a ``git worktree remove`` that failed left things; ``None`` when nothing was removed.
+
+    Asked of the repository's common directory only - the worktree's own ``.git`` may be gone.
+    Still registered: git refused before deleting anything, so the guards can be rechecked and the
+    removal retried or reported as refused. Not registered: git got as far as deleting, so the
+    outcome is ``REMOVED`` (nothing left) or ``PARTIAL`` (a directory left), and the intent stays
+    for that removal - never re-planned, and never released as if nothing had happened.
+    """
+    try:
+        registered = git_registration_exists(plan.common_dir, worktree)
+    except Exception as exc:  # noqa: BLE001 - an unreadable registration is not an answer
+        return {
+            "applied": False, "status": "REGISTRATION_UNKNOWN", "path": str(worktree),
+            "detail": f"Git registration could not be checked: {exc}; cleanup intent kept",
+        }
+    if registered:
+        return None
+    if not worktree.exists():
+        return {"applied": False, **reconcile_cleanup(store, plan.run_id), "path": str(worktree)}
+    return {"applied": False, **_partial_removal(store, plan.run_id, worktree)}
+
+
+def _unfinished_removal(store: Store, run_id: str) -> dict | None:
+    """The outcome of an earlier removal that kept its intent, when it left something to report.
+
+    ``PARTIAL`` (a directory git no longer registers) or ``REMOVED`` (it is gone now, recorded);
+    ``None`` otherwise, including when no intent is pending - the guards' refusal stands then.
+    """
+    state = store.workspace_state(run_id)
+    if not state["cleanup_intent_at"] or state["cleanup_done_at"]:
+        return None
+    reconciled = reconcile_cleanup(store, run_id)
+    return reconciled if reconciled["status"] in {"PARTIAL", WORKSPACE_REMOVED} else None
 
 
 def reconcile_cleanup(store: Store, run_id: str) -> dict:
@@ -690,7 +816,7 @@ def reconcile_cleanup(store: Store, run_id: str) -> dict:
             source = _rootless_source(store, run_id)
             if source is None:
                 raise StoreError("legacy rootless run has no recorded repository source")
-            common_dir = source[1]
+            common_dir = source[1].absolute_common_dir
         registered = git_registration_exists(common_dir, worktree)
     except Exception as exc:  # noqa: BLE001 - a failed read never proves removal
         return {
@@ -705,6 +831,8 @@ def reconcile_cleanup(store: Store, run_id: str) -> dict:
         if not state["cleanup_done_at"]:
             store.finish_cleanup(run_id)
         return {"status": WORKSPACE_REMOVED, "detail": "directory and Git registration confirmed gone"}
+    if not registered and state["cleanup_intent_at"] and not state["cleanup_done_at"]:
+        return _partial_removal(store, run_id, worktree)
     return {
         "status": WORKSPACE_PRESENT if registered else "UNREGISTERED",
         "detail": f"path exists (registered={registered}); nothing was removed",

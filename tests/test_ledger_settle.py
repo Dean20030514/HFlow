@@ -52,7 +52,7 @@ from hflow.store import (
     Store,
     StoreError,
 )
-from tests.store_helpers import mark_invocation_started, settlement_for
+from tests.store_helpers import mark_invocation_started, pending_invocations, settlement_for
 from tests.test_batch_e_ledger import (
     AUTHORIZATION_ID,
     _binding,
@@ -377,7 +377,7 @@ def test_a_late_spawn_report_or_result_changes_nothing_after_an_operator_settle(
     ) is False
     store.mark_invocation_not_started("I-late", "late stop")
     assert store.invocation("I-late") == before
-    assert store.pending_invocations(binding.root_id) == []
+    assert pending_invocations(store, binding.root_id) == []
 
 
 # --------------------------------------------------------------------------
@@ -718,11 +718,11 @@ def test_migration_to_the_settlement_version_keeps_rows(
         assert reopened.invocation("I-mig") == intent_before, "the unknown entry is not rewritten"
         assert reopened.settlements_for(run) == []
         # Still blocking until an operator settles it with this build.
-        assert reopened.pending_invocations(binding.root_id)[0].invocation_id == "I-mig"
+        assert pending_invocations(reopened, binding.root_id)[0].invocation_id == "I-mig"
         reopened.settle_by_operator(
             "I-mig", settled_as="consumed", attested_by="op", attestation=ATTEST
         )
-        assert reopened.pending_invocations(binding.root_id) == []
+        assert pending_invocations(reopened, binding.root_id) == []
     finally:
         reopened.close()
 
@@ -952,10 +952,15 @@ def test_settle_is_allowed_when_the_owner_and_the_child_are_gone(
 
 
 @windows_only
-def test_settle_of_a_run_with_no_owner_token_still_refuses_a_matching_child(
+def test_settle_of_a_run_with_no_owner_host_never_probes_its_child_locally(
     store: Store, project, task_spec: TaskSpec, project_root: Path, capsys
 ) -> None:
-    """A label-only (pre-v6 style) claim has no lock to examine; the child rule still applies."""
+    """A label-only (pre-v6 style) claim recorded no host, so its child cannot be judged here.
+
+    A local lookup of another machine's pid reads ``gone``, which is not an observation of that
+    process: running or exited, the entry is refused, and only the operator's attestation that
+    the owner (and the process tree it launched) is gone settles it.
+    """
     binding, limits = _root(store, project, task_spec, project_root)
     run = _seed_ready_run(store, run_id="R-legacy", project_id=project.project_id, spec=task_spec)
     assert store.get_run(run)["owner_token"] is None
@@ -971,11 +976,20 @@ def test_settle_of_a_run_with_no_owner_token_still_refuses_a_matching_child(
         ) is True
         store.settle_invocation("I-legacy", outcome=None, detail="no observable result")
         store.set_blocked(run, RefusalCode.OUTCOME_UNKNOWN, "stop not confirmed")
+        assert store.get_run(run)["owner_host"] is None
         err = _assert_refused_unchanged(store, "I-legacy", _cli_settle(store, "I-legacy"), capsys)
-        assert "may still be running" in err
+        assert "cannot be judged from here" in err and "without a host" in err, err
     finally:
         _stop(child)
-    assert _cli_settle(store, "I-legacy") == EXIT_OK, capsys.readouterr().err
+    err = _assert_refused_unchanged(store, "I-legacy", _cli_settle(store, "I-legacy"), capsys)
+    assert "without a host" in err and "--legacy-owner-gone" in err, err
+    code = main([
+        "--data-dir", str(store.path.parent), "ledger", "settle", "I-legacy",
+        "--attest", ATTEST, "--legacy-owner-gone",
+    ])
+    assert code == EXIT_OK, capsys.readouterr().err
+    settlement = settlement_for(store, "I-legacy")
+    assert settlement is not None and "operator attests" in settlement.attestation
 
 
 def test_a_pre_v6_run_with_a_recorded_controller_settles_only_on_an_explicit_attestation(
@@ -998,6 +1012,20 @@ def test_a_pre_v6_run_with_a_recorded_controller_settles_only_on_an_explicit_att
 
     err = _assert_refused_unchanged(store, "I-legacy", _cli_settle(store, "I-legacy"), capsys)
     assert "--legacy-owner-gone" in err and "no host" in err, err
+
+    # The bound applies to the text that is stored, the flag's suffix included: a text that fits
+    # alone but not with the suffix is refused up front, saying how long it may be.
+    from hflow.cli import LEGACY_OWNER_GONE_SUFFIX
+    from hflow.store import ATTESTATION_MAX_CHARS
+
+    room = ATTESTATION_MAX_CHARS - len(LEGACY_OWNER_GONE_SUFFIX)
+    code = main([
+        "--data-dir", str(store.path.parent), "ledger", "settle", "I-legacy",
+        "--attest", "x" * (room + 1), "--legacy-owner-gone",
+    ])
+    err = capsys.readouterr().err
+    assert code == EXIT_REFUSED and f"at most {room} characters" in err, err
+    assert settlement_for(store, "I-legacy") is None
 
     code = main([
         "--data-dir", str(store.path.parent), "ledger", "settle", "I-legacy",

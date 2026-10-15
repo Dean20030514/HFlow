@@ -50,7 +50,7 @@ from hflow.report import status_text
 from hflow.store import ATTESTATION_MAX_CHARS, Store, StoreError
 
 from .owner_exit import owner_exits, windows_only
-from .store_helpers import settlement_for
+from .store_helpers import pending_invocations, settlement_for
 from .test_batch_e_dispatch import FAKE_WRITE_PLAN, RunningTask
 from .test_batch_e_ledger import _binding as _ledger_binding
 from .test_batch_e_ledger import _register_authorization, _reserve, _seed_ready_run
@@ -74,8 +74,7 @@ from .test_owner_lease import _controller
 
 def _cli_resume(store: Store, project_root: Path, run_id: str, *extra: str) -> int:
     return main([
-        "resume", run_id, "--project-root", str(project_root),
-        "--data-dir", str(store.path.parent), *extra,
+        "resume", run_id, "--data-dir", str(store.path.parent), *extra,
     ])
 
 
@@ -170,7 +169,7 @@ def test_resume_after_a_cross_process_cancel_waits_for_the_owner_then_reconciles
     assert reconciled is not None and reconciled.state is InvocationStartState.UNKNOWN
     assert store.open_attempt(run_id)["reconcile_json"] is not None
     assert len(driver.started) == started, "resume never re-dispatches"
-    assert [e.invocation_id for e in store.pending_invocations(root_id)] == [entry.invocation_id]
+    assert [e.invocation_id for e in pending_invocations(store, root_id)] == [entry.invocation_id]
     assert store.get_run(run_id)["block_code"] == RefusalCode.OUTCOME_UNKNOWN.value
 
 

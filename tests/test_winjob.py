@@ -114,3 +114,97 @@ def test_a_pid_that_names_no_process_is_gone_through_the_real_binding() -> None:
     and answer ``None``.
     """
     assert winjob.process_gone(UNUSED_PID, 0.0) is True
+
+
+# --------------------------------------------------------------------------
+# resume: a failure the kernel reports is a boundary error, never a silent success
+# --------------------------------------------------------------------------
+
+
+def _resume_stand_in(
+    *, snapshot: int | None, resume_result: int, pid: int = 1234
+) -> tuple[types.SimpleNamespace, list[str]]:
+    """A kernel32 with what ``resume`` calls: one snapshot holding one thread of ``pid``."""
+    calls: list[str] = []
+
+    def create_snapshot(flags: int, owner: int) -> int | None:
+        calls.append("CreateToolhelp32Snapshot")
+        return snapshot
+
+    def thread_first(handle: int, entry_ref: object) -> int:
+        calls.append("Thread32First")
+        entry = entry_ref._obj  # type: ignore[attr-defined] - ctypes.byref keeps its object
+        entry.th32OwnerProcessID = pid
+        entry.th32ThreadID = 77
+        return 1
+
+    def thread_next(handle: int, entry_ref: object) -> int:
+        calls.append("Thread32Next")
+        return 0
+
+    def open_thread(access: int, inherit: bool, thread_id: int) -> int:
+        calls.append("OpenThread")
+        return 99
+
+    def resume_thread(handle: int) -> int:
+        calls.append("ResumeThread")
+        return resume_result
+
+    def close_handle(handle: int) -> int:
+        calls.append(f"CloseHandle({handle})")
+        return 1
+
+    api = types.SimpleNamespace(
+        CreateToolhelp32Snapshot=create_snapshot,
+        Thread32First=thread_first,
+        Thread32Next=thread_next,
+        OpenThread=open_thread,
+        ResumeThread=resume_thread,
+        CloseHandle=close_handle,
+    )
+    return api, calls
+
+
+def test_a_resume_the_kernel_refuses_raises_and_closes_both_handles(monkeypatch) -> None:
+    api, calls = _resume_stand_in(snapshot=55, resume_result=winjob.RESUME_THREAD_FAILED)
+    monkeypatch.setattr(winjob, "_kernel32", lambda: api)
+
+    with pytest.raises(winjob.JobBoundaryError, match="ResumeThread failed"):
+        winjob.resume(1234)
+    assert "CloseHandle(99)" in calls and "CloseHandle(55)" in calls
+
+
+def test_a_resumed_thread_returns_quietly(monkeypatch) -> None:
+    api, calls = _resume_stand_in(snapshot=55, resume_result=1)  # the previous suspend count
+    monkeypatch.setattr(winjob, "_kernel32", lambda: api)
+
+    winjob.resume(1234)
+    assert calls.count("ResumeThread") == 1
+
+
+@pytest.mark.parametrize("snapshot", [winjob.INVALID_HANDLE_VALUE, None], ids=["invalid", "null"])
+def test_a_failed_thread_snapshot_raises(monkeypatch, snapshot: int | None) -> None:
+    """``INVALID_HANDLE_VALUE`` read through a ``HANDLE`` restype is the unsigned all-ones value.
+
+    Through the default ``c_int`` restype it read as ``-1`` and never matched, so a failed
+    snapshot went on to be walked.
+    """
+    api, calls = _resume_stand_in(snapshot=snapshot, resume_result=1)
+    monkeypatch.setattr(winjob, "_kernel32", lambda: api)
+
+    with pytest.raises(winjob.JobBoundaryError, match="CreateToolhelp32Snapshot"):
+        winjob.resume(1234)
+    assert calls == ["CreateToolhelp32Snapshot"]
+
+
+def test_the_kernel32_binding_is_loaded_once_with_every_signature_declared() -> None:
+    from ctypes import wintypes
+
+    api = winjob._kernel32()
+    assert api is winjob._kernel32()
+    for name, (restype, argtypes) in winjob._SIGNATURES.items():
+        function = getattr(api, name)
+        assert function.restype is restype, name
+        assert list(function.argtypes) == argtypes, name
+    assert api.CreateToolhelp32Snapshot.restype is wintypes.HANDLE
+    assert api.ResumeThread.restype is wintypes.DWORD

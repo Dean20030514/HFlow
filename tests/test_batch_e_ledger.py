@@ -44,7 +44,7 @@ from hflow.contracts import (
 )
 from hflow.store import Store, StoreError
 
-from .store_helpers import claim_run, mark_invocation_started
+from .store_helpers import claim_run, mark_invocation_started, pending_invocations
 
 CONTROLLER_ID = "ledger-test-controller"
 CONTROLLER_BUILD = "ledger-test"
@@ -843,7 +843,7 @@ def test_an_unknown_outcome_keeps_the_consumption_and_blocks_the_root(
         else:
             assert intent.outcome is InvocationOutcome.OUTCOME_UNKNOWN
         assert intent.pending is True, "an unknown invocation still blocks its root"
-        assert [entry.invocation_id for entry in store.pending_invocations(binding.root_id)] == [
+        assert [entry.invocation_id for entry in pending_invocations(store, binding.root_id)] == [
             "I-unknown-1"
         ]
 

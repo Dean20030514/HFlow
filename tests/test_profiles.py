@@ -404,3 +404,71 @@ def test_an_invalid_model_selection_is_refused_at_profile_load(
         load_profile(tmp_path, "models")
     assert excinfo.value.code is RefusalCode.INVALID_SPEC
     assert "model_selection" in excinfo.value.message
+
+
+# --------------------------------------------------------------------------
+# the one input-file reader (profiles.load_json_file)
+# --------------------------------------------------------------------------
+
+
+def _profile_document(profile_id: str) -> dict[str, object]:
+    return {
+        "profile_id": profile_id,
+        "role_bindings": {"implementer": "a", "reviewer": "a"},
+        "agents": {"a": {"harness": "dsh", "driver": "acpx-dsh"}},
+    }
+
+
+def test_a_utf8_byte_order_mark_is_accepted_and_changes_no_digest(tmp_path: Path) -> None:
+    """Windows PowerShell 5.1's ``Set-Content -Encoding utf8`` writes a BOM: it is read past,
+    and the digest - over the parsed document, never the bytes - is the same."""
+    path = tmp_path / "profiles" / "bom.json"
+    path.parent.mkdir(parents=True)
+    text = json.dumps(_profile_document("bom"))
+    path.write_text(text, encoding="utf-8")
+    plain = profile_digest(load_profile(tmp_path, "bom"))
+    path.write_bytes(b"\xef\xbb\xbf" + text.encode("utf-8"))
+    assert profile_digest(load_profile(tmp_path, "bom")) == plain
+
+
+@pytest.mark.parametrize(
+    ("encoding", "bom"), [("utf-16", b""), ("utf-16-le", b""), ("utf-16-be", b"\xfe\xff")]
+)
+def test_a_utf16_file_is_refused_with_the_encoding_fix(
+    tmp_path: Path, encoding: str, bom: bytes
+) -> None:
+    """What PowerShell 5.1's ``>`` writes: refused by name, with how to save it as UTF-8."""
+    path = tmp_path / "profiles" / "wide.json"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(bom + json.dumps(_profile_document("wide")).encode(encoding))
+    with pytest.raises(RefusedError) as excinfo:
+        load_profile(tmp_path, "wide")
+    assert excinfo.value.code is RefusalCode.INVALID_SPEC
+    message = excinfo.value.message
+    assert str(path) in message and "could not be read" in message
+    assert "UTF-16" in message and "-Encoding utf8" in message
+
+
+def test_a_file_that_cannot_be_read_is_a_refusal_naming_it(tmp_path: Path) -> None:
+    from hflow.profiles import load_json_file
+
+    directory = tmp_path / "task.json"
+    directory.mkdir()
+    with pytest.raises(RefusedError) as excinfo:
+        load_json_file(directory, what="task spec")
+    assert excinfo.value.code is RefusalCode.INVALID_SPEC
+    assert excinfo.value.message == (
+        f"task spec {directory} could not be read: it is a directory, not a file"
+    )
+
+    latin = tmp_path / "latin.json"
+    latin.write_bytes(b'{"goal": "caf\xe9"}')
+    with pytest.raises(RefusedError) as excinfo:
+        load_json_file(latin, what="task spec")
+    assert "not valid UTF-8 JSON" in excinfo.value.message
+
+    missing = tmp_path / "missing.json"
+    with pytest.raises(RefusedError) as excinfo:
+        load_json_file(missing, what="task spec", missing_code=RefusalCode.NOT_IMPLEMENTED)
+    assert excinfo.value.code is RefusalCode.NOT_IMPLEMENTED
+    assert excinfo.value.message == f"task spec not found: {missing}"

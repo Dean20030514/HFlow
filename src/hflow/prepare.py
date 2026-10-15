@@ -18,9 +18,9 @@ import os
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, ValidationError
+from pydantic import ValidationError
 
 from .admission import predictable_dispatch_problems, validate_task_spec
 from .contracts import (
@@ -59,6 +59,7 @@ from .paths import ENV_ALLOW_WRITES
 from .packet import PacketTooLargeError
 from .profiles import (
     RUN_ROLES,
+    load_model,
     load_profile,
     profile_digest,
     requested_profile_id,
@@ -175,57 +176,8 @@ class ResolvedRun:
 
 
 # --------------------------------------------------------------------------
-# loading the inputs
+# loading the inputs (each file through ``profiles.load_model``, the one input-file reader)
 # --------------------------------------------------------------------------
-
-
-def load_json_file(path: Path, *, what: str, missing_hint: str = "") -> object:
-    """Read one JSON document, refusing rather than defaulting.
-
-    ``missing_hint`` follows the "not found" refusal: how to supply the file.
-    """
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise RefusedError(
-            RefusalCode.INVALID_SPEC,
-            f"{what} not found: {path}" + (f". {missing_hint}" if missing_hint else ""),
-        ) from exc
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise RefusedError(
-            RefusalCode.INVALID_SPEC, f"{what} {path} is not valid UTF-8 JSON: {exc}"
-        ) from exc
-
-
-_Model = TypeVar("_Model", bound=BaseModel)
-
-
-def _load_model(
-    path: Path,
-    model: type[_Model],
-    *,
-    what: str,
-    invalid: str,
-    summarize: bool = True,
-    not_object: str = "",
-    missing_hint: str = "",
-) -> _Model:
-    """Read one input file as ``model``; every failure is an ``invalid_spec`` refusal.
-
-    ``invalid`` starts the refusal for a document that does not match, followed by the rejected
-    fields (:func:`summarize_validation_error`) or, with ``summarize=False``, pydantic's own text.
-    ``not_object``, when given, refuses a document that is not a JSON object before validation.
-    """
-    raw = load_json_file(Path(path), what=what, missing_hint=missing_hint)
-    if not_object and not isinstance(raw, dict):
-        raise RefusedError(
-            RefusalCode.INVALID_SPEC, f"{not_object}, not a JSON {type(raw).__name__}"
-        )
-    try:
-        return model.model_validate(raw)
-    except ValidationError as exc:
-        reason = summarize_validation_error(exc) if summarize else str(exc)
-        raise RefusedError(RefusalCode.INVALID_SPEC, f"{invalid}: {reason}") from exc
 
 
 def load_task_spec(path: Path) -> TaskSpec:
@@ -234,14 +186,14 @@ def load_task_spec(path: Path) -> TaskSpec:
     A malformed task is an admission refusal (exit 2) naming the rejected fields, not a pydantic
     traceback: scripts branch on the documented exit codes.
     """
-    return _load_model(
+    return load_model(
         path, TaskSpec, what="task spec", invalid=f"{path} is not a valid task spec"
     )
 
 
 def load_project_contract(path: Path) -> ProjectConfig:
     """Read one project contract, refusing a document that does not match ``ProjectConfig``."""
-    return _load_model(
+    return load_model(
         path,
         ProjectConfig,
         what="project contract",
@@ -264,7 +216,7 @@ def load_root_budget_plan(path: Path) -> RootBudgetPlan:
     """
     from .authorization import root_budget_from_plan
 
-    plan = _load_model(
+    plan = load_model(
         path,
         RootBudgetPlan,
         what="root budget file",
@@ -288,7 +240,7 @@ def load_repair_policy(path: Path) -> RepairPolicy:
     case) is refused by ``admission`` before a dispatch exists, because that depends on the rest
     of the task and not on this file.
     """
-    return _load_model(
+    return load_model(
         path,
         RepairPolicy,
         what="repair policy file",

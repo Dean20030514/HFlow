@@ -53,7 +53,7 @@ from hflow.store import Store
 from hflow.verify import CheckRunners, FakeCheckRunner
 
 from .owner_exit import owner_exits, successor
-from .store_helpers import claim_run, dispatch_attempt
+from .store_helpers import claim_run, dispatch_attempt, pending_invocations
 from .test_driver_acpx_dsh import FAKE_CLIENT, STUB_AGENT
 
 
@@ -819,7 +819,7 @@ def test_a_stop_after_the_review_turn_is_reserved_still_prevents_the_start(
     # empty and the attempt row keeps the dispatch facts. What must hold is that nothing is
     # pending and nothing was refunded.
     assert store.invocations_for(outcome.run_id) == []
-    assert store.pending_invocations("") == []
+    assert pending_invocations(store, "") == []
 
 
 def test_a_late_failed_review_does_not_relabel_an_unconfirmed_stop(

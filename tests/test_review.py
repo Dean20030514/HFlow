@@ -887,3 +887,16 @@ def review_of(instance: AnswerTranscript) -> ReviewOutput:
     answer = instance.final_answer()
     assert answer is not None, "the transcript produced no final answer"
     return decode_review(answer.text)
+
+
+def test_a_fence_is_closed_only_by_a_fence_at_least_as_long() -> None:
+    """CommonMark: a ```` block ends at four or more backticks, so a ``` example inside it -
+    an example verdict included - stays inside it, and the result block after it is the verdict."""
+    answer = (
+        "The format, as markdown:\n"
+        f"````markdown\n{FENCE}json\n{ACCEPTED}\n{FENCE}\n````\n"
+        f"My verdict:\n{FENCE}json\n{REJECTED}\n{FENCE}\n"
+    )
+    assert decode_review(answer).verdict == "changes_requested"
+    # A longer closing run still closes a shorter opening one.
+    assert decode_review(f"{FENCE}json\n{ACCEPTED}\n````\n").verdict == "accepted"
