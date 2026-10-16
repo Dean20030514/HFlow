@@ -1,113 +1,119 @@
 # Operations
 
-Practical notes for running HFlow as it exists today. The commands below are the ones the
-installed CLI actually accepts; when this file and `hflow <command> --help` disagree, `--help`
-is right. `python -m pytest -q` and `python -m pytest -q --collect-only` are the two ways this
-file's test numbers were checked.
+The operator guide for HFlow as this tree builds it. When this file and `hflow <command> --help`
+disagree, `--help` is right. Internals are in `docs/architecture.md`; what is absent from this
+build is listed once, in the README's "Not implemented" section.
 
 ## Daily commands
 
 ```sh
-hflow doctor --json                        # what is on this machine; no model calls, never runs dsh
-hflow doctor --profile <id>                # resolve the profile per role; non-zero if unusable
-hflow prepare --task task.json --profile <id> --project-root <repo> --plan-out task.plan.json
-hflow approve --plan task.plan.json        # at a terminal only: shows the plan and its approval code; you type the code, then YOUR approval
-hflow run --plan task.plan.json            # every resolution input comes from the plan; a stale plan is refused; finds approve's default file itself
-hflow approve --plan task.plan.json --run  # the same approval, then exactly `run --plan` in the same process (exit code = the run's)
-hflow run --task task.json --project-root <repo> --driver fake --json
-hflow status <run_id>
-hflow status --last                        # the most recently created run (also report, diff); prints `run: <id>` first
-hflow report <run_id>
-hflow resume <run_id>                      # never re-dispatches: reconciles a blocked run (an outcome_unknown one with an owner token only once that owner is gone), takes a live run over from a provably gone owner (blocks it owner_lost), or closes an ended run's open ledger entries once its owner is gone
-hflow resume <run_id> --legacy-owner-gone --attest "<text>"   # a pre-v6 ended run: close its open entries on your attestation that its controller exited
-hflow cancel <run_id>
+hflow doctor                                    # what this machine can run; no model calls
+hflow init project                              # .hflow/project.json with kind=command checks
+hflow init profile dsh-local                    # <data-dir>/profiles/dsh-local.json
+hflow init task T-1 --goal "..." --allow src    # ./T-1.task.json, and the prepare command for it
+hflow approve --task T-1.task.json --profile dsh-local --allow-writes   # writes T-1.plan.json, asks you
+hflow run --plan T-1.plan.json                  # runs the plan with the approval approve wrote
+hflow status                                    # the inbox: runs that need you, each with a next command
+hflow integrate <run-id>                        # at a terminal: put the accepted candidate on its branch
 ```
 
-`run --json` prints a JSON payload that includes the receipt; without `--json` it prints the run,
-its state, the turns and the `next:` lines. Use `--receipt-out <path>` to
-write only the receipt, and check the exit code: `0` accepted, `2` refused at admission,
-`3` blocked after dispatch, `4` usage (any argument-parsing error), `5` the run exists and is
-not finished (`DRAFT`/`READY`/`RUNNING`/`CHECKING`: a submission that found the run claimed by
-another owner process, `resume` refusing a takeover because that owner may be alive, or a
-never-dispatched run whose admission binding is missing, unreadable or changed), `6`
-`status`/`report` found a stored record that no longer validates (`StoredRecordUnreadable`). The
-error names the record; nothing substitutes guessed data for it. `cancel`/`resume` can still work
-from the run row without those presentation records. Any command that hits a ledger error it does
-not map itself prints one stderr line, never a traceback: `database is locked` (another process
-holds the ledger) exits `5` - run it again - and anything else (a storage version newer than this
-build, a file that is not a ledger, a write the ledger refused such as an authorization id already
-recorded with another binding) exits `6`; nothing is repaired or migrated past what it refused.
-A command that looks a run, integration or invocation up (`status`, `report`, `diff`, `cancel`,
-`resume`, `clean`, `integrate`, `ledger settle`) never creates a ledger: an id it cannot find
-exits `4` with one line naming the ledger file it looked in (or that there is none there) and
-suggesting `--data-dir`. `resume` exits `5` whatever the run's own
-state whenever it refused on the owner rule and wrote nothing - an `outcome_unknown` run whose
-owner may still be alive, or an ended run whose open ledger entries it may not close yet (an owner
-that may be alive, or a pre-v6 owner nobody attested gone) - never the `3` or `0` that would read
-as "done". It also exits `5` when one of its store writes failed (`database is locked`, for one):
-stderr says so, that transaction was rolled back whole (an ended run's entry closure and the
-attestation it records commit together), and `resume` can be run again. An unusable
-`--legacy-owner-gone`/`--attest` pair is a usage error (`4`).
-`130`: a Ctrl+C reached the command (`4` before this build) - it prints `interrupted: ...`, retries nothing, and what was recorded before
-the interrupt is authoritative: read it with `hflow status <run_id>` (see "Recovering from a
-controller crash" for what an interrupted run records). Without `--json`, a refusal or a `resume`
-outcome prints `key: value` lines (lists as `- item`, a nested record as one compact JSON line);
-`--json` output is unchanged.
+`approve --task` is `prepare --plan-out` and `approve --plan` in one process. The two-step form
+lets you read the preview before anything asks for an approval:
 
-**`next:` lines.** `run`, `status`, `report`, `resume`, `ledger settle` and every `integrate`
-subcommand end their text output with `next: <command>` lines - what to run next for that run,
-read from stored facts only (no model, no process probe, nothing written); `prepare --plan-out`
-and `approve` end with the `approve` / `run --plan` command (`approve --run` prints `running
-<command>` instead, then the run's own lines). `--json` and `--receipt-out` output
-carry none. The order is: `resume <run>` then `ledger settle <invocation> --attest "<what you
-know and why>"` after an interruption (`--legacy-owner-gone` for a pre-v6 owner) - replace the
-placeholder with your own words: an `--attest` text that is still a `<...>` placeholder, or the
-words `what you know and why`, is refused (`resume` and `integrate reconcile` exit `4`, `ledger
-settle` exits `2`) and nothing is recorded; `integrate
-prepare <run> --target <branch>` for an accepted Git candidate (the task's base branch when it still
-exists in the run's repository - read from its ref files, with `# from the task's base` - else the
-placeholder to replace; `apply` still needs `--expect-target`);
-`integrate apply <id> --expect-target <tip>` for a ready integration; `integrate reconcile <id>`
-for an active one; then `clean <run>` (preview) and `clean <run> --apply`. A live run gets
-`status` again. A trailing `# ...` says when a command depends on something only it can observe.
-Every command carries `--data-dir` when the ledger is not the default one, and none re-runs a task
-or reuses an authorization. `integrate prepare` names `--project` only when its default (below)
-would not resolve the run's contract.
-`status` and `report` without `--project-root` check drift against the project root the run
-recorded (when that directory still exists), not against the current directory.
+```sh
+hflow prepare --task T-1.task.json --profile dsh-local --allow-writes --plan-out T-1.plan.json
+hflow approve --plan T-1.plan.json          # add --run to continue straight into run --plan
+hflow run --plan T-1.plan.json
+```
 
-`hflow doctor` exits `0`, or `2` when a named profile cannot be used. It finds programs on the
-absolute `PATH` entries only and runs `git --version` and `node --version` from those paths -
-never `dsh` (the `dsh` on PATH may be the DSH Desktop app's shim) and never the acpx client. Its
-readiness lines are facts and never change the exit code:
+Everything else is reading and recovery: `status <run-id>`, `report <run-id>` (receipt and
+evidence), `runs` (recent runs, one next command each), `diff <run-id>`, `cancel`, `resume`,
+`ledger settle` and `clean`. `report` and `diff` take `--last` for the newest run instead of an id;
+`status` does not (`status --last` exits `4` naming `report --last`), and `runs --needs-you` is
+gone too (exit `4`, naming `hflow status`).
+
+The offline fake driver (the default without a profile) runs the same loop with no model and no
+approval: `hflow run --task task.json --project-root <repo> --driver fake --fake-write-plan
+writes.json`, where the write plan is a JSON object of `{relative path: file text}`.
+
+## Exit codes, output and `next:` lines
+
+| Code | Meaning |
+|---|---|
+| `0` | done: accepted, or the command did what it was asked |
+| `2` | refused: nothing was created (an admission refusal, a stale plan, a wrong code, a Git error in `integrate`) |
+| `3` | blocked: the run exists, work happened and its evidence is kept; for `integrate`, a decision is yours (hand-off, conflict, stale, failed checks) |
+| `4` | usage: an argument error, a removed flag, an unknown run/integration/invocation id, a bad `--attest` |
+| `5` | in progress: the run is `DRAFT`/`READY`/`RUNNING`/`CHECKING`, another owner may be alive, or another process holds the ledger locked (`database is locked`: run it again) |
+| `6` | a stored record no longer validates, or the ledger cannot be used by this build (a newer storage version, a file that is not a ledger, a write the ledger refused) |
+| `130` | Ctrl+C: prints `interrupted: ...`, retries nothing; what was recorded before is authoritative (`hflow status <run-id>`) |
+
+- A refusal (`2`) and a block (`3`) are different events. A refusal leaves no run row, workspace,
+  reservation or allowance behind; a block is a run that dispatched and stopped.
+- A command that looks something up (`status`, `report`, `diff`, `cancel`, `resume`, `clean`,
+  `integrate`, `ledger settle`) never creates a ledger. An id it cannot find exits `4` with one
+  line naming the ledger file it looked in and suggesting `--data-dir`.
+- `resume` exits `5` whenever it refused on the owner rule and wrote nothing, or a store write
+  failed (rolled back whole; run it again) - never a `0` or `3` that would read as done.
+- `--data-dir` is accepted before or after the verb. `--controller-id`, `--receipt-out`,
+  `--authorization-mode`, `--base-commit` and `--workspace` do not exist (exit `4`): the task file
+  carries its workspace mode and base, and `run --json` carries the receipt.
+- Without `--json`, a refusal or a `run`/`resume` outcome prints `key: value` lines; `--json`
+  prints one JSON document (`approve --run --json` prints two lines: the approval, then the run).
+
+**`next:` lines.** `run`, `status`, `report`, `cancel`, `resume`, `ledger settle` and every
+`integrate` command end their text output with `next: <command>` lines (`prepare --plan-out` and
+`approve` end with the `approve` / `run --plan` command), worked out from stored facts only
+(`hflow.hints`: no model, no process probe, no Git command; it reads only ref and worktree `HEAD`
+files of the run's repository). The order is: `resume` after an interruption, `ledger settle` for
+each unresolved entry, the integration of an accepted Git candidate, then `clean` (preview) and
+`clean --apply`. A trailing `# ...` says when the command depends on something only it can
+observe. No hint re-runs a task, reuses an authorization or proposes a new revision.
+
+- An `--attest "<what you know and why>"` placeholder must be replaced by your own words. A
+  `<...>` placeholder or those words pasted as printed are refused with exit `4`, before anything
+  is opened, by `resume`, `ledger settle`, `integrate reconcile` and `integrate <run-id>`.
+- Every printed command carries `--data-dir <absolute path>` when the ledger is not the default
+  one, and a path is quoted for PowerShell on Windows (7 or 5.1) and for `sh` elsewhere. Do not
+  paste into cmd.exe: it expands `%VAR%` inside double quotes and passes single quotes on. A drive
+  or share root is printed as `C:\.` so no backslash precedes a closing quote.
+- An accepted Git candidate's integration step is always `hflow integrate <run-id>` (it prepares,
+  asks for the confirmation code, applies or hands the merge over, and reconciles). It names
+  `--project` only when the command's default would not resolve the run's contract, and
+  `--target <branch>` only when neither an earlier integration's branch nor the task's base
+  branch (still present in the run's repository) gives one. When a ready integration's target is
+  checked out (read from `HEAD` files, any letter case) the comment says where the merge will be
+  handed over.
+
+## Setting up
+
+### `hflow doctor`
+
+Exit `0`, or `2` when a named profile (`--profile`, else `HFLOW_PROFILE`) cannot be used. It finds
+programs on the absolute `PATH` entries only, runs `git --version` and `node --version` and
+nothing else - never `dsh` (the one on `PATH` may be the DSH Desktop app's shim) and never the acpx
+client - and opens the ledger read-only. Its readiness lines are facts and never change the exit
+code:
 
 | Line | What it says |
 |---|---|
-| `ledger health` | the ledger's storage version and SQLite's `PRAGMA quick_check(1)`, over a read-only connection (`mode=ro`): `ok`, `problem` (the first finding; nothing is repaired), `incomplete` (a lock or the 10-second bound stopped it - not a finding), `unreadable`, or no ledger. Never creates, migrates or rebuilds one (`ledger_health` in `--json`) |
-| `integrate` | `hflow integrate: usable` / `NOT USABLE` / `unknown`, judged from the PATH Git's version against the integration minimum (Git 2.40: `merge-tree --write-tree --merge-base`) |
-| `acpx client` | the acpx entry a launch would use and its `package.json` version, or `NOT FOUND` with the resolution order: `HFLOW_ACPX_CLI`, then `<data-dir>/m0/acpx/node_modules/acpx/dist/cli.js`, then the HFlow checkout's `.probe/acpx/...`. PATH is never consulted for acpx, and a machine profile cannot name the entry; with `--profile` each role's line shows the entry and version its launch resolved |
-| `dsh launcher` | where a launch finds `dsh` (path only, never run): the `PATH` lookup (`dsh=PATH`), else the npm CLI under the data directory, `<data-dir>/dsh/0.2.0-rc.2/node_modules/.bin/dsh.cmd` (`dsh=npm (data dir)`; `source` and `data_dir_install` in `--json`). With neither it is `NOT FOUND`, names both places and prints the install, `npm install --prefix <data-dir>\dsh\0.2.0-rc.2 --ignore-scripts @deepseek-ai/dsh@0.2.0-rc.2` (`install_command`). A DSH Desktop shim under `%LOCALAPPDATA%\Programs\DeepSeek Harness` is named (checked by stat) but not recommended: DSH #9626 (unconfirmed) makes its workspace-write sandbox, DSH's default, fail every shell tool call. A profile cannot name the dsh path |
-| `credentials` | whether `DEEPSEEK_API_KEY` is in the environment (name only; the value is never read) and, with a bound `DSH_HOME`, whether its `.credentials.yaml` and `.env` exist (stat only - never opened, sized or hashed). Without a bound home a child's home is the empty per-invocation one, so the launch environment is its only credential source (inferred from upstream source). It then says plainly whether a real launch from this environment would be **refused before dispatch** (`no_credential_source`; `real_launch_refused` in `--json`) - the same rule `prepare` and the spawn gate apply - or is not refused for credentials, which is a presence check and does not prove the credential is valid |
+| `ledger health` | storage version and `PRAGMA quick_check(1)` over a read-only connection: `ok`, `problem` (the first finding; nothing repaired), `incomplete` (a lock or the 10-second bound stopped it - not a finding), `unreadable`, or no ledger |
+| `ledger settle` | how many entries were settled by operator attestation, `consumed` and `void` |
+| `integrate` | `hflow integrate` usable, not usable or unknown, from the PATH Git's version (2.40 needed) |
+| `acpx client` | the acpx entry a launch would use and its `package.json` version, else `NOT FOUND` with the order: `HFLOW_ACPX_CLI`, `<data-dir>/m0/acpx/node_modules/acpx/dist/cli.js`, the HFlow checkout's `.probe/acpx`. `PATH` is never consulted for acpx and a profile cannot name it |
+| `dsh launcher` | where a launch finds `dsh` (path only): `PATH` (`dsh=PATH`), else the npm CLI at `<data-dir>/dsh/0.2.0-rc.2/node_modules/.bin/dsh.cmd` (`dsh=npm (data dir)`). With neither it prints the install, `npm install --prefix <data-dir>\dsh\0.2.0-rc.2 --ignore-scripts @deepseek-ai/dsh@0.2.0-rc.2`. A Desktop shim under `%LOCALAPPDATA%\Programs\DeepSeek Harness` is named but not recommended (DSH #9626, unconfirmed: its workspace-write sandbox fails every shell call) |
+| `credentials` | whether `DEEPSEEK_API_KEY` is in the environment (name only) and, with a bound `DSH_HOME`, whether `.credentials.yaml` / `.env` exist there (stat only), then whether a real launch from this shell would be refused `no_credential_source`. A presence check, not a validity check |
+| `writes` | how a task with `scope.write_allow` gets its write opt-in, and whether `HFLOW_ALLOW_WRITES` is enabled in this shell |
 
-**Breaking change to `hflow doctor --json` (batch J).** A script that read the old shape must be
-updated: `executables.dsh.version` is gone - doctor no longer runs `dsh --version` - and
-`executables.dsh.note` says so instead; `executables.<name>.path` comes from the absolute `PATH`
-entries only (no current-directory hit, no relative path); `readiness` is new, with one section
-per line above (`integrate`, `acpx`, `dsh`, `credentials`); and with `--profile` each role under
-`profile.roles.<role>` gains `launch` (`client_entry`, `acpx_version`, `dsh_executable`, `node`,
-`resolvable`). `git` and `node` still carry `version`. The exit code is unchanged.
+With `--profile` it prints each role's resolved launch (agent argv, `--model` flag or "no --model
+flag", the launch entry files with their SHA-256) and names `child_dsh_home`, the DSH home an
+HFlow child uses - not your own shell's unless `DSH_HOME` is set.
 
-## Configure once, then reuse it
+### Machine profile
 
-A machine profile is the machine half of a run: which agent, transport and permission each
-**role** uses. It lives beside the runtime data, never inside a project checkout:
-
-```text
-%LOCALAPPDATA%\HFlow\profiles\<id>.json          (or <data-dir>/profiles/<id>.json)
-```
-
-The shape is generated, not hand-written twice - `hflow schema` prints it under
-`MachineProfile`. A two-role profile looks like this:
+A machine profile binds each role to an agent and a driver. It lives at
+`<data-dir>/profiles/<id>.json`, never in a checkout; `hflow init profile <id>` writes the usual
+one and `hflow schema` prints its shape (`MachineProfile`):
 
 ```json
 {
@@ -123,2441 +129,1018 @@ The shape is generated, not hand-written twice - `hflow schema` prints it under
 }
 ```
 
-`model_selection: "native_profile"` passes no model flag: the DSH launcher's own profile decides
-the model. Any other value is passed to the acpx client as `--model <value>` - see "Model
-selection" below for the accepted values, what acpx does with the flag, and why concrete values
-for real DSH are not chosen yet. `hflow doctor --profile dsh-local` prints the resolved launch
-per role - the agent argv and either the exact `--model` flag or "no --model flag" - so nothing
-about the launch has to be assumed. `hflow doctor` (with or without `--profile`) also names the
-DSH home a child uses (`child_dsh_home`), which is not the `dsh_home` your own shell's `dsh` uses
-unless `DSH_HOME` is set.
+Precedence: `--profile` beats `HFLOW_PROFILE`; with neither, `--driver` decides and defaults to
+`fake`. Every one of these is refused, never defaulted:
 
-**Both roles must be bound.** An unbound role is refused instead of inheriting the other one,
-because a task revision can start requiring a review. Every one of these is a refusal, never a
-fallback to a default:
-
-| Input | What happens |
+| Input | Refusal |
 |---|---|
-| `--profile ghost` (no such file) | refused, naming the path it looked in |
-| a file whose `profile_id` disagrees with its name | refused |
-| an unknown field, or a role bound to an undeclared agent | refused, naming the field |
-| a role the profile does not bind | refused, naming the role |
-| `driver: "some-other-harness"` | refused: one production transport plus the offline fake |
-| `harness: "codex"` with `driver: "acpx-dsh"` | refused: that driver launches `dsh`, and every process the run started would be DSH while the record said Codex |
-| one role `fake`, the other `acpx-dsh` | refused: half a run scripted, half a model |
-| `--driver fake` together with a real profile | refused, naming the roles that disagree |
-| a `model_selection` that is not `native_profile`, one token, or a two-token pair (empty, spaces, quotes, a leading `-`) | refused (`invalid_spec`, naming `model_selection`) at profile load, so by `prepare`, `run` and `doctor` alike |
+| no such profile file; `profile_id` disagreeing with the file name | refused, naming the path |
+| an unknown field, a role bound to an undeclared agent, a role left unbound | refused, naming it (both roles must be bound) |
+| a driver other than `acpx-dsh` or `fake`; `harness` other than `dsh` with `acpx-dsh` | refused |
+| one role `fake` and the other real; `--driver fake` with a real profile | refused, naming the roles |
+| an invalid `model_selection` (see "Model selection") | `invalid_spec` at profile load |
 
-Precedence, defined once in `profiles.requested_profile_id`: `--profile` beats `HFLOW_PROFILE`;
-with neither, `--driver` decides and defaults to `fake` (offline).
+Every hand-written JSON input (task, contract, profile, plan, authorization, root budget, repair
+policy, fake write plan) is read as UTF-8, a byte-order mark accepted. A file that cannot be read
+that way - UTF-16 from Windows PowerShell 5.1's `>` included - is a one-line `invalid_spec`
+refusal naming the file (exit `2`).
 
-Every hand-written JSON input - task, project contract, profile, plan, authorization, root budget,
-repair policy, fake write plan - is read by one loader (`profiles.load_json_file`): UTF-8, with a
-UTF-8 byte-order mark accepted (Windows PowerShell 5.1's `-Encoding utf8` writes one; every digest
-is over the parsed document, so it changes no binding). A file that cannot be read - a directory,
-a permission, UTF-16 (what PowerShell 5.1's `>` writes; the refusal says how to save it as UTF-8),
-other non-UTF-8 text, invalid JSON - is a one-line `invalid_spec` refusal naming the file (exit
-`2`), never a traceback.
+### Where the data lives
+
+| Data | Path |
+|---|---|
+| Ledger | `<data-dir>/hflow.sqlite`; the data dir is `--data-dir`, else `HFLOW_DATA_DIR`, else `%LOCALAPPDATA%\HFlow` on Windows, `$XDG_DATA_HOME/hflow` (default `~/.local/share/hflow`) elsewhere |
+| Profiles | `<data-dir>/profiles/<id>.json` |
+| Check artifacts, invocation scratch | `<data-dir>/artifacts/...`, `<data-dir>/invocations/...` |
+| Worktrees | `<repo>.hflow-worktrees/<run-id>` beside the repository |
+| Build id recorded into each run | `HFLOW_BUILD_ID`, else `hflow/<version>`, plus `+<sha>` only when run from HFlow's own source checkout |
+
+Nothing runtime is written inside a project checkout. Storage versions and migration backups:
+`docs/architecture.md`, "Storage version and migrations".
 
 ## Before you run anything: `hflow prepare`
 
-`prepare` resolves the task, the project contract and the machine bindings through the *same*
-function `run` uses, and prints what would happen. It calls no model, creates no run row, no
-workspace, no SQLite database and no authorization:
+### What it reports
 
-```sh
-hflow prepare --task task.json --profile dsh-local --project-root <repo>
-hflow prepare --task task.json --profile dsh-local --project-root <repo> --json
-hflow prepare --task task.json --profile dsh-local --root-budget-file root-budget.json
-hflow prepare --task task.json --profile dsh-local --project-root <repo> --plan-out task.plan.json
-```
-
-The last form is the normal start of a real task: see "From preview to run" below.
-
-It reports:
+`prepare` resolves the task, the project contract and the machine bindings through the same
+function `run` uses. It calls no model and creates nothing: no run row, workspace, database or
+authorization. Exit `0` when the run would pass admission and its dispatch gate, `2` otherwise; the
+full preview prints either way.
 
 | Section | What it answers |
 |---|---|
-| `effective_config` | which profile, which agent/driver per role, the **resolved launch** (client entry point and interpreter, agent argv, the `model` passed as `--model` when one is set, DSH home/profile), which write permission, and a `digest` |
-| `admission` | every problem with the task's definition that `run` would refuse on |
-| `dispatch_preconditions` | every problem with running it *now* that `run`'s dispatch gate would refuse on - the repair-policy rules included, for offline runs too |
-| `write_allow` / `write_deny` | the scope the worker will be told (the project's deny list and the built-in deny list are enforced too, but not listed to the worker) |
-| `checks` | the approved checks this task's acceptance needs, and which criterion needs each |
-| `budget` | implementer + reviewer turns required, against the task budget and project ceiling. With a repair policy `required_turns` is the **worst case** (I1 + R1 + I2 + R2) and `repair_cycles` is 1 |
-| `root_budget` | with `--root-budget-file`: the root binding, its ceilings, the normal dispatch count (`single_loop_dispatches`) next to the worst case the gates must cover (`required_top_level_submissions`), the repair switch and the deadline. `null` without the flag (a legacy-shaped run) |
-| `repair_plan` | always present: `enabled`, the policy digest, the declared check exit codes, whether reviewer changes count, the enabled triggers, `single_loop_dispatches` and `worst_case_dispatches`. `enabled=false` is a stated fact, not a missing field |
-| `packet_preview` | the implementer's input packet, byte length and digest. It states the configured deadline; a run under a root whose `deadline_seconds` is lower states, and sends, the capped one |
-| `authorization` | the binding an approval would have to cover, and nothing that is one. Its `base_commit` is the SHA the task's base resolved to now, not the name written in the task |
+| `effective_config` | profile, agent and driver per role, the resolved launch (client entry, interpreter, agent argv, `--model` when set, DSH home), the write permission, and its digest |
+| `admission` | every problem with the task that `run` would refuse on |
+| `dispatch_preconditions` | every problem with running it now (next section); look here as well as at `admission` |
+| `write_allow` / `write_deny` | the scope the worker is told (the project's and the built-in deny lists are enforced but not listed) |
+| `checks` | the approved checks acceptance needs |
+| `budget` | turns required against the task budget and project ceiling; with a repair policy, the worst case |
+| `root_budget`, `repair_plan` | the root binding and ceilings with `--root-budget-file`; whether a repair is armed |
+| `packet_preview` | the implementer's packet, its size and digest (for a worktree run, rendered for the template path; the reviewer's packet does not exist before a candidate does) |
+| `launch_surfaces` | what DSH would read on its own (see "Launch-surface record") |
+| `authorization` | the binding an approval must cover, with `base_commit` as the resolved SHA |
 
-Two things it deliberately does not do. It does not render the **reviewer's** packet - that
-packet embeds the frozen candidate identity, the verification status and the evidence rows, none
-of which exists before the implementer runs, so a preview now would be an invented input. And it
-does not mint an approval: `creates_authorization` is pinned to `false`, no `user_text` and no
-`provided_by` appear anywhere in its output (or in a plan file), and feeding either to
-`load_authorization` fails. Approving is a user action - `hflow approve`, below, or a file you
-write by hand.
+It never mints an approval (`creates_authorization` is `false`) and never states a remaining
+allowance: that depends on the ledger, which only the run's dispatch transaction reads.
 
-A third: it does not promise **remaining allowance**. With `--root-budget-file` it prints the
-root binding and the ledger path it would use, but it opens no database at all - no SQLite file
-is created, no run row, no authorization - so the number that matters (does this root still have
-allowance, has its deadline passed) is decided by the run's own dispatch transaction. A preview
-that printed a remaining figure would be reading a file another process may already have spent.
+### The plan flow
 
-For a worktree run the workspace path contains the run id, which is chosen at dispatch, so
-`execution_root_is_final` is `false` and the packet size/digest are for the template path.
+| Command | What it does | Refused (nothing written) |
+|---|---|---|
+| `prepare --plan-out P` | writes a plan (`kind: "hflow-plan"`): the inputs with every path absolute (the data dir too), the profile it selected, the write opt-in, the full report and the binding digest. Atomic; an existing plan at `P` is replaced. `--json` keeps stdout for the report and puts the plan lines on stderr | exit `2` when `P` exists and is not a plan, or when the run would be refused (`plan not written: ...`) |
+| `approve --task T [resolution flags] [--allow-writes] [--plan-out P] [--out A] [--run]` | resolves `T` as `prepare` does, writes the plan to `P` (default `<task dir>/<stem>.plan.json`, a trailing `.task` dropped: `T-1.task.json` -> `T-1.plan.json`), then exactly the `approve --plan` path below. An identical plan already at the default path is kept | exit `2`: a task the run would refuse; a different plan at the default path unless `--plan-out` names it; a `--plan-out` that exists and is not a plan; non-interactive stdin when an approval is needed (checked before any file is written) |
+| `approve --plan P [--out A] [--run]` | calls no model and opens no database. Resolves the plan again; at an interactive terminal it prints the summary, the binding digest and an 8-hex **approval code** (the start of the binding digest) on stderr, reads the code (trimmed, any case), then your approval in your own words (one line). Writes the authorization file as an exclusive create: by default `<plan stem>.<12 hex of the digest>.authorization.json` beside the plan. Stdout carries only the result and `next: hflow run --plan P` | exit `2`: stale plan; task the run would refuse; stdin not a console (piped, redirected or the NUL device) - refused unread, before anything is shown; wrong code (the second question is never asked); empty approval; target file exists (the refusal names the `run --plan` that would use it). Exit `4`: a resolution flag or `--plan-out` with `--plan` |
+| `approve ... --run` | the same approval, then - only once the file is written - `running hflow run --plan P --authorization-file <that file>` in the same process; the exit code is the run's | nothing runs when the approval fails |
+| `run --plan P [--authorization-file A]` | takes every resolution input from the plan and uses the plan's data dir. Without `--authorization-file` it uses approve's default file when it exists (stderr says so). Every check a run makes still runs: the binding, `root_limits`, single use, the credential and launch refusals | exit `4`: any resolution flag (`--task`, `--project`, `--project-root`, `--profile`, `--driver`, `--allow-writes`, `--root-budget-file`, `--repair-policy-file`), or a `--data-dir` naming another directory. Exit `2`: a stale plan (before anything is claimed); a real-driver plan with no approval file ("approve the plan first") |
 
-Exit code: `0` when the run would get past admission **and** its dispatch gate, `2` otherwise.
-The full preview prints either way - that is the point of asking. What `prepare` cannot check is
-stated rather than implied: remaining authorization allowance depends on a run's history, so it
-is checked only once a run exists, and it says so in its notes.
+A plan that needs no authorization (offline fake driver, no root budget) is said to need none
+(exit `0`, nothing written). An offline plan with a root budget can run directly: `run --plan`
+charges the root to a CLI-minted record labelled as not a user approval, and `approve --plan` is
+the optional alternative.
 
-### From preview to run: `prepare --plan-out`, `approve`, `run --plan`
+**Stale plans.** `approve` and `run --plan` refuse a plan whose inputs no longer resolve to its
+binding, root ceilings or submission count - an edited task or contract, a moved base branch,
+another profile or launch, a changed root file: "plan ... is stale", listing each differing field
+(for the effective configuration, each changed field and, where it comes from the environment of
+the resolving process, the variable: `DSH_HOME`, `HFLOW_ACPX_CLI`, `HFLOW_ACPX_NODE`, `PATH`,
+`SystemRoot`, the data dir's npm DSH install, and `HFLOW_PROFILE` for a plan that names no
+profile). The refusal ends with the `hflow prepare ... --plan-out P` command rebuilt from the
+plan. A plan written by an older build that set `--base-commit` or `--workspace` is refused (exit
+`2`) with that re-prepare command: the task file now carries both.
 
-A real task takes three commands, and approving stays a separate step that only you perform, at
-a terminal:
+**The write opt-in.** A task that declares `scope.write_allow` needs `--allow-writes` on `prepare`
+or `approve --task` (or `HFLOW_ALLOW_WRITES=1`, `true` or `yes` in that shell); the plan records
+the result and the binding covers it, so `approve --plan` and `run --plan` never read the variable.
+`run --task` accepts `--allow-writes` or the variable. A plan from before the field keeps the write
+permission its own report recorded. Without an opt-in a real run is refused `scope_violation`
+(location `scope.write_allow`), naming `--allow-writes`. `hflow init task` prints the `prepare`
+command with `--allow-writes` and says why.
 
-```sh
-hflow prepare --task task.json --profile dsh-local --project-root <repo> --plan-out task.plan.json
-hflow approve --plan task.plan.json          # shows the summary and an approval code; type the code, then your approval
-hflow run --plan task.plan.json              # uses the file approve wrote next to the plan
-```
+The approval code makes approving a deliberate act; it does not identify you: a process that
+drives a pseudo-terminal can read the summary and type both lines.
 
-`approve --plan task.plan.json --run` does the last two in one command: the approval exactly as
-below, then - only once the file is written - exactly `run --plan` in the same process.
+### What stops a run before it dispatches
 
-- **`prepare --plan-out <file>`** writes a plan (`kind: "hflow-plan"`, generated contract
-  `RunPlan`): the resolution inputs as you gave them, with every path made absolute (the task,
-  `--project`, `--project-root`, `--root-budget-file`, `--repair-policy-file`, and the data
-  directory - the default one when you passed no `--data-dir`), the profile it selected
-  (`--profile`, else `HFLOW_PROFILE`), `--base-commit` exactly as written (a ref stays a ref, so
-  it is resolved again later), the full report, the binding and its digest, and the root
-  budget's ceilings. It is written atomically. An existing **plan** there (a JSON object with
-  `"kind": "hflow-plan"`, any schema version) is replaced; any other existing path - the task,
-  an authorization file, the project contract, a directory, a file that is not JSON - is refused
-  (exit `2`) before anything is resolved or printed, and left as it was. It is **not** written
-  when the run would be refused (exit `2`); the report says why. With `--json` stdout is still the
-  report alone - the plan lines go to stderr. Its `next:` line is `approve --plan` for a plan that
-  needs an approval; an offline plan with a root budget gets `run --plan` first - it reaches no
-  model and runs directly, charging the root to a CLI-minted record labelled as not a user
-  approval - and `approve --plan` as the optional alternative.
-- **`approve --plan <file>`** calls no model and opens no database. It resolves the plan's inputs
-  again through the same function `prepare` and `run` use, and refuses (exit `2`, nothing written)
-  when the binding or the root ceilings changed since the plan was written - an edited task or
-  contract, a moved branch, another profile or launch, a changed root budget file: "plan ... is
-  stale", listing each differing field; re-run `prepare --plan-out`. When the effective
-  configuration is what changed, the refusal also lists each configuration field that differs
-  (`effective_config.implementer_writes`, `effective_config.roles[<role>].launch.dsh_home`, ...)
-  and, for a field read from the environment of the process resolving the plan, the variable:
-  `HFLOW_ALLOW_WRITES`, `DSH_HOME`, `HFLOW_ACPX_CLI`, `HFLOW_ACPX_NODE`, `PATH` (`dsh`, `node`,
-  `python`), `SystemRoot` (`cmd.exe`), and `HFLOW_PROFILE` for a plan that names no profile - a
-  shell with another value resolves another configuration. The refusal ends with the
-  `hflow prepare ... --plan-out <the same plan>` command rebuilt from the plan's recorded inputs
-  (with `--data-dir` when it is not the default), ready to paste; so does a task the run would
-  refuse, and `run --plan` given a resolution flag. A plan that needs no
-  authorization (the offline fake driver without a root budget) is said to need none (exit `0`,
-  nothing written). A task the run would refuse is refused here too, its issues printed on
-  stderr. Otherwise it needs **a person at an interactive terminal**. When standard input is not
-  a console - piped, redirected from a file, absent - it refuses (exit `2`) without reading it,
-  before showing anything, and writes nothing: `echo ok | hflow approve --plan ...` approves
-  nothing. A scripted flow writes the authorization file by hand instead ("Writing the artifact by
-  hand" under "Running a real Harness task"). At a terminal it prints the same summary `prepare`
-  prints, the binding digest and an **approval code** - the first 8 hex characters of the plan's
-  binding digest - and asks two questions. First the code, compared whitespace-trimmed and
-  case-insensitively: anything else (`y`, `no`, an empty line) refuses with "the approval code did
-  not match" (exit `2`), nothing approved or written, and the second question is never asked.
-  Then your approval in your own words, one line, stored as typed apart from surrounding
-  whitespace; an empty line cancels (exit `2`, nothing written). Neither is ever an argument: a
-  command line is what the process that wants to run could type for itself. The summary, the code
-  and both questions go to **stderr**, so `approve --plan ... > log.txt` still shows what you are
-  approving; stdout carries only the result - the authorization path, its id and the `next:`
-  line, or the `--json` payload. The code makes approving a deliberate act (you have to read the
-  summary to type it); it does not identify you - a process that drives a pseudo-terminal can
-  read it and type both lines (see "What the authorization does and does not prove"). The
-  artifact gets a fresh
-  `AUTH-...` id, `provided_by: user`, `origin: user_artifact`, the current UTC time, the plan's
-  binding, its root ceilings as `root_limits`, and `max_top_level_submissions` = the count the
-  preview requires. It goes to `--out <file>`, by default next to the plan as
-  `<plan stem>.<first 12 hex of the binding digest>.authorization.json` (a trailing `.plan` is
-  dropped from the stem), so re-preparing never collides with an older approval. An existing
-  file is **never overwritten** (checked before you are asked, and the write is an exclusive
-  create); the refusal adds the `next: hflow run --plan <plan>` that would use the approval
-  already there (with `--authorization-file` for an `--out` path), which the run verifies like any
-  other. It ends with a `next:` line and the exact `run` command, quoted for PowerShell:
-  `hflow run --plan <plan>`, which finds the default file by itself, or - for a file `--out` put
-  anywhere else - `hflow run --plan <plan> --authorization-file <file>`.
-- **`approve --plan <file> --run`** is `approve` followed by `run --plan`, in one process. The
-  approval is unchanged - the same staleness check, the same refusal of a non-terminal standard
-  input before anything is read, the code and your own words typed, the exclusive create - and
-  there is no flag that skips any of it. Only once the file is written does it print `running
-  hflow run --plan <plan> --authorization-file <the file just written>` in place of the `next:`
-  line and continue with exactly that command: the plan is loaded and resolved again (a plan that
-  went stale in between is refused), the approval is verified, the run takes the owner lease and
-  ends with its own `next:` lines, a Ctrl+C exits `130`, and the exit code is the run's. The file
-  just written is named explicitly, so a plan re-prepared in between is refused rather than run
-  under another approval. When the approval fails, nothing runs and no ledger is opened. With
-  `--json` stdout carries two JSON lines: the approval's payload (`running` in place of `next`),
-  then the run's. An offline plan that needs no authorization is run straight away, as `run
-  --plan` would run it.
-- **`run --plan <file>`** takes every resolution input from the plan: `--task`, `--project`,
-  `--project-root`, `--profile`, `--driver`, `--base-commit`, `--workspace`,
-  `--authorization-mode`, `--root-budget-file` or `--repair-policy-file` given as well - even
-  with the same value - is a usage error (exit `4`), as is a `--data-dir` naming another
-  directory than the plan's. Without `--authorization-file` it uses `approve`'s default file for
-  the plan's digest when that exists (stderr says so), and otherwise behaves exactly like a run
-  with no authorization. A plan whose inputs no longer resolve to its binding is refused as stale
-  (exit `2`) before anything is claimed - an offline plan too, and an offline plan that now
-  resolves to a real driver (`HFLOW_PROFILE` set later) is named stale before any "approve the
-  plan first" - and every check a run with flags
-  makes still runs: the authorization's binding, `root_limits` against the root file, the
-  single-use consumption in the dispatch transaction, the credential and launch refusals.
+`prepare` reports the "dispatch precondition" rows under `dispatch_preconditions` - they are the
+list the run's own gate raises (`admission.predictable_dispatch_problems`, two callers). The
+repair rows apply to offline runs too; the others only to a real driver. Each is refused before a
+run row, an authorization record, a reservation or a process exists.
 
-Writing the artifact by hand and repeating every flag to `run` still works; see "Running a real
-Harness task" for the complete field list.
+| Condition | Code (location) | Decided by |
+|---|---|---|
+| a `repair_policy` on a task that is not `worktree`, or not reviewed, or whose worst case (4 dispatches) exceeds `budget.max_agent_turns` | `scope_violation` / `not_implemented` / `budget_exceeded` | dispatch precondition |
+| a `repair_policy` with a real transport and no `--root-budget-file` | `budget_exceeded` (`root_budget`) | dispatch precondition |
+| write paths with `workspace.mode` not `worktree`; write paths without the write opt-in; a required review with `max_agent_turns` 1 | `scope_violation` / `budget_exceeded` | dispatch precondition |
+| a launch that cannot be resolved: no acpx client; no `dsh` on an absolute `PATH` entry or in the data dir's npm install; no `node`/`python` the client needs; a relative explicit program; a launcher, `dsh`, interpreter, acpx entry or npm carrier `node` inside the project root or `<repo>.hflow-worktrees` (or a workspace inside the client's `node_modules` tree); no `SystemRoot`; a shim path holding `& \| < > ^ % ! " ( ) @ ; , =` | `not_implemented` | dispatch precondition |
+| `.acpxrc.json` or `.env`, any letter case, at the root of the starting workspace (the project root in place; the base commit's tree for a worktree, via `git ls-tree`). Listed, never opened | `workspace_client_config` / `workspace_env_file` (`workspace`) | dispatch precondition |
+| a bound `DSH_HOME` that is relative, unresolvable, or equal to, inside or around the project root or worktree directory | `dsh_home_in_workspace` (`launch.dsh_home`) | dispatch precondition |
+| no credential source: `DEEPSEEK_API_KEY` not among the child's variable names and the child's DSH home holding neither `.credentials.yaml` nor `.env` as a regular file (stat only; an unbound home is the empty per-invocation one, so only the environment counts) | `no_credential_source` (`launch.credentials`) | dispatch precondition |
+| a real delivery whose approved checks are `kind=fake` | `not_implemented` (`checks.<id>`) | admission |
+| a `write_allow` entry with `*`, `?` or `[`; under the built-in deny list (`.git`, `.hflow`, `.acpxrc.json`); with a segment ending in a dot or space or holding `:`; resolving (8.3 short name) to a denied path; or passing through a link or junction | `scope_violation` (`scope`) | admission |
+| a `write_deny` entry that is empty after normalization, absolute, drive-qualified, holds `..`, or starts with `/` or `\` | `scope_violation` | admission |
+| unknown check, scope violation, risk below the project floor, `integrated`/`published` delivery requested, reuse not decided (`reuse_not_approved`), budget above the project ceiling, a non-empty `dependencies` list | admission codes | admission |
+| not enough authorization allowance for the whole fixed loop | `budget_exhausted` | controller, before the run row |
+| a root whose `max_repairs` cannot cover the repair the run may buy (`needed` is 2 when an earlier run already dispatched an implementer on the root) | `budget_exhausted` | controller, before the run row (`prepare` reports only the `max_repairs: 0` case) |
+| a run without `--root-budget-file` for a task that already has a root in this ledger | `budget_exhausted` ("pass --root-budget-file") | controller; the dispatch transaction repeats it as a race backstop |
 
-### What stops a run before it dispatches, and what `prepare` therefore reports
+A run that already exists for an identical TaskSpec is a history query: it returns the recorded
+outcome and consumes nothing. To run again, submit a new revision (a changed task).
 
-| Condition | Where it is decided |
-|---|---|
-| a `repair_policy` on a task whose `workspace.mode` is not `worktree` (`scope_violation`) | shared precondition, offline runs included |
-| a `repair_policy` on a task that will not be reviewed (`not_implemented`) | shared precondition, offline runs included |
-| a `repair_policy` whose worst-case loop (I1 + R1 + I2 + R2) exceeds `budget.max_agent_turns` (`budget_exceeded`) | shared precondition, offline runs included |
-| a `repair_policy` while a role uses a real transport and no root is bound: **a real-driver repair needs `--root-budget-file`** (`budget_exceeded`, location `root_budget`). A fully offline fake run may still repair rootless | shared precondition |
-| the task declares write paths but `workspace.mode` is not `worktree` | shared precondition, real driver |
-| the task declares write paths but `HFLOW_ALLOW_WRITES` is not enabled | shared precondition, real driver |
-| a required review, but `budget.max_agent_turns` is 1 | shared precondition, real driver |
-| a role's launch could not be resolved: no acpx client on this machine; no `dsh` on an absolute `PATH` entry or in `<data-dir>/dsh/0.2.0-rc.2/node_modules/.bin` (or no `node`/`python` the client needs on `PATH`) - there is no bare-name fallback; an explicitly named program that is not an absolute path; a launcher, `dsh`, client interpreter or acpx client entry inside the project root or the worktree directory (`<repo>.hflow-worktrees`), or one of those directories inside the `node_modules` tree the client entry loads its modules from; no `SystemRoot` to find the absolute `cmd.exe` the DSH batch shim needs; or a batch shim path holding a character `cmd.exe` would reinterpret (`& \| < > ^ % ! " ( ) @ ; , =`) | shared precondition, real driver |
-| the workspace the run starts in already holds `.acpxrc.json`, in any letter case, at its root - the project root for an in-place run, the base commit's tree for a worktree run (`workspace_client_config`, location `workspace`; the detail names the spelling found) | shared precondition, real driver; refused before a run row, an authorization record, a reservation or a process exists |
-| the workspace the run starts in already holds `.env`, in any letter case, at its root - the project root for an in-place run, the base commit's tree for a worktree run (`workspace_env_file`, location `workspace`; found by a listing or `ls-tree`, never opened). Remedy: remove or rename it; for a worktree run commit its removal (a real run then needs an authorization for the new base) | shared precondition, real driver; refused before a run row, an authorization record, a reservation or a process exists |
-| a role's launch binds a `DSH_HOME` that is relative (a leading `~` included), cannot be resolved, or - as written or with links resolved, case-folded - equals or lies inside the project root or the worktree directory (`<repo>.hflow-worktrees`), or contains one of them (`dsh_home_in_workspace`, location `launch.dsh_home`). Remedy: point `DSH_HOME` at an absolute directory outside them, or unset it (the per-invocation home is unaffected), then prepare again - the launch changes, so a real run needs a new authorization | shared precondition, real driver; refused before anything exists |
-| a role's launch would start DSH with no credential source visible: `DEEPSEEK_API_KEY` is not among the child's launch-environment variable names (the environment `hflow` runs in, as the driver passes it on; name only) and the DSH home the child would use holds neither `.credentials.yaml` nor `.env` as a regular file (stat only, never opened; with `DSH_HOME` unbound the home is the empty per-invocation one and only the environment counts) (`no_credential_source`, location `launch.credentials`; user ruling 2026-10-07). Remedy: set `DEEPSEEK_API_KEY` in the shell that runs `hflow`, or bind `DSH_HOME` to an absolute directory outside the project holding either file (the launch changes, so a real run needs a new authorization), then prepare again. A presence check: it does not prove the credential is valid | shared precondition, real driver; refused before a run row, an authorization record, a reservation or a process exists |
-| a real delivery whose approved checks are `kind=fake` | admission |
-| a `write_allow` entry containing `*`, `?` or `[` (only literal file or directory paths are accepted; `write_deny` keeps its globs), a `write_allow` entry under the built-in deny list (`.git`, `.hflow`, `.acpxrc.json`), a `write_allow` entry with a segment ending in a dot or a space or holding a `:` (`.git.` opens `.git` on Windows), a `write_allow` entry whose resolved spelling (an 8.3 short name such as `SECRET~1`) is denied, or a `write_allow` entry that is, or passes through, a symbolic link or junction in the checkout (a link can name a different place in the run's worktree) | admission (`scope_violation`) |
-| unknown check, scope violation, risk below the project floor, unmet delivery level, reuse not decided, budget above the project ceiling | admission |
-| an invalid `model_selection` in the profile | profile load (`invalid_spec`) |
-| not enough authorization allowance left for the whole fixed loop | controller, before a run row, a root row or an authorization record exists (`budget_exhausted`); for an admitted run that never dispatched, before it continues - read-only and before this process claims or adopts the run, so the run is left exactly as it was and a new authorization for the same TaskSpec and unchanged admission binding, from any later process, can continue it |
-| a root with a policy armed whose `max_repairs` cannot cover the repair this run may buy (`used_repairs + needed > max_repairs`, where `needed` is 2 when an earlier run already dispatched an implementer on the root) | controller, before a run row, a root row, an authorization record or a dispatch exists (`budget_exhausted`), so resubmitting with a root file whose `max_repairs` covers it works; `prepare` reports `max_repairs` 0 with a policy armed under `dispatch_preconditions` (location `root_budget`) - the ledger-dependent part only the run sees. For an admitted run that never dispatched (unclaimed, this controller's, or adopted from a provably gone owner) the counter can never be raised, so the run ends `BLOCKED` `budget_exhausted` instead of staying `DRAFT` |
-| a run without `--root-budget-file` for a task that already has a root in this ledger | controller, before a run row or an authorization record exists (`budget_exhausted`, "pass --root-budget-file"), so resubmitting the same TaskSpec with its root and a covering authorization dispatches; `prepare` does not open the ledger and cannot see it. The dispatch transaction repeats the check as a race backstop: a root registered after the run was admitted blocks that run (no driver starts, no counter moves), and since an identical resubmission only returns it, that case needs a new revision |
+## What an approval covers
 
-The `shared precondition` rows are the ones `prepare` reports under `dispatch_preconditions`, and
-they are the same list the run's own gate raises - one function (`predictable_dispatch_problems`),
-two callers. The repair-policy rows are facts about the task, so they are reported for offline
-runs too; the others are facts about this machine and are reported only for a real driver. A
-policy problem therefore shows up under `dispatch_preconditions` while `admission` still reads
-`ok` - look in both.
+The authorization binds the **effective configuration**, not only the task: mode, driver,
+project, repository path, base commit (as a SHA), task digest and path, the roles that will be
+dispatched, the effective configuration digest (profile, per-role agents, drivers, model
+selections, limits, write permission, resolved launch), the project contract digest, the launch
+content digest, the ledger path and, for a root run, the root binding and `root_limits`.
+`prepare` prints it, the plan saves it, `approve` writes it after resolving again, and `run`
+verifies against the same resolution. Any mismatch refuses the run, naming the fields.
 
-## What an approval now covers
+- **Profile and launch.** Another profile, `HFLOW_ACPX_NODE`, `HFLOW_ACPX_CLI`, `DSH_HOME`, or a
+  different `dsh`/`node`/`python` earlier on `PATH` changes the digest. The launch is resolved once
+  and consumed by the driver; nothing re-reads the environment afterwards. A bound `DSH_HOME` is set
+  on the child and an unbound one is removed from it, `extra_env` included.
+- **Contract.** Editing `.hflow/project.json` after approval refuses the artifact ("the project
+  contract changed since approval").
+- **Ledger.** Single use is per ledger, so a real-driver approval names the absolute ledger path
+  and `run` against another data dir refuses it ("issued for another ledger").
+- **Base commit.** A ref such as `main` is resolved once to a 40-hex SHA and that SHA is bound; an
+  approval stops applying once `main` moves. The run records `base 'main' -> <sha>` and uses that
+  commit for the worktree, every round and the receipt.
+- **Launch entry files are bound by content; transitive modules remain bound by path.** The fixed
+  list: the client interpreter (`node.exe`), the acpx entry and its `package.json`, the
+  `@agentclientprotocol/sdk` `package.json` Node resolves from that entry, the dsh launcher, and
+  for a Desktop or npm carrier the carrier entry its shim runs and that file's `package.json` (for
+  the Desktop app, whose entry lives inside `resources\app.asar`, the archive file is bound
+  instead, `carrier_archive`; an entry also under `app.asar.unpacked` is refused). For the **npm
+  carrier** the `node` its shim runs - the `node.exe` beside the shim, else the first `node` on the
+  child's `PATH` - is bound too (`carrier_interpreter`), refused inside a workspace and looked up
+  again in the child's environment at the spawn gate. Plans and approvals for the npm route
+  prepared before this build must be prepared again. `prepare` and `doctor --profile` print each
+  file's kind, SHA-256, size and path; a changed file refuses the artifact
+  (`launch_content_changed`).
+- **The spawn gate hashes the same list again** just before `CreateProcess` and refuses a changed
+  byte, size or resolved path (`launch_content_changed`, no process created, the run blocked).
+- **Not covered:** `node_modules` beyond those `package.json` files and anything Node loads at
+  runtime, DSH's own code loading, the Desktop carrier's `DeepSeek Harness.exe` and
+  `app.asar.unpacked`, `cmd.exe`, and what an unclassified launcher starts. Windows has no
+  exec-by-handle, so a file swapped between the gate's hash and process creation is not caught.
+- **The ACP SDK is not pinned** (user ruling 2026-10-14): acpx 0.17.1 accepts any
+  `@agentclientprotocol/sdk ^1.4.0`. Its `package.json` is bound by content, and `prepare`/`doctor`
+  note a version outside `CHECKED_SDK_VERSIONS` (1.4.0, 1.8.0); after a reinstall run `python
+  tools/m0_probe/real_client_checks.py all --acpx-cli <.../acpx/dist/cli.js>` and add the version
+  only when it passes.
+- **Not bound:** the launch-surface record and the client and carrier versions. A changed
+  `AGENTS.md` does not change the digest.
+- A launch built by hand rather than by `resolve_launch_config` carries no digests, so the spawn
+  gate has nothing to compare it with. A Node or npm upgrade changes the digests and needs a new
+  `prepare` and approval.
+- An artifact that lacks a field this build binds (configuration, contract, launch content,
+  ledger path) cannot authorize a run that resolved one: prepare and approve again. Its digest is
+  unchanged, so a consumed approval never looks unused.
 
-The authorization artifact binds the *effective configuration*, not just the task: profile id,
-per-role agents and drivers, model selections, limits, the write permission, and the **resolved
-launch** - the client entry point, the interpreter that starts it, the launcher argv, and the DSH
-home/profile. `prepare` prints exactly that binding (and `--plan-out` saves it), `approve` writes
-it into the artifact after resolving the plan again, and `run` verifies against the same
-resolution, so a preview, an approval and a run cannot disagree. Wherever this section says
-"re-issue it", the short way is a fresh `prepare --plan-out` followed by `approve`: a plan whose
-inputs changed is refused as stale by both `approve` and `run --plan`, naming the fields.
+**Trust model: trusted-local, user-attested.** Enforced: the binding; consumption bounded per
+authorization id by a guarded UPDATE plus a CHECK constraint (a restart, a new run id or a
+resubmitted spec cannot restore it); `provided_by` must be `user`; an `authorization_id` already
+recorded with another binding or immutable field is refused, never overwritten; `origin`
+separates a user artifact from the CLI's offline record, which no real driver accepts. **Not
+enforced:** provenance - nothing distinguishes bytes you typed from the same bytes written by the
+executing agent - and a fresh authorization id is a fresh allowance. Unattended execution
+therefore stays disabled. Before any dispatch a zero-model preflight runs the client with
+`--version`; its failure refuses the run and consumes nothing.
 
-Consequences worth knowing:
+## Root budgets and the dispatch ledger
 
-- Approving a task on one profile does not approve it on another; switching profile after
-  approval changes the digest and the run is refused, naming both sides.
-- Changing where the client or the interpreter lives changes it too: `HFLOW_ACPX_NODE`,
-  `HFLOW_ACPX_CLI`, `DSH_HOME`, or a different `dsh`/`node`/`python` earlier on `PATH` all change
-  the approval digest, because all of them change which program would run. The launch programs
-  (`dsh`, `node`, `python`, the agent launcher) are bound as absolute paths: only absolute `PATH`
-  entries are searched, a missing program makes the launch not resolvable rather than falling
-  back to a bare name, and an explicit program (`HFLOW_ACPX_NODE`, for one) must be absolute.
-- The launch is resolved **once**, before the approval, and then consumed by the driver. Nothing
-  re-reads the environment after the check, so a variable changed mid-run cannot swap the client.
-- `DSH_HOME` is part of the launch in both directions: a bound value is set on the child, and
-  *absence is bound too* - when the resolution found no DSH home, the variable is removed from
-  the child environment rather than inherited, including any value passed in through the
-  driver's `extra_env`. A `DSH_HOME` that appears after the resolution therefore cannot reach
-  the process. With none bound, DSH's home is the per-invocation
-  `<data-dir>/invocations/<id>/home/.dsh`, created empty (inferred from upstream source, not
-  observed): the child's USERPROFILE/HOME point at the invocation's own home.
-- The launch-surface record (what DSH reads on its own: see "What DSH reads on its own" below)
-  and the client and carrier versions are **not** part of the binding. A changed AGENTS.md or
-  `.env` does not change the digest; the launch entry files are bound by content (below).
-- An artifact written before config binding existed still loads, still lists, and still keys its
-  own single-use ledger row - but it cannot authorize a run that resolved a configuration,
-  because nothing in it says which one. Re-issue it.
-- The digest of an old artifact is unchanged by this build: the new fields are omitted while
-  they are empty, so an already-consumed approval cannot look unused again.
-- **The ledger is bound too** (`ledger_path`, printed by `prepare` as `ledger` under the binding
-  digest). Single use is enforced per ledger (`<data-dir>/hflow.sqlite`), so a real-driver
-  approval names the resolved absolute path of the ledger it is spent in - the same string a
-  root's `ledger_path` carries, whether the data directory came from `--data-dir`, a relative or
-  absolute `HFLOW_DATA_DIR`, or the default. `run` against another data directory refuses it
-  ("issued for another ledger"): a fresh ledger has no record of the approval, and that is not a
-  second allowance. An artifact without the field cannot authorize a real run, because it could
-  be spent once per data directory; re-issue it. Offline bindings name no ledger and digest as
-  before.
-- **The project contract is bound too** (`project_contract_digest`, printed by `prepare` as
-  `contract`): every check with its argv and timeout, `write_deny`, the limits, the review floor
-  and `review_required`. Editing `.hflow/project.json` (or pointing `--project` at another file)
-  after approval refuses the artifact ("the project contract changed since approval"); an
-  artifact without the field cannot authorize a run that resolved a contract. Re-issue it.
-- The binding's `roles` are the roles the run will actually dispatch (the reviewer only when the
-  task needs a review) and `run` compares them, so a change that drops the reviewer is refused.
-- **Launch entry files are bound by content; transitive modules and anything Node loads later
-  remain bound by path** (`launch_content_digest`, user ruling 2026-10-03). The list is fixed and
-  short: the client interpreter (`node.exe`), the acpx entry file and its package's
-  `package.json`, the `@agentclientprotocol/sdk` `package.json` Node resolves from that entry
-  (`client_sdk_package_json`; see "The ACP SDK is not pinned" below), the dsh launcher the agent
-  argv starts, and for a Desktop or npm carrier the
-  carrier entry its shim runs (the one `%~dp0`/`%dp0%`-relative `.js` path in the shim) and that
-  file's `package.json`. For the installed Desktop carrier that script
-  (`..\..\..\app.asar\dsh\node_modules\@deepseek-ai\dsh-desktop-host\lib\cli.js`) and its
-  `package.json` exist only inside `resources\app.asar`, a regular Electron archive file: when the
-  entry's path passes through a regular file named `*.asar`, the archive file itself is bound
-  (`carrier_archive`, streamed SHA-256; ~121 MB, about 0.1 s warm on the development machine) in
-  place of the entry and its `package.json`, with the note "the carrier entry inside <archive> is
-  bound through the archive's digest". The archive is not parsed. An entry that also exists under
-  `app.asar.unpacked` is refused (which copy Electron runs is in the archive header), as is a shim
-  whose entry exists neither as a file nor inside such an archive. `prepare` prints each file's kind, SHA-256, size and final path under its
-  role's launch plus the combined `launch_content_digest`; `doctor --profile <id>` prints them as
-  `launch content:` lines. Replacing one of those files at the same path refuses the artifact
-  (`launch_content_changed`); an artifact without the field cannot authorize a run whose launch
-  resolved digests (re-issue it). The digests are left out of `config_hash`, so the refusal names
-  the changed file rather than "a different configuration".
-- The driver hashes the same list again inside the spawn gate, after the `.acpxrc.json` check and
-  just before `CreateProcess`, and refuses a changed byte, a changed size, or a path that now
-  resolves elsewhere (`launch_content_changed`, spawn reported as not created, the run blocked;
-  `prepare` again and re-issue). Hashing `node.exe` (~90 MB) costs about 60 ms warm.
-- What this does not cover: `node_modules` trees (beyond the two `package.json` files above) and everything Node resolves at runtime, DSH's
-  own code loading, the Desktop carrier's `DeepSeek Harness.exe` and `app.asar.unpacked` tree,
-  the npm shim's `node`,
-  `cmd.exe`, and whatever an unclassified dsh launcher starts (the launcher file itself is bound).
-  Windows has no exec-by-handle: a file swapped between the spawn gate's hash and process creation
-  is not caught. Each file's final path is resolved once (links and junctions followed once), and
-  that path is both hashed and started, so a link cannot point the hash at one file and the spawn
-  at another. A missing or unreadable file, a Node entry outside any `node_modules` package, or a
-  Desktop/npm shim whose carrier entry cannot be named makes the launch not resolvable.
-- **The ACP SDK is not pinned** (user ruling 2026-10-14: keep compatibility checkable rather than
-  lock a version). acpx 0.17.1 declares `@agentclientprotocol/sdk ^1.4.0` and ships no lockfile,
-  so a fresh install resolves the newest 1.x (1.8.0 on 2026-10-14); the checkout's `.probe/acpx`
-  install keeps 1.4.0 through its own `package-lock.json`. Three things keep that safe: the SDK's
-  `package.json` is bound by content, so a reinstall after approval refuses the approval
-  (`launch_content_changed`) instead of running a client nobody saw; `prepare`/`doctor` note an SDK
-  version that has not passed the model-free client checks (`CHECKED_SDK_VERSIONS` in
-  `src/hflow/drivers/dsh_surfaces.py`: 1.4.0 and 1.8.0 so far); and `python
-  tools/m0_probe/real_client_checks.py all --acpx-cli <node_modules/acpx/dist/cli.js>` runs those
-  checks against any install (the real client against the mock agent: version, config, permission
-  mapping and a full `exec` turn - not a live compatibility proof). After a reinstall that resolves
-  a new SDK, run it, and add the version to the list only when it passes.
-- **The base commit is bound as a SHA.** `workspace.base_commit` (or `--base-commit`) may name a
-  ref such as `HEAD` or `main`; `prepare` and `run` resolve it once to a 40-hex commit, and the
-  binding's `base_commit` is that SHA, not the name. The task text and its `spec_digest` do not
-  change. An approval written while `main` pointed at one commit stops applying once `main`
-  moves (a `base_commit` mismatch), and an artifact that carries a symbolic `base_commit` no
-  longer matches at all - re-issue it from a fresh `prepare`. The run records the resolution as a
-  note (`base 'main' -> <sha>`), uses that one commit for the worktree, every round and the
-  receipt, and a branch that moves during the run changes neither the base nor the delivery.
-- **Artifacts issued before the 2026-10-02 launch hardening must be re-issued.** The DSH batch
-  shim is now wrapped in the absolute `%SystemRoot%\System32\cmd.exe` instead of a bare `cmd.exe`,
-  which changes the bound agent argv for a `.cmd` launcher, and a profile whose `model_selection`
-  is not `native_profile` now binds the `--model` value it really passes. Both change the
-  effective-configuration digest. A `native_profile` launch passes no flag and digests exactly as
-  before the model change, but the absolute `cmd.exe` still changes its digest whenever the DSH
-  launcher is a `.cmd`/`.bat` shim - which it is on Windows. On a machine where an earlier build
-  bound `dsh`, `node` or `python` as a bare or relative name, the launch now binds the absolute
-  path (or is not resolvable at all), so those digests change as well.
-
-## Root budgets: `--root-budget-file` (batch E1)
-
-A **root** is one requirement in one repository, across revisions. One root budget file, passed
-as `--root-budget-file` to `prepare` and `run`, declares what that requirement may spend in
-total. It is a JSON document with exactly two members:
+A **root** is one requirement (`project_id`, canonical repository path, `task_id`) across
+revisions; its id `root-<32 hex>` is derived, never chosen. `--root-budget-file` on `prepare`,
+`approve --task` and `run --task` declares what it may spend in total:
 
 ```json
-{
-  "limits": {
-    "max_top_level_submissions": 4,
-    "max_repairs": 1,
-    "deadline_seconds": 86400
-  },
-  "note": "E2 repair ceiling for the parser task; approved 2026-01-01"
-}
+{ "limits": { "max_top_level_submissions": 4, "max_repairs": 1, "deadline_seconds": 86400 },
+  "note": "free text; never an approval" }
 ```
 
 | Field | Meaning | Range |
 |---|---|---|
-| `max_top_level_submissions` | how many top-level dispatches (implementer + reviewer invocations) this root may buy in total | 1..64 |
-| `max_repairs` | how many *additional* implementer attempts the root may buy. The root's first implementer attempt is not a repair; every later one is, including a later revision's first implementer. **A ceiling, not a switch**: the dispatch transaction enforces it, and any later implementer on the root spends it whatever its `repair_policy`; only a task's explicit `repair_policy` arms the in-run repair round (see "When a repair may happen"). A later revision on a root with no repair left is refused `budget_exhausted` before its run row or authorization record exists (a policy-less one on a root that also has an unresolved invocation is instead blocked by the dispatch transaction's "unresolved invocation" refusal, as before). With the default 0 a root file used with a repair policy is refused before the first dispatch, and before the root is registered: set at least 1, and at least 2 for a later revision that wants its own repair, and resubmit (`prepare` reports the 0 case) | 0..8, default 0 |
-| `deadline_seconds` | wall-clock ceiling measured from the root's **first successful reservation**, recorded as `deadline_at` and never reset by a new run or revision (before that first reservation there is no clock yet, and a role gets the smaller of its configured value and this `deadline_seconds`, since the clock will start with exactly that much - "no clock" is not "no time left"). What it caps: a dispatch past it is refused; each role's invocation deadline (the implementer's configured value, the reviewer's 900 s) is the smaller of its own value and what the root has left, and the driver's local wait and forced stop follow that deadline; the checks share **one** countdown of the remaining time, so each check runs for at most what is actually left and a check with under a second left is not started (recorded as a `timed_out` error); the repair attempt is given the same capped deadline; and acceptance re-checks the clock, so a candidate finished after the deadline is not accepted (`budget_exhausted`). It does not stop a remote model request or a remote bill | >= 60, default 86400 |
-| `note` | free text the user keeps in the file. Never an approval: the approval is the authorization artifact's `user_text` | - |
+| `max_top_level_submissions` | implementer + reviewer dispatches for the whole root | 1..64 |
+| `max_repairs` | additional implementer attempts: every implementer after the root's first is one, a later revision's first included. A ceiling, not a switch: only a task's `repair_policy` arms a repair | 0..8, default 0 |
+| `deadline_seconds` | wall clock from the root's first successful reservation, never reset. A dispatch past it is refused; each role's deadline, the checks' shared countdown and the repair are capped by what is left; acceptance re-checks it. It stops no remote request or bill | >= 60, default 86400 |
 
-Unknown members, a missing `limits`, or a value outside its range is refused rather than
-defaulted - a ceiling nobody chose is not a ceiling.
+Unknown members, a missing `limits` or an out-of-range value is refused, never defaulted.
 
-What the root file does, and what it does not:
+- A real-driver root run needs an authorization that binds the same root and whose `root_limits`
+  equal the file's `limits`. An offline root run without one is charged to a CLI-minted record
+  (`AUTH-offline-...`, `origin: cli_offline_synthetic`) whose text says it is not an approval.
+- One transaction reserves each dispatch: ownership, phase, root allowance, deadline, authorization
+  allowance, attempt and invocation rows and every counter commit together or not at all.
+  Replaying the same invocation id charges nothing.
+- **One root runs one task at a time**; the whole remaining loop must fit before the implementer
+  is bought; one review per candidate.
+- A **pending** invocation (`reserved`, `requested`, `started`, `unknown`, `launch_unknown`) blocks
+  every later dispatch of its root, under a new revision too, and also a rootless run of the same
+  task. Nothing is refunded, retried or re-dispatched.
 
-- The root identity is **derived mechanically** from `(project_id, canonical repo path, task_id)`
-  (`root-<32 hex>`). No worker and no flag can choose one; a new `task_id` is a new root and needs
-  its own approval.
-- The **ledger path is part of the authorization binding**. `run` refuses an artifact whose
-  `root_budget.ledger_path` is not the ledger this `--data-dir` resolves, so changing
-  `--data-dir` gives a refusal naming the fields, not a second unused allowance. That guard is
-  against ordinary path mistakes: copying the database, deleting it, or editing the artifact all
-  stay inside the trusted-local boundary and are not defended against.
-- A root charge is always recorded **with the authorization that bought it**. For a real driver
-  that means `--root-budget-file` requires `--authorization-file`: the artifact must bind the same
-  root, and its `root_limits` must equal the file's `limits`, or the run is refused before anything
-  is dispatched. The offline fake driver reaches no model and has no approval to give, so an
-  offline root run **without** `--authorization-file` mints a labelled in-memory record instead
-  (`authorization_id` starts with `AUTH-offline`), whose `user_text` states that it is not a user
-  approval and whose binding names `driver: fake`, so it can never authorize a real transport.
-  Pass `--authorization-file` if you want the offline run charged to your own artifact: it is then
-  loaded and verified exactly like a real one. No path charges a root with an empty authorization
-  id.
-- `prepare` prints the root binding, its ceilings, the normal dispatch count (implementer +
-  reviewer), the repair switch and the deadline, and prints the same root inside the pending
-  authorization binding, so the digest a user approves is the digest the run checks. The repair
-  switch is the **task's own `repair_policy`**, not the root file's `max_repairs` (see "When a
-  repair may happen"). `prepare` creates nothing.
-- One transaction reserves a dispatch: ownership, role/phase, root ownership and allowance,
-  authorization allowance, the attempt row, the invocation row and every counter commit together
-  or not at all. The deadline and the counters are read and written inside it, so two controllers
-  cannot both spend the last submission. Replaying the same invocation id returns the recorded
-  reservation and charges nothing, and the caller may then only coordinate it - a retried call
-  cannot start a second process.
-- **One root runs one task at a time.** A dispatch is refused while another run of the same root
-  is not `ACCEPTED`/`BLOCKED`/`CANCELLED`; the refusal names the owning run. Unresolved
-  invocations are not the whole rule - a run is busy while its approved checks run and while a
-  verdict is rendered, and in both windows nothing is pending.
-- **The whole remaining loop has to fit.** The reservation is checked against this dispatch plus
-  every further dispatch the run needs, so a revision whose reviewer cannot be afforded is refused
-  before the implementer is bought.
-- **One review per candidate.** A non-implementer dispatch attaches to the attempt the implementer
-  created and is refused if that attempt already recorded a reviewer invocation - whether or not
-  the first review is still unresolved. A new invocation id is not a second review and not a
-  second allowance.
-- A pending invocation of a root - `reserved`, `requested`, `started`, `unknown` or
-  `launch_unknown` - blocks every later dispatch of that root, **including under a new revision
-  and including a run started without `--root-budget-file`**: a rootless run of a task that
-  already has a root in this ledger (same project, repository and task) is refused with
-  `budget_exhausted`, naming the root - by the controller before its run row exists, and again in
-  the dispatch transaction as a race backstop. An unresolved invocation is never
-  refunded, retried or re-dispatched; `resume` records an observation and settles nothing. An
-  `unknown` or `launch_unknown` entry of a run that has ended is closed only by
-  `hflow ledger settle` (next item), an operator attestation; until then the root stays blocked.
-  An entry left **open** on a run that ended for another reason - a confirmed stop whose ledger
-  write failed (`cancelled_by_operator`), a driver that raised without reporting a spawn fact
-  (`internal_error`, or `review_protocol_error` for the reviewer), a settlement write that failed
-  on a run that then ended (`ACCEPTED` included) - is refused by `hflow ledger settle`, so
-  `hflow resume <run_id>` closes it first (batch I1). It acts only once the run's owner is
-  provably gone, by the owner half of the settle rule below (a run with no owner token passes
-  when it recorded no controller process; a pre-v6 run with a recorded controller pid passes only
-  on `hflow resume <run_id> --legacy-owner-gone --attest "<text>"`, your attestation that its
-  controller has exited - batch J, the counterpart of settle's flag); otherwise it writes nothing,
-  says why and exits `5`. An entry named by the run's own recorded confirmed stop - the stop that
-  ended the run, not one that reached a run already ended - is closed from that stop fact, as the
-  stop would have closed it (`started` -> `settled`/cancelled, requested -> `launch_unknown`,
-  never requested -> `not_started`); every other open entry becomes `unknown` (a launch was
-  recorded) or `launch_unknown` (no launch recorded), with a `dispatch: resume closed ...` note. No
-  driver is called, nothing is dispatched or refunded, and the run's state, block code, receipt
-  and outcome stay as they were; a second `resume` is a no-op. While such entries remain,
-  `status`/`report` show an `open entries` section (the entries, one fact line each) and their
-  `next:` lines name `hflow resume <run_id>` (with `--legacy-owner-gone --attest` for a pre-v6 run
-  that recorded a controller pid, and `--data-dir` for a non-default ledger); the run's failure
-  note names the same two steps.
-- `hflow resume <run_id> --legacy-owner-gone --attest "<text>"` (batch J) passes exactly one
-  blocker: an ended run with no owner token whose attempts recorded a controller pid (no host, so
-  HFlow can never probe it). `--attest` is required with the flag and has the settle bounds
-  (1-2000 characters, no NUL); a blank or oversized text, the flag without `--attest`, or
-  `--attest` without the flag exits `4` and nothing is read or written. When the attestation is
-  what let the closure go ahead and something was closed, each closed entry's detail and the
-  `dispatch: resume closed ...` note name it as "the operator attested ...; an attestation, not an
-  observation", and an `operator_attestation:` run note keeps your text verbatim with the OS user
-  (recorded, not authenticated). It never passes an owner this build recorded (judged by the
-  takeover rule whatever you attest), never takes a live run over, and never changes an
-  `outcome_unknown` reconcile; given where it decides nothing, `resume` says it was not used and
-  records none of it. Each entry is then settled with its own attestation:
-  `hflow ledger settle <invocation_id> --legacy-owner-gone --attest "<text>"`.
-- `hflow ledger settle <invocation_id> --as consumed|void --attest "<text>"` (ruling
-  2026-10-03; storage version 7) moves one `unknown` or `launch_unknown` entry of a run that has
-  ended to `operator_settled` and appends a row to `invocation_settlements` (prior state, choice,
-  `basis = operator_attested`, the OS user name - recorded, not authenticated - the UTC time and
-  the attestation, 1-2000 characters, counted with the note `--legacy-owner-gone` appends). `consumed`
-  (default) keeps every counter spent. `void` is
-  refused for `unknown` and, for `launch_unknown`, returns that dispatch's root charge (one
-  top-level submission, plus one repair if it was charged as the repair; a voided implementer
-  entry is also no longer counted as the root's first attempt). The authorization counter and
-  the run's turns are not returned. Both the controller's advance repair-allowance check and
-  the transactional dispatch charge use that same effective implementer history: a voided
-  first implementer does not make the next revision's first implementer a repair; a `consumed`
-  entry still does. Resolve-once; open or final entries, a run that has not
-  ended and a blank or oversized attestation are refused (exit 2); an unknown id exits 4. The
-  run keeps its state, block code and outcome, nothing is re-dispatched, and the entry renders
-  as "settled by operator attestation (not observed)" in `status`/`report` (and as counts in
-  `doctor`); billed usage stays unknown. Settling unblocks the root for a new revision only - that
-  revision still needs its own explicit approval.
-  Before the store transaction the CLI also refuses (exit 2, nothing written) while anything
-  recorded may still act: the run's owner must be provably gone by the takeover rule (owner lock
-  free or absent **and** identity `gone`; a run with no owner token passes this half only when it
-  recorded no controller process at all, or when you add `--legacy-owner-gone` to attest that the
-  pre-v6 controller it recorded has exited - recorded with the settlement, never checked), and
-  the entry's own child (`process_pid` +
-  `process_started_at`, probed on the owner's recorded host) must read `gone` - `matching` or
-  `unknown` refuses. Wait for the controller or child to exit (or stop its process tree
-  yourself), run `hflow resume <run_id>`, then settle again. A run with no recorded owner host
-  (pre-v6, or a label-only claim) never has its child probed locally - another machine's pid
-  would read `gone` here - so it reads `unknown` and refuses until you add `--legacy-owner-gone`,
-  attesting that owner and the process tree it launched have exited. An entry with no recorded
-  pid rests on the owner rule alone.
-- A result or stop settlement only closes an **open** entry (`reserved`, `requested`,
-  `started`). An entry that is already `not_started`, `settled`, `unknown` or `launch_unknown` keeps that state whatever a
-  later result or stop reports; the refused settlement becomes a run note ("dispatch: invocation X
-  was not settled as <outcome>: the ledger already records it as <state>, and that state
-  stands"). A confirmed stop closes an open entry as: `started` -> `settled`/cancelled, never
-  requested -> `not_started`, requested with no spawn report -> `launch_unknown`. A spawn report
-  that arrives after an entry was closed as `launch_unknown` (by a reconcile or a confirmed stop)
-  never reopens it: a reported launch records its process facts and the entry becomes `unknown`,
-  a reported non-launch records `not_started` - the same states the closure would have recorded
-  had the report come first, and neither is open, so no later result or stop can release the root.
-  The ledger separates four facts: `requested` (a driver was asked), `started` (the launch
-  happened), the process count (a driver reported a pid) and the settlement. `not_started` is
-  recorded only on a driver's own word that nothing launched (its spawn report, a refusal before
-  launch, or - for a driver that never reports - the stop-before-launch case in the next item), or
-  when no driver was ever asked; a launch that was requested and never reported back is
-  `launch_unknown`, because an empty timestamp is not evidence that nothing ran - a forced stop of
-  a real child is evidence of the opposite.
-- `status`/`report` read the ledger back: root id, used/limit submissions, repairs used/limit,
-  deadline, and per-invocation role, launch state and spawn kind. The `processes` line counts
-  reported operating-system children, so an offline run shows zero however many times it settled.
-  A run recorded before E1 has no root row and says `legacy / not recorded` - absent facts, never
-  zeros. A driver that never sends a spawn report is read from the row: completed work is recorded
-  as a launch with `spawn=unknown` and no process, so it is counted as launched but never in
-  `processes`; a cancelled return with no work is recorded `not_started` only when the stop was
-  already recorded when the controller handed the invocation to the driver. Otherwise the entry
-  stays `requested`: a confirmed stop then records `launch_unknown`, and an unconfirmed one leaves
-  it open until `resume` records `launch_unknown`.
-- Automatic repair exists only under an explicit policy and is bounded to one round: see "When a
-  repair may happen" for the two triggers, what stops it, and why an undeclared exit code never
-  repairs. E1's ledger and dispatch transaction are unchanged underneath it. A repair on a run
-  whose roles use a real transport **needs `--root-budget-file`**; only a fully offline fake run
-  may repair rootless.
+The ledger keeps four facts apart: an allowance reserved, a launch requested, a launch that
+happened (and separately whether a process was reported), and a result settled. The states are
+defined in `docs/architecture.md`, "State". `not_started` is recorded only on a driver's own word
+that nothing launched, or when no driver was asked; a launch requested and never reported is
+`launch_unknown`. A settled, `not_started`, `unknown` or `launch_unknown` entry never moves again
+on a result or a stop; the refused settlement becomes a `dispatch:` note.
 
-## When a repair may happen (batch E2)
+**`hflow resume <run-id>` on an ended run** closes entries left open (a confirmed stop whose ledger
+write failed, a driver that raised, a failed settlement write) once the owner is provably gone: an
+entry named by the run's own confirmed stop is closed from that fact; every other one becomes
+`unknown` (a launch was recorded) or `launch_unknown`, with a `dispatch: resume closed ...` note.
+The run's state, block code, receipt and outcome stay as they were; a second `resume` is a no-op.
+Until then `status`/`report` show an `open entries` section. A pre-v6 run that recorded a
+controller pid with no host needs `--legacy-owner-gone --attest "<text>"` (1-2000 characters, no
+NUL): your attestation that its controller exited, recorded verbatim with the OS user. It never
+passes an owner this build recorded and never takes a live run over.
 
-A repair is **one** second implementer attempt inside the same run, on the same revision, starting
-from the frozen candidate, followed by fresh checks and a fresh independent review. It is never a
-`hflow repair` command, it never revives a historical `BLOCKED` run, and it never retries an
-environment or transport failure. The switch lives in the task, not in the root budget file:
-`BudgetRequest.max_repair_cycles` keeps its historical default of `1` and **authorizes nothing**.
+**`hflow ledger settle <invocation-id> --as consumed|void --attest "<text>"`** moves one `unknown`
+or `launch_unknown` entry of an ended run to `operator_settled` and appends a row to
+`invocation_settlements` (prior state, choice, OS user - recorded, not authenticated - UTC time,
+attestation). `consumed` (default) keeps every counter spent; `void` is only for `launch_unknown`
+and returns that dispatch's root charge (and its repair charge; a voided first implementer no
+longer counts as the root's first), never the authorization counter or the run's turns.
+
+| `ledger settle` refuses | Exit |
+|---|---|
+| a placeholder, blank, NUL-bearing or oversized attestation (2000 characters, counting the suffix `--legacy-owner-gone` appends) - checked before the ledger opens: `refusing: <problem>; nothing was done` | `4` |
+| an unknown invocation id | `4` |
+| an open or final entry, a run that has not ended, `void` on `unknown` | `2` |
+| an owner not provably gone (lock free and identity `gone`; a run with no owner token passes only when it recorded no controller process, or with `--legacy-owner-gone`), or the entry's own child not reading `gone` on the owner's recorded host (`matching` or `unknown` refuse; a pre-v6 run with no host reads `unknown` until `--legacy-owner-gone`) | `2` |
+
+Settling unblocks the root for a new revision only; that revision needs its own approval. The entry
+then reads "settled by operator attestation (not observed)" and billed usage stays unknown.
+
+## When a repair may happen
+
+A repair is **one** second implementer attempt in the same run and revision, starting from the
+frozen candidate, followed by fresh checks and a fresh review. It is never a command, never revives
+a `BLOCKED` run and never retries an environment or transport failure. It is armed only by the
+task's own `repair_policy` (or `--repair-policy-file`, the same bare document, which becomes part
+of the effective TaskSpec and its digest; a different policy in the task file is refused):
 
 ```json
-"repair_policy": {
-  "max_attempts": 1,
-  "check_exit_codes": { "unit": [1], "lint": [1, 2] },
-  "allow_reviewer_changes": true
-}
+"repair_policy": { "max_attempts": 1, "check_exit_codes": { "unit": [1], "lint": [1, 2] }, "allow_reviewer_changes": true }
 ```
 
-| Field | Meaning |
+`max_attempts` is pinned to 1. A policy with no trigger, an empty code list or exit code `0` is
+refused. A real-driver repair needs a root (`used_repairs + needed <= max_repairs`, checked before
+anything exists); a fully offline run may repair rootless.
+
+**A check failure buys the repair only when all hold**, for the current attempt and candidate: the
+check id is in `check_exit_codes`; its recorded exit code is listed for it (an undeclared code never
+repairs); its `exit_reason` is `completed` or `nonzero_exit` (`timed_out`, `settlement_forced`,
+`settlement_unknown`, `output_capture_error`, `not_launched`, `boundary`, `startup`, `empty_argv`,
+`no_artifact_dir` and an empty reason never do); and the round has no ERROR row at all. Otherwise a
+`not_a_business_failure` decision names the check, its code and what the policy declared.
+
+**A reviewer rejection buys it** when the verdict is a valid `changes_requested` on the current
+candidate, `allow_reviewer_changes` is set, and it carries at least one finding. Findings are typed
+(`contracts.Finding`): `body` (required, non-blank), optional `title`, `location` (`path`,
+`line_start >= 1`, `line_end >= line_start`), `severity` (`P0`-`P3`, recorded, gates nothing) and
+`id`; nothing else, nothing coerced. `changes_requested` with `[]` records `no_findings` and stops.
+A finding that breaks the schema makes the whole answer a `review_protocol_error`, never a
+rejection. The schema checks shape only: a `location` is not checked against the candidate and
+`severity` is the reviewer's own label. The offline replay (`tools/m2_live/replay_review.py`)
+reads a saved answer under the untyped contract only when the recorded reviewer prompt did not
+show typed findings, and records which contract it used (`review_contract`).
+
+**The repair round** is its own `attempts` row (`is_repair = 1`; the schema allows one). Its
+packet carries the original goal, scope and base, the previous candidate, the failed checks and
+every finding (JSON-quoted, values over 2048 bytes cut and marked; a findings section that pushes
+the packet past 32 KiB blocks the run before the repair is bought). Its reviewer sees the
+cumulative diff from the original base plus a labelled "this round's change". A second failure, or
+a repair that changes no scoped content (`verification_failed`, or `no_content_change` ->
+`scope_violation` when only unscoped files moved), ends the run. The repair reuses the first
+round's worktree only while it is exactly the previous candidate (same HEAD and tree, clean, no
+assume-unchanged/skip-worktree flags) and the shared Git metadata is unchanged; otherwise
+`workspace_drift` blocks `scope_violation` before anything is bought. Ignored caches the first
+round's checks left outside the fingerprinted scope are carried as literal entries; an ignored
+file inside a `write_allow` directory refuses the repair. Every decision, refusals included, is a
+`RepairRecord` in the run's record.
+
+Offline: `kind=fake` evidence records `not_launched` and never repairs; an offline test that wants
+the repair path declares the exit reason it models
+(`FakeCheckRunner(exit_reasons={"unit": "nonzero_exit"})`).
+
+## Reading a run
+
+`hflow status <run-id>` prints the state, the block code, the root and ledger counters, attempts,
+model/stream/launch lines per invocation, repair decisions, evidence, integrations and `next:`
+lines. What each counter does and does not mean: `docs/architecture.md`, "Reading the counters
+honestly". `--project-root` changes the drift check's workspace (default: the project root the run
+recorded, while it exists).
+
+**`hflow status` with no run id is the inbox**: every run whose stored facts name something for
+you, from ledger reads and the clock only (no model, no process probe, no Git, no write; no ledger
+is created), grouped and printed as one line of facts and one `next:` per run:
+
+| Group | Runs |
 |---|---|
-| `max_attempts` | pinned to `1`. This build implements exactly one bounded repair per run; anything else is refused when the spec is loaded |
-| `check_exit_codes` | the check ids that may trigger a repair, and the exit codes that mean *that check's business assertion failed*. A check id absent from this map never triggers one, whatever its code |
-| `allow_reviewer_changes` | may a substantive `changes_requested` on the current candidate buy the repair? |
+| Running | a live run within the per-dispatch deadline its admission recorded; an accepted candidate an integration process may still be working on |
+| Ready | an accepted Git candidate with nothing else in the way: no integration yet, one ready to apply or hand-merge, one `stale` or `superseded` to prepare again |
+| Attention | a live run past that deadline (probably interrupted; `resume` decides), a blocked run, open or unresolved ledger entries, an integration that ended `conflict`/`checks_failed`/`interrupted`/`failed`, an interrupted cleanup |
 
-A policy that names no trigger at all, a check with an empty code list, and exit code `0` listed as
-a failure are all refused - not defaulted. HFlow does not claim to read a root cause out of an
-arbitrary process exit code, so "every non-zero code is repairable" is not an available policy.
-
-**How the policy gets into a run.** Write it in the task file as `repair_policy`, or pass
-`--repair-policy-file PATH` to `prepare` and `run` - the same bare `RepairPolicy` document, not a
-task file and not an authorization. The flag is applied *before* admission and becomes part of the
-effective TaskSpec, so the stored spec, `spec_digest` and the authorization binding all cover the
-repair that was asked for. If the task file already names a policy and the file names a different
-one, the run is refused rather than one silently winning; the same policy written twice (compared
-by digest) is not a disagreement, so re-running a policied task with its own policy file works. A
-missing file, a non-object document or a contract-invalid policy is refused **before the store is
-opened**: no run row, no worktree and no authorization is created. Whether the *scope* can honour
-the policy at all - an isolated worktree, a review, a run ceiling covering the worst case of four
-top-level dispatches - is refused before anything is dispatched as a **dispatch precondition**:
-`prepare` reports it under `dispatch_preconditions` (not `admission`), for offline runs as well.
-
-**A real-driver repair needs a root.** When any role uses a real transport, a policy without
-`--root-budget-file` is refused the same way (`budget_exceeded`, location `root_budget`), and
-`run` refuses before a run row or an authorization record exists: the root's repair counter and
-clock are what bound a task's repairs across revisions, and without them each new revision could
-buy another. A fully offline fake-driver run may still perform its one repair without a root; that
-repair is charged to no root counter. With a root bound, the root must also be able to afford the
-repair before the first dispatch: `used_repairs + needed <= max_repairs`, where `needed` is 1, or 2
-when an earlier run already dispatched an implementer on this root (a later revision's first
-implementer is itself charged as a repair; a later revision without a policy needs 1 for that
-reason alone). Otherwise the run is refused `budget_exhausted` before
-anything exists - no run row, no authorization record and no root row, so a corrected root file
-is not refused later as a different ceiling - and if the counter is found spent at the decision itself a `budget_exhausted`
-repair record is written instead of `allowed`.
-
-**A policy only classifies a failure it can see.** A check id the project contract does not run
-never produces a failed row, so that entry cannot buy anything however it is written; and when a
-check does fail whose id or exit code the policy does not declare, `business_failure_for` returns
-false and the run records a `not_a_business_failure` decision naming the check, its exit code and
-what the policy declared for it (`declared: nothing` for an id the policy does not list). The
-decision is stored before the run blocks, so an operator can read exactly which check failed and
-why the policy did not cover it.
-
-**What a check failure must look like to trigger a repair.** All of these, from the *current*
-attempt and the *current* candidate only (a previous round's evidence is part of the same run and
-can never describe this one):
-
-1. the check's id is declared in `check_exit_codes`;
-2. its recorded exit code is listed for that id - an **undeclared exit code never repairs**,
-   however non-zero it is, and neither does a row with no exit code at all;
-3. its recorded `exit_reason` says the check *ran to completion*: `completed` or `nonzero_exit`
-   (`verify.CLEAN_EXIT_REASONS`). Everything else `verify.py` writes is ineligible: `timed_out`
-   (kept even when the boundary was slow to empty after the timeout's termination; the leftover
-   is recorded as `processes_alive_after_timeout_termination=N` in the detail),
-   `settlement_forced` (a check that left descendants), `settlement_unknown` (the boundary could
-   not be observed), `output_capture_error` (an incomplete capture), `not_launched` (nothing
-   ran - every `kind=fake` check and every kind this build cannot execute), `boundary` and
-   `startup` (the check could not be launched inside its boundary), `empty_argv`,
-   `no_artifact_dir`, and an **empty reason** - every evidence row written before storage v5.
-   The reason is a structured fact stored in its own column; it is never back-filled from an
-   exit code and never guessed from the `verification_failed` text or a log keyword;
-4. the round contains **no ERROR row at all**. A mixed round - one declared business failure plus
-   one check that timed out, or a review that was malformed - stops the run without buying a
-   second implementer.
-
-**What a reviewer rejection must look like.** The verdict must be a valid `changes_requested` on
-the current candidate, the policy must set `allow_reviewer_changes`, and it must carry at least
-one finding. Findings are typed (`contracts.Finding`; user ruling, 2026-10-03):
-
-| key | required | value |
-|---|---|---|
-| `body` | yes | non-blank string: what is wrong, why, and the input or scenario that triggers it |
-| `title` | no | string |
-| `location` | no | `{path: non-blank string, line_start?: integer >= 1, line_end?: integer >= line_start}`; `line_end` needs `line_start` |
-| `severity` | no | `"P0"`, `"P1"`, `"P2"` or `"P3"` - recorded and rendered, gates nothing |
-| `id` | no | string |
-
-No other key is accepted, an optional key is omitted rather than `null`, and nothing is coerced
-(`"3"` or `true` is not a line). Because `body` is required and never blank, every valid finding
-is usable. `changes_requested` with `[]` records `no_findings` and stops the run: there is no
-target to repair, and HFlow does not guess one. A finding that breaks the schema - `{}`, a blank
-body, an unknown key or severity, a bad line range, the old untyped shapes - makes the whole answer
-invalid: a wire failure (`review_protocol_error`), like any malformed verdict, and an unbound one
-is an unknown outcome; neither is a rejection, and neither repairs anything. The reviewer packet's
-output contract lists the same keys and rules as the schema embedded under it. Review evidence
-recorded before typed findings keeps its untyped findings; `status`/`report` read it as stored,
-and it never buys a repair.
-
-**What the repair attempt is told.** The repair packet carries the original goal, criteria and
-scope, the original base, the previous candidate, the failed checks with their current evidence,
-and the findings. Each finding is rendered with its title, location, severity and body (an
-absent key is printed as `(not given)`; reviewer text is JSON-quoted so its newlines cannot open a
-packet section), followed by a note that severity filtered nothing; a value longer than 2048 UTF-8
-bytes is cut on a character boundary and marked `…[truncated N bytes]`. Findings
-are never dropped to fit: a findings section that pushes the packet past 32 KiB blocks the run
-before the repair is reserved or dispatched. The previous candidate's paths, on the other hand,
-are capped like the reviewer's lists - 20 entries plus a `(+N more)` count - followed by a
-`full path list: git diff --no-renames --name-only <original base> <previous candidate>`
-reference (`--no-renames`, like every path list HFlow records, so a move names its deleted source
-too), so a wide first round cannot push the repair packet past its bound. The packet's remaining
-deadline is the deadline the repair attempt actually has - the configured value, capped by the
-root's remaining clock when a root is bound - never `0` for a clock that does not exist.
-
-**What happens after the repair.** The repair round is its own `attempts` row (`is_repair = 1`,
-same run and revision; the schema allows exactly one), and the reviewer for that round attaches to
-the run's *current* attempt, so round two's verdict can never be recorded against round one's
-candidate. That reviewer is shown the candidate as it would be delivered: base = the task's
-original base, "paths changed from the base commit" = the cumulative diff from that base, plus a
-labelled "this round's change" (`git diff <previous candidate> <new candidate>`); each path list is
-capped at 20 entries plus a "(+N more)" count. So on the check-failure path the second reviewer
-also reviews round one's change. Checks are fresh (the first round's passing rows are never reused
-for the repaired candidate) and the review is fresh; on a root run the root's `max_repairs`
-ceiling and the deadline are checked at every handoff, and a stop wins every handoff. A second
-failure, or a repair that changes no content, ends the run - there is no third implementer. "No
-content" means the scoped fingerprint equals the previous round's: with the tree unchanged too the
-run blocks `verification_failed`; if the tree changed but the scoped fingerprint did not (for
-example an un-ignored `__pycache__` file under an allowed directory) the run records
-`no_content_change` and blocks `scope_violation`, buying no reviewer and no re-run of the checks.
-
-The repair runs in the first round's worktree, so before anything is bought that worktree must
-still be exactly the previous candidate: same HEAD, same tree, nothing changed, and no index entry
-flagged assume-unchanged or skip-worktree (`git ls-files -v`; git's status cannot show whether a
-flagged file still holds the checked bytes, and HFlow never clears the flag). A worktree that
-moved or became dirty after the freeze - for example a check that wrote a file git does not
-ignore - or when the shared Git metadata changed since dispatch (see "Shared Git metadata is
-compared before HFlow's git reads it again" below), records `workspace_drift`, blocks
-`scope_violation` and buys nothing; nothing is reset or
-overwritten. Ignored files the first round's checks or review left **outside** what the scoped
-fingerprint hashes (a `.ruff_cache` or `.mypy_cache` at the repository root, say) are not drift:
-the first freeze refused every ignored path off its allowlist (and every freeze refuses an ignored
-file the scoped fingerprint hashes, and a sourceless `.pyc` outside `__pycache__`), so whatever
-else is ignored now came from HFlow's own checks or is a cache the allowlist names, and the repair
-round's freeze accepts exactly those paths, as literal
-entries. The worker may not change them (the round's manifest comparison still sees them and
-refuses a change as outside the scope), an ignored file is never staged, and an ignored path that
-appears during the repair round still refuses the freeze. An ignored file a previous check left
-**inside** a `write_allow` directory, where the scoped fingerprint would hash it (`src/run.log`
-under `write_allow: ["src"]`; `__pycache__` and `.pytest_cache` contents are not hashed), is not
-carried: no candidate commit holds it, so the fingerprint would describe bytes the frozen commit
-does not have, and a worker edit to it would pass the manifest comparison. That repair is refused
-as `workspace_drift` before it is bought, and the file is not deleted.
-
-Each decision, refusals included, is stored as one `RepairRecord` row in `run_repair_records` and
-appears in the run's inspection record, so "we did not repair because that check failed for an
-environmental reason" is readable afterwards instead of leaving the run looking arbitrary.
-
-**Offline checks.** `kind=fake` starts no process, so its evidence records `not_launched` and can
-never trigger a repair. An offline test that wants the repair path exercised must declare the clean
-process exit it is modelling (`FakeCheckRunner(verdicts=..., exit_reasons={"unit": "nonzero_exit"})`).
-That is a deliberate modelling choice in the offline facility, not a compatibility claim about a
-live harness.
-
-## Where the data lives
-
-| Data | Path |
-|---|---|
-| Runtime database | `%LOCALAPPDATA%\HFlow\hflow.sqlite` (Windows), `$XDG_DATA_HOME/hflow/` otherwise |
-| Machine profiles | `<data-dir>/profiles/<id>.json` |
-| Override | `--data-dir <dir>` or `HFLOW_DATA_DIR` |
-| Profile selection | `--profile <id>` or `HFLOW_PROFILE` |
-| Build id recorded into every run | `HFLOW_BUILD_ID`, else `hflow/<version>` plus the short git SHA |
-
-`run`/`status`/`report` accept `--data-dir` before or after the subcommand. Runtime data
-is never written inside a project checkout, so a run cannot dirty the tree it measures. A
-controller writes its scratch and check artifacts under the data directory of the ledger it
-opened (`<data-dir>/artifacts/...`, `<data-dir>/invocations/...`) - for `cancel` and `resume`
-with `--data-dir` too; the platform default applies only when no data directory is given. The
-test suite points `HFLOW_DATA_DIR` at a per-test temp directory (and clears `HFLOW_PROFILE`), so
-running it never reads or writes your real data directory.
-
-## Storage version and migrations (batch E1, extended by E2)
-
-The database records its own **storage version**, separate from the public contract version.
-Batch E1 adds `root_budgets` and `invocations` (plus a few columns); batch E2 adds
-`evidence.exit_reason` - the structured reason a check ended - the `run_repair_records` table
-that holds the run's repair decisions, and `attempts.is_repair`. The file is migrated to the
-current `migrate.STORAGE_VERSION` (8 as of batch I) the first time a build that understands it
-opens it. All DDL lives in `src/hflow/migrate.py`; `store.py` only decides when to migrate.
-
-| Version | What it adds, and what an older row gets |
-|---|---|
-| v1 | the original bootstrap: `runs`, `attempts`, `evidence`, `run_notes`, `authorizations` |
-| v2 | the root ledger (`root_budgets`) and the per-dispatch record (`invocations`) |
-| v3 | `invocations.launch_requested_at`, splitting "a launch was requested" from "a launch happened", and `authorizations.origin`. Every v2 row past `reserved` keeps its own state and outcome and becomes a launch *request*, because v2 wrote that timestamp before asking the driver |
-| v4 | the process facts a driver reports (`process_started_at`, `process_pid`, `spawn_kind`); older rows keep `spawn_kind = unknown`, because nothing reported a process to inherit. v4 also repairs rows the first v3 step left behind (a `settled`/`unknown` v2 row that kept its request time in `started_at`): only rows with `started_at` set and `launch_requested_at` empty are touched, so a correctly migrated row is never rewritten |
-| v5 | `evidence.exit_reason`, `run_repair_records` and `attempts.is_repair`; older rows keep an empty reason and `is_repair = 0`, because the build that wrote them observed neither |
-| v6 | the run's owner identity (`owner_token`, `owner_pid`, `owner_created`, `owner_host`, `claim_generation`); an older row keeps a NULL owner, read as "owner unknown" |
-| v7 | `invocation_settlements`, the append-only record of `hflow ledger settle`; only adds a table |
-| v8 | `integrations` (batch I2), one row per attempt to integrate a run's accepted candidate into a local branch, with partial unique indexes (one `preparing`/`checking`/`applying` record per run, one `applying` record per repository and target branch); only adds a table. A run accepted before v8 has no integration record and its receipt is untouched |
-
-A file whose bootstrap never stamped a version is read by its *shape*, newest first, so a v2 file
-without a version is never re-`ALTER`ed as if it were v1.
-
-One v5 step **rebuilds** `attempts` instead of adding to it, because v1 had declared
-`UNIQUE (run_id, task_revision, role)` and SQLite cannot drop a table-level constraint. The
-rebuilt table keeps every row and every column and replaces that key with
-`UNIQUE (run_id, task_revision, role, is_repair)`: one first attempt and at most one repair
-attempt per run, revision and role, so a third implementer attempt cannot exist even if a bug
-asked for one. Existing rows get `is_repair = 0` - every attempt written before v5 was a first
-attempt. The rebuild follows SQLite's own procedure (create under a temporary name, copy, drop
-the old table, rename the new one into place - renaming the *temporary* name is what keeps
-`evidence` and `invocations` pointing at `attempts`) with foreign-key enforcement suspended before
-the transaction opens (`PRAGMA foreign_keys` is a no-op inside one) and `PRAGMA foreign_key_check`
-verified before the transaction commits, so a reference that stopped resolving rolls the
-migration back rather than committing. An `attempts` table whose columns are not the ones this
-step expects is refused rather than copied blind. The E1 phase rule stays as it was - an
-implementer is only reserved before the candidate is checked - so `store.reopen_for_repair` moves the run back to its implementation phase in one transaction,
-immediately before the repair reservation, and refuses a stopped or terminal run.
-
-What happens on that first open:
-
-1. The version is read **before** anything is written. A file that records a version newer than
-   this build understands is refused with nothing touched - no snapshot, no write.
-2. If the file is at version > 0, it is copied first with the SQLite backup API to
-   `<db>.pre-v<version>.bak` (for example `hflow.sqlite.pre-v1.bak`), next to the database. A
-   brand-new file gets no backup: there is nothing to protect. The copy is written to
-   `<db>.pre-v<version>.bak.partial`, checked (`PRAGMA integrity_check` and its storage version),
-   flushed and only then renamed into place, so an interrupted copy never takes the `.bak` name.
-3. The migration runs inside one `BEGIN IMMEDIATE` transaction of plain statements. Any failure
-   rolls the whole thing back, and re-opening an already-migrated file does nothing (no second
-   backup, no rewrite). The backup is never overwritten, so the earliest pre-migration state
-   stays restorable.
-   - An existing `.bak` is checked the same way before it is trusted. If it is empty, damaged
-     or of another version (for example left by an older build's interrupted backup), the open
-     is refused with the file named and the ledger unchanged. Move that file aside, then open
-     again to take a fresh snapshot.
-
-**Do not open a migrated database with an older binary.** A build that predates the version
-check has no idea what `root_budgets`/`invocations` mean and would read (and write) a layout it
-does not understand. There is no downgrade path and no partial-version support.
-
-To roll back, stop everything, keep the migrated file, and restore the snapshot:
-
-```sh
-# Windows PowerShell, with data-dir pointing at the directory that holds the database
-Copy-Item "$data\hflow.sqlite" "$data\hflow.sqlite.migrated"
-Copy-Item "$data\hflow.sqlite.pre-v1.bak" "$data\hflow.sqlite"
-```
-
-```sh
-# POSIX
-cp "$data/hflow.sqlite" "$data/hflow.sqlite.migrated"
-cp "$data/hflow.sqlite.pre-v1.bak" "$data/hflow.sqlite"
-```
-
-The restored file is the pre-migration state: runs, authorizations and evidence as they were at
-that moment, and **without** anything the newer build wrote afterwards (a root ledger row, an
-invocation reservation, a delivery decision recorded later, a repair decision). Restoring is a
-deliberate data loss of everything after the snapshot; it is the only supported rollback, and it is
-why the snapshot is never overwritten.
-
-Two things the migration deliberately does **not** do: it never back-fills `evidence.exit_reason`
-for an old row (a stored exit code is not an observation that the process completed cleanly, and an
-empty reason is exactly what keeps a pre-v5 row ineligible to trigger a repair), and it never
-rewrites the reason of a row that has one.
+`--json` prints the `runs --json` entries plus `group`; an unreadable run is an entry with `error`
+in `attention`. Exit `0`, or `6` when a run could not be read (named on stderr); `--project-root`
+without a run id exits `4`.
 
 ## Reading a blocked run
 
-`hflow status <run_id>` prints the block code and the attempts. The codes you will
-actually meet today:
+### Block codes
 
-| Code | Meaning | Next action |
+| Code | Meaning | Next |
 |---|---|---|
-| `budget_exhausted` | the turn ceiling, the authorization or the root could not cover the next dispatch: root submissions or repairs spent, the root's deadline passed (at a dispatch - including during a role's own reservation, which then keeps the spent submission and launches nothing - during the checks, or at acceptance), or a rootless run of a task whose root was registered after the run was admitted (a rootless run of a task that already has a root is normally refused before its run row exists) | split the task, or raise `limits` deliberately; for a root, pass `--root-budget-file` with a fresh approval - nothing tops a root up |
-| `verification_failed` | an approved check failed; the worker's exit code is irrelevant. Also a repair round that changed nothing | read the evidence detail, fix the code or the check, submit a new revision |
-| `scope_violation` | files changed that the TaskSpec did not authorize, or a changed path matches the task's or the project's `write_deny` or the built-in deny list (`.git`, `.hflow`, `.acpxrc.json`) - even inside an allowed directory, and before anything is frozen. Also: the worker moved the worktree's HEAD (its own commit, amend, reset or checkout: "the worker moved HEAD from X to Y"); an index entry flagged assume-unchanged or skip-worktree ("index flags hide worktree changes from the freeze"); the candidate commit or the delivery changes a path outside the scope or under a deny rule (checked after the freeze and again at acceptance); a `write_allow` entry that started resolving outside the worktree during the run; a repair round that moved the tree but not the scoped content; a repair refused as `workspace_drift`; the shared Git metadata changed after dispatch ("shared Git metadata changed ...", before the freeze, before a repair round or at acceptance) | inspect the reported paths; nothing was accepted, and no receipt was written; for a metadata change, restore it before `hflow clean` or another worktree run |
-| `evidence_stale` | the candidate changed after verification, or at acceptance the worktree is no longer the frozen candidate (a check rewrote a tracked file outside the scope, or moved HEAD) | re-run; do not reuse the old evidence |
-| `review_rejected` | the reviewer returned a validated `changes_requested` | read the finding, then submit a new revision |
-| `review_protocol_error` | the reviewer turn produced no usable verdict: missing, malformed or ambiguous output, a reviewer stream whose `messageId` resumes after another message started (the review evidence reads `invalid: agent_message_chunk on line N continues message ...`), or a final message holding two verdicts, for example one on each side of its own reasoning (`ambiguous`), a prompt-digest mismatch, a reviewer that could not be started, or a reviewer turn that `FAILED` (for example `model_rejected_before_prompt`, `cancelled_unrequested`, `stop_reason_max_tokens`), or a reviewer that sent an `agent_message_chunk` after its own prompt response, or whose output was not read to its end (`review_ambiguous`: the final answer is not identified). It is a wire failure, never the reviewer's judgment | read `block_reason` and the review evidence; fix the cause before a new revision |
-| `outcome_unknown` | nobody knows how an invocation ended: its stop was not confirmed (including every cross-process `hflow cancel`), the controller was interrupted while it ran, or the driver reported an unknown outcome (`unbound_completion`, `boundary_not_empty`, `no_stop_reason`, `prompt_error_response`, `unknown_stop_reason`, `output_limit_exceeded`, `unparseable_output`, `completion_timeout`, `reader_failed`, `stream_not_drained` (implementer only; an undrained reviewer is `review_protocol_error` / `review_ambiguous`), `prompt_write_incomplete`) for either role | `hflow resume` to reconcile once the owning controller is provably gone (before that it writes nothing and exits `5`; a run with no owner token is reconciled at once); the root stays blocked while the stopped invocation's ledger entry is open - a cross-process `hflow cancel` that lands during the checks or the review handoff leaves none, so the root then accepts a new revision even while the original controller is still finishing; submit a new revision only after it is resolved |
-| `cancelled_by_operator` | a stop was requested and confirmed (or the run was stopped before any dispatch) | nothing runs; the workspace and evidence are kept |
-| `driver_failed` | the implementer's driver reported a failure before/without a result (for example `model_rejected_before_prompt`: the profile's `--model` value is not one the agent advertises, so no prompt was sent) | read `block_reason`; fix the environment or the profile, do not blindly retry. An identical TaskSpec returns this blocked run; to run again submit a new revision, whose first implementer, under a root budget, is charged as a repair (a root with none left refuses that revision before its run row exists) |
-| `workspace_client_config` | an entry named `.acpxrc.json` (in any letter case) appeared at the workspace root after admission (for the reviewer, in the candidate worktree), so the launch was refused at the driver's spawn gate before any process existed; the invocation is `not_started` and its allowance stays consumed. (A file already in the starting workspace never gets this far: it is refused before the run exists, see "What stops a run before it dispatches") | remove the file or directory, then submit a **new revision**: an identical TaskSpec returns this blocked run, and under a root budget the new revision's first implementer is charged as a repair, so the root needs a repair left (without one the revision is refused before its run row exists) |
-| `workspace_env_file` | an entry named `.env` (in any letter case) appeared at the workspace root after admission (for the reviewer, in the candidate worktree), so the launch was refused at the driver's spawn gate before any process existed; the file was listed, never opened; the invocation is `not_started` and its allowance stays consumed. (One already in the starting workspace is refused before the run exists) | remove or rename the file or directory, then submit a **new revision**, as for `workspace_client_config` |
-| `dsh_home_in_workspace` | the launch's bound `DSH_HOME` is relative, unresolvable, or in or around the role's cwd, the user's checkout (named from a `<repo>.hflow-worktrees/<run>` cwd) or the worktree directory, found at the driver's spawn gate before any process existed (admission normally refuses it first) | point `DSH_HOME` at an absolute directory outside them or unset it, prepare again (new authorization), then submit a **new revision** |
-| `no_credential_source` | at the driver's spawn gate, before any process existed, the environment the child was about to get had no `DEEPSEEK_API_KEY` and its DSH home neither `.credentials.yaml` nor `.env` - the variable or the file disappeared after admission (which refuses a run that starts without one); the invocation is `not_started` and its allowance stays consumed - no client was started, so nothing is left `outcome_unknown` or open for `ledger settle` | make a credential visible (the variable in the shell that runs `hflow`, or a file in a bound home), then submit a **new revision**, as for `workspace_client_config` |
-| `internal_error` | a controller step failed that is not the worker's result: the Git workspace could not be created, the candidate freeze failed or was incomplete (`freeze incomplete`), a prompt-digest mismatch on the implementer, an implementer driver that raised instead of returning a result (its ledger entry stays `requested`, which keeps the root blocked), an acceptance write that failed for a reason other than a stop, or a refused phase transition | read `block_reason`; it names the step |
-| `not_implemented` | the requested driver does not exist in this build, or the TaskSpec asked for a delivery level this build cannot reach | use `--driver fake`, request `local_candidate`, or wait for the implementation |
-| `context_file_change` | the frozen candidate changes a file DSH loads as instructions or skills (`AGENTS.md`, `CLAUDE.md` and their `.local` forms at any depth, root `.dsh/skills`, `.agents/skills`) that no `write_allow` entry names explicitly, or adds, changes or deletes the root `.env` (refused even when named); no candidate ref was written and no check ran | if the change is intended, name each file in `write_allow` by its path (a skill by an entry under its skill directory) in a new revision; a root `.env` change is never accepted |
+| `budget_exhausted` | the turn ceiling, the authorization or the root could not cover the next dispatch, or the root's deadline passed (at a dispatch, during the checks or at acceptance) | split the task or raise limits deliberately; a root is never topped up |
+| `verification_failed` | an approved check failed (the worker's exit code is irrelevant), or a repair changed nothing | read the evidence; new revision |
+| `scope_violation` | a changed path outside `write_allow` or under any deny list; the worker moved HEAD; an index flag hid changes; the delivery left the scope; a `write_allow` entry started resolving outside the worktree; `no_content_change`; `workspace_drift`; the shared Git metadata changed after dispatch | inspect the paths; for metadata, restore it before `clean` or another worktree run |
+| `evidence_stale` | the candidate changed after verification, or the worktree is no longer the frozen candidate at acceptance | re-run; never reuse the evidence |
+| `review_rejected` | a validated `changes_requested` | read the findings; new revision |
+| `review_protocol_error` | no usable verdict: missing, malformed or ambiguous output, a `messageId` that resumes after another message, a chunk after the prompt response, a stream not read to its end (`review_ambiguous`), a reviewer that could not start or `FAILED`. A wire failure, never the reviewer's judgment | fix the cause; new revision |
+| `outcome_unknown` | nobody knows how an invocation ended: an unconfirmed stop (every cross-process `cancel`), an interrupted controller, or an unknown driver outcome (table below) | `hflow resume` once the owner is provably gone; the root stays blocked while the entry is open |
+| `owner_lost` | `resume` took a live run over from an owner proven gone | see "Recovering from a controller crash" |
+| `cancelled_by_operator` | a confirmed stop, or a stop before any dispatch | nothing runs; workspace and evidence kept |
+| `driver_failed` | the implementer's driver failed before or without a result (e.g. `model_rejected_before_prompt`) | fix the environment or profile; new revision |
+| `workspace_client_config`, `workspace_env_file`, `dsh_home_in_workspace`, `no_credential_source`, `launch_content_changed` | the driver's spawn gate refused, before any process existed, something that appeared or changed after admission (for the reviewer, in the candidate worktree). The invocation is `not_started`; its allowance stays consumed | fix it, then a **new revision** (an identical TaskSpec returns this run; under a root its first implementer is charged as a repair) |
+| `context_file_change` | the candidate changes a file DSH loads as instructions or skills (`AGENTS.md`, `CLAUDE.md` and their `.local` forms at any depth, root `.dsh/skills`, `.agents/skills`) that no `write_allow` entry names by its path, or touches the root `.env` at all | name each file in `write_allow` in a new revision; a root `.env` change is never accepted |
+| `internal_error` | a controller step that is not the worker's result failed (worktree creation, `freeze incomplete`, an implementer prompt-digest mismatch, a driver that raised, a refused transition) | `block_reason` names the step |
+| `not_implemented` | a driver or delivery level this build does not have | use `--driver fake` or `local_candidate` |
 
-The driver's own `error_code` (`unbound_completion`, `model_rejected_before_prompt`,
-`boundary_not_empty`, `cancelled_unrequested`, `stop_reason_<reason>`, ...) is not a block code.
-It is stored with the invocation's result in the ledger (`attempts.result_json`, and
-`review_json` for the reviewer), and the driver's message is usually quoted in `block_reason`, and
-for an unknown outcome of either role the code is quoted with it. What each one means:
+### Driver error codes
 
-| Driver `error_code` | Outcome | Meaning |
+Stored with the invocation's result (`attempts.result_json` / `review_json`), quoted in
+`block_reason`; not block codes.
+
+| `error_code` | Outcome | Meaning |
 |---|---|---|
-| `unbound_completion` | `OUTCOME_UNKNOWN` | a terminal response arrived, but it answers no observed `session/prompt` id; the turn's completion cannot be attributed to this prompt, so nothing is frozen, checked or taken as a verdict |
-| `model_rejected_before_prompt` | `FAILED` | a `--model` value was passed, acpx refused it (or relayed the agent's refusal) with its own JSON-RPC error and exited, no `session/prompt` was sent, and the process tree is gone. Nothing reached a model; nothing is refunded |
-| `boundary_not_empty` | `OUTCOME_UNKNOWN` | the client exited, but its Job could not be confirmed empty afterwards; work it started may still be running |
-| `cancelled_unrequested` | `FAILED` | the harness settled the prompt as `cancelled` although no stop was requested for this invocation (DSH also does that when it disposes of a session) |
-| `stop_reason_<reason>` | `FAILED` | the prompt's own response settled as `max_tokens`, `max_turn_requests` or `refusal` |
-| `unknown_stop_reason` | `OUTCOME_UNKNOWN` | the prompt's own response carried a stop reason outside ACP v1's closed set (`end_turn`, `max_tokens`, `max_turn_requests`, `refusal`, `cancelled`). Before this build it was `FAILED stop_reason_<reason>`; it now blocks the root for both roles, and for the reviewer it is no longer `review_protocol_error` |
-| `prompt_error_response` | `OUTCOME_UNKNOWN` | the observed `session/prompt` was answered with a JSON-RPC error, ACP v1's failed-prompt shape. DSH sends -32603 `Internal error: turn failed: ...` / `assistant output delivery failed: ...` after the turn ran; before any model work it sends `prompt was not queued: ...` (-32603), invalid params (-32602), or a content-admission error with no fixed prefix (documented from DSH source, not observed). The code and the first 500 characters of the message (repr-quoted) go into `error_message`, the limitation and `block_reason`. The outcome stays unknown because whether a model call was made is not observable. A prompt answered with an error and a stop reason is unknown too. An error answering another id is not attributed, and one carrying the prompt's id after a request from the agent reused it is recorded as the limitation `prompt_error_unattributed` - DSH numbers its own permission requests from 0, so a long turn can hit this |
-| `no_stop_reason`, `output_limit_exceeded`, `unparseable_output`, `completion_timeout` | `OUTCOME_UNKNOWN` | the stream does not say how the turn ended - including a prompt response with no `stopReason` (such as the `{messageId}` insertion acknowledgement in an unreleased ACP v2 RFD sketch); a later `state_update` with a stop reason settles nothing |
-| `reader_failed` | `OUTCOME_UNKNOWN` | the driver's stream reader stopped before the end of the client's output (the exception class is named), or could not be started after the client was created; nothing is judged from the part it read |
-| `stream_not_drained` | `OUTCOME_UNKNOWN` | implementer only: the reader had not finished the client's output within the drain wait after the client exited, so a stop reason in the part read settles nothing (a reviewer keeps `COMPLETED` with no verdict, `review_ambiguous`) |
-| `prompt_write_incomplete` | `OUTCOME_UNKNOWN` | the turn settled with `end_turn`, but the prompt could not be fully written to the client's stdin (broken pipe), so the reported prompt digest is not what the client received. Recorded as a limitation on every other outcome. A client that reads part of its stdin and then closes it is not detected: the pipe accepts a write before the client reads it |
+| `unbound_completion` | `OUTCOME_UNKNOWN` | a terminal response answers no observed `session/prompt` id |
+| `model_rejected_before_prompt` | `FAILED` | acpx refused the `--model` value before any prompt was sent; nothing reached a model, nothing is refunded |
+| `boundary_not_empty` | `OUTCOME_UNKNOWN` | the client exited but its Job could not be confirmed empty |
+| `cancelled_unrequested` | `FAILED` | settled `cancelled` with no stop requested (DSH also does this when it disposes of a session) |
+| `stop_reason_<reason>` | `FAILED` | `max_tokens`, `max_turn_requests` or `refusal` |
+| `unknown_stop_reason` | `OUTCOME_UNKNOWN` | a stop reason outside ACP v1's set |
+| `prompt_error_response` | `OUTCOME_UNKNOWN` | the prompt was answered with a JSON-RPC error (DSH's failed turn); code and the first 500 characters recorded. Whether a model call was made is not observable. An error carrying the prompt's id after an agent request reused that id is not attributed (limitation `prompt_error_unattributed`) |
+| `no_stop_reason`, `output_limit_exceeded`, `unparseable_output`, `completion_timeout` | `OUTCOME_UNKNOWN` | the stream does not say how the turn ended |
+| `reader_failed` | `OUTCOME_UNKNOWN` | the stream reader stopped early or could not start; nothing is judged from the prefix |
+| `stream_not_drained` | `OUTCOME_UNKNOWN` | implementer: the output was not drained in time after exit (a reviewer gets `review_ambiguous`) |
+| `prompt_write_incomplete` | `OUTCOME_UNKNOWN` | the prompt could not be fully written to stdin |
 
-`stream_order` (`prompt_response_line`, `updates_after_prompt_response`,
-`message_chunks_after_prompt_response`) is stored in `attempts.result_json` / `review_json` for
-every bound result whose stream was read to its end without wire-state truncation, and `status`
-prints it as a `stream` line per
-invocation. A count above zero adds the limitation `updates_after_prompt_response=N: ...`. It
-changes no outcome except the reviewer case above (`review_ambiguous`). What is pinned:
-`test_real_client_prints_an_update_sent_right_after_the_prompt_response` shows that, with the
-installed acpx 0.17.1 and the mock agent, a chunk written right after the response is printed after
-it. From the 0.17.1 source (documented, not a timing guarantee): `exec` does not wait for idle after
-the response and keeps reading while it closes the agent - 100 ms after ending its stdin, then
-SIGTERM with a 1.5 s grace. The five recorded live DSH streams had no update after the response.
+`stream_order` (where the prompt response fell, and how many updates followed it) is recorded for
+every bound result read to its end and shown as a `stream` line; a count above zero is a
+limitation and changes no outcome except the reviewer's. `end_turn` means the turn settled, not
+that the work succeeded: acceptance is decided by checks and review.
 
-`end_turn` means the turn settled, not that the work succeeded (DSH maps blocked and aborted turns
-to `end_turn` too - documented, not observed); acceptance is decided by checks and review.
+## Worktree runs: freeze, scope and receipt
 
-Refusals that happen *before* a run exists (exit `2`) are listed in `issues`, not in a block
-code. Two of them are easy to meet by accident:
+A task selects isolation with `"workspace": {"mode": "worktree", "base_commit": "<sha or ref>"}`
+(`hflow init task` writes the current branch). The worktree is created at a staging path and moved
+into place with `git worktree move`; HFlow never runs `git worktree repair`. Your HEAD, index,
+working files, stash and branches are not written to, but the worktree shares the repository's
+objects and admin files.
 
-| Admission issue | Meaning | Next action |
-|---|---|---|
-| `reuse_not_approved` | `choice` is `reuse`/`adapt` while `fit_test_status` is `pending` or `failed`, or `not_required` was claimed without a reason | answer the compatibility question (or record the choice as `build`/`defer`) and submit again |
-| `not_implemented` at `delivery.mode` | the task asked for `integrated`/`published` | this build delivers `local_candidate` only; a lower level than requested is not delivered silently - change the request deliberately |
+The freeze (after the implementer, before any check):
 
-These are **refusals**, not blocks: no run row, no workspace, no reservation, no invocation and
-no allowance exists afterwards, and `status` has nothing to show you. A block (`exit 3`) is the
-opposite kind of event - the run exists, work happened, and its evidence is kept. Reading a
-refusal as "the run failed" and a block as "nothing happened" are both wrong.
+- **HEAD must not move.** A worker commit, amend, reset or checkout is refused `scope_violation`
+  ("the worker moved HEAD from X to Y").
+- **No index entry may be flagged** assume-unchanged or skip-worktree ("index flags hide worktree
+  changes from the freeze"); HFlow never clears the flags.
+- A changed path under the task's or project's `write_deny` or the built-in list (`.git`, `.hflow`
+  at the root, `.acpxrc.json` anywhere) blocks before the freeze, even inside an allowed directory.
+- Each `write_allow` entry is staged with `git add -A` under literal pathspecs (a deleted listed
+  file is committed as a deletion); anything staged outside the scope refuses the commit, and a
+  worktree that still shows a change afterwards blocks `internal_error` ("freeze incomplete").
+- **Ignored bytecode is not a candidate.** An ignored file the scoped fingerprint would hash, a
+  sourceless `.pyc` outside `__pycache__`, or any ignored file under `__pycache__` other than a
+  `.pyc` refuses the freeze. Before each `command` check of a worktree run, regular `.pyc` files
+  directly inside a real `__pycache__` are deleted (counted in the evidence and a
+  `bytecode_removed` note); a link there refuses the check (`bytecode_not_cleared`). An in-place
+  run deletes nothing.
+- A directory link or junction is one entry (`link:<target>`), never walked.
+- After the freeze, and again at acceptance, the whole diff from the original base is held to the
+  scope and every deny list, then classified against DSH's context list (`context_file_change`,
+  above). Path lists use `--no-renames`, so a move names its deleted source too.
+- Declared context files reach the reviewer and repair packets in a section headed as untrusted
+  data, with a bounded diff (8 KiB). DSH still loads the candidate's version in the reviewer's and
+  the repair implementer's worktree; the section is a label, not enforcement. Not covered at all:
+  such files already in the base commit, in-place runs, a link to a directory that holds one, an
+  ignored `AGENTS.md` under an allowlisted cache directory, a `.env` below the root, and anything
+  under the DSH home.
 
-## Guarantees you can rely on
+**HFlow's own Git cannot be hooked or redirected.** Every call forces `core.hooksPath` below a
+system file no worker can write, disables maintenance, gc, fsmonitor, signing, `ignoreStat` and
+sparse checkout, sets `safe.bareRepository=explicit`, switches off replace objects, lazy fetch,
+grafts and the system config, drops inherited repository-locating and read-redirecting variables
+(`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_CONFIG`, `GIT_EXTERNAL_DIFF` and the rest), and
+commits with `--no-verify`; the list is in `docs/architecture.md`. Your global config is still
+read, and filters stay on (LFS needs them), so a filter is caught by comparison instead:
 
-- `status`, `report` and `doctor` make zero model calls. They are pure SQLite reads plus
-  static local probes (the optional `--project-root` drift check reads project files).
-- Submitting the identical TaskSpec again returns the existing run; it does not buy a
-  second worker turn. To genuinely re-run, change the task (a new revision produces a
-  new run).
-- A refused admission (`exit 2`) creates no run state at all.
-- `cancel` on a run that never dispatched is local and instant; on a dispatched run it
-  asks the driver and records `confirmed_stopped` / `still_running` / `unknown`
-  honestly. What can be stopped is what the process boundary owns: a Windows Job Object, which
-  covers the tree it was given. On other platforms the boundary degrades to
-  `direct_child_only` and says so (`ProcessBoundary.kind`), so there is no descendant control
-  to claim there - and its terminate does nothing, so a forced stop or a deadline teardown
-  (`completion_timeout`) there does not kill even the direct child - and nothing here reaches a
-  remote model request or a remote bill. A
-  `hflow cancel` typed in another shell is a different process from the controller running the
-  task: it holds no handle, answers `unknown` and blocks the run `outcome_unknown` (see "Stopping
-  a run").
+**Shared Git metadata is compared.** Right after `worktree add`, HFlow digests every configuration
+key your checkout and the worktree see, the files they come from, both `config.worktree` files,
+`.git/info/attributes` and the global attributes file, and records only the digest
+(`git_metadata: snapshot before dispatch sha256:...`). It compares again before the freeze,
+before a repair round and at acceptance; a difference blocks `scope_violation` ("shared Git
+metadata changed since the pre-dispatch snapshot (...)", keys shown as `filter.*.clean`, at most
+five). A run that ends without a receipt for another reason gets a note only (`git_metadata:
+changed when the run ended ...`) and keeps its block. `status`/`report` show every such note as a
+`git metadata` line. Git output that is not text in the locale's encoding counts as unreadable.
+What to do: `git config --list --show-origin --show-scope`, inspect `.git/info/attributes` and
+`git var GIT_ATTR_GLOBAL`, and restore them before `hflow clean` or another worktree run (HFlow
+restores nothing); see "What is not safe yet" for what the comparison does not cover. An in-scope
+`.gitattributes` the worker wrote is a receipt limitation, not a refusal.
 
-## M2 runs through the CLI
-
-An offline candidate needs three files: the target repository (a real Git repo), a project
-contract, and a task. The change itself comes from a plan file, because the fake driver is a
-scripted stand-in:
-
-```sh
-hflow run --task task.json --project .hflow/project.json --project-root <repo> \
-          --driver fake --fake-write-plan plan.json --json
-hflow status <run-id> --project-root <repo>
-hflow report <run-id> --json --project-root <repo>
-```
-
-The TaskSpec selects isolation with `"workspace": {"mode": "worktree", "base_commit": "<sha>"}`.
-`--base-commit` / `--workspace` override it *before* admission, so the stored spec and its
-digest describe what actually ran. `base_commit` may be a ref (`HEAD`, `main`); it is resolved
-once to a SHA, and that SHA - not the name - is the worktree's start, every round's base and the
-receipt's `candidate.base_commit`.
-
-What the freeze commits, and what it refuses:
-
-- `scope.write_allow` takes **literal** file or directory paths only. An entry containing `*`,
-  `?` or `[`, or one that is or passes through a symbolic link or junction in the checkout, is
-  refused at admission and by `prepare` (`scope_violation`, location `scope`); `write_deny` (task
-  and project) keeps its globs. An entry that only starts resolving outside the worktree during
-  the run (the worker replaced it with a link) blocks the run `scope_violation` before the
-  freeze, and the run ends instead of being left `RUNNING`.
-- A `write_deny` entry is matched after normalization (a leading `./`, `.` segments and repeated
-  `/` removed), so `./config/**` blocks like `config/**`. One that is empty after that, absolute,
-  drive-qualified or holds `..` could never match and is refused at admission and by `prepare`
-  (`scope_violation`), the task's and the project's alike.
-  An entry with a leading `/` or `\` (gitignore-style `/config/secrets/**`) is refused too, with
-  its own message; an earlier build stripped that slash silently, so drop it from such an entry.
-- **A `write_allow` entry cannot name a denied path by another spelling.** A segment ending in a
-  dot or a space (Windows opens `.git.` as `.git`) or holding a `:` (a data stream) is refused at
-  admission and by `prepare` (`scope_violation`). Every deny list - the task's, the project's and
-  the built-in one - is matched against the entry as written and as resolved in the checkout, so
-  an 8.3 short name such as `SECRET~1` for an existing denied directory is refused as well. A `~`
-  in a file name is allowed.
-- **A directory link or junction is one entry, not a tree.** The scoped fingerprint, the run's
-  before/after manifest and the `status`/`report` drift check never enter a symbolic link to a
-  directory or an NTFS junction (Python's `os.walk` entered junctions, and two junctions pointing
-  back at their parent made it run forever). Each is recorded by its target (`link:<target>`), so
-  pointing one elsewhere changes the fingerprint and shows as a changed path; files reached only
-  through it are not hashed. A link to a file is still hashed by its content. A fingerprint an
-  earlier build recorded for a scope holding such a link no longer matches, so that evidence is
-  refused as stale, never reused.
-- **Ignored bytecode is not a candidate.** Every freeze, the first round's included, refuses
-  `scope_violation` on an ignored file the scoped fingerprint would hash and on a sourceless
-  `.pyc` outside `__pycache__` (Python imports it in place of a missing source, and no commit
-  holds it); the freeze deletes nothing. `.pyc` files in `__pycache__` and `.pytest_cache` stay
-  allowed; any other ignored file under `__pycache__` refuses (Python imports
-  `__pycache__/helper.py` as a namespace package, and no commit holds it). Before
-  every `command` check of a worktree run, each regular `.pyc` directly inside a real
-  `__pycache__` of the worktree is deleted (an emptied `__pycache__` too), so worker-left bytecode
-  is never loaded, whether or not the check runs Python with `-I` or `-E`. Those files are never
-  committed or fingerprinted, so the candidate commit and fingerprint do not change; `.pyc` files
-  the candidate commit tracks stay, and `.git` and anything outside `__pycache__` are never
-  touched. The walk follows no link or junction: a `__pycache__` link or junction (or a `.pyc`
-  link) is left alone and the check is not started (`bytecode_not_cleared`, never a repair). Each
-  check's evidence says how many files were removed, and a `bytecode_removed` run note gives the
-  total. An in-place run deletes nothing in the user's checkout and gets no such protection.
-- **The worker may not move HEAD.** The freeze first checks that the worktree's HEAD is still the
-  commit the round started from - the original base in round one, the previous candidate in a
-  repair. A worker that ran `git commit`, `--amend`, `reset` or `checkout` inside the worktree is
-  refused `scope_violation` ("the worker moved HEAD from X to Y"): its commit never passed the
-  scope and deny checks, which read the uncommitted status, so it is neither built on nor
-  delivered.
-- **No index entry may be flagged.** An entry marked assume-unchanged or skip-worktree (a
-  lowercase or `S` tag in `git ls-files -v`) makes status, `git add` and the staged diff trust the
-  index instead of the file, so the commit would hold old bytes while the checks read new ones.
-  The freeze refuses `scope_violation` ("index flags hide worktree changes from the freeze")
-  before it reads the status or stages anything, and the repair round's reconcile refuses the same
-  way (`workspace_drift`, before the repair is bought). HFlow never clears the flags.
-- Each `write_allow` entry is staged with `git add -A -- <entry>` under literal pathspecs, so a
-  deleted, exactly listed file is committed as a **deletion** - the receipt's commit is the
-  content that was checked and reviewed.
-- A changed path matching the task's `write_deny`, the project's `write_deny` or the built-in
-  deny list (`.git` and `.hflow` at the workspace root, `.acpxrc.json` at any depth) blocks
-  `scope_violation` **before** the freeze, even inside an allowed directory: it is never staged,
-  never committed, and no reviewer is bought. A `write_allow` entry under the built-in list is
-  refused at admission. A project whose tools generate files under an allowed but denied
-  directory will therefore block; a repository may keep an `.acpxrc.json`, but no task can change
-  it (and a real driver refuses to launch on it, see "Client launch hardening").
-- Anything staged outside the scope or denied refuses the commit, and if the worktree still shows
-  any change after the commit the run blocks `internal_error` ("candidate freeze failed: freeze
-  incomplete"). A repository whose line-ending or attribute settings leave a tracked file
-  permanently modified fails closed here instead of freezing silently. (HFlow's Git ignores the
-  system config, while a worker's own `git` in the same worktree reads it - Git for Windows ships
-  `core.autocrlf=true` there - so the two can disagree about line endings on CRLF content a worker
-  commits.)
-- After the freeze, before a candidate ref is written or a check runs, the whole change from the
-  original base to the candidate - as Git computes it - is held to `write_allow` and every deny
-  list once more, and the delivery paths are checked the same way at acceptance, before a receipt
-  names them, so a change the manifest scan skips (it does not read `.git`, `.hflow`,
-  `__pycache__` or `.pytest_cache`) is still held to the scope. A refusal after the freeze writes
-  no candidate ref and runs no check; one at acceptance writes no receipt.
-- Path lists are taken with `--no-renames`: a moved file appears as both its old and its new path
-  in the staged set, the round and reviewer lists and `candidate_paths`, so the deleted side of a
-  move is held to the deny rules too.
-- The same cumulative list is classified against DSH's context list (instruction files, the root
-  skill directories, a root `.env`; see "What the harness does that HFlow does not control"),
-  right after the cumulative scope check. A root `.env` the candidate adds, changes or deletes
-  blocks `context_file_change` even when `write_allow` names it; any other listed file blocks
-  `context_file_change` unless a `write_allow` entry names it by its path (a skill: an entry that
-  is or lies under `.dsh/skills` or `.agents/skills`) - `src` or `.` containing it is not a
-  declaration. Like a scope refusal, it writes no candidate ref and runs no check. What passes is
-  kept as that attempt's `dsh_context` record, after the candidate ref is written; a stopped or
-  refused candidate gets no record.
-- Declared context files reach the reviewer packet in a section whose heading calls them
-  untrusted data, not instructions (`packet.CONTEXT_FILES_HEADING`): the file list, a
-  `git diff --no-renames <base> <candidate>` reference and a unified diff read through
-  `GitRepo.diff_text_bounded` (`--no-ext-diff --no-textconv`, at most 8 KiB in all, fenced by
-  delimiters carrying a digest of the fenced text, cut with an explicit marker). If the packet
-  would then exceed 32 KiB it is rendered with the list and a marker instead. A repair packet
-  lists the same files with the same framing. DSH still loads the candidate's version in the
-  reviewer's and the repair implementer's worktree; the section is a label, not enforcement.
-- HFlow's own Git commands cannot be hooked or redirected. Every call through its repository
-  handle forces `core.hooksPath` to a path below an existing system file (`ntdll.dll` in the
-  Windows system directory, `/dev/null` elsewhere), where no worker running as the user can
-  create a hook - an empty directory in the user's temporary directory could be written to -
-  `maintenance.auto=false` and `gc.auto=0` (a commit otherwise starts `git maintenance run
-  --auto`, which Windows cannot detach from the freeze), `core.fsmonitor=false`,
-  `commit.gpgsign=false`, `core.ignoreStat=false`,
-  `core.sparseCheckout=false` and `safe.bareRepository=explicit` (through `GIT_CONFIG_COUNT`,
-  read after the global, repository and worktree config files and, being command scope, honoured
-  for the protected-only `safe.bareRepository`; when the caller's environment carries a
-  `GIT_CONFIG_PARAMETERS` - what `git -c` exports, read after that list - the forced keys are
-  appended to it too, so a caller's `git -c` cannot override them while its other settings still
-  apply). It sets `GIT_CONFIG_NOSYSTEM=1`, `GIT_NO_REPLACE_OBJECTS=1` and `GIT_NO_LAZY_FETCH=1`
-  (in a partial clone a missing object is an error, never a fetch from the remote), gives git no
-  standard input, reads its output as UTF-8 whatever the Windows code page, points
-  `GIT_GRAFT_FILE` at a path below the same system file, which can never exist (replace objects
-  off does not switch grafts off, and a worker can
-  write `.git/info/grafts`; a graft can give a commit any parents, which would change the ancestry
-  an integration decides on), and drops an inherited `GIT_DIR`, `GIT_WORK_TREE`,
-  `GIT_IMPLICIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`,
-  `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_COMMON_DIR`, `GIT_NAMESPACE`, `GIT_PREFIX` or
-  `GIT_DISCOVERY_ACROSS_FILESYSTEM` (every call names its repository by its working directory,
-  so a variable inherited from a hook or an alias cannot point it elsewhere) and `GIT_CONFIG`
-  (it would make the metadata snapshot below read one file, as command scope, and so see no
-  configuration at all), `GIT_SHALLOW_FILE`, `GIT_REPLACE_REF_BASE`, `GIT_ATTR_SOURCE`,
-  `GIT_EXTERNAL_DIFF`, `GIT_DIFF_OPTS` (it overrides the reviewer excerpt's `--unified=3`) and
-  the `GIT_LITERAL/GLOB/NOGLOB/ICASE_PATHSPECS` modes. An inherited `GIT_CEILING_DIRECTORIES` is
-  kept: it can only stop discovery from climbing, never point it at another repository. The
-  freeze commit also passes `--no-verify`. So no repository, user, worker or caller hook, monitor
-  command or signer runs during `worktree add`, the freeze or a ref write; a directory git would
-  only implicitly take for a bare repository - for example a worktree root whose `.git` file a
-  worker replaced with `HEAD`, `objects/`, `refs/` and a `config` of its own - is refused rather
-  than read (checkouts, linked worktrees, also of a bare main repository, and `--git-dir` are
-  unaffected); and HFlow's own `worktree add` never checks an entry out flagged assume-unchanged
-  or skip-worktree (a flag set any other way refuses the freeze, above). The user's global config
-  is still read for everything else, and
-  filters cannot be switched off without breaking legitimate ones such as LFS, so a filter a
-  worker configures is caught by comparison instead (next bullet).
-- Shared Git metadata is compared before HFlow's git reads it again. A worktree shares
-  `.git/config` with your checkout, and a worker (or a check, or the reviewer) can configure a
-  clean, smudge or process filter there and select it through `.git/info/attributes` or
-  `core.attributesFile` - no `.gitattributes` needed - so HFlow's own status, add or commit would
-  run it. Right after `worktree add` (which can itself write `extensions.relativeWorktrees` under
-  `worktree.useRelativePaths`, or the run's `config.worktree`) and before the first dispatch,
-  HFlow snapshots every configuration key `git config --list` reports in your checkout and in the
-  run's worktree, the files they come from (includes and `includeIf` targets too), both
-  `config.worktree` files, `.git/info/attributes` and the global attributes file, and records
-  only a digest: `git_metadata: snapshot before dispatch sha256:...` (never values). It compares
-  again before the freeze, before a repair round (which records `workspace_drift` and buys
-  nothing) and at acceptance (which writes no receipt); any difference blocks `scope_violation`
-  with a reason that starts "shared Git metadata changed since the pre-dispatch snapshot (...)"
-  or "... or became unreadable". Keys are shown with the subsection hidden (`filter.*.clean`,
-  `url.*.insteadof`), plus file paths, at most five. The `git_metadata: changed <where>` notes
-  carry the same list, because a stop that already decided the run keeps its own reason. A run
-  that ends without a receipt for another reason (a failed check or a rejection that buys no
-  repair, a driver failure, an unknown outcome, a stop while the worker ran) is compared once
-  more and gets only a note, `git_metadata: changed when the run ended ...`; it never relabels the
-  block, so an `outcome_unknown` stays. A comparison that cannot read the metadata at that point
-  notes `git_metadata: unreadable when the run ended ...` and the run's block still stands. You
-  see these warnings without opening the store: `hflow run` prints the at-exit note with its
-  other notes, and `hflow status` / `report` print every `git_metadata: changed ...` /
-  `unreadable ...` note as a `git metadata` line under the block (`git_metadata_notes` in
-  `report --json`). Output git prints that is not text in the locale's encoding (a config value
-  is raw bytes, so a worker can write any; a legacy GBK value under a UTF-8 locale) counts as
-  unreadable: "... or became unreadable" after dispatch, and `internal_error` ("git workspace
-  failed: ...") before it, when no snapshot can be taken - such a value already in your config
-  blocks every worktree run until you fix it. What to do: run `git config --list --show-origin
-  --show-scope`, inspect `.git/info/attributes`, the file `git var GIT_ATTR_GLOBAL` names and any
-  included files, and restore them before `hflow clean` or another worktree run - both read the
-  metadata again, and HFlow restores nothing. If the edit was your own (any change counts, even
-  `user.name`), submit a new revision: an identical TaskSpec returns the blocked run, and under a
-  root budget the new revision is charged as a repair (refused before its run row exists when the
-  root has none left). An in-scope `.gitattributes` the worker
-  wrote is not refused; it appears in the receipt's `limitations`, because HFlow's `git add`
-  applied it at the freeze. Requires Git 2.31+. Offline-tested only (README, "Not verified").
-- The worker packet still lists only the task's `write_deny` under forbidden paths; the project's
-  and the built-in deny lists are enforced, not shown.
-
-What the receipt gives you, and how to read it:
+What the receipt gives you:
 
 | Field | Meaning |
 |---|---|
-| `candidate.base_commit` | the fixed commit the worktree started from: always the resolved SHA, and after a repair still the task's original base |
-| `candidate.git_commit` / `git_tree` | real Git objects for the frozen candidate |
-| `candidate.fingerprint` | content hash over the write scope; **not** a Git id |
-| `candidate.worktree` | where the candidate lived (until you clean it) |
-| `candidate_paths` | the paths changed from that base to the final candidate - both rounds' changes after a repair |
-| `verification.status` / `evidence_ids` | the approved check's result on that candidate |
+| `candidate.base_commit` | the resolved SHA the worktree started from; after a repair still the original base |
+| `candidate.git_commit` / `git_tree` | the frozen candidate as Git objects, kept by `refs/hflow/candidates/<run-id>/<attempt-id>` |
+| `candidate.fingerprint` | content hash over the write scope - **not** a Git id |
+| `candidate.worktree` | where the candidate lived until you clean it |
+| `candidate_paths` | paths changed from the base to the final candidate |
+| `verification.status` / `evidence_ids` | the approved checks' result on that candidate |
 
-`--driver acpx-dsh` (or a profile that binds it) launches the real Harness. It needs
-`--authorization-file <auth.json>` plus `--authorization-mode`, and the artifact must cover
-exactly this run. It refuses before reading credentials, creating a
-workspace or reserving budget, and it never falls back to the fake driver. `--live-authorized`
-is not a flag in this build and never was one that worked: a bare flag could be typed by the
-same process that runs the task, which is the thing the artifact exists to prevent.
+`hflow diff <run-id>` (or `--last`, `--stat`) prints the Git diff between those two recorded
+commits; it never reads a working tree.
+
+## Integrating an accepted candidate
+
+A run ends at `ACCEPTED / LOCAL_CANDIDATE`. Putting the change on a local branch is a separate
+delivery with its own record and `IntegrationReceipt`; the run's receipt is never rewritten.
+Nothing here calls a model, dispatches or spends a budget. Contract:
+`docs/batch-i-integration-plan.md`.
+
+### `hflow integrate <run-id>`
+
+```sh
+hflow integrate <run-id> [--target <branch>] [--project <project.json>] [--owner-gone --attest "<text>"] [--keep-worktree] [--json]
+```
+
+It continues the run's integration from whatever state it is in, and is safe to run again. It
+continues the run's integrated record if one exists, else its newest (only records for
+`--target`'s branch when given):
+
+| State found | What it does |
+|---|---|
+| none, or `stale` / `interrupted` / `failed` / `superseded` | prepares (below). Target: `--target`, else that record's branch, else the task's base branch when it is a local branch of the run's repository (otherwise exit `4`: pass `--target`) |
+| `ready` (including just prepared) | reconciles first (a hand merge is recorded `integrated`, a moved target `stale`). Still `ready` and stdin is not an interactive terminal: stops with `next: hflow integrate <run-id>  # run it at an interactive terminal ...` (exit `0`). At a terminal: prints the record and an 8-hex **confirmation code** on stderr, reads the code you type (any case), and only on a match applies with `--expect-target` bound to the tip just shown - a branch that moved in between ends `stale`, never moved from elsewhere |
+| apply finds the target checked out | prints `git -C <checkout> merge --ff-only <M>` and `next: hflow integrate <run-id>` (exit `3`); run it again after your merge to record it |
+| `preparing` / `checking` / `applying` | reconciles, passing `--owner-gone --attest` through |
+| `integrated` | reports it; nothing written |
+| `conflict` / `checks_failed` | reports it (exit `3`) and does not prepare again: that decision is yours (`integrate prepare`, or a new revision) |
+
+| Exit | When |
+|---|---|
+| `0` | stopped at `ready` without a terminal, or `integrated` |
+| `2` | wrong confirmation code (nothing applied), a refusal, a Git error |
+| `3` | hand-off, `stale`, `interrupted`, `conflict`, `checks_failed`, `failed`, or a ref update that failed and left the record `ready` |
+| `4` | unknown run, no default target, `--project` needed, a bad `--attest` |
+| `5` | another process may still be working on the integration (the `next:` line says when to run it again, or offers `--owner-gone` when HFlow cannot tell) |
+| `6` | an unreadable stored record |
+
+**Auto-clean.** When `integrate <run-id>`, `integrate apply` or `integrate reconcile` brings an
+integration to `integrated` in this process (and `integrate <run-id>` whenever it finds one
+integrated), the run's worktree is released by the same guarded cleanup `hflow clean <run-id>
+--apply` runs, never forced. The result prints as `cleanup <STATUS>: ...` with any `refuse` lines
+(`--json`: a `cleanup` member); a refusal, `PARTIAL` or error never changes the exit code.
+`--keep-worktree` keeps the worktree (`cleanup KEPT`).
+
+### The steps underneath
+
+```sh
+hflow integrate prepare <run-id> --target <branch> [--project <project.json>]
+hflow integrate apply <integration-id> --expect-target <full tip printed by prepare> [--keep-worktree]
+hflow integrate reconcile <integration-id> [--owner-gone --attest "<text>"] [--keep-worktree]
+hflow integrate show <integration-id> [--json]
+```
+
+**prepare** fixes the target's tip `T` and builds one commit `M` on it with Git plumbing:
+
+| Target since the task's base `B` | Mode | `M` |
+|---|---|---|
+| unchanged (`T == B`) | `squash` | one commit with the candidate's tree on `B`; earlier repair rounds never enter the branch |
+| moved on (`B` is an ancestor of `T`) | `replayed` | `git merge-tree --write-tree --merge-base=B T C`, committed on `T`; a conflict ends `conflict` with its paths and commits nothing |
+| rewritten | - | refused `target_moved` |
+
+`M` is kept by `refs/hflow/integrations/<run-id>/<integration-id>` and checked out in a worktree
+of its own (`<repo>.hflow-worktrees/<integration-id>`), where the run's required checks run again
+(evidence kind `integration-check`). `T..M` must change only paths the delivery changed, inside
+the scope. The checks are bracketed by a shared-Git-metadata snapshot: a change ends
+`checks_failed` with a detail starting "shared Git metadata changed", leaves that worktree in place
+(`LEFT`, no status read), and adds a run note `git_metadata: changed|unreadable during integration
+...` - so `hflow clean` of the run refuses until the metadata is restored. Otherwise the worktree is
+removed without `--force` (left and named if Git refuses). A pass ends `ready`. prepare never moves
+a branch or writes your checkout. It refuses: a contract whose digest differs from the one the run
+was accepted under (`project_mismatch`, exit `2`; with no `--project`, exit `4` when
+`<project root>/.hflow/project.json` no longer is that contract); a `kind=fake` check; Git older
+than 2.40; a `--target` no ref carries in exactly that spelling; a run whose change already
+reached that branch through an earlier integration. A newer prepare marks the run's `ready`
+record `superseded`, unless the branch already contains it (then it is recorded `integrated`).
+
+**apply** is your approval. `--expect-target` must be exactly `T`; the run must still be
+`ACCEPTED`, the integration ref must point at `M` and its evidence must still describe `M`. The
+intent (`applying`) is recorded before `git update-ref refs/heads/<target> M T` (compare-and-set).
+It never forces, creates or deletes a branch.
+
+| apply finds | Result |
+|---|---|
+| target at `T`, not checked out | moved to `M`; `integrated` (`hflow_ref_update`), receipt written |
+| target checked out in any worktree - HEAD names it in any letter case, or a rebase or bisect will return to it | not moved: `git -C <checkout> merge --ff-only <M>`, then reconcile (exit `3`) |
+| target already contains `M` | `integrated` (`operator_merge_observed`) |
+| target moved elsewhere | `stale`; prepare again |
+| the ref is locked (`<ref>.lock` held by another Git process or left by a crash) | the compare-and-set fails with Git's own "cannot lock" message and the record returns to `ready` (exit `3`); HFlow never deletes a lock file |
+
+**reconcile** settles a record from what Git shows and never re-runs an update or a check:
+`applying` with its process gone -> `integrated` (`observed_after_interruption`) if the target
+contains `M`, `ready` if it is still `T`, else `stale`; `preparing`/`checking` with its process
+gone -> `interrupted` (its worktree removed without force when possible); `ready` -> `integrated`
+once the target contains `M` (how a hand merge is recorded), `stale` once the target moved
+elsewhere, else unchanged. Terminal records are only reported. While the process may still run it
+writes nothing (exit `5`). When HFlow cannot tell (another host, no creation time, a pid it may
+not open), `--owner-gone --attest "<text>"` (at most 500 characters, recorded whole in the run's
+audit note with your OS user) attests that it exited; a process seen running is never overridden.
+
+States: `preparing -> checking -> ready -> applying -> integrated`; terminal `conflict`,
+`checks_failed`, `stale`, `interrupted`, `superseded`, `failed`. One active record per run, one
+`applying` per repository and branch. Subcommand exits: `0` when it did what it was asked
+(`prepare` -> `ready`, `apply` -> `integrated`, `reconcile` -> `ready` or `integrated`), `3` for
+anything needing your decision, `5` for a record another process may still be working on, `2`
+refused (Git errors included), `4` unknown id, bad `--attest` or `--project` needed, `6`
+unreadable record.
+
+An integration receipt claims nothing about a remote (nothing is pushed), a review of a merged
+tree (a `replayed` tree is checked, not reviewed), or who merged a hand-off. `M` carries HFlow's
+fixed identity.
 
 ## Releasing a workspace (`clean`)
 
-`clean` deletes the run's **working directory**. It never deletes the delivery.
+`clean` removes a run's working directory, never the delivery:
 
 ```sh
-hflow clean <run-id>              # preview only; changes nothing, not even git metadata
-hflow clean <run-id> --apply      # remove this run's worktree
-hflow clean <run-id> --reconcile  # after an interruption, decide from recorded facts
+hflow clean <run-id>              # preview (same as --dry-run); changes nothing
+hflow clean <run-id> --apply      # remove the worktree, without --force
+hflow clean <run-id> --reconcile  # after an interrupted cleanup, decide from recorded facts
 ```
 
-The run's internal `WorkspaceProvenance` records its project root, Git common directory and
-worktree path in the same transaction that attaches the worktree path. `clean` compares that
-identity with the observed workspace and Git registration before using the repository for
-cleanup. Run notes and receipt paths cannot redirect cleanup or replace that provenance record.
-Historical records may use the root ledger's source repository; a missing path without a reliable
-source is unknown, never proof that cleanup completed. Invalid provenance refuses cleanup or
-leaves reconciliation unknown.
-
-The preview prints the resolved path, the Git common directory, the registration, HEAD, the
-candidate ref and its target, the tracked/ignored/unsupported status, and every reason for
-the decision. It creates no ref and removes no file. `--dry-run` is the same preview;
-combining it with `--apply` is refused.
-
-`--apply` re-checks everything (an earlier preview is not a standing permission), claims the
-run's cleanup intent in a short transaction that requires a terminal run and no active attempt,
-and calls `git worktree remove` **without `--force`**. A run that becomes live before the claim
-cannot be removed. Success requires both the working directory and its Git registration to be
-gone; Git returning zero is not sufficient. It refuses when:
+`--apply`, `--dry-run` and `--reconcile` exclude each other (exit `4`). The preview prints the
+path, Git common directory, registration, HEAD, candidate ref and every reason. `--apply`
+re-checks everything, claims the cleanup in a transaction that requires a terminal run and no
+active attempt, and succeeds only when both the directory and its registration are gone (exit `0`;
+also for an already recorded removal; otherwise `3`). It identifies the worktree from the
+`WorkspaceProvenance` recorded with the run, never from notes or receipt paths.
 
 | Refusal | Why |
 |---|---|
-| `no_managed_workspace` | the run did not use a worktree |
-| `workspace_provenance_missing` | a legacy rootless run has neither workspace provenance nor a root ledger repository; keep the workspace until its source can be established |
-| `provenance_unreadable`, `provenance_mismatch` | stored workspace provenance cannot be read, or the observed path or Git common directory differs from it; no replacement identity is inferred from notes or receipt paths |
-| `not_a_worktree`, `not_registered` | the path is not the linked worktree git has for this run |
-| `is_source_repository` | the path is the repository's main worktree |
-| `execution_active`, `run_in_flight` | an attempt or the run is still live |
-| `stop_unconfirmed` | a cancellation was requested but never confirmed: a stop that reached a live run and came back `unknown` or `still_running`, any `still_running` answer, or an intent with no receipt. A stop of a run that had **already ended**, answered `unknown` (what `hflow cancel` gets when it asks about an ended run's invocation - the CLI holds no handle) and recorded with `run_already_ended`, decided nothing about the run: it does not refuse, the preview says so, and the run faces exactly the gates it had before the stop |
-| `unfrozen_changes`, `head_drift` | the worktree holds changes that were never frozen. For a run without a receipt, `head_drift` means HEAD is neither the latest attempt's recorded frozen candidate nor the run's base |
-| `unretained_commit` | a run without a receipt whose HEAD is not its base commit, and no branch, tag or `refs/hflow/` ref contains HEAD (a worker commit, or a commit refused after the freeze, which gets no candidate ref). Removing the worktree would drop that commit. Inspect it; to keep it, create a ref (`git branch <name> <commit>`) and run `clean` again |
-| `unknown_ignored_files` | ignored files that are not known build artifacts (an `.env`, local data - and also a check's cache such as `.ruff_cache` or `.mypy_cache`: only `*.pyc` and `.pytest_cache` are known; any other file under `__pycache__` is not) |
-| `index_flags_hide_changes` | assume-unchanged or skip-worktree flags can hide modified tracked bytes from Git status; inspect the files and flags before trying again |
-| `unsupported_status` | unmerged or submodule records that cannot be interpreted |
+| `no_managed_workspace`, `workspace_provenance_missing`, `provenance_unreadable`, `provenance_mismatch`, `not_a_worktree`, `not_registered`, `is_source_repository` | not provably this run's linked worktree |
+| `execution_active`, `run_in_flight` | an attempt or the run is live |
+| `stop_unconfirmed` | a stop of a live run came back `unknown`/`still_running`, or an intent has no receipt (a stop that reached an already-ended run and answered `unknown` does not refuse) |
+| `git_metadata_changed` | the run carries a `git_metadata: changed` or `unreadable` note and the shared metadata does not match its pre-dispatch snapshot (or none was recorded); checked before any status read, since that read would run a filter the metadata names |
+| `unfrozen_changes`, `head_drift` | changes never frozen; HEAD is neither the frozen candidate nor (without a receipt) the base |
+| `unretained_commit` | without a receipt, HEAD is a commit no branch, tag or `refs/hflow/` ref contains; create a ref (`git branch <name> <commit>`) to keep it |
+| `unknown_ignored_files` | ignored files other than `*.pyc` and `.pytest_cache` (an `.env`, a `.ruff_cache`) |
+| `index_flags_hide_changes` | assume-unchanged or skip-worktree flags |
+| `unsupported_status` | unmerged or submodule records |
 
-A refusal keeps everything and releases the cleanup claim, so the same command works once
-you fix what blocked it. `unfrozen_changes`, `unknown_ignored_files`, `index_flags_hide_changes`
-and `head_drift` end with pasteable read-only commands to inspect the worktree
-(`git -C <worktree> status --short --ignored`, `diff --stat`, `ls-files -v`, `log --oneline -5`);
-none removes anything. Every deletion attempt, including the bounded retry, rechecks the
-guards and the claimed workspace identity. Git runs `worktree remove` from your recorded
-checkout (for a bare repository, the linked worktree you work in), never from inside the
-worktree it removes. What survives a successful `clean`: the candidate commit (reachable
-through `refs/hflow/candidates/<run-id>/<attempt-id>`), its tree, the receipt, the evidence,
-and the run's history. A run without a receipt has no receipt to keep; its HEAD is kept only
-because it is the run's base or a ref named in the preview contains it. Repeat `--apply` is idempotent; a path that vanished without a cleanup
-record is reported `MISSING`, never as a success. A new `--reconcile` conclusion uses the same
-repository source and both removal facts; a surviving registration or directory is unfinished
-cleanup, not a successful removal. A repeated `--apply` after a recorded success reports
-"previously removed and recorded": it removes nothing and makes no new observation about the
-path. It must not delete a directory that appeared there later. An existing completion record
-remains historical and is not rewritten by reconciliation.
+A refusal keeps everything and releases the claim; several end with read-only `git -C <worktree>
+...` commands to inspect it. What survives a successful clean: the candidate commit and its ref,
+the receipt, the evidence and the run's history. Limits:
 
-## Known limits of `clean`
+- A file something holds open makes `git worktree remove` delete part and fail: `PARTIAL`, state
+  `REMOVING`. Git no longer knows the directory and HFlow never deletes one itself; remove what is
+  left, then `hflow clean <run-id> --reconcile` records `REMOVED`.
+- Windows can hold a directory briefly after a check exits; HFlow retries once, never forces.
+- Never `git gc`, `git clean`, `worktree prune` or `rmtree`; worktrees are not collected
+  automatically. DSH on Windows may leave a permission entry on a worktree (documented upstream).
+- It guards against HFlow's own concurrent operations, not another process of the same user.
 
-- It protects against HFlow's own concurrent operations, not against another process running
-  as the same user that deliberately holds files open or rewrites the ledger. Workspace
-  provenance is controller-recorded consistency data, not an authenticated record.
-- Windows can keep a directory undeletable for a moment after a check's child exits. HFlow
-  retries once after a short settle; if git still refuses, it reports the failure and does
-  not force anything.
-- A file something holds open makes `git worktree remove` delete what it can (the worktree's
-  `.git` file among it), then the registration, and fail. That is `PARTIAL`, not a refusal:
-  the cleanup intent stays (`state REMOVING`), the message lists what the directory still
-  holds, and every later `--apply` or `--reconcile` reports the same. Git no longer knows the
-  directory as a worktree and HFlow never deletes one itself, so removing what is left is
-  yours; then `hflow clean <run-id> --reconcile` records `REMOVED`.
-- DSH on Windows can leave a standing permission entry on the worktree directory it worked in
-  (documented upstream, not observed here); `clean` does not change permissions.
-- Worktrees are not garbage-collected automatically, and `clean` deliberately never runs
-  `git gc`, `git clean`, `worktree prune`, or `rmtree`.
-- It does not check the run's shared-Git-metadata warnings. Even the preview runs `git status`
-  in the worktree (and `--apply` then `git worktree remove`), and a status read runs any clean
-  filter that metadata names. When `hflow status` shows a `git metadata` line, inspect and
-  restore the metadata first (the "Shared Git metadata is compared ..." item under "M2 runs
-  through the CLI").
-- Without a receipt, HEAD still needs to be the recorded base or a commit retained by a ref.
-  Those retention gates do not prove removal: reconciliation still needs a reliable repository
-  source to check registration after the path has disappeared.
+## Running a real Harness task
 
-## Integrating an accepted candidate (`integrate`, batch I2)
-
-A run ends at `ACCEPTED / LOCAL_CANDIDATE`: a frozen commit in a detached worktree. Putting that
-change on a branch you work with is a **separate delivery** with its own record and its own
-receipt. The run's `ResultReceipt` is never rewritten: `status` and `report` keep showing
-`delivery LOCAL_CANDIDATE` for the run and list its integrations beside it. Nothing in this
-section calls a model, dispatches an agent or spends a budget. The contract is
-`docs/batch-i-integration-plan.md`.
-
-```sh
-hflow integrate prepare <run-id> --target main [--project <project.json>]
-hflow integrate apply   <integration-id> --expect-target <full tip printed by prepare>
-hflow integrate reconcile <integration-id> [--owner-gone --attest "<what you know>"]
-hflow integrate show    <integration-id> [--json]
-```
-
-The `next` lines these commands print can be pasted as printed into PowerShell on Windows
-(PowerShell 7 or Windows PowerShell 5.1) or into `sh` elsewhere - not into cmd.exe, which expands
-`%VAR%` inside double quotes and passes PowerShell's single quotes on to the program. An
-integration exists only in the ledger it was prepared in, so when that ledger is not the default
-one (`HFLOW_DATA_DIR`, else the platform directory) every printed `hflow` command carries
-`--data-dir <absolute path>`; without it the command would open the default ledger and exit `4`.
-A printed path is quoted for that shell: on Windows in double quotes, or in single quotes when it
-holds `$`, a backtick or a quote character; a root is printed with a `.` (`C:\.`,
-`\\server\share\.` - the same directory) so that no backslash stands before the closing quote,
-which Windows PowerShell 5.1 would pass on escaped for a path with a space. `apply` and
-`reconcile` take no `--project`, so none is printed.
-
-**Which contract `prepare` checks with.** The run's admission binding records its project root and
-the digest of its whole project contract. `--project` may be left out when
-`<project root>/.hflow/project.json` still digests to that contract (the default `prepare` and
-`run` read); otherwise `prepare` exits `4` and asks for `--project`. A named contract whose whole
-digest differs from the recorded one - a weaker `write_deny`, a dropped review floor, not only a
-changed check - is refused `project_mismatch` (exit `2`) and nothing is recorded: an accepted
-delivery is re-checked only under the contract it was accepted under. A run admitted before that
-digest was recorded is held to its checks digest and always needs `--project`.
-
-**prepare** fixes the target branch's current tip `T` and builds exactly one integration commit
-`M` on top of it, with Git plumbing only:
-
-| The target since the task's base `B` | Mode | `M` |
-|---|---|---|
-| unchanged (`T == B`) | `squash` | one new commit with the candidate's tree on `B`. Earlier repair rounds (each round's candidate is a child of the previous one) never enter the branch's history |
-| moved on (`B` is an ancestor of `T`) | `replayed` | `git merge-tree --write-tree --merge-base=B T C`, committed on `T`. A conflict is recorded as `conflict` with its paths; nothing is committed |
-| rewritten (`B` is not an ancestor of `T`) | - | refused `target_moved`: HFlow does not guess how the candidate relates to that history |
-
-`M` is kept reachable by `refs/hflow/integrations/<run-id>/<integration-id>`, then checked out in a
-fresh detached worktree of its own (`<repo>.hflow-worktrees/<integration-id>`) where the run's
-required checks run again (evidence kind `integration-check`, a new execution every time). The
-paths `T..M` changes must be paths the accepted delivery changed and inside the task's scope.
-The worktree is then removed **without `--force`**; if Git refuses (a check left untracked files),
-it is left in place and named, and the integration's result does not depend on it. A passing
-prepare ends `ready` and prints the apply command; prepare itself never moves a branch and never
-writes your checkout or index. The project contract must be the one the run was accepted under
-(same checks digest), and a `kind=fake` check is refused: it cannot verify a tree that is about to
-land on a real branch. Git 2.40 or later is required. `--target` must be the branch's exact
-spelling: on a case-insensitive file system `MAIN` resolves through `main`'s file, and every later
-comparison (which worktree has it checked out, which ref an apply locks) would then miss the real
-branch, so a name no ref carries exactly is refused. A run whose change already reached that branch
-through an earlier integration is refused too, even if the change was reverted since; a `ready`
-integration of the run whose commit the branch now contains (your merge after a hand-off) is first
-recorded as `integrated`, never superseded.
-
-**apply** is your approval. `--expect-target` must be the exact tip the integration was checked
-against. Before anything moves, apply re-checks that the run is still `ACCEPTED`, that the
-integration ref still points at `M` and that its evidence still describes `M`, records its intent
-(`applying`) in SQLite, and only then runs `git update-ref refs/heads/<target> M T` - Git's
-compare-and-set. It never forces and never creates or deletes a branch.
-
-| What apply finds | Result |
-|---|---|
-| the target at `T`, not checked out anywhere | moved to `M`; `integrated`, basis `hflow_ref_update`; an `IntegrationReceipt` is written |
-| the target checked out in any worktree - your main checkout included, or a worktree rebasing or bisecting it | **not moved** (moving it would leave that checkout's index and files at the old commit while its HEAD names the new one). You get `git -C <checkout> merge --ff-only <M>` to run yourself, then `hflow integrate reconcile <id>`. Exit `3` |
-| the target already contains `M` | `integrated`, basis `operator_merge_observed` |
-| the target moved elsewhere | `stale` (terminal); prepare again against the new tip |
-| `<ref>.lock` exists | refused; HFlow never deletes a Git lock file |
-
-A second apply of an integrated record writes nothing and returns the same receipt.
-
-**reconcile** settles a record from what Git shows and never re-runs the update or a check. An
-`applying` record whose process is gone becomes `integrated` (`observed_after_interruption`)
-when the target contains `M`, `ready` again when the target is still `T`, `stale` otherwise. A
-`preparing`/`checking` record whose process is gone becomes `interrupted` (its worktree is removed
-without force when possible). A `ready` record becomes `integrated` (`operator_merge_observed`)
-once the target contains `M` - this is how a hand merge after a hand-off is recorded. While the
-recorded process may still run, reconcile refuses and writes nothing (exit `5`). When HFlow
-cannot tell (`unknown`: another host, no creation time recorded, a pid it may not open),
-`--owner-gone --attest "<what you know>"` lets you attest that the process has exited; the
-attestation (at most 500 characters - it is recorded whole in the run's audit note, and a longer
-one is refused, exit `4`, never cut) and your OS user name are recorded as such, never as an
-observation. A process HFlow
-sees running (`matching`) is never overridden. `apply` runs the same reconciliation first when it
-finds an `applying` record. A record another process settled in the meantime is reported as stored
-rather than raised.
-
-States: `preparing -> checking -> ready -> applying -> integrated`; terminal `conflict`,
-`checks_failed`, `stale`, `interrupted`, `superseded` (a newer prepare of the same run replaced a
-ready one) and `failed`. A run has at most one `preparing`/`checking`/`applying` integration, and
-a repository has at most one `applying` integration per target branch.
-
-Exit codes: `0` when the subcommand did what it was asked - `prepare` left the record `ready`,
-`apply` left it `integrated`, `reconcile` left it `ready` or `integrated`; `3` for anything that
-needs your decision (a conflict, failed checks, a stale or interrupted record, a hand-off because
-the branch is checked out, a ref update that failed and left the record `ready`); `5` for a record
-another process is still working on, or whose process may still run; `2` refused, nothing written
-(including a Git error); `4` unknown id; `6` a stored integration record no longer validates.
-
-What an integration receipt does **not** claim: anything about a remote (nothing is pushed), a
-review of a merged tree (a `replayed` tree is checked, not reviewed again - the review covered
-`B..C`), or who merged a hand-off (`operator_merge_observed` records only that the branch contains
-`M`). The integration commit carries HFlow's fixed identity, not yours.
-
-## Running a real Harness task (authorized only)
-
-A real driver needs an **authorization artifact**: a JSON file holding the user's own approval
-text, bound to one execution, with a hard cap on how many top-level submissions it covers. The
-primary way to produce one is the plan flow ("From preview to run" above):
-
-```sh
-hflow prepare --task task.json --project .hflow/project.json --project-root <repo> \
-              --profile dsh-local --data-dir <data> --plan-out task.plan.json
-hflow approve --plan task.plan.json         # or: approve --plan task.plan.json --run
-hflow run --plan task.plan.json --json      # add --authorization-file <file> only after approve --out <file>
-```
-
-**Writing the artifact by hand** is the documented alternative. Copy `authorization.binding`
-from `hflow prepare --json` whole - every field it prints - and add your own text:
-
-```json
-{
-  "schema_version": 1,
-  "authorization_id": "AUTH-m2-live-1",
-  "provided_by": "user",
-  "user_text": "<the user's approval, verbatim>",
-  "authorized_at": "<when the user said it, UTC>",
-  "max_top_level_submissions": 2,
-  "binding": {
-    "mode": "m2-live-change",
-    "driver": "acpx-dsh",
-    "project_id": "m2-live-reportkit",
-    "repo_path": "<abs path>",
-    "base_commit": "<40-hex>",
-    "spec_digest": "sha256:<the task as admitted>",
-    "spec_path": "<abs path to task.json>",
-    "roles": ["implementer", "reviewer"],
-    "effective_config_digest": "sha256:<config_hash prepare prints>",
-    "profile_id": "dsh-local",
-    "project_contract_digest": "sha256:<contract prepare prints>",
-    "launch_content_digest": "sha256:<launch_content_digest prepare prints>"
-  }
-}
-```
-
-and pass every resolution flag `prepare` was given, identically, to `run`:
-
-```sh
-hflow run --task task.json --project .hflow/project.json --project-root <repo> \
-          --profile dsh-local --authorization-file auth.json --data-dir <data> --json
-```
-
-The examples in this file are illustrations; the shapes are generated. `hflow schema` prints
-`AuthorizationRecord` (the artifact, defined in `authorization.py`), `RootBudgetPlan` (the root
-budget file) and `RepairPolicy` (the `--repair-policy-file` document) next to `TaskSpec`,
-`ProjectConfig`, `MachineProfile` and the rest. `base_commit` is the 40-hex SHA that
-`hflow prepare --json` prints under `authorization.binding`, never a branch name.
-`max_top_level_submissions` is at most 4 and must cover
-`authorization.max_top_level_submissions_required`. `origin` may be omitted (it defaults to
-`user_artifact`). Leaving out a binding field `prepare` printed does not narrow the approval, it
-breaks it: without `effective_config_digest`, `project_contract_digest` or
-`launch_content_digest` the artifact cannot authorize a run that resolved a configuration, a
-contract or launch content, and a missing `roles` reads as implementer and reviewer, which a run
-that dispatches no reviewer refuses. `--authorization-mode` defaults to `m2-live-change`; pass
-it only for a `stop-trial`.
-
-For a run that spends against a **root ledger** (`--root-budget-file`, batch E1) the artifact
-carries two more members: the derived `binding.root_budget` and the approved `root_limits`.
-`approve` writes both from the plan. By hand, write them from
-`hflow prepare --root-budget-file <file> --json`, which prints exactly that binding (and the
-limits under `root_budget.limits`):
-
-```json
-{
-  "binding": {
-    "...": "the same fields as above, plus:",
-    "root_budget": {
-      "root_id": "root-<32 hex>",
-      "project_id": "<project>",
-      "repo_path": "<abs path>",
-      "task_id": "<task id>",
-      "ledger_path": "<abs path to hflow.sqlite>"
-    }
-  },
-  "root_limits": {
-    "max_top_level_submissions": 4,
-    "max_repairs": 1,
-    "deadline_seconds": 86400
-  }
-}
-```
-
-`root_limits` is **required** whenever the binding carries a root: an approval that named a root
-but not its ceiling would otherwise get whatever default the build happens to use. Both
-directions are checked - a root run whose artifact carries no root is refused, and a root artifact
-used for a run that resolves no root is refused. `root_limits` must equal the `limits` in the
-`--root-budget-file`, or the run is refused before anything is dispatched.
-
-Why an artifact instead of a flag: a flag would be written by the same process that runs the
-task, so an agent could authorize itself. The artifact is refused unless
-
-- `provided_by` is exactly `user` (a model-written note is rejected by the schema);
-- the binding matches the run about to happen - mode, driver, project, repository path, base
-  commit, task digest and task path, the roles the run will dispatch, the effective
-  configuration, the project contract and, for a root run, the root binding (see the
-  authorization section above). Any mismatch lists the offending fields;
-- allowance remains. Consumption is a single SQL UPDATE guarded by a CHECK constraint, so a
-  restart, a new run id or a resubmitted identical spec cannot restore it.
-
-`mode` keeps activities apart: a `stop-trial` approval does not cover a `m2-live-change` task.
-
-Before any dispatch, a **zero-model preflight** runs: the driver launches the installed client
-with a metadata argument (`--version`), so a broken launch binding is found without spending a
-submission. Preflight failure refuses the run and consumes nothing. A duplicate submission
-(which correctly dispatches none) also consumes nothing.
-
-`implementer` and `reviewer` are separate invocations and separate top-level submissions; both
-are claimed from the same artifact.
-
-### Validate the client config offline (do this before a live run)
+A real run (`acpx-dsh` through a profile) needs an approval from the plan flow above; there is no
+flag substitute and no fallback to the fake driver. A scripted flow writes the artifact by hand:
+see "Appendix: writing the artifact by hand". Before a first live run, validate the installed
+client offline:
 
 ```sh
 python tools/m0_probe/real_client_checks.py all
 ```
 
-Four model-free checks: the installed client reports its version through the production
-launcher; the client **accepts the config the driver writes** in both permission modes
-(`config show` must parse it); and a full one-shot `exec` round trip runs against the project's
-mock agent. The config check exists because an invented key makes the client exit during
-startup, which is indistinguishable from "the agent did nothing" - it cost one live submission
-once, and never will again: `defaultPermissions` takes `approve-all` / `approve-reads` /
-`deny-all`, and `nonInteractivePermissions` accepts only `deny` or `fail`.
+It runs the model-free checks: the client reports its version through the production launcher,
+accepts the config the driver writes in both permission modes, and completes an `exec` round trip
+against the project's mock agent. No live task runs without its own explicit approval.
 
-Writes are off unless `HFLOW_ALLOW_WRITES=1`, which the controller honors only for a run whose
-workspace is a disposable worktree created from a fixed base commit; the effective mode is
-recorded in the run's notes.
+### M0 transport probe
 
-### What each role is actually told
-
-Neither invocation receives a bare one-line goal any more. The controller renders one
-**input packet** per role (`src/hflow/packet.py`) from recorded facts, and the driver transports
-that text verbatim through the client's stdin path - it never re-renders, extends or explores the
-repository to fill a gap.
-
-| Role | The packet carries |
-|---|---|
-| implementer | goal, acceptance criteria with their check ids, allowed/forbidden write paths, the workspace, the formal check ids, external-side-effect limits, the deadline and the effective file permission |
-| reviewer | the same task facts, the frozen candidate identity (base commit, candidate commit/tree, content fingerprint, diff reference, worktree), the recorded program evidence (verification status, per-check exit codes, evidence rows), the review rules, the canonical `ReviewOutput` contract, and the read-only constraint |
-
-Three facts about this wiring:
-
-- each packet is bounded (32 KiB by default). A packet that does not fit is refused **before**
-  dispatch; a required field is never silently truncated. A full diff or a full log travels by
-  reference, not inline;
-- the digest of the exact text is recorded in the run notes (`role_input_packet`) and reported
-  back by the driver (`prompt_digest`). A driver that hands the transport different text than the
-  controller rendered blocks the run rather than having its result attributed to this task.
-  That digest is a *local* record of what was sent - not a receipt from the ACP server or the
-  model, which nothing in this build can observe. "The prompt arrived" is evidenced in tests by
-  the receiving agent's own record of what it read;
-- the implementer is never told the candidate identity or the check results (it produces them),
-  and the reviewer is never handed the implementer's own summary of its work;
-- each role's stated deadline is the deadline its invocation is actually given: the configured
-  value (the reviewer's is 900 s) capped by what is left of the root's clock, or, before that
-  clock has started, by the root's `deadline_seconds`. A packet rendered earlier that names a
-  longer one is re-rendered before launch (the value can only shrink, so the packet cannot grow;
-  a re-rendered reviewer packet gets its own `role_input_packet` note). `hflow
-  prepare`'s packet preview still renders the configured value, so when a root's
-  `deadline_seconds` is below the task's deadline the preview's deadline line, length and digest
-  differ from the packet the run sends.
-
-### Three kinds of transport evidence, kept apart
-
-| Evidence | What it proves | Where |
-|---|---|---|
-| offline fake driver | the controller's state machine, budget, evidence and receipt rules | `tests/test_controller.py` and most of the suite |
-| production driver + Python stand-in for acpx | the driver's launch, framing, event projection, stop and reconcile logic | `tests/test_packet_wire.py` (most cases), `tests/test_driver_acpx_dsh.py` |
-| **installed pinned acpx + input-sensitive ACP stub** | the real Node client carries the rendered packet, and the agent checks the values it received | `tests/test_packet_wire.py`, the two `real_acpx` cases |
-| **installed pinned acpx + the project's mock agent** | the hardened launch (absolute `cmd.exe`, stripped `DSH_*` mode variables) completes a turn with the exact packet bytes; a workspace `.acpxrc.json` is never launched on; `--model` is applied with `session/set_config_option` before the prompt against the mock's DSH-shaped `dsh-catalog` (placeholder ids), an unadvertised value fails before any prompt, and a missing catalog is recorded as not advertised; a prompt answered with a JSON-RPC error (`prompt-error` scenario) is relayed with the prompt's id and no client error line of its own, and is recorded as `prompt_error_response`; a chunk the agent writes right after its prompt response is printed and counted after it (`trailing-update`) | `tests/test_real_client_review.py` |
-| real DSH with a model | nothing in this repository claims it: a live task needs its own explicit approval | `docs/m2-live-acceptance-result.md` (historical) |
-
-A fake client result is never presented as a real-client proof, and a real-client result is never
-presented as a live-model proof. The pinned client is never downloaded or upgraded by the tests: a
-missing copy skips with the reason.
-
-### Refusals that now happen before the first invocation
-
-For a real driver (`--driver acpx-dsh`), admission refuses a run it already knows cannot finish,
-instead of spending an implementation turn and failing afterwards:
-
-| Refused up front | Why |
-|---|---|
-| a required check declared `kind=fake` | a fake check executes nothing: a receipt resting on it would claim a verification that never ran |
-| a task with write paths but `workspace.mode` not `worktree` | an in-place run would write into your own checkout |
-| a task with write paths but `HFLOW_ALLOW_WRITES` off | the invocation would be launched read-only and could not make the change |
-| a task that needs a review but reserves fewer than 2 turns | the review is a separate invocation; one turn cannot reach an accepted run |
-| a task whose fixed loop needs more submissions than the authorization has left | the predictable half of budget exhaustion: without this check the implementer would run and the run would then block with the implementation already paid for |
-| a repository that cannot be discovered, or a base commit that does not exist | both are knowable without side effects, and the worktree would otherwise fail after the run existed |
-| an implementer packet that does not fit the 32 KiB bound | the bound is checked against the packet this run would actually send, with its real worktree path - not against a placeholder |
-| a task with a `repair_policy` but no `--root-budget-file` | a real-driver repair is charged to a root's repair counter and clock; without one each new revision could buy another |
-| a root whose `max_repairs` cannot cover the repair an armed policy may buy | the predictable half of a repair the root could never pay for; the root is not registered, so resubmitting with a root file that covers the repair works |
-| a starting workspace that already holds `.acpxrc.json` at its root, in any letter case (the project root in place, the base commit's tree for a worktree) | the driver would refuse to launch there only after the dispatch was reserved, and an identical resubmission would then return the blocked run; refused now, nothing was recorded (not even the root a `--root-budget-file` names), so resubmitting works once the file is gone from that workspace (for a worktree run that means a base commit without it, so a real run needs an authorization issued for that base) |
-| a launch program that is not an absolute file outside the workspace, or an acpx client entry inside the workspace (see "Client launch hardening") | a bare or relative name, or a program inside the workspace, would be looked up where the agent can write |
-
-`--driver fake` is the offline driver: it keeps its fake checks and needs none of the above. A
-refusal through any of these gates creates no run, consumes no authorization allowance and starts
-no process. The per-dispatch ledger is still the authoritative limit; these checks remove the
-predictable failures in front of it, and they are not a substitute for its atomic claim.
-
-A request for a TaskSpec that already has a run is a **history query**, not a new dispatch: it
-returns the recorded outcome even when the authorization has since been used up, and it never
-consumes allowance. Only a run that still needs turns is checked against the remaining allowance,
-and only for the turns it still needs.
-
-### Check output: what is kept, and what that word means
-
-A command check's stdout and stderr are drained continuously through pipes into a bounded sink. The
-default retention is **8 MiB per stream** (the run's whole invocation budget, including the
-driver's own logs, is 32 MiB); both are operating values, not measured optima.
-
-What the evidence row and the artifact say, precisely:
-
-- `stdout`/`stderr` carry `total_bytes` (everything read), `retained_bytes` (what is on disk),
-  a `sha256` digest **of the retained bytes**, and a `truncated` flag. The digest covers what a
-  reader can actually obtain, so it can be recomputed; the discarded tail is a recorded count, not
-  a silent loss;
-- the files live under `<data-dir>/artifacts/<evidence-id>/<check-id>/` - inside the run's own
-  record, never in the workspace under test - together with an `artifact.json` manifest naming the
-  argv, sizes, digests, exit code and reason, elapsed time, and the environment summary;
-- **truncated output cannot authorize acceptance on its own**: a stream cut at the retention limit
-  is recorded as truncated in the evidence row. Debug output that is cut is not by itself a
-  business failure, but a verdict or a control event read from a cut stream is never treated as
-  complete;
-- a check whose output pipes are still held open after it exits (a descendant inherited them) is
-  reported as `output_capture_error` with `ERROR`, not as a clean pass. The wait for the readers is
-  bounded, and what was read is still digested;
-- an artifact factory or directory-creation failure records `ERROR/no_artifact_dir` without
-  starting the check. A manifest write failure records `ERROR/output_capture_error`, keeping
-  the observed exit code and captured stream references; `artifact=` names the directory,
-  rather than presenting a missing or partial manifest as readable evidence. The run ends
-  `BLOCKED/verification_failed`, not `CHECKING`; neither failure can buy a repair;
-- `elapsed` covers launch, the check itself, the settle window and the reaping, so it is not a
-  claim that the check's own timeout bounds the whole call.
-
-### Worker log retention (what is bounded, and what is only measured)
-
-Two different things live here, and the difference is stated rather than glossed:
-
-**Bounded (HFlow's own retention and wire state).** Each invocation has a raw-log retention
-budget (32 MiB by default), a 1 MiB pending-line bound, and a 20,000 nonempty wire-record bound:
-
-- every stdout read is captured before parsing. `events.ndjson` retains the raw prefix up to
-  the protocol share (`max_raw_log_bytes` minus the stderr share), including empty lines,
-  invalid UTF-8 and an EOF without a final newline. `total_bytes` counts everything read;
-  `digest` is SHA-256 of the retained bytes, so it verifies the file that remains, not the full
-  discarded stream;
-- all accumulated wire state is limited by both that byte share and 20,000 nonempty records.
-  Records with no neutral event count too. At either bound the raw-line window, events,
-  prompt/terminal/error records, model state and answer transcripts stop growing; output still
-  drains and is counted. A stop reason beyond the bound cannot authorize completion;
-- the client's **stderr** is drained from a pipe this driver owns and retained up to the stderr
-  share. What exceeds it is read, counted and digested but not written. (It used to be a file the
-  child wrote into and a reader that had nothing to read: the record said "0 bytes, not truncated"
-  while the child wrote mebibytes. It is a pipe now, so the bound is real and the record is true.)
-  Releasing an invocation never waits on that pipe: when some holder of its write end outlives
-  the teardown (a process the Job could not run down, or one outside it), `release()` leaves the
-  pipe to its daemon reader, which closes it at EOF, and records "stderr reader still blocked at
-  release ..." in `driver.release_notes(invocation_id)` instead of hanging the controller after
-  the outcome was already recorded;
-- a line over 1 MiB is counted as unusable and discarded through its next newline. Its raw bytes
-  still count toward capture; its suffix cannot become a new JSON message;
-- spending the budget is recorded **on the read that spends it**, not on the next line, so a stream
-  whose final line crosses the budget is reported as `output_limit_exceeded` with an
-  `OUTCOME_UNKNOWN` outcome. Reaching the wire-record bound has the same error code, with its
-  own reason named. Neither case produces a verdict, refunds allowance or re-dispatches.
-
-When wire state is incomplete, `model_observation` and `stream_order` are absent. A launch that
-passed `--model` records `model_applied=unknown`; one without it records `not_passed`. An observed
-prompt still records `agent_turns=1`; when none was observed and the stream is incomplete, the
-count is unknown rather than a claim that no prompt was sent. `prompt_response_line` keeps its
-zero-based **nonempty-line ordinal**, so raw blank lines can make it differ from a physical file
-line number. Historical records and replay indexing are not reinterpreted.
-
-The protocol file is created before its reader starts. Failure to open, seek or read it,
-including the final tail read after client exit, is `reader_failed`, not EOF. A valid prompt
-response already read from the prefix cannot turn that failure into completion. No reviewer
-verdict, complete-stream ordering or final model observation is taken from that prefix;
-confirmed operator stops and unconfirmed process boundaries keep their existing precedence.
-
-**Measured, not bounded (the client's own protocol file).** The client writes `stdout.ndjson`
-itself. HFlow does **not** truncate a file another process is writing - that removes bytes nobody
-has read and can leave a hole - so it does not claim to cap that file. Its size is reported as the
-measured number it is: `peak_raw_bytes` in the invocation record, and the retained copy's
-`total_bytes` equals what was actually read. A client that writes 17 MiB therefore leaves a 17 MiB
-file, and HFlow's record says exactly that instead of reporting the full stream as retained.
-
-Is a cut stderr file a failure? No - stderr is diagnostics, and it is reported as truncated. A cut
-*protocol* stream is: a verdict read from a stream that was cut is not a verdict.
-
-### What a check's environment contains
-
-The child environment is built from an **allowlist** of what a process needs to start and find its
-runtime (PATH/PATHEXT, SystemRoot/TEMP, `USERNAME`, the usual Windows and POSIX shell and locale
-variables, `VIRTUAL_ENV`/`CONDA_PREFIX` and Python's encoding and bytecode switches), plus the
-variables HFlow itself sets for every check (`PYTHONDONTWRITEBYTECODE=1`,
-`PYTEST_ADDOPTS=-p no:cacheprovider`). Unlisted names do not travel, and a name that looks like a
-credential (`*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `*_CREDENTIAL`, `*_AUTH*`, ...) is
-refused even when declared. The refusal is reported as a fact in the evidence row's
-`withheld_secret_like=` list.
-
-`PYTHONPATH`, `NODE_PATH` and `NODE_OPTIONS` are **not** inherited: they choose which code a check
-loads (an absolute `PYTHONPATH` naming your checkout makes a check test the checkout instead of
-the candidate; `NODE_OPTIONS` can preload code into every Node process), and only variable names -
-never values - are recorded, none of them in the checks digest. There is no project or check field
-for declaring check variables: a check that needs one must set it itself inside its approved argv
-(for example `python -c` or a script in the repository that sets it before running the tests).
-
-The environment summary records **names and counts only** - never a value, and never a hash of a
-value, since a hash of a low-entropy secret is still a disclosure. This is not confinement: a check
-still runs with the current user's rights and can read whatever that user can read.
-
-## Preparing a real M2 task
+The transport decision (`docs/adr/0001-transport.md`) rests on this probe:
 
 ```sh
-python tools/m2_live/prepare_m2_live.py --out .probe/m2-live
+cd .probe/acpx && npm install --no-fund --no-audit acpx@0.17.1   # project-local, once
+python tools/m0_probe/run_probe.py --phase a --phase b           # local checks + mock agent; no model
+python tools/m0_probe/run_probe.py --phase c --live --live-max-submissions 2 \
+    --live-credential-ref DEEPSEEK_API_KEY                       # real DSH: needs its own approval
+python tools/m0_probe/write_results_doc.py                       # regenerate docs/m0-results.md
 ```
 
-Builds a synthetic Git project with two genuine input-handling defects, the project contract
-and the TaskSpec. It asserts the base commit really fails both defect tests and that nothing
-fails for import or collection reasons - so a later live run is never the first time the package
-is exercised. It contains no fixed patch and no fake-write plan. It ends by printing the
-`hflow prepare` preview for the task, project and repository it built; to approve and run it, add
-`--plan-out <plan>` to that command, then `hflow approve --plan <plan>` and `hflow run --plan
-<plan>`. It no longer writes an authorization template: the template carried a binding with no
-`roles`, `effective_config_digest`, `project_contract_digest` or `launch_content_digest`, which
-cannot authorize a run that resolves a profile.
+The probe never touches `~/.dsh`, `~/.acpx`, `PATH` or a global install: each child gets a
+probe-private `USERPROFILE`/`HOME`/`DSH_HOME` under the gitignored `.probe/`. The live phase is
+bounded by a persisted submission counter, and `--live-credential-ref` is the only path that reads a
+credential (one named reference, in memory, never written or logged). `docs/m0-results.md` is
+generated from recorded artifacts only (a hand edit is overwritten); its forced-stop row predates
+M2 trial A, which `docs/m2-live-acceptance-result.md` supersedes for one machine, one acpx/DSH
+version and one binding.
 
-### What the authorization does and does not prove
+### What each role is told
 
-**Trust model: trusted-local, user-attested operation.** A human creates the artifact - by typing
-the approval into `hflow approve`, or by writing the file by hand - and the artifact records that
-decision and bounds its consumption. The executor is trusted not to forge approvals and not to
-modify the controller or its database.
+The controller renders one input packet per role (`src/hflow/packet.py`) from recorded facts; the
+driver sends it verbatim on stdin.
 
-What is actually enforced:
+| Role | Packet |
+|---|---|
+| implementer | goal, acceptance criteria and check ids, allowed/forbidden paths, workspace, side-effect limits, deadline, effective file permission |
+| reviewer | the same task facts, the frozen candidate (base, commit, tree, fingerprint, diff reference, worktree), per-check results and evidence rows, the review rules and the `ReviewOutput` contract, the read-only constraint |
 
-- the **binding** must match the run about to happen - mode, driver, project, repository path,
-  base commit, task digest, task path, the roles it dispatches, the effective configuration
-  (profile, per-role agents, drivers, models, write permission and resolved launch), the project
-  contract, the launch entry files' content and, for a root run, the root binding - so an
-  approval for one task, configuration or contract cannot authorize another;
-- **consumption is bounded per authorization id** by a single guarded UPDATE plus a CHECK
-  constraint, so a restart, a new run id or a resubmitted identical spec cannot restore
-  allowance for that id;
-- `provided_by` must be the literal value `user` - a value constraint that rejects an artifact
-  *labelling itself* agent-authored;
-- an approval is **not edited in place**: re-using an `authorization_id` is refused when the
-  binding digest or any immutable field changed (`user_text`, `provided_by`, `authorized_at`,
-  `max_top_level_submissions`, `mode`, `origin`), and the recorded row is never overwritten, so a
-  consumed artifact cannot be revived or enlarged by editing its file. `origin` tells a user's
-  artifact (`user_artifact`) from the record the CLI synthesizes for an offline root run
-  (`cli_offline_synthetic`), which is refused for any driver but the offline fake.
+- Each packet is bounded at 32 KiB; one that does not fit is refused before dispatch. A full diff
+  or log travels by reference.
+- A failed check is rendered as its reference line (status, exit, reason, artifact, stream sizes and
+  digests, never shortened) and then only the check's own text after that reference block,
+  JSON-quoted (line separators escaped) and capped at 600 escaped characters. The environment
+  summary stays in the evidence row and is not repeated in the packet.
+- The digest of the exact text is a `role_input_packet` run note and is reported back by the
+  driver (`prompt_digest`); a mismatch blocks the run. It is a local record of what was sent, not
+  a receipt from the agent.
+- The implementer never sees candidate identities or check results; the reviewer never sees the
+  implementer's own summary.
+- Each role's stated deadline is the one its invocation gets: the configured value (the reviewer's
+  900 s) capped by the root's remaining clock. `prepare`'s preview renders the configured value.
 
-What is **not** enforced, and must not be claimed:
+### Transport evidence, kept apart
 
-- provenance is **not authenticated**. Nothing distinguishes bytes a user typed from the same
-  bytes written by the executing agent, because there is no approval issuer and no protected
-  store outside the executor's reach. `tests/test_authorization.py` asserts this limit
-  explicitly, so it is a recorded fact rather than an unstated assumption. `hflow approve` does
-  not change it: it takes neither the approval code nor the text from its arguments and refuses
-  piped input, but whoever types at the terminal is not identified - a process that drives a
-  pseudo-terminal can read the code and type both lines;
-- a **fresh authorization id resets the allowance** - the cap bounds one id, not a person or a
-  day. Raising this to real anti-forgery would need a separate issuer or store and is a
-  deliberate design decision, not something to solve with another string field.
+| Evidence | Proves |
+|---|---|
+| offline fake driver | the controller's state machine, budget, evidence and receipt rules |
+| production driver + Python stand-in for acpx (`tests/test_driver_acpx_dsh.py`) | launch, framing, event projection, stop and reconcile |
+| installed pinned acpx + stub or mock agent (`tests/test_packet_wire.py`, `tests/test_real_client_review.py`) | the real client carries the exact packet and completes a turn under the hardened launch |
+| real DSH with a model | nothing in this repository claims it (`docs/m2-live-acceptance-result.md` is historical) |
+
+A fake result is never a real-client proof, and a real-client result is never a live-model proof.
+
+### Check output and environment
+
+- A check's stdout and stderr are drained into a bounded sink: 8 MiB retained per stream (the
+  invocation budget is 32 MiB). The evidence records `total_bytes`, `retained_bytes`, the SHA-256
+  of the retained bytes and `truncated`; files live under `<data-dir>/artifacts/<evidence-id>/`
+  with an `artifact.json` manifest. Truncated output never authorizes acceptance on its own.
+- Pipes still held open after exit (a descendant inherited them) are `output_capture_error`; an
+  artifact directory failure is `no_artifact_dir` before launch; a manifest write failure is
+  `output_capture_error`. Each ends `BLOCKED / verification_failed` and never buys a repair.
+- The environment is an allowlist (`PATH`/`PATHEXT`, `SystemRoot`/`TEMP`, `USERNAME`, the usual
+  shell and locale variables, `VIRTUAL_ENV`/`CONDA_PREFIX`, Python's encoding switches) plus
+  `PYTHONDONTWRITEBYTECODE=1` and `PYTEST_ADDOPTS=-p no:cacheprovider`. A credential-like name is
+  withheld even when declared, and listed as `withheld_secret_like=`. `PYTHONPATH`, `NODE_PATH` and
+  `NODE_OPTIONS` are not inherited; a check that needs one sets it inside its approved argv. Only
+  names and counts are recorded. A check still runs with your rights.
+
+### Worker log retention
+
+- Each invocation retains its raw stdout up to the protocol share of a 32 MiB budget, with a 1 MiB
+  line bound and a 20,000 nonempty-record bound on parsed state. Past either bound output still
+  drains and is counted, but nothing parsed can authorize an outcome: `OUTCOME_UNKNOWN /
+  output_limit_exceeded`, no verdict, no refund.
+- Stderr is drained from a pipe HFlow owns and retained up to its share; the rest is read and
+  counted, not written. Release never waits on that pipe: a still-blocked reader is recorded in the
+  driver's release notes.
+- A failure to open, seek or read the protocol file is `reader_failed`, never EOF.
+- **The client's own protocol file is measured, not bounded.** acpx writes `stdout.ndjson` itself
+  and HFlow never trims a file another process writes. Its size is a `client protocol file <path>:
+  N bytes read from it (measured, not bounded ...)` limitation in the invocation's result, next to
+  what was retained of it.
 
 ### Effective permissions per role
 
-Before a live run, the controller records the effective modes in the run's notes, and they are
-enforced per role:
+| Role | acpx `defaultPermissions` |
+|---|---|
+| implementer with the write opt-in, in a disposable worktree | `approve-all`: every tool permission request is approved, which is broader than file writes |
+| implementer otherwise | `approve-reads` |
+| reviewer | `approve-reads`; never inherits the implementer's write permission |
 
-| Role | `defaultPermissions` | Rationale |
-|---|---|---|
-| implementer (write-capable, disposable worktree, `HFLOW_ALLOW_WRITES=1`) | `approve-all` | the task must change a file; **all** tool permission requests are auto-approved, which is broader than file writes |
-| implementer (default) | `approve-reads` | reads proceed, writes are refused |
-| reviewer | `approve-reads` | never inherits the implementer's write approval |
+The policy lives only in the per-invocation global config HFlow writes (no permission flag on the
+command line), which is safe only because a workspace `.acpxrc.json` is refused. acpx permission
+mediation is not a sandbox.
 
-`HFLOW_ALLOW_WRITES` is a local request, not authority: it is honored only for a run whose
-workspace is a disposable worktree created from a fixed base, it is disclosed in the notes, and
-it never applies to the review invocation. acpx permission mediation is also **not** a sandbox:
-its filesystem checks do not confine arbitrary shell commands, and a disposable worktree does
-not confine anything by itself. The policy lives only in the per-invocation global config HFlow
-writes; no acpx permission flag is passed on the command line, which is safe only because a
-workspace `.acpxrc.json` is refused (next section).
+### What DSH does that HFlow does not control
 
-### What the harness does that HFlow does not control (documented, not observed)
+Read from upstream source (DSH up to `dsh-v0.2.0-rc.2`, acpx 0.17.1); documented, not observed:
 
-These come from reading upstream source and documentation (DSH `dsh-v0.1.7-rc.1` through
-`dsh-v0.2.0-rc.2`, pinned acpx 0.17.1) during the 2026-10-02 survey. None of them was observed in
-a run on this machine; they are stated so nobody claims the opposite:
+- **`approve-all` approves DSH's escalations.** DSH's permission requests carry only a tool-call
+  id, so the write-capable implementer approves sandbox escalations too (up to
+  `danger-full-access`). Do not claim DSH's sandbox confined an implementer run.
+- **DSH runs with its own sandbox defaults** (`workspace-write` with `ask`; partial on Windows).
+  HFlow removes `DSH_PERMISSION_MODE` and `DSH_TOOLS_MODE`; binding a per-role value is an open
+  decision. On the ACP path the mode does not confine DSH's own file tools (DSH #9693,
+  unconfirmed), and an ACP client cannot change it per session, so the launch-time mode is final
+  (DSH #9735). HFlow's scope check and user-checkout fingerprint are what notice an outside write.
+- **DSH uploads session logs by default** (`session-log-deepseek`), so packets and repository
+  content can reach DeepSeek that way too. HFlow does not disable it.
+- **A failed DSH turn is a JSON-RPC error**, and blocked or aborted turns settle as `end_turn`.
+- **acpx `--timeout` is per phase** and sends no `session/cancel`; HFlow's own deadline is the
+  bound. HFlow never passes `--prompt-retries`.
+- **DSH loads from the workspace and its home:** every `AGENTS.md`/`CLAUDE.md` (and `.local`)
+  from the nearest `.git` down to its cwd, skills under `.dsh/skills` and `.agents/skills`,
+  `<cwd>/.env` then `$DSH_HOME/.env` (a workspace `.env` setting a bootstrap or `DSH_` name makes
+  DSH throw before serving ACP), `cordis.patch.yml` layers in the home, and `$DSH_HOME/AGENTS.md`.
+  Credential precedence: launch environment, `$DSH_HOME/.credentials.yaml`, `<cwd>/.env`,
+  `$DSH_HOME/.env`. DSH 0.2.0-rc.2 rewrites a pre-release flat `.credentials.yaml` in place at boot
+  (DSH #9845), so a first launch may change that file's format.
+- **Turn-time git (DSH #9382):** the Web/Desktop bundle's `workspace-changes` plugin runs `git add
+  --all` with the repository's config at each turn; the ACP profile HFlow launches does not load it.
+  A bound home whose patch layers mention it is noted in the launch record.
 
-- **`approve-all` approves DSH's permission escalations.** DSH's ACP permission requests carry
-  only a tool-call id (no kind, no title), so under `approve-all` - the write-capable implementer's
-  mode - every request is approved, including a sandbox escalation the model asks for (up to
-  `danger-full-access`) and, from 0.2.0 on Windows, a bundled skill that runs an ACL-changing
-  PowerShell script unconfined after one approval. HFlow must not claim DSH's sandbox confined an
-  implementer run. Under `approve-reads` (the reviewer) the same requests are effectively denied.
-- **DSH runs with its own sandbox defaults.** HFlow removes `DSH_PERMISSION_MODE` and
-  `DSH_TOOLS_MODE` from the child, so DSH falls back to its defaults (`workspace-write` with
-  `ask`). On Windows DSH itself reports that sandbox as partial (reads unconfined), and it can
-  leave a standing permission entry on the worktree directory. It is the shell runner's mode: on
-  the ACP path DSH composes no permission preset for a session (DSH #9693, from dsh-v0.2.0-rc.2
-  `packages/acp/acp/src/index.ts` L200-203; a reporter saw file-tool writes outside the workspace
-  succeed; unconfirmed), so DSH's own file tools are not confined by it. HFlow's scope check and
-  the user-checkout fingerprint are what notice a write outside the workspace.
-- **DSH uploads session logs by default.** The shipped `session-log-deepseek` row is enabled at
-  both surveyed versions (0.2.0 caps a request at 8 MiB), so what HFlow sends - rendered packets,
-  and repository content tools read in the worktree - can reach DeepSeek as the session-log
-  extension as well as model input. HFlow does not disable it.
-- **`end_turn` is turn settlement, not success.** DSH maps blocked and aborted turns to
-  `end_turn` as well as completed ones. HFlow reports such a turn as `completed` and decides
-  acceptance from checks and review only.
-- **A failed DSH turn is a JSON-RPC error, not a stop reason.** DSH answers `session/prompt` with
-  `RequestError.internalError` (-32603) `turn failed: ...` after the turn, or `prompt was not
-  queued: ...` (and other admission errors) before it; only blocked and aborted turns settle as
-  `end_turn`. HFlow records `prompt_error_response`, leaves the outcome unknown and does not tell
-  the pre-model form from the post-model one.
-- **Turn order is the agent's.** Stable ACP v1 requires a turn's updates before its prompt
-  response, and ACP #554 records agents that send the response first. From reading DSH
-  0.2.0-rc.2's `dsh_session.ts`: DSH settles a prompt only once its agent is idle and its output
-  queue has drained, but queues a model-catalog `config_option_update` off that chain, so one can
-  follow the response. From the acpx 0.17.1 source: `exec` does not wait for idle after the
-  response, but keeps reading while it closes the agent (100 ms after closing its stdin, then
-  1.5 s after SIGTERM). HFlow records what arrives (`stream_order`) and gives a reviewer whose
-  message arrives late no verdict.
-- **acpx `--timeout` is per phase.** It bounds start-up, session creation, the model change and
-  the prompt separately, not the whole call, and its expiry sends no `session/cancel`. HFlow's own
-  invocation deadline - capped by the root's clock - is the bound, enforced by the local wait and
-  the forced stop. HFlow never passes `--prompt-retries`.
-- **DSH loads instruction files, skills and an env file from the workspace.** These facts were
-  read at `dsh-v0.2.0-rc.2` (639ed015) only, not at the earlier tags. Its agent-instructions
-  (maxBytes 65536) loads every present `AGENTS.md`, `CLAUDE.md`, `AGENTS.local.md` and
-  `CLAUDE.local.md` from the project root - the nearest `.git`, a worktree's `.git` file included -
-  down to its cwd, and in a deeper directory after a tool touches a file there, following links.
-  Its skill-filesystem scans the root `.dsh/skills` and `.agents/skills`, and loadLayeredEnv reads
-  `<cwd>/.env`. The reviewer's and a repair implementer's cwd is the candidate worktree. HFlow
-  refuses a frozen candidate that changes one of these files without `write_allow` naming it, or
-  that touches the root `.env` at all (`context_file_change`), and records the declared ones
-  (`dsh_context`, shown by `status` and `report`, with a receipt limitation, and listed in the
-  reviewer and repair packets as untrusted data); an ignored file of this kind already refuses the
-  freeze, and files already in the base commit are not flagged. A root `.env` that appears in a
-  worktree any other way refuses a real launch at the driver's spawn gate (`workspace_env_file`).
+### Client launch hardening
 
-Pinned to dsh-v0.2.0-rc.2 (639ed015), documented, not observed:
+- **A workspace `.acpxrc.json` or `.env`, a `DSH_HOME` in or around a workspace, and a launch with
+  no credential source are refused twice**: at admission (the table in "Before you run anything")
+  and again at the driver's spawn gate, for the role's actual cwd and the environment actually built
+  for that child - which catches a file the implementer planted for the reviewer. acpx lets
+  `<cwd>/.acpxrc.json` override the agent argv and permissions, and DSH loads `<cwd>/.env`; both
+  are matched in any letter case among the root's entries only. At the gate a
+  `<repo>.hflow-worktrees/<run>` cwd also protects the checkout it names. Not covered: a file
+  written between the gate and the client's read, and 8.3 short names in `DSH_HOME`.
+- **Every launch program is an absolute file outside the workspace**, found on absolute `PATH`
+  entries only (with `PATHEXT`), never a bare name. `dsh` alone has a second place, used only when
+  `PATH` has none: the npm CLI installed with `--ignore-scripts` at `<data-dir>/dsh/0.2.0-rc.2`
+  (user ruling 2026-10-14, the route around DSH #9626). The source is the launch's first content
+  note (`dsh=PATH` or `dsh=npm (data dir)`). With `HFLOW_ACPX_CLI` unset and no copy under
+  `<data-dir>/m0/acpx`, the entry falls back to the HFlow checkout's `.probe/acpx`, so a run on the
+  HFlow repository itself is not resolvable until `HFLOW_ACPX_CLI` names an install outside it.
+- **The DSH batch shim runs through `%SystemRoot%\System32\cmd.exe /d /c`** (`/d` skips AutoRun);
+  a shim path holding `& | < > ^ % ! " ( ) @ ; , =` is not resolvable.
+- **The child never searches its cwd for a program**: every child environment (the preflight's
+  too) gets `NoDefaultCurrentDirectoryInExePath=1` and drops relative or empty `PATH` entries, and
+  `hflow` sets the same variable in its own process before any command runs (a planted `git.exe`
+  in the starting directory ran instead of Git before that; observed on Windows 11). An approved
+  check's own environment does not carry it.
+- **The agent child environment withholds secret-like variables.** Every name for which
+  `artifacts.is_secret_like` is true (containing `API_KEY`, `APIKEY`, `TOKEN`, `SECRET`,
+  `PASSWORD`, `PASSWD`, `CREDENTIAL`, `AUTH`, `COOKIE`, `SESSION_KEY`, `PRIVATE_KEY` or
+  `ACCESS_KEY`) is removed, except `DEEPSEEK_API_KEY`, the credential DSH needs (user ruling
+  2026-10-16). The launch record notes `agent environment: withheld_secret_like=<names>`. It is a
+  denylist, not a sandbox: proxy variables pass, and a credential under another name or in a file
+  still reaches the agent. Repository-locating Git variables, `DSH_PERMISSION_MODE`,
+  `DSH_TOOLS_MODE` and `DSH_AGENTS_HOME` are removed in any letter case; `DSH_HOME` is set only to
+  the bound value.
 
-- **DSH layers two `.env` files into its environment.** `loadLayeredEnv` reads `<cwd>/.env`
-  (the workspace acpx starts DSH in), then `$DSH_HOME/.env`; a name the child already has wins.
-  A bootstrap name (49 of them: `PATH`, `NODE_OPTIONS`, the proxy and CA variables, Git's SSH,
-  pager and editor commands, and so on) or a `DSH_`, `XDG_`, `DYLD_` or `BASH_FUNC_` prefix in a
-  workspace `.env` makes DSH throw before it serves ACP; only the home `.env` may set the
-  proxies. HFlow does not parse either file, so it cannot predict this.
-- **Credential precedence:** the launch environment, then `$DSH_HOME/.credentials.yaml`, then
-  `<cwd>/.env`, then `$DSH_HOME/.env`. With `DSH_HOME` unbound the home is the per-invocation
-  empty one, so the launch environment and a workspace `.env` are what is left - and a real launch
-  refuses a workspace `.env` (`workspace_env_file`), so in practice the launch environment. A real
-  launch with none of the remaining sources visible is refused (`no_credential_source`, user
-  ruling 2026-10-07; see "Client launch hardening"): without a credential DSH fails with a
-  no-API-key error before any model work (observed in M0, `docs/m0-results.md`).
-- **`cordis.patch.yml` layers** in `$DSH_HOME` and `$DSH_HOME/profiles/<profile>` can replace
-  the shipped sandbox-policy and approval rows.
-- **Agent instructions and skills:** `$DSH_HOME/AGENTS.md`, the AGENTS.md/CLAUDE.md(.local)
-  chain from the nearest `.git` marker down to the cwd, and skills under `<root>/.dsh/skills`,
-  `<root>/.agents/skills` and `<home>/skills`. Nested instruction files DSH reads after a tool
-  call cannot be captured by any record taken before the launch.
-- **`DSH_TELEMETRY_*` pass through** to the child; HFlow removes `DSH_PERMISSION_MODE`,
-  `DSH_TOOLS_MODE` and an inherited `DSH_AGENTS_HOME` (every spelling on Windows), and sets
-  `DSH_HOME` only to a bound value.
-- **`~/.agents/skills` resolves inside the per-invocation home**, because `~` is the redirected
-  USERPROFILE.
+### Launch-surface record
 
-## Client launch hardening
+For each invocation, just before the spawn gate, the driver records what DSH would read besides
+the packet (`src/hflow/drivers/dsh_surfaces.py`). It is a record: nothing in it is enforced,
+refused or bound.
 
-What the launch path does, for both roles, since the 2026-10-02 refinement:
-
-- **A workspace `.acpxrc.json` is never launched on, and is refused as early as it is knowable.**
-  acpx always loads `<--cwd>/.acpxrc.json` and lets it override HFlow's per-invocation config -
-  scalar settings such as permissions win over the global file, and a project `agents.<name>`
-  entry replaces the agent argv HFlow bound. There is no flag to skip or pin it (upstream
-  openclaw/acpx issue #835, open as of v0.19.4). The name is matched **without regard to case**,
-  and only among the workspace root's own entries: on a case-insensitive filesystem (NTFS by
-  default) acpx's open of `.acpxrc.json` finds `.ACPXRC.JSON` too, so every spelling refuses and
-  the refusal names the one it found, while a nested `src/.ACPXRC.JSON` or a lookalike such as
-  `.acpxrc.json.bak` does not. The refusal happens in two places:
-  - **At admission**, which `hflow prepare` and the run's dispatch gate share: a real run whose
-    starting workspace already holds the file - the project root for an in-place run (a listing
-    of that directory), the base commit's root tree for a worktree run
-    (`git ls-tree -z --name-only <base>`, no pathspec, because a pathspec matches
-    case-sensitively) - is refused `workspace_client_config` (location `workspace`) before a run
-    row, an authorization record, a reservation or a process exists. An uncommitted copy in your checkout is not in the worktree
-    and does not refuse a worktree run. Nothing was recorded (with `--root-budget-file`, not even
-    the root), so resubmitting works once the file is gone; for a worktree run that means
-    committing its removal, and because the binding carries the resolved base SHA, a real run then
-    needs an authorization issued for the new base.
-  - **At the driver's spawn gate**, for every invocation, before any process exists: a workspace
-    whose root contains **any** entry by that name in any case (file, directory or link) is
-    refused, and so is one whose root cannot be listed for a reason other than not existing. This
-    now only catches a file that appeared after admission - most importantly in the candidate
-    worktree the reviewer runs on, which stops an implementer from planting a config the
-    reviewer's acpx would load (the freeze already denies writing one). The dispatch is already
-    reserved by then: the run blocks `workspace_client_config`, the invocation is recorded
-    `not_started` and its allowance stays consumed. The remedy is not "submit again": remove the
-    file and submit a **new revision** - an identical TaskSpec returns the blocked run, and under a
-    root budget the new revision's first implementer is charged as a repair, so the root needs a
-    repair left (`used_repairs < max_repairs`; otherwise that revision is refused
-    `budget_exhausted` before its run row or authorization record exists).
-  The spawn-gate check runs just before the spawn, and acpx reads the file a moment later - a
-  process writing the workspace in that window is not covered.
-- **A workspace `.env` is never launched on** (user ruling 2026-10-03). DSH loads `<cwd>/.env`
-  at launch into its own environment and its tool processes (documented at dsh 5badb150, not
-  observed). HFlow refuses rather than parses: the file is never opened, and every surveyed
-  name denylist grew after incidents. The rule mirrors `.acpxrc.json` exactly - any letter case,
-  root entries only, any kind of entry - at admission (`prepare.start_workspace_env_file`: the
-  project root's listing, or `git ls-tree` of the base commit's root) and at the driver's spawn
-  gate for the role's actual cwd, with the same remedies and the same time-of-check window. The
-  offline fake driver is unaffected.
-- **A bound `DSH_HOME` the agent can write, or that sits above the workspace, is never launched
-  with** (user ruling 2026-10-03). DSH never checks where its home is, and loads patch layers,
-  `AGENTS.md`, skills and `.env` from it. `acpx_dsh.dsh_home_workspace_problem` refuses a relative
-  value (a leading `~` included), one that cannot be resolved, and one whose path as written or
-  with links resolved (`os.path.realpath`, case-folded) equals or lies inside, or contains, a
-  protected directory: at `prepare` and the run gate the project root and the worktree directory;
-  at the spawn gate the role's cwd and, for a `<repo>.hflow-worktrees/<run>` cwd, that directory
-  and the checkout named by it. An unbound `DSH_HOME` (the per-invocation home) is unaffected. Not
-  covered: 8.3 short names `realpath` leaves unexpanded, and other directories the agent may write.
-- **A launch with no credential source visible is never started** (user ruling 2026-10-07, given in
-  chat: "Refuse before dispatch"). Without a credential DSH fails with a no-API-key error before
-  any model work (observed in M0); HFlow would record that invocation `outcome_unknown`, spend the
-  approved submission and leave a ledger entry for `hflow ledger settle`. The rule
-  (`acpx_dsh.credential_source_problem`, on the facts `dsh_surfaces.credential_sources` reports)
-  refuses when `DEEPSEEK_API_KEY` is not among the child environment's variable *names*
-  (case-insensitive on Windows; the value is never read, so an empty value counts as present) and
-  the child's DSH home holds neither `.credentials.yaml` nor `.env` as a regular file - one
-  `os.stat` each, links followed; a directory, a broken link or an entry that cannot be examined
-  does not count; nothing is opened, and no size or digest is kept. With `DSH_HOME` unbound the
-  home is the per-invocation one, created empty, so only the environment counts and the home is not
-  looked into; a relative bound home is not looked into either (and is refused
-  `dsh_home_in_workspace` anyway). A workspace `.env` is not a source here: a real launch never
-  starts on one. It is checked:
-  - **at admission**, shared by `prepare` and the run gate (`prepare.launch_credential_problem`),
-    on the child environment the driver would build from the environment `hflow` runs in (for a
-    driver handed to the controller directly, plus that driver's `extra_env`): refused
-    `no_credential_source` (location `launch.credentials`) before a run row, an authorization
-    record, a reservation or a process exists, so after fixing it `prepare` again and submit;
-  - **at the driver's spawn gate**, for every invocation - both roles, a repair round's too - on
-    the environment it actually builds for that child and the home it would use, after the
-    `DSH_HOME` check and before the launch-content check. It catches a variable removed, or a home
-    file deleted, after admission; the dispatch is already reserved by then, so the run blocks
-    `no_credential_source` with no client started and the remedy is a new revision.
-  A presence check, not a validity check: an empty, mistyped, revoked or unfunded key, or a home
-  file holding no credential, passes, and DSH then still fails after the dispatch. The offline
-  fake driver is unaffected. `hflow doctor` reports the same verdict for its own environment.
-- **Every launch program is an absolute file, and none may live in a workspace.** `dsh` - and
-  `node` for a `.js` client, `python` for a `.py` client - is resolved to an absolute file from the
-  absolute `PATH` entries of the resolving environment only (with `PATHEXT` on Windows), never
-  from the current directory or a relative entry. `dsh` alone has one more place, looked at only
-  when `PATH` has none: the npm CLI `@deepseek-ai/dsh@0.2.0-rc.2` installed with
-  `--ignore-scripts` at `<data-dir>/dsh/0.2.0-rc.2` (user ruling 2026-10-14, the route around DSH
-  #9626), whose shim, carrier entry and package.json are bound by content like a PATH-found one.
-  Where it came from is the launch's first content note (`dsh=PATH` or `dsh=npm (data dir)`),
-  shown by `prepare` and `doctor --profile`. A missing launcher makes the launch **not
-  resolvable** (`prepare` and the dispatch gate refuse it, `hflow doctor --profile` reports the
-  role unusable); there is no bare-name fallback, so on a machine with no `dsh` on `PATH` or in
-  the data directory the launch is reported missing rather than "resolved". An explicitly named program
-  (`HFLOW_ACPX_NODE`, a driver argument, an agent-argv override) must be an absolute path. A
-  launcher, `dsh`, client interpreter or acpx client entry (the script `node` runs; its package
-  root contains it, so a package root inside a workspace is caught too) inside the project root or
-  the directory the run's worktrees are created in (`<repo>.hflow-worktrees`) is refused as
-  "inside the workspace": the agent can write there. So is a workspace that lies inside the
-  `node_modules` tree the client entry loads its modules from, because the agent could rewrite a
-  dependency the client runs. One consequence:
-  with `HFLOW_ACPX_CLI` unset and no copy under `<data-dir>/m0/acpx`, the entry falls back to
-  the HFlow checkout's own `.probe/acpx/node_modules/acpx/dist/cli.js`, so a run whose project
-  root is the HFlow repository itself reports the launch as **not resolvable**. Point
-  `HFLOW_ACPX_CLI` at an acpx installed outside the project.
-- **The DSH batch shim goes through the absolute `%SystemRoot%\System32\cmd.exe /d /c`.** A bare
-  `cmd.exe` can be searched for in the agent's working directory (the worktree) before `PATH`.
-  If `SystemRoot` is missing from the resolved environment the launch is not resolvable; like
-  every other launch program, it never falls back to a bare name. `/d` skips cmd.exe's registry
-  AutoRun commands, which would run first, in the workspace, and write into the ACP stdout
-  stream. Node quotes the shim path by C runtime rules, not cmd's, so a shim path (or profile)
-  holding `& | < > ^ % ! " ( ) @ ; , =` is not resolvable: an `&` splits the command, `^` and
-  `%VAR%` are consumed, an unquoted `( ; , =` cuts the path, and an `@` in a path with a space
-  makes `/c` drop the quotes (observed, Windows 11). Install the launcher under a plain path.
-- **Repository-locating Git variables never reach the agent.** `GIT_DIR`, `GIT_WORK_TREE`,
-  `GIT_INDEX_FILE` and the rest of the set HFlow drops from its own git calls are removed from
-  every child environment (any letter case on Windows), so DSH's git and the agent's shell work on
-  the workspace's repository, not on one an inherited variable points at.
-- **The child never searches its working directory for a program.** Every child environment -
-  each invocation's, and the zero-model preflight's - gets `NoDefaultCurrentDirectoryInExePath=1`
-  (any other spelling of that name is removed first), and relative or empty `PATH` entries are
-  dropped. Without that, cmd.exe running the DSH npm shim's bare `node`, and any bare name acpx
-  spawns, would be looked up in the workspace before `PATH`. Only the working directory and
-  relative entries are excluded: absolute `PATH` entries are passed to the child as they are.
-- **The HFlow process never runs a program from the directory it was started in.** `hflow`'s
-  `main` sets `NoDefaultCurrentDirectoryInExePath=1` in its own environment (every other
-  spelling removed first) before any command runs: `CreateProcess` searches the *parent's* current
-  directory for a bare name before `PATH`, and HFlow starts bare `git` (worktrees, freezing,
-  integration) and an approved check's argv unchanged. A `git.exe` planted in that directory ran
-  instead of Git before this (observed on Windows 11, Python 3.14.7). An approved check's own
-  environment is the check allowlist, which does not carry the variable, so what a check process
-  itself starts by bare name is still searched in its working directory first.
-- **Ambient `DSH_PERMISSION_MODE` and `DSH_TOOLS_MODE` are removed** from the child environment
-  (including anything passed through the driver's `extra_env`) and never set, so an operator's
-  shell cannot silently switch DSH's sandbox off for a role. `hflow doctor` lists which of the two
-  were present and removed. Binding a per-role value instead is an open decision.
-
-### What DSH reads on its own: the launch-surfaces record
-
-For each invocation and role, just before the spawn gate, the driver records what DSH would read
-besides HFlow's packet (`src/hflow/drivers/dsh_surfaces.py`). It is a record: nothing in it is
-enforced, refused or part of an approval.
-
-- **Fields:** the DSH home and how it is chosen (`bound`, or `per_invocation` when `DSH_HOME` is
-  unbound - inferred from upstream source), the home's `cordis.patch.yml`,
-  `profiles/<profile>/cordis.patch.yml`, `.env`, `AGENTS.md` and `skills`; the workspace, its
-  `.env`, the project root (the nearest `.git` marker), the AGENTS.md/CLAUDE.md(.local) files
-  present from that root down to the workspace and the two project skill directories; the names
-  of the DSH_* variables that reach the child; whether `DEEPSEEK_API_KEY` is among the child's
-  variable names; the user-level agents file DSH >= 0.2.1-alpha.2 reads after the home's
-  `AGENTS.md` (`$DSH_AGENTS_HOME/AGENTS.md` when that variable reaches the child, else
-  `<child home>/.agents/AGENTS.md`; documented from upstream source, not observed; a relative or
-  unresolved path is `unknown`). HFlow removes an inherited `DSH_AGENTS_HOME` from every child,
-  so at an HFlow launch it is the per-invocation home's `.agents/AGENTS.md`, created empty - an
-  instruction file elsewhere that no approval binds is not pointed at; and the client identity - acpx and @agentclientprotocol/sdk versions from
-  their package.json (the SDK found by Node's node_modules walk from the client entry), and the
-  dsh carrier.
-- **Turn-time git (DSH #9382):** DSH's `workspace-changes` plugin runs `git add --all` and
-  `git write-tree` in the workspace repository at every top-level turn start and end, with a
-  private index but the repository's own config - so its hooks (`post-index-change`,
-  `core.hooksPath`), fsmonitor and clean/process filters can run, and a worktree shares the user
-  checkout's config. Only the Web/Desktop bundle (`dsh-web-app`) loads it; the ACP profile
-  template HFlow launches is `[dsh-base, dsh-acp-app]`, and a per-invocation home always starts
-  from that template (dsh-v0.2.0-rc.2 and -alpha.2 source, documented - not observed). For a bound
-  home, the patch layers and `profiles/<profile>/package.json` are searched as text and a mention
-  of `workspace-changes` or `dsh-web-app` is noted in the record (recorded, never enforced).
-- **Sandbox mode (the `sandbox` line):** the mode DSH would start a new ACP session in, read as
-  text from a bound home's two patch layers, else DSH's default `workspace-write` (documented from
-  upstream source, not observed), plus a `warning` line for DSH #9626 under the Desktop shim. It
-  is the shell runner's mode, not a file-tool boundary: DSH's own file tools are not confined by
-  it on the ACP path (DSH #9693, unconfirmed), so HFlow's scope check and user-checkout
-  fingerprint are what notice an outside write. Recorded, never enforced.
-- **How it is read:** a fixed list of paths, never a directory listing. A regular file gets its
-  size and SHA-256 (none above 4 MiB); a `.env` is examined by stat only - presence and size,
-  never opened - and the home's stored-credentials file is never read. An entry that cannot be
-  examined is `unknown`, not absent. Variable values are never recorded. Nothing is executed.
-- **Carrier:** only a Windows batch shim's text is classified. The Desktop shim (it sets
-  `ELECTRON_RUN_AS_NODE` and runs an absolute `DeepSeek Harness.exe`) gives `desktop`, with the
-  version from `primary-runtime/runtime.json`'s `desktopVersion`, which the Desktop README
-  documents as equal to the dsh version (not verified); `payloadDigest` is never read or shown.
-  The npm shim gives `npm`, with the version from its `@deepseek-ai/dsh` package.json. Anything
-  else is `unknown`; an override argv that does not start the resolved dsh is `not_applicable`.
-- **Where it shows:** `prepare`'s `launch_surfaces` and its "launch surfaces" text section (a
-  worktree's files are not known before dispatch, and a per-invocation home is named, not looked
-  into); `doctor`'s `child_dsh_home` and, with `--profile`, the per-role probe notes; the
-  per-attempt `dsh home`, `workspace` and `client` lines of `status`; and `report --json`'s
-  `launch_surfaces` / `review_launch_surfaces`. The offline driver, an older row, a stop that won
-  the spawn gate and a failed observation show "not recorded"; a failed observation's reason is in
-  the result's limitations, and it never changes or stops the launch. In `prepare`, a role whose
-  surfaces could not be examined is left out of that section and named in prepare's notes; the
-  preview itself still completes.
-- **Time of check:** DSH reads the files after the look. A worktree holds only what the base
-  commit tracks, so an untracked `.env` in your checkout is not in it.
-- A DSH home that lies inside the workspace is noted in the record (the agent could write what
-  DSH loads at the next launch) and, since the 2026-10-03 ruling, refused on a real driver
-  (`dsh_home_in_workspace`, see "Client launch hardening").
+- **Fields:** the DSH home (`bound`, or `per_invocation`: `<data-dir>/invocations/<id>/home/.dsh`,
+  created empty, USERPROFILE/HOME pointed at it - inferred from upstream source) and its patch
+  layers, `.env`, `AGENTS.md` and `skills`; the workspace's `.env`, instruction files and skill
+  directories; the `DSH_*` names reaching the child, whether `DEEPSEEK_API_KEY` is among them, and
+  the withheld secret-like names; `<child home>/.agents/AGENTS.md`; acpx, SDK and carrier versions;
+  and the `sandbox` line (the mode from a bound home's patch layers, else `workspace-write`, with
+  the #9626 warning under the Desktop shim).
+- **How it is read:** fixed paths, never a listing. A regular file gets its size and SHA-256 (up to
+  4 MiB); a `.env` and a bound home's `.credentials.yaml` are found by stat only, never opened or
+  hashed. An entry that cannot be examined is `unknown`. Values are never recorded, nothing runs.
+- **Carrier:** a Windows batch shim's text is classified as `desktop` (version from
+  `primary-runtime/runtime.json`), `npm` (from its `@deepseek-ai/dsh` package.json), `unknown`, or
+  `not_applicable` for an override argv.
+- **Where it shows:** `prepare`'s `launch_surfaces`, `doctor --profile`, the per-attempt `launch`
+  lines of `status`, and `report --json`'s `launch_surfaces` / `review_launch_surfaces`. The
+  offline driver, an older row or a stop that won the gate shows "not recorded". DSH reads the
+  files after the look.
 
 ## Model selection
 
-What a profile can say, per role, in `model_selection`:
-
-| Value | Meaning |
+| `model_selection` | Meaning |
 |---|---|
-| `"native_profile"` | no model flag; the DSH launcher's own profile decides. The launch digests exactly as it did before model passing existed |
-| a bare token, e.g. `"deepseek-v4-pro"` | 1-128 characters from `A-Za-z0-9._:/-`, not starting with `-` (so it can never read as a flag) |
-| a two-element JSON array, e.g. `["deepseek-official","deepseek-v4-pro"]` | a `[provider, model]` pair - DSH's own option id. Written as an array or as a string holding one, and stored in compact form, which is the exact value acpx and DSH compare |
+| `"native_profile"` | no model flag; DSH's own profile decides |
+| a token such as `"deepseek-v4-pro"` | 1-128 characters from `A-Za-z0-9._:/-`, not starting with `-` |
+| `["deepseek-official", "deepseek-v4-pro"]` | a `[provider, model]` pair, stored compact |
 
-Anything else is refused when the profile loads. A value other than `native_profile` is passed to
-the acpx **client** (not the agent argv) as the global flag `--model <value>`, before `exec`, and
-is bound as `LaunchConfig.model` - so it is part of the effective-configuration digest and of what
-an approval covers. That this counts as a "fixed flag" under AGENTS.md rule 9 is a user ruling
-(2026-10-02): the value is fixed by the machine profile, validated and digest-bound, and is never
-task text, user content or a credential.
-
-What the pinned acpx 0.17.1 does with it (read in its bundle, then run against the project's mock
-agent - offline evidence only): after `session/new` it looks for the agent's select option with
-category `model` (preferring id `model`, grouped options included). If the value is already
-current it sends nothing; otherwise it sends `session/set_config_option` before `session/prompt`.
-It **fails closed**: an unadvertised value, or an agent with no model option, ends the client with
-its own JSON-RPC error and no prompt sent, which HFlow records as `FAILED`
-`model_rejected_before_prompt` (nothing reached a model; nothing is refunded). acpx also copies the
-value into `session/new` `_meta.claudeCode.options.model` - the same bound value, in a second
-place. Every other missing-stop-reason case stays `OUTCOME_UNKNOWN`.
-
-Model and reasoning observations belong to the first valid created session, checked against
-the first prompt's session. Updates or model-set requests for another or missing session do
-not alter them. A creation/prompt mismatch or request-id collision leaves the requested model
-`unknown`. With no model-set request, `passed` needs both the initial and final values to match
-the request. The effective value remains the session's last reported configuration, including
-same-session updates after the prompt response; it is not proof of the model used to reason
-during that turn. A failed protocol read supplies no final model observation.
-
-What `status` and `report` show: one `model` line per invocation, with `model_applied`, whether
-a catalog was `advertised`, the `requested` and `effective` values and where the effective one
-came from (`session/new`, `session/set_config_option` or `config_option_update`), the number of
-changes, and the `thought_level` value. `model_applied` is classified from the stream and never
-guessed upward:
+Anything else is refused at profile load. A value other than `native_profile` is passed to the
+acpx client as `--model <value>` before `exec` and is part of the effective-configuration digest
+(a fixed flag under AGENTS.md rule 9; user ruling 2026-10-02). The pinned acpx sends
+`session/set_config_option` before the prompt when the value is not already current and **fails
+closed** on an unadvertised value (`FAILED model_rejected_before_prompt`). `status` prints one
+`model` line per invocation:
 
 | `model_applied` | Meaning |
 |---|---|
-| `not_passed` | no `--model` was on the client command line (`native_profile`) |
-| `passed` | the flag was passed, no change request was needed (the session started on that value), and the stream's last reported value is **still** the requested one |
-| `accepted` | `session/set_config_option` for the model succeeded and the effective value equals the request |
-| `rejected` | refused before any prompt: the client's confirmed pre-prompt refusal (`model_rejected_before_prompt`), or a change request the agent answered only with errors |
-| `unknown` | anything the stream does not settle: a change request with no answer, or an answered one whose effective value is not the request; or no change request and a value other than the request - a later `config_option_update` that moved the model away, or a refusal the stream shows (not advertised, not in the catalog) that an earlier outcome such as `boundary_not_empty` or `completion_timeout` shadowed. That last case stays `unknown`, not `rejected`, because no pre-prompt rejection confirmed it |
+| `not_passed` | no `--model` flag |
+| `passed` | no change was needed and the last reported value is still the request |
+| `accepted` | the change request succeeded and the effective value equals the request |
+| `rejected` | the client's confirmed pre-prompt refusal, or a change request answered only with errors |
+| `unknown` | anything the stream does not settle |
 
-`report --json` carries the same facts per
-attempt as `model_observation`/`model_applied` and `review_model_observation`/
-`review_model_applied`. A run recorded before this, or by the offline driver, says `not recorded`.
-
-What is **not** known, and why profiles should stay on `native_profile` for now: the
-`model_selection` capability stays `documented` for real DSH. DSH advertises a `model` selector
-(observed in the recorded M0 `session/new` reply) and its source routes `session/set_config_option`
-to it, but no live `set_config_option` round trip has been observed, and whether DSH 0.2.0 answers
-it with the full option list is open - a reply that reports no effective value leaves
-`model_applied` at `unknown`, never `accepted`. Which
-values the current DSH build advertises - the M0 catalog was observed on DSH 0.1.5 - needs a
-zero-prompt live catalog check first, and that check is a live harness launch that needs its own
-explicit approval (AGENTS.md rule 10). Changing a role's model changes the digest, so its
-authorization must be re-issued.
-
-## Reading the counters honestly
-
-`status` prints several things that are easy to confuse. This is the real output of `hflow
-status` for an offline fake run with a root budget file (one implementer, one reviewer, one
-`command` check, `--driver fake --root-budget-file`, a temp data dir; no model), with the long
-paths and digests shortened:
-
-```text
-run           R-irlfug6bgw
-task          T-status-demo revision 1
-state         ACCEPTED
-delivery      LOCAL_CANDIDATE
-claimed_by    local-controller
-turns         reserved 2/4, implementer self-reported 1 (a self-report, not a dispatched count and not a bill)
-spec_digest   sha256:86d411dd...
-configuration command_line (no profile) digest=sha256:b3ff83ec...
-  implementer  agent=command-line driver=fake -> fake
-  reviewer     agent=command-line driver=fake -> fake
-  writes      implementer=False reviewer=False
-invocations   implementer=1 reviewer=1 (attempt rows; a deterministic dispatch count, not a model-request count)
-root budget   root-7e95f001e712052558f0de0542c8abd8
-  covers      project demo, task T-status-demo
-  repo        <temp>\demo-project
-  ledger      <temp>\data\hflow.sqlite
-  submissions used 2/3 (remaining 1)
-  repairs     used 0/0 (the root's own counter: a repair dispatch is charged here; whether repair was armed for a run is in that run's repair decisions)
-  deadline    2026-10-03T13:20:07Z (root limit 86400s, measured from the first reservation at 2026-10-02T13:20:07Z)
-  runs        R-irlfug6bgw
-  approvals   AUTH-offline-gsld39zld8
-dispatch ledger
-  reserved=0 requested=0 started=0 not_started=0 settled=2 unknown=0 launch_unknown=0
-  processes   0 operating-system child(ren) reported by a driver (ever started 0); 2 launch(es) ran without one, which is what the offline driver does
-  meaning     reserved = the dispatch transaction committed: allowance spent, intent durable. Not a launch, not a process, not a model request
-  meaning     requested = the controller asked a driver to launch it; nothing reported yet. A crash here leaves launch_unknown, which blocks the root
-  meaning     started = the launch happened. Whether it created a process is the separate count above; a childless launch is still a launch
-  meaning     not_started = no launch happened (a stop won the handoff, or the driver reported none); the allowance is kept, never refunded
-  meaning     settled = a recorded result was applied; unknown = a launch was never settled, which blocks the root and is never re-dispatched
-  provider model requests: unknown - no invocation row records one, and neither a reservation nor a process is counted as one
-  invocations
-    I-dlqeqsf4tq  role=implementer state=settled spawn=no_process repair=False attempt=A-2432mgtqqj approval=AUTH-offline-gsld39zld8
-      launch_requested_at=2026-10-02T13:20:07Z launched_at=2026-10-02T13:20:07Z settled_at=2026-10-02T13:20:07Z outcome=completed detail=implementer invocation completed
-    I-zlgdoixhe6  role=reviewer state=settled spawn=no_process repair=False attempt=A-2432mgtqqj approval=AUTH-offline-gsld39zld8
-      launch_requested_at=2026-10-02T13:20:08Z launched_at=2026-10-02T13:20:08Z settled_at=2026-10-02T13:20:08Z outcome=completed detail=review invocation completed
-candidate     workspace still matches the accepted fingerprint
-attempts
-  A-2432mgtqqj  revision=1 role=implementer state=SUCCEEDED outcome=completed repair=False
-    model         implementer not recorded (this result carries no model observation)
-    stream        implementer updates_after_prompt_response=unknown (not recorded: no bound prompt response, no stream read to its end, or a result without this record)
-    launch        implementer surfaces not recorded (this result carries no launch-surface record)
-    model         reviewer not recorded (this result carries no model observation)
-    stream        reviewer updates_after_prompt_response=unknown (not recorded: no bound prompt response, no stream read to its end, or a result without this record)
-    launch        reviewer surfaces not recorded (this result carries no launch-surface record)
-dsh context   not recorded: no frozen Git candidate was classified for this run (an in-place run, a run that ended or was refused before its candidate was kept, or one recorded before this build)
-repair        no repair decision recorded
-evidence
-  E-69hb2f96cn  kind=verification check=unit status=passed exit=0
-  E-upyj46qytc  kind=review check=review status=passed exit=unknown
-model_calls   0 (this command; provider-side requests are reported by the receipt and stay unknown when not observed)
-```
-
-- The sample predates storage v6. A current build prints two more lines right after
-  `claimed_by`: `owner pid=... host=... created=... generation=N token=xxxxxxxx...` (or "not
-  recorded" for a run claimed before v6) and
-  `liveness <matching|gone|unknown|not_recorded|not_probed> (lock ...; <basis>)`. The basis says
-  what the word rests on: "observed by this command, not stored" only when `status` actually asked
-  the operating system; "decided by rule, nothing was probed" for an `unknown` that needed no
-  question (another host, a pre-v6 pid with no host); "nothing to observe" for `not_recorded` (no
-  owner and no controller process was recorded - not proof of death); "not probed" for a terminal
-  run like this one (`not_probed`). Nothing of it is stored. `claimed_by` stays the human label.
-- `reserved 2/4` means two turns were *paid for* out of a ceiling of four: one for the
-  implementer invocation and one for the reviewer invocation. Both were dispatched; a run that
-  cannot afford the review turn blocks *before* the reviewer starts.
-- `implementer self-reported 1` is the sum of the implementer's self-reports across rounds (a
-  repaired run adds both rounds; a result that arrived after a stop adds nothing). It is not the
-  reserved total and it cannot return reserved budget. The receipt's `controller_turns_observed`
-  is the same sum. The controller's own **dispatch** count is
-  the `invocations` line.
-- `configuration` is the effective configuration the run recorded once, with its digest; a run
-  that predates config binding says `not recorded` instead of being back-filled.
-- `root budget` reads the ledger row: `submissions` are top-level dispatches of the whole root
-  (every run and revision of the task), `repairs` is the root's own repair counter, and
-  `deadline` is fixed at the root's first reservation and never reset. `approvals` names every
-  authorization charged; an offline run without `--authorization-file` shows the CLI's labelled
-  `AUTH-offline-...` record, which can never authorize a real transport.
-- The **dispatch ledger** keeps four facts apart, and they are not one number: an allowance
-  *reserved*, a launch *requested*, a launch that *happened* (and, separately, whether it created
-  an operating-system *process*), and a result *settled* - the per-state meanings are printed
-  under it, and are the `InvocationStartState` values described in `docs/architecture.md`:
-  - `processes` (and its historical alias `ever started`) counts invocations whose driver
-    reported a pid. It is never derived from a result state, so this offline run shows two
-    settled launches and **zero** processes; a real `acpx-dsh` run shows `spawn=process` and a
-    count per invocation;
-  - `unknown` and `launch_unknown` both block the root and are never re-dispatched; neither
-    counts as a process;
-  - `operator_settled=N (by attestation, not observed)` appears only once `hflow ledger settle`
-    closed an entry; the entry's lines then show who attested, when and the text. It is not a
-    result, a process or a provider request;
-  - **provider model requests: unknown.** No invocation row records one, and a reservation or a
-    process is never counted as one.
-- Whether a Harness makes internal model requests per turn is not observable here, so billed
-  usage stays `null` and "billed model requests" stays `unknown`. Do not read `null` as `0`.
-  ACP `usage_update.used/size` is context-window usage, not a bill, and an agent-reported
-  `PromptResponse.usage` (UNSTABLE in ACP) or `usage_update.cost` is not a bill either: neither
-  ever fills `provider_billed_tokens` / `provider_cost` / `subscription_quota_remaining`.
-- A run with no root ledger row (any run recorded before E1, or one that never used a root
-  budget file) prints `legacy / not recorded` for both the root budget and the dispatch ledger.
-  That is **not** "0 used": there is no root, no invocation row and no counter to read, and
-  nothing is back-filled from the new rules.
-- `model` lines: one per invocation, from the stream the driver observed (see "Model
-  selection"). The offline driver and runs recorded before model observation print `not
-  recorded`.
-- `stream` lines: one per invocation, showing where its bound prompt response fell in the stream
-  and how many updates for the prompt's session followed it (see "Driver `error_code`" above).
-  They read `unknown`, never `0`, for the offline driver, older runs, unbound turns and streams
-  not read to their end.
-- `launch` lines: one per invocation, the stored launch-surface record (see "What DSH reads on
-  its own"). They read `not recorded` for the offline driver, older rows, a stop that won the
-  spawn gate and an observation that failed; a recorded one prints its `dsh home`, `workspace`
-  and `client` lines instead.
-- `repair` lists every repair decision the run recorded, refusals included, or says `no repair
-  decision recorded`.
-- `dsh context` projects the stored `dsh_context` records. `not recorded` means no frozen Git
-  candidate was classified (this demo is in place); otherwise each frozen candidate shows `none on
-  the list` or `CHANGED n:` with the files a DSH agent started in its worktree would load as
-  instructions, skills or environment. The `list` line is the list each record was classified
-  against, as stored with it. The review evidence of an attempt whose record changed files ends
-  in `dsh_context=changed`, a join by attempt id rather than a field of the evidence. Each record
-  ends in `declaration checked` or `recorded without a declaration check (before the 2026-10-03
-  ruling)`. In a record marked `declaration checked`, a listed file is one a `write_allow` entry
-  names by its path (an undeclared one, or any root `.env` change, blocks the run
-  `context_file_change` before a record exists); a record without that mark was written by an
-  earlier build, so its files were never checked against `write_allow` and may not have been
-  declared. Files already in the base commit are not listed.
-- `candidate` compares the workspace against the fingerprint the run was accepted at. If it
-  says `DRIFTED`, the stored `ACCEPTED` describes the candidate as it was, not the files on
-  disk now; nothing has been re-verified.
+Keep profiles on `native_profile`: the capability is `documented` for real DSH, no live
+`set_config_option` round trip has been observed, and which values DSH 0.2.0 advertises needs a
+zero-prompt live check that needs its own approval. Changing a role's model changes the digest.
 
 ## Stopping a run
 
-`hflow cancel <run_id>` records the intent **first**, then decides from the run's state as read
-*after* the intent, asks the driver, and reports what actually happened:
+`hflow cancel <run-id>` records the intent first, decides from the run's state as read after it,
+asks the driver and reports what happened:
 
 | Receipt | Meaning |
 |---|---|
-| `confirmed_stopped` + `mechanism=forced` | the managed process boundary was terminated; *local execution stopped* |
-| `confirmed_stopped` + `mechanism=none` | there was nothing left to stop: never dispatched, or the client had exited and its Job was already empty |
-| `still_running` / `unknown` | the stop could not be confirmed: the run stays blocked, the workspace and evidence are kept, and nothing is re-dispatched |
+| `confirmed_stopped`, `mechanism=forced` | the managed process boundary (a Windows Job Object) was terminated: local execution stopped |
+| `confirmed_stopped`, `mechanism=none` | nothing was left to stop |
+| `still_running` / `unknown` | not confirmed: the run blocks `outcome_unknown`, nothing is re-dispatched |
 
-The receipt (`hflow cancel --json`, `CancellationReceipt` in `hflow schema`) also carries
-`run_already_ended`: `true` when the stop reached a run that had already ended, so its answer
-decided nothing about that run; `false` - and what every receipt recorded before the field
-existed reads as - when it decided a live run.
+- A **live run** gets its receipt and terminal block in one statement; a confirmed stop then
+  finishes the attempt and closes the invocation's ledger entry. A bookkeeping failure after that
+  is a `dispatch:` note on an already-terminal run (`resume` closes such an entry).
+- A **run that already ended** keeps its outcome; its last invocation is still asked to stop and
+  the receipt says `run_already_ended: true`. Such an `unknown` answer does not make `clean`
+  refuse. An `ACCEPTED` run is never reopened.
+- **`hflow cancel` from another shell** holds no handle to the controller's child: it records the
+  intent and an `unknown` receipt, the live run blocks `outcome_unknown`, and `resume` reconciles
+  once that controller is provably gone (until then it writes nothing and exits `5`). A cancel that
+  lands during the checks or the review handoff leaves no open entry, so the root accepts a new
+  revision at once even while the original controller finishes.
+- The stop goes to the **role that is running**, recorded as a `cancel_target` run note. Every
+  registration and block is conditional on "no stop recorded", and the driver creates a child only
+  inside a gate both stop paths take: a stop that wins the gate means no process is created; one
+  that loses finds the published handle and terminates it.
+- A client that exited is not an empty boundary: the stop asks the Job. A live stop is confirmed
+  only when the Job is empty and the client is shown to have exited; a process Windows will not
+  open (`ERROR_ACCESS_DENIED`) is unanswered, never gone. Off Windows the boundary is
+  `direct_child_only` and a forced stop does not kill even the direct child.
+- After a stop, a result of either role is a fact, not a decision: it is kept only as a
+  `late_result` note, creates no candidate ref or verdict, and settles no ledger entry.
 
-What the stop does to the run depends on where the run is:
-
-- **A live run** ends here. Its receipt and its terminal block - `cancelled_by_operator` for a
-  confirmed stop, `outcome_unknown` for one that was not - are written in **one** statement,
-  before any attempt or ledger bookkeeping. The receipt is what makes a repeated `cancel` return
-  early, so it never exists without the block: if that one write fails, only the intent is left,
-  and a retried `cancel` asks the driver again and ends the run. A confirmed stop then finishes
-  the attempt and closes the invocation's ledger entry if it is still open; if that bookkeeping
-  fails, the failure is a `dispatch:` note on a run that is already terminal - it can no longer
-  leave a run `RUNNING` with its root owned forever (the note names `hflow resume <run_id>`, which
-  closes such an entry from this recorded stop once the run's owner has exited, then
-  `hflow ledger settle`). A receipt found on a run that is still live (a database written while
-  the receipt and the block were separate writes) is not returned as if the stop had finished:
-  the block it implies is re-applied, with a "re-applied" `cancel_target` note, and the driver is
-  not asked again. On a run with no ledger (no root), a stop recorded between the attempt's
-  reservation and the implementer's registration wins: the registration is conditional on it, no
-  driver is asked, the attempt ends `CANCELLED`, and the receipt says the reserved turn and
-  authorization submission stay consumed.
-- **A run that already ended** (`BLOCKED` with any code, or `CANCELLED`) keeps its outcome. The
-  invocation it was on is still asked to stop - a child can outlive an unknown or failed result -
-  and the receipt (with `run_already_ended: true`), a `cancel_target` note and an "already
-  BLOCKED (code)" note are recorded, but the block is not relabelled and neither the attempt nor
-  any ledger entry is touched. An `outcome_unknown` run therefore keeps its code and its
-  `unknown` entry, and `resume` still reconciles it after `hflow cancel`. Because such a stop
-  decided nothing, an `unknown` answer to it - which is what `hflow cancel` gets from another
-  process - does not make `hflow clean` refuse `stop_unconfirmed`: the run faces exactly the
-  cleanup gates it had before the stop, and the preview says why. A `still_running` answer still
-  refuses.
-- **Two stops that race** on one live run: the first to write ends the run, and its receipt and
-  block are the stored ones. The later stop returns its *own* receipt with `run_already_ended: true`
-  (a confirmed forced stop keeps that fact there and in its `cancel_target` note), but it does not
-  relabel the block or touch the attempt or any ledger entry, exactly like a stop of an ended run.
-- **An accepted run** is not reopened; the stop is recorded (`confirmed_stopped`,
-  `mechanism=none`, `run_already_ended: true`), nothing is asked to stop and history is not
-  rewritten.
-
-**`hflow cancel` from another shell reports `unknown`.** The CLI is a different process from the
-controller executing the task, and it holds no handle to that controller's child. It builds an
-observer per role from the run's recorded configuration, so the receipt names the recorded
-driver (`driver=acpx-dsh-acp, agent=dsh`, or `unrecorded` for a run with no recorded
-configuration), never the offline fake. It records the intent and an `unknown` receipt
-(`mechanism=none`), and a live run blocks `outcome_unknown` ("stop could not be confirmed ...
-work may still be running"). It settles no ledger entry and does not cancel the attempt; the
-owning controller's late result changes nothing, and `hflow resume` reconciles the run once that
-controller is provably gone - its lock can be taken and its identity reads `gone`. Until then
-`resume` writes nothing (no ledger closure, no reconcile record, no note), says the owner may still
-be alive and exits `5` (batch J: it used to reconcile at once, recording the in-flight entry
-`unknown` while the agent still ran). The root stays blocked only while the stopped invocation's
-ledger entry is still open. A cancel that lands during the checks or the review handoff (the
-implementer's entry already `settled`, no reviewer registered yet) leaves no open entry, and the run, now `BLOCKED`,
-no longer counts as the root's live run, so the root accepts a new revision immediately, even
-while the original controller is still finishing its checks (for an in-place run, in the same
-workspace). This holds for offline runs too: the offline fake confirms only the stops of
-invocations its own instance started, so a cross-process cancel of an offline run is `unknown` as
-well. The owner noticing, while it collects, a stop that another process recorded is not built,
-and neither is keeping a root busy for as long as its run's controller process is alive (the
-owner identity of storage v6 is recorded, but the root rule does not read it).
-
-The stop goes to the **role that is running**, not always to the implementer: while the review
-phase is live it names the reviewer's own invocation and asks the reviewer's driver (a profile
-may bind the two roles to different drivers). Which role, driver and invocation were asked, and
-what the stop reported, is recorded as a `cancel_target` line in the run's own note table
-(`run_notes`, alongside the effective configuration and the role input packets); apart from the
-`git_metadata` warnings (the `git metadata` lines), the run's notes are not part of the
-`status`/`report` projection, so read them from the store.
-
-A recorded stop is coordinated through the **write** and through the **spawn gate**, not
-through a sequence of checks. Registering a role's invocation and every block of a run carry
-"no cancellation intent" as a condition in the same statement, and the driver publishes an
-invocation's handle and creates its child inside one gate that *both* stop entry points
-(`cancel_handle` and `cancel(invocation_id)`) take to record their request. So a stop that
-arrives while the reviewer packet is being built, while the review turn is being reserved, or
-while the checks are still running cannot be followed by a reviewer process - and a stop that
-arrives as the process is about to be created wins outright: no child is created, the invocation
-is reported as cancelled, and nothing runs. A stop that arrives while the child is being created
-waits for that critical section to end - normally by waiting to acquire the gate, which the spawn
-releases only after publishing the handle - and then terminates the process it finds, reported as
-`mechanism=forced`. "No handle for this invocation" is never an answer while a spawn is in
-flight. That wait is bounded by the spawn, not by the invocation: the gate is released before the
-model answer is awaited, so a stop may wait for a process to be created but never for the call it
-is stopping to finish. A review turn already reserved for a stopped run stays spent - nothing is
-refunded - but no process is started for it. A driver that reports no spawn fact (one without
-`on_spawn`) and returns a cancelled invocation with no work is recorded `not_started` only when
-the stop was already recorded when the controller handed it the invocation; a stop recorded while
-that role was running proves nothing about a launch, so the entry stays `requested` - a confirmed
-stop then records `launch_unknown`, an unconfirmed one leaves it for `resume`, which records
-`launch_unknown` too.
-
-**A client that has exited is not an empty boundary.** A stop for an invocation whose client
-already exited asks the Job: it is `confirmed_stopped` with `mechanism=none` when the Job is
-already empty (including after the result was collected), `forced` when the stop had to terminate
-descendants the client left, `still_running` when the Job cannot be emptied (the Job stays open so
-it can still be observed), and `unknown` when the Job was closed earlier without being confirmed
-empty. The same applies without a stop: when the client exits, collecting its result terminates
-whatever is still in the Job and adds `descendants_terminated_after_client_exit: N` to the
-result's limitations, and a Job that cannot be emptied makes the result `OUTCOME_UNKNOWN` /
-`boundary_not_empty`. Every invocation's Job handle and its `stdout.ndjson` handle are closed when
-its result is collected, including after a deadline teardown.
-
-**A process Windows will not open is not a process that has gone.** A live stop is confirmed only
-when the Job is empty *and* the client process itself is shown to have exited: the driver's own
-`Popen` handle reports its exit, its process object is signalled, or `OpenProcess` answers
-`ERROR_INVALID_PARAMETER` (no process has that id). `ERROR_ACCESS_DENIED`, any other failure, and
-a wait that fails are unanswered, not gone. A stop whose Job emptied but whose client exit neither
-`Popen` nor a re-opened pid shows is `unknown` with `mechanism=none`, never reports
-`local_process_stopped=true`, and blocks like any unconfirmed stop. An in-process reconcile
-reports a client that its own process handle still sees running as `still_running`. The
-unanswered path is exercised with an injected `OpenProcess` failure in the offline tests; it has
-not been observed on a real client.
-
-Once an intent is recorded the run's stop state is final: acceptance refuses, and a later
-failure (a transport error, a `review_protocol_error`, a rejected review) is recorded against
-the attempt without relabelling the run - an unconfirmed stop stays `outcome_unknown`, a
-confirmed one stays `cancelled_by_operator`. A result of **either role** that arrives after a
-stop - confirmed or not - is a fact, not a decision: the result's first write is conditional on
-the stop in the same statement, and a refused write leaves it only as a `late_result` note. The
-attempt keeps the state the stop left (for an implementer, `ACTIVE` after an unconfirmed stop and
-`CANCELLED` after a confirmed one), the ledger entry is **not settled** and keeps its state (an
-unconfirmed stop leaves it open, so it keeps blocking the root until `resume` marks it `unknown`;
-an entry the confirmed stop already closed keeps that state, with the refused settlement noted),
-and the run keeps the stop's block. An implementer's late result creates no candidate commit and
-no `refs/hflow/candidates/*` ref; a reviewer's records no verdict, no review evidence and no
-process identity. A stop that
-commits after the result was written keeps the applied result; for the implementer, a stop that
-lands after the result was applied but before the freeze still prevents the freeze and the ref.
-A stop that lands while the acceptance is being written makes the acceptance write refuse the late
-success in its own transaction: the run is left in the state the stop recorded, with no receipt,
-and `hflow run` reports that outcome (with a note saying so) instead of exiting with a traceback.
-
-`resume` then reconciles such a run once the owning controller is provably gone (see above): it
-records what it observed and closes every entry still open as `unknown` (a launch was reported)
-or `launch_unknown` (no launch recorded), with the detail
-"no result was applied for this invocation - none was observed, or one arrived after the run's
-stop and is recorded as a late_result note; reconciled by an operator. The consumption stands and
-this root does not re-dispatch."
-
-A confirmed stop is **not** a rollback, **not** a successful protocol cancellation, and
-**not** a known business result. Cooperative cancellation (`session/cancel`) is unsupported by
-this launcher. The pinned acpx `exec` path does send `session/cancel` (and waits 2.5 s) when its
-own process receives SIGINT, SIGTERM or SIGHUP, but HFlow starts the client with
-`CREATE_NEW_PROCESS_GROUP`, which disables Ctrl+C for that group on Windows, a Ctrl+Break reaches
-Node as SIGBREAK, which acpx does not handle, and Windows has no external SIGTERM/SIGHUP. M0
-observed exactly that: a CTRL_BREAK killed the client (exit `0xC000013A`) before any cancel
-reached the agent. The rest is reasoning from Win32 and Node semantics, not a measured delivery.
-So the only mechanism available is forced teardown of the boundary. That teardown has been
-recorded as passing once, for one machine, one acpx/DSH version and one binding (M2 trial A,
-with the client in `approve-reads` mode); it does not extend to another platform, to a process
-that leaves the boundary, or to remote billing. Unattended production execution therefore stays
-disabled.
-
-An accepted cancellation cannot be overwritten by a late success: acceptance refuses while a
-cancellation intent is recorded, in the same transaction that would have written the receipt.
-
-## What is not safe yet
-
-- **No sandbox.** A worker and `command` checks run as ordinary child processes with your
-  user's rights. Scope is detected after the fact and the candidate is refused, but the write
-  already happened. Nothing confines credentials either: an approved check gets an allowlisted
-  environment, but runs with your rights and can read whatever you can read, so keep project
-  checks free of anything that needs a secret.
-- **The managed worktree is a workspace boundary, not a permission boundary.** With
-  `"workspace": {"mode": "worktree", "base_commit": "<sha>"}` a run works in a detached
-  worktree beside the repository, your HEAD/index/working files/stash/branches are left alone,
-  and the frozen candidate is kept under `refs/hflow/candidates/...`. It is added at a staging
-  path and put in place with `git worktree move`, which updates that one worktree; HFlow never
-  runs `git worktree repair`, which rewrites every linked worktree's `.git` file, yours
-  included. It still shares the
-  source repository's Git objects and admin files, and a process running as this user can read
-  and write outside it. With `mode: in_place` a run edits the project root directly.
-- **The reviewer is not sandboxed.** It is a separate process, session and invocation and it
-  never inherits the implementer's write permission, but it reviews the same checkout with
-  `isolation=prompt_only` recorded. A prompt-level instruction is not an enforced boundary.
-- **The implementer's harness permissions are broad.** Under `approve-all` every DSH permission
-  request is approved, sandbox escalations included (documented, not observed; see "What the
-  harness does that HFlow does not control").
-- **A stop is local.** Closing the managed process boundary ends the processes it owns; it is
-  not a cooperative protocol cancellation (unsupported by this launcher, see "Stopping a run"),
-  it does not follow a descendant that leaves that boundary, it exists on Windows only, and it
-  says nothing about a remote model request or remote billing having stopped. A `hflow cancel`
-  from another process cannot stop a child at all; it reports `unknown`.
-- **Repair is bounded, explicit and narrow.** One repair per run, only under a task's
-  `repair_policy` (and, for a real driver, a root budget), only from a clean declared business
-  check failure or a substantive reviewer rejection with at least one usable finding, and never
-  for a timeout, a lifecycle defect, an undeclared exit code, a malformed review, an unknown
-  outcome or a cancellation (see "When a repair may happen"). It is not a `hflow repair` command,
-  and it cannot revive a historical `BLOCKED` run.
-- **No billing observation.** Cost and token fields are `null`; do not read `null` as 0.
-- **Authorization is trusted-local.** The artifact records a human decision and bounds its
-  consumption, but its provenance is not authenticated and a fresh authorization id resets the
-  allowance; the executor is trusted not to forge approvals or edit the ledger. Until that
-  changes, unattended execution stays disabled.
+A confirmed stop is not a rollback, not a protocol cancellation (unsupported on this launcher:
+HFlow starts the client in a new process group, which disables Ctrl+C there, and acpx does not
+handle Ctrl+Break; M0 observed a CTRL_BREAK kill the client before any cancel reached the agent),
+and says nothing about a remote request or bill.
 
 ## Recovering from a controller crash
 
-The durable facts are the `runs`, `attempts` and `invocations` rows. What survives depends on how
-the controller ended:
+The durable facts are the `runs`, `attempts` and `invocations` rows. A run is owned by one
+controller **process** (user ruling 2026-10-03): a random token, its pid, creation time
+(`GetProcessTimes`) and host, recorded with the run in the same insert, plus an exclusive OS file
+lock on `<ledger dir>/owners/<token>.lock` held for the process's lifetime. `status`/`report` print
+the owner and a read-only `liveness` probe that is never stored. A second `hflow run` of the same
+TaskSpec while that owner holds it returns the run as it stands with a note naming the owner (exit
+`5`; no setup, no block).
 
-- **Interrupted (Ctrl+C / `KeyboardInterrupt`, `SystemExit`) while an implementer or reviewer
-  invocation was starting or running.** The driver waits for the agent in slices of at most 0.1 s,
-  so a Ctrl+C in the owner's terminal arrives at once rather than at the invocation's deadline,
-  and it terminates the invocation's managed boundary right away (best effort; no stop is
-  recorded or claimed for it). Before the exception propagates, the controller writes,
-  best effort and in this order: the run's block `outcome_unknown` ("controller interrupted
-  during <role> invocation; its result was never observed"), the run's open ledger entries as
-  `unknown` (a launch was reported) or `launch_unknown` (no launch recorded), and the attempt as an
-  unknown outcome. The root stays blocked and nothing is refunded. Once the interrupted
-  controller's process has exited, `hflow resume <run_id>` reconciles: it records what it observed
-  (`reconcile_json`, outcome `unknown`) and does not re-dispatch; while that process still runs
-  (its lock held, or its identity `matching`) `resume` writes nothing and exits `5`. A second
-  Ctrl+C during those writes can still interrupt them. The command itself then exits `130` with
-  `interrupted: ...`: the recorded state is the answer (`hflow status`).
-- **Killed hard** (process kill, power loss, a crash outside a driver start, or an interrupt
-  during the checks or the freeze). A Ctrl+C during a `command` check reaches the controller
-  within about 0.1 s (the check runs in its own console process group and never sees it), and the
-  check's Job Object is terminated before the interrupt propagates; no evidence row is written
-  for that check. Nothing is recorded at the time: the run stays `RUNNING` with
-  its attempt row, reservation and recorded owner (token, pid, creation time, host, claim
-  generation). `hflow resume <run_id>` then takes it over **only** if that owner is proven gone:
-  its lock file `<ledger dir>/owners/<token>.lock` can be locked and its pid plus creation time no
-  longer name a running process. The takeover blocks the run `owner_lost` (exit `3`) in one
-  transaction - open ledger entries become `unknown`/`launch_unknown`, live attempts finish as
-  unknown, the claim generation increments so the old owner's fenced writes fail - and records a
-  probe of each child pid the run recorded ("may still be running; nothing was stopped", or "reads
-  gone", never a confirmed stop). If the lock is held or the owner reads `matching` or `unknown`
-  (access denied, another host, off Windows), `resume` prints "owner may be alive", changes
-  nothing and exits `5`; run it again once the owner has exited. Nothing re-dispatches
-  automatically, and there is no timeout: a lease expiry alone does not prove the worker stopped.
-  A run recorded before storage v6 has no owner token. A controller pid its attempts recorded
-  carries no host, so it reads `unknown` and such a run is never taken over: `hflow cancel` (which
-  blocks it `outcome_unknown`) followed by `hflow resume` is the way out. One that recorded no
-  controller process reads `not_recorded` and is taken over only when nothing was dispatched (see
-  the README's "Owner lease" bullet for the exact rule and its limits). An `hflow run` interrupted
-  in setup (no attempt, no invocation) needs no `resume`: once its owner is provably gone, resubmitting
-  the same TaskSpec may adopt the run and continue it only under its original admission binding.
+- **Interrupted** (Ctrl+C, `SystemExit`) while an invocation was starting or running: the driver
+  waits in slices of at most 0.1 s, so the interrupt arrives at once and the invocation's boundary
+  is terminated (best effort, not recorded as a stop). The controller then records, best effort,
+  the block `outcome_unknown`, the open entries as `unknown`/`launch_unknown`, and the attempt as
+  unknown; the command exits `130`. Once that process has exited, `hflow resume <run-id>`
+  reconciles (records `reconcile_json`, never re-dispatches); while it still runs `resume` writes
+  nothing and exits `5`.
+- **Killed hard** (process kill, power loss, an interrupt during checks or the freeze): nothing is
+  recorded at the time; the run stays `RUNNING` with its owner (token, pid, creation time, host,
+  claim generation). A Ctrl+C during a check reaches the controller within about 0.1 s and
+  terminates the check's Job; no evidence row is written for it. `hflow resume` takes the run over
+  **only** when the owner is proven gone - its lock can be taken and its pid plus creation time
+  name no running process (exited, no such pid, or a reused pid) - and blocks it `owner_lost`
+  (exit `3`) in one transaction: open entries become `unknown`/`launch_unknown`, live attempts
+  end unknown, the claim generation increments so the old owner's writes fail, and each recorded
+  child pid is probed and recorded ("may still be running; nothing was stopped" or "reads gone").
+  A held lock or an owner reading `matching`/`unknown` changes nothing (exit `5`). There is no
+  lease timeout.
+- After a takeover the old owner's dispatch reservation, result application, check transition,
+  repair reopen and acceptance carry its token and generation and are refused (`owner_lost`); its
+  launch registration and review attachment write nothing; acceptance also requires the receipt to
+  name this run, its current attempt and its revision. Writes other than these fenced ones (notes,
+  evidence rows, spawn reports) are guarded only by the run's state and ledger rules, which the
+  takeover set to `BLOCKED`/`unknown`.
+- A **pre-v6 run** has no token. One with a controller pid (no host) reads `unknown` and is never
+  taken over: `hflow cancel` (which blocks it `outcome_unknown`) followed by `hflow resume` is the
+  way out. One that recorded no controller process reads `not_recorded` (not proof of death) and is
+  taken over ("no owner was recorded") only when it has no attempt and no invocation - wrong only
+  for a pre-v6 controller still in setup on a ledger migrated under it.
+- An `hflow run` interrupted in setup (no attempt, no invocation) needs no `resume`: once its owner
+  is gone, resubmitting the same TaskSpec adopts it in one compare-and-set (token and generation
+  replaced, the run kept `DRAFT`/`READY`, a note "adopted from a controller that is provably
+  gone"), and only under its original admission binding (project root, Git directory, workspace
+  path, base, contract, configuration and launch content, drivers, deadline, root). A missing,
+  unreadable or changed binding returns the run unchanged with exit `5`; restore the inputs, or
+  cancel it and submit a new revision.
 
-The internal `RunAdmissionBinding` is written with the run in its creation transaction. It fixes
-the project root, Git common directory, managed workspace path and resolved base, project
-contract, effective configuration and launch-content digests, drivers, deadline, and root
-binding and limits. It is checked before claiming or adopting any never-dispatched run. An
-explicitly absent effective configuration from an offline API caller is a recorded value, not
-a missing historical binding. A fresh authorization may cover the same execution: its id is not
-part of this binding.
+**What the owner lease does not cover.** File locks on network shares or cloud-synced folders (a
+ledger under a OneDrive-synced Desktop, say) may not exclude anything, and such a location is not
+detected. An owner running elevated or as another user, on another host, or off Windows (no
+creation time is read there; documented, not observed) reads `unknown`: its run is never taken
+over and its `outcome_unknown` block is never reconciled. A hard-killed owner's lock is released
+promptly but not instantly, so a takeover right after a kill can be refused once (run `resume`
+again); sleep or hibernation keeps the owner alive. A takeover stops nothing - a child that "may
+still be running" runs until it exits or you end it - and no takeover is automatic. No writer that
+sets `BLOCKED` relabels a run that already ended or carries a receipt, and a controller never
+records its own refusal as the block of a run another controller reserved. The spawn coordination
+behind a stop covers the one driver that creates processes (`AcpxDshDriver`).
 
-A missing, unreadable or changed binding returns the existing run unchanged with exit `5`; no workspace is
-created, no owner is claimed or adopted, no authorization is consumed and no dispatch is bought.
-Restore the original configuration and inputs, or `hflow cancel <run_id>` and submit a new task
-revision. A new revision still faces the root's unresolved entries, deadline and repair allowance.
-HFlow never reconstructs a historical admission binding from notes, and does not replace an
-unreadable binding with a fresh admission. `status`/`report` use exit `6` for unreadable structured
-records; that presentation error does not widen the continuation path or grant a new allowance.
+`cancel` and `resume` build an observer per role from the run's recorded configuration, so their
+records name the recorded driver, never the offline fake.
 
-`resume` and `cancel` build their observer per role from the run's recorded configuration (see
-"Stopping a run"), so their records name the recorded driver, never the offline fake for a
-production run, and `--data-dir` is honoured for any scratch they write.
+## What is not safe yet
+
+What this build does not do is listed once, in the README's "Not implemented" section. In
+operating terms, and what is not verified even where something works on one binding:
+
+- **Scope is detected after the fact**: a worker or check that writes outside the scope has already
+  written. A managed worktree is a workspace boundary, not a permission boundary, and an in-place
+  run edits the project root directly. The reviewer is a separate process and invocation but runs
+  with `isolation=prompt_only`: a prompt-level instruction, not an enforced read-only boundary.
+- **Authorization is trusted-local**: provenance is not authenticated and a fresh id resets the
+  allowance.
+- **Stopping** covers what the Windows Job Object owns: not a descendant that leaves it, not
+  another platform, and the access-denied answer that keeps a stop `unknown` has only been
+  injected in offline tests. A cross-process `cancel` cannot stop a child at all.
+- **Shared Git metadata is compared, not confined**, and in offline tests only (never against a
+  real DSH worker). The comparison is point-in-time: a process running as you can change the
+  metadata between a comparison and HFlow's next git command. Nothing is restored and there is no
+  cross-run baseline: a later or concurrent run takes the changed state as its baseline. False
+  positives fail closed - your own `git config`, `push -u`, an IDE writing `branch.*`, a check
+  running `git config` - each costing a new revision (under a root, one charged as a repair). Not
+  compared: ignore rules, system attributes (`GIT_ATTR_SYSTEM`; they can only select a filter the
+  compared config defines), hooks (neutralised anyway), object and ref metadata. A FIFO, device or
+  directory in a metadata path is recorded by type, never read. In-place runs make no git call.
+- **Your checkout is compared by stat, not content.** An accepted worktree run compares HEAD, the
+  stash ref, the index entries and, for every `git status --ignored` entry, its path, status, size
+  and mtime, before dispatch and after acceptance; a difference records a WARNING, and the "left
+  untouched" note is written only without one. A run that blocks or stops before acceptance records
+  no after-comparison. A rewrite that keeps size and mtime, or a change inside a directory git
+  reports collapsed, is not detected.
+- **Billed usage stays unknown.** An agent-reported `usage` (UNSTABLE in ACP, disputed in ACP
+  #1860) or `usage_update.cost` never fills `provider_billed_tokens`, `provider_cost` or
+  `subscription_quota_remaining`; DSH 0.2.0-rc.2's source sends neither, and the recorded live
+  streams carry neither. Do not read `null` as `0`.
+- **Model selection** is exercised with the pinned acpx against a mock agent only.
+- **Message boundaries without `messageId` are inferred**: a non-chunk update or a sequence gap
+  ends a message and only the last segment is the answer. Every chunk in the recorded live DSH
+  streams carries a `messageId`, so no recorded run took this path; DSH's "text, reasoning, text"
+  order inside one message is handled in offline tests only.
+- **What DSH does on its own** (above) is documented upstream and recorded, not observed or
+  controlled; whether DSH expands a leading `~` in `DSH_HOME` is not verified (HFlow refuses one).
+
+## Running the tests
+
+```sh
+python -m pytest -q             # add -n 8 with pytest-xdist; -n 16 exhausted the Windows page file (WinError 1455)
+python -m pip install -e ".[dev]"
+```
+
+Tests need no model, network or DSH: the offline fake driver, a stand-in for the acpx client
+(`tests/fixtures/fake_acpx_client.py`) and stub ACP agents that are real separate processes
+(`tests/fixtures/stub_acp_agent.py`), one of which ignores cancellation and holds a helper child,
+so a decorative process boundary fails. `tests/conftest.py` points `HFLOW_DATA_DIR` at a per-test
+temp directory (and clears `HFLOW_PROFILE`), puts a stand-in `dsh` first on `PATH` (an npm-style
+`dsh.CMD` on Windows) that only exits 1 and is never run, and sets a stand-in `DEEPSEEK_API_KEY`
+that replaces any real one; the tests of `no_credential_source` remove it. Test knobs: the client
+stand-in mirrors `--model` (`STUB_MODEL_CATALOG`, `STUB_CLIENT_FAIL_BEFORE_PROMPT`); the stub agent
+can answer with a JSON-RPC error or a reused id (`STUB_TERMINAL_RESPONSES=2:!<code>` /
+`2:?<method>`), without a stop reason (`2:v2:<stopReason>`), send updates after its response
+(`STUB_TRAILING_UPDATES`, `STUB_REVIEWER_TRAILING_UPDATES`) and report usage
+(`STUB_REPORTED_USAGE`); the mock agent has `dsh-catalog`, `prompt-error` and `trailing-update`
+scenarios. Some tests skip when a precondition is absent (a directory-link right, `node` plus the
+pinned acpx at `.probe/acpx`, the recorded M2 ledger, Windows, Git 2.48+, a non-single-byte locale)
+and say so.
+
+Git: 2.31+ for worktree runs, 2.40+ for `hflow integrate`. The global attributes file is located
+with `git var GIT_ATTR_GLOBAL` on Git 2.42+, else from `core.attributesFile`, else
+`$XDG_CONFIG_HOME/git/attributes`, else `~/.config/git/attributes`. Two tools write:
+`tools/m0_probe/write_results_doc.py` regenerates `docs/m0-results.md`, and
+`tools/m2_live/replay_review.py <run> --finalize` records a delivery decision through the Store,
+which needs its own explicit approval.
+
+## Appendix: writing the artifact by hand
+
+The plan flow writes the authorization for you. A scripted flow that cannot use a terminal writes
+it by hand: `hflow schema` prints its shape (`AuthorizationRecord`, next to `RootBudgetPlan`,
+`RepairPolicy` and the rest). Copy `authorization.binding` from `hflow prepare --json` whole -
+every field it prints, `ledger_path` and, for a root run, `root_budget` included - and add your own
+text:
+
+```json
+{
+  "schema_version": 1,
+  "authorization_id": "AUTH-<unique>",
+  "provided_by": "user",
+  "user_text": "<your approval, verbatim>",
+  "authorized_at": "<UTC time>",
+  "max_top_level_submissions": 2,
+  "binding": { "...": "authorization.binding from hflow prepare --json, unchanged" },
+  "root_limits": { "...": "root_budget.limits from prepare, for a root run only" }
+}
+```
+
+`max_top_level_submissions` is at most 4 and must cover
+`authorization.max_top_level_submissions_required`. Leaving out a field `prepare` printed does not
+narrow the approval, it breaks it. Then run with every resolution flag `prepare` was given and
+`--authorization-file <file>` (`hflow run --task ... --authorization-file auth.json`), or prepare a
+plan with the same inputs and use `run --plan P --authorization-file <file>`.
+
+The synthetic live-acceptance package (`python tools/m2_live/prepare_m2_live.py --out
+.probe/m2-live`) builds a project with two real defects, its contract and task, and prints an
+`hflow prepare` command for them; add `--allow-writes --plan-out <plan>` to it. Its history and
+recorded results:
+`docs/history/HFlow_M2_Controlled_Live_Acceptance.md` and `docs/m2-live-acceptance-result.md`.

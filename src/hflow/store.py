@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from collections.abc import Iterator, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, TypeVar
@@ -32,7 +32,6 @@ from typing import Any, TypeVar
 from pydantic import BaseModel, ValidationError
 
 from .contracts import (
-    AttemptRecord,
     AttemptState,
     CancellationReceipt,
     CheckPhase,
@@ -58,7 +57,6 @@ from .contracts import (
     RootBudgetLimits,
     RootBudgetUsage,
     RunAdmissionBinding,
-    RunSummary,
     SpawnFact,
     SpawnKind,
     TaskSpec,
@@ -67,19 +65,9 @@ from .contracts import (
     WorkspaceProvenance,
     canonical_json,
     digest_of,
-    json_schema,
 )
 from .ids import add_seconds, new_attempt_id, new_evidence_id, new_id, parse_ts, utc_now
-from .migrate import (
-    MIGRATION_BACKUP_SUFFIX as MIGRATION_BACKUP_SUFFIX,
-    STORAGE_VERSION as STORAGE_VERSION,
-    SUPPORTED_STORAGE_VERSION as SUPPORTED_STORAGE_VERSION,
-    MigrationError,
-    StepHook,
-    effective_version as effective_version,
-    migrate,
-    recorded_version as recorded_version,
-)
+from .migrate import MigrationError, StepHook, migrate
 from .ownership import OwnerFence, ProcessIdentity
 
 #: Marks a receipt that records an offline reprocessing decision rather than the outcome of
@@ -160,6 +148,13 @@ _TERMINAL_STATES: tuple[str, ...] = tuple(state.value for state in TERMINAL_TASK
 #: state, or a delivery receipt - is never relabelled. Its three placeholders take
 #: ``_TERMINAL_STATES``.
 _LIVE_RUN_GUARD = "task_state NOT IN (?, ?, ?) AND receipt_json IS NULL"
+#: An attempt-row write's condition on its run: no stop recorded and the run still live. One
+#: placeholder for the run id, then ``_TERMINAL_STATES``. A takeover blocks the run in the
+#: transaction that supersedes its owner, so this also refuses the superseded owner's late write.
+_RUN_UNSTOPPED_AND_LIVE = (
+    "EXISTS (SELECT 1 FROM runs WHERE runs.run_id = ? AND runs.cancel_intent_at IS NULL "
+    f"AND {_LIVE_RUN_GUARD})"
+)
 #: The run has no attempt and no invocation row: nothing of it was ever dispatched.
 _NOTHING_DISPATCHED = (
     "NOT EXISTS (SELECT 1 FROM attempts WHERE attempts.run_id = runs.run_id) "
@@ -361,13 +356,61 @@ def _integration_states(
     return states
 
 
-def _integration_values(record: IntegrationRecord) -> dict[str, Any]:
-    """Column name -> stored value for every ``IntegrationRecord`` field."""
+#: ``EvidenceRecord`` fields stored as JSON, and their column.
+_EVIDENCE_JSON_COLUMNS: dict[str, str] = {"command": "command_json"}
+
+
+def _row_values(
+    record: BaseModel, json_columns: Mapping[str, str] | None = None
+) -> dict[str, Any]:
+    """Column name -> stored value for every field of ``record``.
+
+    A field named in ``json_columns`` is stored as canonical JSON in that column; every other
+    field is stored in the column of the same name.
+    """
     values: dict[str, Any] = {}
     for name, value in record.model_dump(mode="json").items():
-        column = _INTEGRATION_LIST_COLUMNS.get(name)
+        column = (json_columns or {}).get(name)
         values[column or name] = canonical_json(value) if column else value
     return values
+
+
+def _insert_model(
+    conn: sqlite3.Connection,
+    table: str,
+    record: BaseModel,
+    json_columns: Mapping[str, str] | None = None,
+) -> None:
+    """Insert ``record`` as one row of ``table`` (a name from this module, never caller input)."""
+    values = _row_values(record, json_columns)
+    conn.execute(
+        f"INSERT INTO {table} ({', '.join(values)}) VALUES ({', '.join('?' for _ in values)})",
+        list(values.values()),
+    )
+
+
+def _model_from_row(
+    model: type[_Record],
+    row: sqlite3.Row,
+    json_columns: Mapping[str, str] | None = None,
+    *,
+    null_as_empty: Collection[str] = (),
+) -> _Record:
+    """The contract view of one stored row, the inverse of :func:`_row_values`.
+
+    ``null_as_empty`` names the string fields whose column is nullable in older ledgers: a NULL
+    there reads as ``""``, the value the contract records for "nothing recorded".
+    """
+    data: dict[str, Any] = {}
+    for name in model.model_fields:
+        column = (json_columns or {}).get(name)
+        value = row[column or name]
+        if column is not None:
+            value = json.loads(str(value))
+        elif value is None and name in null_as_empty:
+            value = ""
+        data[name] = value
+    return model.model_validate(data)
 
 
 class Store:
@@ -422,29 +465,6 @@ class Store:
                 raise StoreError(str(exc)) from exc
             raise
 
-        with self.transaction():
-            self.conn.execute(
-                "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
-                (str(SCHEMA_VERSION),),
-            )
-            self.conn.execute(
-                "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('contracts_schema_digest', ?)",
-                (
-                    digest_of(
-                        {
-                            name: json_schema(model)
-                            for name, model in (
-                                ("RunSummary", RunSummary),
-                                ("AttemptRecord", AttemptRecord),
-                                ("EvidenceRecord", EvidenceRecord),
-                                ("ResultReceipt", ResultReceipt),
-                                ("TaskSpec", TaskSpec),
-                            )
-                        }
-                    ),
-                ),
-            )
-
     # -- transaction helpers -------------------------------------------------
 
     @contextmanager
@@ -453,15 +473,22 @@ class Store:
 
         The migrations in :mod:`hflow.migrate` open their own transaction on the connection before
         any of these exist, so the two are never nested.
+
+        ``COMMIT`` is inside the ``try``: a commit that fails (``database is locked`` leaves the
+        transaction open; an I/O error or a full disk can make SQLite roll it back itself) is
+        rolled back here when it is still open, so the connection never keeps the write lock or
+        its own uncommitted rows, and the next transaction can begin. ``ROLLBACK`` runs only for
+        an open transaction, so the original error is the one raised.
         """
         with self._lock:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
                 yield self.conn
+                self.conn.execute("COMMIT")
             except BaseException:
-                self.conn.execute("ROLLBACK")
+                if self.conn.in_transaction:
+                    self.conn.execute("ROLLBACK")
                 raise
-            self.conn.execute("COMMIT")
 
     def close(self) -> None:
         with self._lock:
@@ -963,6 +990,11 @@ class Store:
         stop that commits at any point up to this statement wins, and no window exists between
         deciding "not stopped" and writing the registration for one to land in.
 
+        The same clause refuses a run that already ended (terminal state or a delivery receipt).
+        A takeover blocks the run ``owner_lost`` in the transaction that supersedes its owner, so
+        a superseded controller that reserved before the takeover gets ``False`` here and starts
+        nothing.
+
         ``column`` is one of the two invocation columns; it is never interpolated from user
         input, and anything else is refused rather than formatted into SQL.
         """
@@ -975,9 +1007,9 @@ class Store:
                    SET {column} = ?
                  WHERE attempt_id = ?
                    AND run_id = ?
-                   AND (SELECT cancel_intent_at FROM runs WHERE run_id = ?) IS NULL
+                   AND {_RUN_UNSTOPPED_AND_LIVE}
                 """,
-                (invocation_id, attempt_id, run_id, run_id),
+                (invocation_id, attempt_id, run_id, run_id, *_TERMINAL_STATES),
             )
             return cur.rowcount == 1
 
@@ -1010,15 +1042,32 @@ class Store:
         result arrived: an accepted cancellation must not be overwritten by a late
         success (the mirror of the stale-attempt rule). ``fence`` refuses it with ``owner_lost``
         when a takeover superseded the caller.
+
+        The receipt must be bound to this run as it stands: its ``run_id`` is this run, its
+        ``attempt_id`` is the run's current attempt (the compare-and-set every result write uses)
+        and its ``task_revision`` is the run's. A receipt naming another run, an older attempt or
+        another revision is refused with nothing written - an integration later trusts the
+        receipt's attempt.
         """
         with self.transaction() as conn:
             self._check_fence_locked(conn, run_id, fence)
             row = conn.execute(
-                "SELECT task_state, checks_digest, cancel_intent_at FROM runs WHERE run_id = ?",
+                "SELECT task_state, checks_digest, cancel_intent_at, task_revision FROM runs "
+                "WHERE run_id = ?",
                 (run_id,),
             ).fetchone()
             if row is None:
                 raise RunNotFound(run_id)
+            if receipt.run_id != run_id:
+                raise StoreError(
+                    f"the receipt is for run {receipt.run_id}, not {run_id}; refusing to accept"
+                )
+            if receipt.task_revision != int(row["task_revision"]):
+                raise StoreError(
+                    f"the receipt is for revision {receipt.task_revision} but run {run_id} is on "
+                    f"revision {row['task_revision']}; refusing to accept"
+                )
+            self._guard_current(conn, run_id, receipt.attempt_id)
             if row["checks_digest"] != checks_digest:
                 raise StoreError(
                     f"run {run_id} was admitted under checks digest {row['checks_digest']} but the "
@@ -1033,26 +1082,29 @@ class Store:
                     f"run {run_id} has a recorded cancellation intent at {row['cancel_intent_at']}; "
                     "a late success cannot overwrite it"
                 )
-            conn.execute(
-                "UPDATE runs SET receipt_json = ?, updated_at = ? WHERE run_id = ?",
-                (canonical_json(receipt.model_dump(mode="json")), utc_now(), run_id),
-            )
+            # One guarded write: the receipt and the state change land together or not at all,
+            # under the same conditions the checks above report.
             cur = conn.execute(
                 """
                 UPDATE runs
-                   SET task_state = ?, phase = NULL, delivery_state = ?,
+                   SET receipt_json = ?, task_state = ?, phase = NULL, delivery_state = ?,
                        block_code = NULL, block_reason = NULL, updated_at = ?
-                 WHERE run_id = ? AND task_state = ?
+                 WHERE run_id = ? AND task_state = ? AND receipt_json IS NULL
+                   AND cancel_intent_at IS NULL
+                   AND current_attempt_id = ? AND task_revision = ?
                 """,
                 (
+                    canonical_json(receipt.model_dump(mode="json")),
                     TaskState.ACCEPTED.value,
                     DeliveryState.LOCAL_CANDIDATE.value,
                     utc_now(),
                     run_id,
                     TaskState.CHECKING.value,
+                    receipt.attempt_id,
+                    receipt.task_revision,
                 ),
             )
-            if cur.rowcount != 1:
+            if cur.rowcount != 1:  # pragma: no cover - the checks above hold the same transaction
                 raise StoreError(f"run {run_id} left CHECKING during acceptance; no receipt written")
 
     def finalize_offline_reprocessing(
@@ -1464,7 +1516,7 @@ class Store:
         invocation row and that column are written here, in the same transaction, so a reader
         never sees one without the other.
         """
-        if role not in {"implementer", "reviewer", "planner"}:
+        if role not in {"implementer", "reviewer"}:
             raise StoreError(f"unknown dispatch role {role!r}")
         with self.transaction() as conn:
             existing = conn.execute(
@@ -2637,18 +2689,21 @@ class Store:
 
         The reviewer's form of ``finish_attempt(unless_stopped=True)``: the stop decision and the
         first write of the result are one statement, so a stop committed at any point up to it
-        wins. ``True`` when the result was attached; ``False`` when a stop is recorded, in which
-        case nothing was written and the caller treats the result as a late one. An unknown
-        attempt is refused with ``StoreError``, as :meth:`attach_review_result` does.
+        wins. ``True`` when the result was attached; ``False`` when a stop is recorded or the run
+        already ended (a takeover blocks it ``owner_lost``, so a superseded controller's result
+        lands here), in which case nothing was written and the caller treats the result as a
+        late one. An unknown attempt is refused with ``StoreError``, as
+        :meth:`attach_review_result` does.
         """
         with self.transaction() as conn:
             cur = conn.execute(
-                """
+                f"""
                 UPDATE attempts SET review_json = ?
                  WHERE attempt_id = ?
-                   AND (SELECT cancel_intent_at FROM runs WHERE run_id = ?) IS NULL
+                   AND run_id = ?
+                   AND {_RUN_UNSTOPPED_AND_LIVE}
                 """,
-                (canonical_json(payload), attempt_id, run_id),
+                (canonical_json(payload), attempt_id, run_id, run_id, *_TERMINAL_STATES),
             )
             if cur.rowcount == 1:
                 return True
@@ -3291,35 +3346,7 @@ class Store:
         repair from this field alone. An empty reason is a fact ("no reason was observed") and
         makes the row ineligible to trigger one.
         """
-        now = utc_now()
-        with self.transaction() as conn:
-            conn.execute(
-                """
-                INSERT INTO evidence (
-                    evidence_id, run_id, attempt_id, kind, status, check_id,
-                    candidate_fingerprint, checks_digest, command_json, exit_code,
-                    exit_reason, stdout_digest, stderr_digest, detail, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    evidence_id,
-                    run_id,
-                    attempt_id,
-                    kind,
-                    status.value,
-                    check_id,
-                    candidate_fingerprint,
-                    checks_digest,
-                    canonical_json(list(command)),
-                    exit_code,
-                    exit_reason,
-                    stdout_digest,
-                    stderr_digest,
-                    detail,
-                    now,
-                ),
-            )
-        return EvidenceRecord(
+        record = EvidenceRecord(
             evidence_id=evidence_id,
             run_id=run_id,
             attempt_id=attempt_id,
@@ -3334,8 +3361,11 @@ class Store:
             stdout_digest=stdout_digest,
             stderr_digest=stderr_digest,
             detail=detail,
-            created_at=now,
+            created_at=utc_now(),
         )
+        with self.transaction() as conn:
+            _insert_model(conn, "evidence", record, _EVIDENCE_JSON_COLUMNS)
+        return record
 
     @staticmethod
     def _evidence_from_row(row: sqlite3.Row) -> EvidenceRecord:
@@ -3344,23 +3374,10 @@ class Store:
         ``exit_reason`` is read as stored, including the empty string a pre-v5 row carries: an
         empty reason means "no reason was observed", and that is what keeps a legacy row
         ineligible to trigger an automatic repair. It is never defaulted to something plausible.
+        ``check_id`` is nullable in a v1 ledger; a NULL reads as ``""``.
         """
-        return EvidenceRecord(
-            evidence_id=str(row["evidence_id"]),
-            run_id=str(row["run_id"]),
-            attempt_id=str(row["attempt_id"]),
-            kind=str(row["kind"]),  # type: ignore[arg-type]
-            status=EvidenceStatus(str(row["status"])),
-            check_id=str(row["check_id"] or ""),
-            candidate_fingerprint=str(row["candidate_fingerprint"]),
-            checks_digest=str(row["checks_digest"]),
-            command=list(json.loads(row["command_json"] or "[]")),
-            exit_code=row["exit_code"],
-            exit_reason=str(row["exit_reason"] or ""),
-            stdout_digest=str(row["stdout_digest"] or ""),
-            stderr_digest=str(row["stderr_digest"] or ""),
-            detail=str(row["detail"] or ""),
-            created_at=str(row["created_at"]),
+        return _model_from_row(
+            EvidenceRecord, row, _EVIDENCE_JSON_COLUMNS, null_as_empty=("check_id",)
         )
 
     def evidence_records_for(self, run_id: str) -> list[EvidenceRecord]:
@@ -3610,29 +3627,7 @@ class Store:
                 returned_top_level_submissions=returned_top_level,
                 returned_repairs=returned_repairs,
             )
-            conn.execute(
-                """
-                INSERT INTO invocation_settlements (
-                    settlement_id, invocation_id, run_id, root_id, prior_state, settled_as,
-                    basis, attested_by, attested_at, attestation,
-                    returned_top_level_submissions, returned_repairs
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    settlement.settlement_id,
-                    settlement.invocation_id,
-                    settlement.run_id,
-                    settlement.root_id,
-                    settlement.prior_state,
-                    settlement.settled_as,
-                    settlement.basis,
-                    settlement.attested_by,
-                    settlement.attested_at,
-                    settlement.attestation,
-                    settlement.returned_top_level_submissions,
-                    settlement.returned_repairs,
-                ),
-            )
+            _insert_model(conn, "invocation_settlements", settlement)
             self._record_note_locked(
                 conn,
                 settlement.run_id,
@@ -3642,27 +3637,10 @@ class Store:
             )
             return settlement
 
-    @staticmethod
-    def _settlement_from_row(row: sqlite3.Row) -> InvocationSettlement:
-        return InvocationSettlement(
-            settlement_id=str(row["settlement_id"]),
-            invocation_id=str(row["invocation_id"]),
-            run_id=str(row["run_id"]),
-            root_id=str(row["root_id"] or ""),
-            prior_state=str(row["prior_state"]),  # type: ignore[arg-type]
-            settled_as=str(row["settled_as"]),  # type: ignore[arg-type]
-            basis=str(row["basis"]),  # type: ignore[arg-type]
-            attested_by=str(row["attested_by"]),
-            attested_at=str(row["attested_at"]),
-            attestation=str(row["attestation"]),
-            returned_top_level_submissions=int(row["returned_top_level_submissions"]),
-            returned_repairs=int(row["returned_repairs"]),
-        )
-
     def settlements_for(self, run_id: str) -> list[InvocationSettlement]:
         """This run's operator settlements, oldest first. Attestations, not observations."""
         return [
-            self._settlement_from_row(row)
+            _model_from_row(InvocationSettlement, row)
             for row in self._fetchall(
                 "SELECT * FROM invocation_settlements WHERE run_id = ?"
                 " ORDER BY attested_at, rowid",
@@ -3676,15 +3654,7 @@ class Store:
     def _integration_from_row(row: sqlite3.Row) -> IntegrationRecord:
         """The contract view of one ``integrations`` row. An unreadable row raises, never skips."""
         try:
-            data = {
-                name: (
-                    json.loads(str(row[_INTEGRATION_LIST_COLUMNS[name]]))
-                    if name in _INTEGRATION_LIST_COLUMNS
-                    else row[name]
-                )
-                for name in IntegrationRecord.model_fields
-            }
-            return IntegrationRecord.model_validate(data)
+            return _model_from_row(IntegrationRecord, row, _INTEGRATION_LIST_COLUMNS)
         except (ValidationError, ValueError, RecursionError) as exc:
             raise StoredRecordUnreadable(
                 f"integration {row['integration_id']} is not a readable IntegrationRecord: {exc}"
@@ -3824,14 +3794,8 @@ class Store:
                         IntegrationState.READY.value,
                     ),
                 )
-            values = _integration_values(record)
-            columns = list(values)
             try:
-                conn.execute(
-                    f"INSERT INTO integrations ({', '.join(columns)}) "
-                    f"VALUES ({', '.join('?' for _ in columns)})",
-                    [values[column] for column in columns],
-                )
+                _insert_model(conn, "integrations", record, _INTEGRATION_LIST_COLUMNS)
             except sqlite3.IntegrityError as exc:
                 raise self._integrity_conflict_locked(conn, record, exc) from exc
             note = (
@@ -3913,7 +3877,7 @@ class Store:
                 updates["state"] = target
             updates["updated_at"] = utc_now()
             merged = IntegrationRecord.model_validate({**current.model_dump(), **updates})
-            values = _integration_values(merged)
+            values = _row_values(merged, _INTEGRATION_LIST_COLUMNS)
             columns = [_INTEGRATION_LIST_COLUMNS.get(name, name) for name in updates]
             try:
                 cur = conn.execute(

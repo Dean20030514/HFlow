@@ -185,7 +185,7 @@ def test_real_client_launch_path_stays_the_production_one(tmp_path: Path) -> Non
     node, entry = _require_real_client()
     driver = AcpxDshDriver(data_dir=tmp_path / "data", acpx_cli=entry, python_executable=sys.executable)
 
-    argv = driver._client_argv(tmp_path, tmp_path, 60)
+    argv = driver._client_argv(tmp_path, 60)
 
     assert argv[0] == node, "the installed client is a Node program, not a Python script"
     assert argv[1] == str(entry)
@@ -419,7 +419,7 @@ def test_real_client_turn_completes_under_the_hardened_launch(
     driver = _real_client_driver(tmp_path, run_dir, wire_log)
     driver.extra_env["MOCK_IMPLEMENTER_PATH"] = "src/parser.py"
     driver.extra_env["MOCK_REVIEW_MODE"] = "fenced"
-    assert "DSH_PERMISSION_MODE" not in driver._child_env(workspace)
+    assert "DSH_PERMISSION_MODE" not in driver._child_env()
 
     spec, project = _spec_and_project()
     store = Store(run_dir / "hflow.sqlite")

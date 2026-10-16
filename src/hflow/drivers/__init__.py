@@ -1,5 +1,2 @@
-"""Driver package. ``fake`` is the only implemented driver in M1."""
-
-from .base import DriverProtocolError
-
-__all__ = ["DriverProtocolError"]
+"""Driver package: the production transport (``acpx_dsh``, selected in ``selected``) and the
+offline fake (``fake``)."""

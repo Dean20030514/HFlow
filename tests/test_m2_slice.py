@@ -31,6 +31,7 @@ from hflow.contracts import (
     DeliveryState,
     ProjectConfig,
     ProjectLimits,
+    RefusalCode,
     ReuseDecision,
     ReuseStatus,
     RunRequest,
@@ -454,6 +455,83 @@ def test_dirty_target_repository_is_left_alone(sample_repo: Path, tmp_path: Path
         assert not any(note.startswith("WARNING") for note in store.notes_for(outcome.run_id))
         # Exactly one commit exists: the controller did not commit the user's work.
         assert _git(sample_repo, "rev-list", "--count", "HEAD").strip() == "1"
+    finally:
+        store.close()
+
+
+def test_a_checkout_that_cannot_be_reread_after_acceptance_keeps_the_receipt_and_says_so(
+    sample_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A git failure after the receipt is written is a note on the outcome, never a traceback.
+
+    ``finalize_acceptance`` has already recorded ``ACCEPTED``; the re-read of the user's checkout
+    that follows (a 300 s git timeout, a moved checkout) used to escape ``run_task`` while the
+    ledger said accepted, and neither the "left untouched" note nor the WARNING was written.
+    """
+    calls: list[int] = []
+    real = GitRepo.user_change_fingerprint
+
+    def flaky(self, exclude=()):  # noqa: ANN001, ANN202 - GitRepo method shape
+        calls.append(1)
+        if len(calls) > 1:
+            raise GitError("git status timed out after 300 s")
+        return real(self, exclude)
+
+    monkeypatch.setattr(GitRepo, "user_change_fingerprint", flaky)
+    store = Store(tmp_path / "data" / "hflow.sqlite")
+    base_commit = _git(sample_repo, "rev-parse", "HEAD").strip()
+    controller = _controller(store, sample_repo, tmp_path / "data")
+    try:
+        outcome = controller.run_task(
+            RunRequest(
+                task=_task(sample_repo, base_commit),
+                project=_project(sample_repo),
+                project_root=sample_repo,
+                workspace_root=sample_repo,
+            )
+        )
+        assert len(calls) == 2, "the checkout is read before dispatch and again after acceptance"
+        assert outcome.task_state is TaskState.ACCEPTED, outcome.block_reason
+        assert outcome.receipt is not None
+        stored = store.notes_for(outcome.run_id)
+        for notes in (outcome.notes, stored):
+            assert any(
+                "could not be re-read after acceptance" in note and "receipt stands" in note
+                and "timed out" in note
+                for note in notes
+            ), notes
+        assert not any("left untouched" in note for note in stored)
+        assert not any(note.startswith("WARNING") for note in stored)
+    finally:
+        store.close()
+
+
+def test_a_status_read_that_fails_during_setup_blocks_the_run_before_dispatch(
+    sample_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dirty-checkout read is a git step of the setup: its failure blocks, never escapes."""
+
+    def broken(self):  # noqa: ANN001, ANN202 - GitRepo method shape
+        raise GitError("git status failed: the checkout moved")
+
+    monkeypatch.setattr(GitRepo, "is_dirty", broken)
+    store = Store(tmp_path / "data" / "hflow.sqlite")
+    base_commit = _git(sample_repo, "rev-parse", "HEAD").strip()
+    controller = _controller(store, sample_repo, tmp_path / "data")
+    try:
+        outcome = controller.run_task(
+            RunRequest(
+                task=_task(sample_repo, base_commit),
+                project=_project(sample_repo),
+                project_root=sample_repo,
+                workspace_root=sample_repo,
+            )
+        )
+        assert outcome.task_state is TaskState.BLOCKED
+        assert outcome.block_code is RefusalCode.INTERNAL_ERROR
+        assert "git workspace failed" in (outcome.block_reason or "")
+        assert "the checkout moved" in (outcome.block_reason or "")
+        assert controller.driver.started == [], "nothing is dispatched after a failed setup read"
     finally:
         store.close()
 
@@ -1157,7 +1235,7 @@ def test_an_older_git_without_git_attr_global_locates_the_global_attributes_file
 
     def older_git(argv, *args, **kwargs):  # noqa: ANN001,ANN002,ANN003 - subprocess.run shape
         if list(argv[:3]) == ["git", "var", "GIT_ATTR_GLOBAL"]:
-            return subprocess.CompletedProcess(argv, 129, "", "usage: git var (-l | <variable>)\n")
+            return subprocess.CompletedProcess(argv, 129, b"", b"usage: git var (-l | <variable>)\n")
         return real_run(argv, *args, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", older_git)
@@ -1215,13 +1293,6 @@ def test_a_git_timeout_inside_the_metadata_snapshot_is_a_git_error(
 #: A config value git stores as raw bytes and prints as-is: not valid UTF-8 (nor GBK).
 NOT_TEXT_CONFIG = b"\n[hflowprobe]\n\tx = \xff\xfe\n"
 
-#: On Windows CPython's subprocess reader thread raises the UnicodeDecodeError itself (stdout then
-#: comes back ``None``, which ``GitRepo`` turns into a ``GitError``), and pytest reports that
-#: thread's exception as a warning. It is the condition under test, not a leak.
-NOT_TEXT_THREAD_WARNING = pytest.mark.filterwarnings(
-    "ignore::pytest.PytestUnhandledThreadExceptionWarning"
-)
-
 
 def _append_to_shared_config(worktree: Path, data: bytes) -> None:
     """What a worker can do from its worktree: the repository's config is shared by every worktree."""
@@ -1232,16 +1303,14 @@ def _append_to_shared_config(worktree: Path, data: bytes) -> None:
         handle.write(data)
 
 
-@NOT_TEXT_THREAD_WARNING
 def test_a_config_value_that_is_not_text_makes_the_metadata_snapshot_a_git_error(
     sample_repo: Path, isolated_git_home: Path
 ) -> None:
-    """Undecodable git output must raise ``GitError``, never ``AttributeError`` or ``UnicodeDecodeError``.
+    """Undecodable git output must raise ``GitError``, never ``UnicodeDecodeError`` or "empty".
 
-    On Windows the decode fails in subprocess's reader thread and the output comes back as
-    ``None``; on POSIX ``subprocess.run`` raises ``UnicodeDecodeError`` itself. Unconverted, either
-    escapes every ``except GitError`` and leaves the run ``RUNNING`` with no block. Git's output
-    is read as UTF-8 whatever the locale, so the bytes below are never text.
+    Unconverted, a decoding error escapes every ``except GitError`` and leaves the run ``RUNNING``
+    with no block. Git's output is read as UTF-8 whatever the locale, so the bytes below are never
+    text.
     """
     repo = GitRepo.discover(sample_repo)
     worktree = repo.create_worktree("R-metadata-not-text", repo.head)
@@ -1252,25 +1321,41 @@ def test_a_config_value_that_is_not_text_makes_the_metadata_snapshot_a_git_error
         repo.metadata_snapshot(worktree)
 
 
-@pytest.mark.parametrize("how", ["posix-raises", "windows-returns-none"])
-@pytest.mark.parametrize("query", ["run-config-list", "git-query-attr-global"])
-def test_undecodable_git_output_is_a_git_error_on_either_platforms_path(
-    sample_repo: Path, isolated_git_home: Path, monkeypatch: pytest.MonkeyPatch, how: str, query: str
+@pytest.mark.parametrize("query", ["run-config-list", "query-attr-global"])
+def test_undecodable_git_output_is_a_git_error_for_checked_and_unchecked_reads(
+    sample_repo: Path, isolated_git_home: Path, monkeypatch: pytest.MonkeyPatch, query: str
 ) -> None:
-    """Both platform behaviours, simulated on whichever one runs the test, for both helpers."""
     repo = GitRepo.discover(sample_repo)
     worktree = repo.create_worktree("R-metadata-undecodable", repo.head)
-    # ``GitRepo.run`` reads the listing; ``_git_query`` reads ``git var GIT_ATTR_GLOBAL``.
+    # ``GitRepo.run`` reads the listing; ``GitRepo.query`` reads ``git var GIT_ATTR_GLOBAL``.
     marker = "--list" if query == "run-config-list" else "GIT_ATTR_GLOBAL"
     real_run = subprocess.run
 
     def undecodable(argv, *args, **kwargs):  # noqa: ANN001,ANN002,ANN003 - subprocess.run shape
         if argv and argv[0] == "git" and marker in argv:
-            if how == "posix-raises":
-                raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
-            return subprocess.CompletedProcess(argv, 0, None, "")
+            return subprocess.CompletedProcess(argv, 0, b"\xff\xfe\n", b"")
         return real_run(argv, *args, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", undecodable)
     with pytest.raises(GitError, match="could not be decoded as text"):
         repo.metadata_snapshot(worktree)
+
+
+def test_a_config_value_changed_only_by_a_carriage_return_is_a_key_change(
+    sample_repo: Path, isolated_git_home: Path
+) -> None:
+    """Git prints a value's bytes as they are; a text-mode pipe read ``a\\r\\nb`` as ``a\\nb``.
+
+    The change then showed only as the config file's digest, never as the key that changed.
+    """
+    repo = GitRepo.discover(sample_repo)
+    worktree = repo.create_worktree("R-metadata-cr", repo.head)
+    # Backslash-n is git's escape for a newline; a lone CR (not before LF) is part of the value.
+    _append_to_shared_config(worktree, b"\n[hflowprobe]\n\tvalue = a\\nb\n")
+    before = repo.metadata_snapshot(worktree)
+    config = sample_repo / ".git" / "config"
+    config.write_bytes(config.read_bytes().replace(b"value = a\\nb", b"value = a\r\\nb"))
+
+    changes = repo.metadata_snapshot(worktree).changes_since(before)
+    assert "config@checkout:hflowprobe.value" in changes, changes
+    assert "config@worktree:hflowprobe.value" in changes, changes

@@ -1,14 +1,18 @@
-"""Read-only views over stored runs for one operator: ``hflow runs`` and ``hflow diff`` (batch L).
+"""Read-only views over stored runs for one operator: ``hflow runs``, the inbox ``hflow status``
+prints without a run id, and ``hflow diff`` (batch L; the inbox since batch N).
 
-Neither calls a model, probes a process or writes anything.
+None calls a model, probes a process or writes anything.
 
 * ``runs`` lists runs from the ledger, newest first, each with the first command ``hints``
   prints for it. Like ``status``, it reads the project contract file a run's admission recorded,
-  and only to decide whether a printed ``integrate prepare`` needs ``--project``. ``--needs-you``
-  keeps the runs whose *stored* facts name something for the operator to do (:func:`attention`),
-  judged with the clock and nothing else - no process is probed. Nothing is inferred from a run
-  that cannot be read: such a run is named (in ``--json`` as an entry with an ``error``), the rest
-  is still listed, and the command exits 6.
+  and only to decide whether a printed ``integrate prepare`` needs ``--project``. Nothing is
+  inferred from a run that cannot be read: such a run is named (in ``--json`` as an entry with an
+  ``error``), the rest is still listed, and the command exits 6.
+* The inbox (:func:`inbox`) keeps every run whose *stored* facts name something for the operator
+  to do (:func:`attention`), judged with the clock and nothing else - no process is probed - and
+  files it under one group (:func:`inbox_group`): ``running``, ``ready`` or ``attention``. Each
+  entry prints one line of facts and exactly one ``next:`` command: the first one ``hints`` gives,
+  or ``status <run>`` when it gives none. A run that cannot be read is named as for ``runs``.
 * ``diff`` prints the Git change between a run's recorded base commit and its frozen candidate
   commit - two commits in the repository the run recorded, never a working tree. That is the
   candidate's Git identity, not its content fingerprint (AGENTS rule 11), and the header says so.
@@ -17,7 +21,6 @@ Neither calls a model, probes a process or writes anything.
 from __future__ import annotations
 
 import json
-import subprocess
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -30,7 +33,15 @@ from .contracts import (
     ResultReceipt,
     TaskState,
 )
-from .hints import RunFacts, integrable, recorded_repository, run_facts, steps_for
+from .hints import (
+    RunFacts,
+    hflow_command,
+    integrable,
+    recorded_repository,
+    run_facts,
+    steps_for,
+    word,
+)
 from .profiles import summarize_validation_error
 from .store import Store, StoredRecordUnreadable
 
@@ -69,6 +80,20 @@ def _parse_time(text: str) -> datetime | None:
     return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
 
 
+_LIVE_STATES = frozenset({TaskState.DRAFT, TaskState.READY, TaskState.RUNNING, TaskState.CHECKING})
+
+
+def _past_deadline(facts: RunFacts, now: datetime) -> bool:
+    """The clock is past the per-dispatch deadline a live run's admission recorded, counted from
+    the last change its run row recorded; ``False`` when either was not recorded."""
+    changed = _parse_time(facts.updated_at)
+    return (
+        facts.deadline_seconds is not None
+        and changed is not None
+        and now > changed + timedelta(seconds=facts.deadline_seconds)
+    )
+
+
 def _live_reasons(facts: RunFacts, now: datetime) -> list[str]:
     """A live run: its recorded owner, and whether the clock is past its recorded deadline.
 
@@ -84,10 +109,7 @@ def _live_reasons(facts: RunFacts, now: datetime) -> list[str]:
         else "no owner process recorded"
     )
     reasons = [f"live {facts.task_state.value}, {owner}"]
-    changed = _parse_time(facts.updated_at)
-    if facts.deadline_seconds is not None and changed is not None and (
-        now > changed + timedelta(seconds=facts.deadline_seconds)
-    ):
+    if _past_deadline(facts, now):
         reasons.append(
             f"past its deadline: nothing recorded since {facts.updated_at}, longer than the "
             f"{facts.deadline_seconds}s per-dispatch deadline its admission recorded; probably "
@@ -109,9 +131,7 @@ def attention(facts: RunFacts, *, now: datetime | None = None) -> list[str]:
     that was interrupted. A released or kept worktree and an integrated candidate name nothing.
     """
     reasons: list[str] = []
-    if facts.task_state in {
-        TaskState.DRAFT, TaskState.READY, TaskState.RUNNING, TaskState.CHECKING,
-    }:
+    if facts.task_state in _LIVE_STATES:
         reasons += _live_reasons(facts, now or datetime.now(UTC))
     if facts.task_state is TaskState.BLOCKED:
         reasons.append(f"blocked: {facts.block_code or 'no block code recorded'}")
@@ -138,8 +158,8 @@ def attention(facts: RunFacts, *, now: datetime | None = None) -> list[str]:
             latest = facts.integrations[-1]
             if latest.state is IntegrationState.READY:
                 reasons.append(
-                    f"integration {latest.integration_id} ready: apply it, or merge it yourself "
-                    "and reconcile"
+                    f"integration {latest.integration_id} ready: integrate applies it or hands "
+                    "the merge over"
                 )
             else:
                 reasons.append(
@@ -198,49 +218,42 @@ class Unreadable:
         return {"run_id": self.run_id, "error": f"stored record unreadable: {self.reason}"}
 
 
-def list_runs(
-    store: Store, *, limit: int, needs_you: bool = False
-) -> tuple[list[RunLine], list[Unreadable]]:
-    """The newest ``limit`` runs (with ``needs_you``: the newest ``limit`` that need the operator).
+def _line(
+    store: Store,
+    row,  # noqa: ANN001 - a runs row
+    facts: RunFacts,
+    reasons: list[str],
+) -> RunLine:
+    """One run's :class:`RunLine`; raises one of :data:`UNREADABLE_ERRORS` for a record that no
+    longer validates."""
+    return RunLine(
+        run_id=facts.run_id,
+        task_id=str(row["task_id"]),
+        task_state=facts.task_state.value,
+        delivery_state=facts.delivery_state,
+        block_code=facts.block_code,
+        updated_at=str(row["updated_at"]),
+        next=steps_for(store, facts),
+        needs_you=reasons,
+    )
 
-    Every run looked at is either listed or named as unreadable; with ``needs_you`` every run in
-    the ledger is looked at, so a run that cannot be read is never silently left out.
-    """
-    # SQLite reads a negative LIMIT as "no limit".
-    rows = store.list_runs(limit=-1 if needs_you else limit)
+
+def list_runs(store: Store, *, limit: int) -> tuple[list[RunLine], list[Unreadable]]:
+    """The newest ``limit`` runs; every one looked at is either listed or named as unreadable."""
     lines: list[RunLine] = []
     unreadable: list[Unreadable] = []
-    for row in rows:
-        run_id = str(row["run_id"])
+    for row in store.list_runs(limit=limit):
         try:
-            facts = run_facts(store, run_id)
-            reasons = attention(facts)
-            if needs_you and (not reasons or len(lines) >= limit):
-                continue
-            steps = steps_for(store, facts)
+            facts = run_facts(store, str(row["run_id"]))
+            lines.append(_line(store, row, facts, attention(facts)))
         except UNREADABLE_ERRORS as exc:
-            unreadable.append(Unreadable(run_id, unreadable_reason(exc)))
-            continue
-        lines.append(
-            RunLine(
-                run_id=run_id,
-                task_id=str(row["task_id"]),
-                task_state=facts.task_state.value,
-                delivery_state=facts.delivery_state,
-                block_code=facts.block_code,
-                updated_at=str(row["updated_at"]),
-                next=steps,
-                needs_you=reasons,
-            )
-        )
+            unreadable.append(Unreadable(str(row["run_id"]), unreadable_reason(exc)))
     return lines, unreadable
 
 
-def render_runs(lines: list[RunLine], *, needs_you: bool, unreadable: bool = False) -> str:
+def render_runs(lines: list[RunLine], *, unreadable: bool = False) -> str:
     """A text table: run, task, state, updated, and the first next command."""
     if not lines:
-        if needs_you:
-            return "no readable run needs you" if unreadable else "no run needs you"
         return "no readable run" if unreadable else "no runs recorded"
     header = ("RUN", "TASK", "STATE", "UPDATED", "NEXT")
     rows = [
@@ -251,12 +264,130 @@ def render_runs(lines: list[RunLine], *, needs_you: bool, unreadable: bool = Fal
         for line in lines
     ]
     widths = [max(len(row[index]) for row in (header, *rows)) for index in range(4)]
+    return "\n".join(
+        "  ".join([*(cell.ljust(width) for cell, width in zip(row, widths)), row[4]]).rstrip()
+        for row in (header, *rows)
+    )
+
+
+# --------------------------------------------------------------------------
+# hflow status (no run id): the inbox
+# --------------------------------------------------------------------------
+
+#: The inbox's groups, in the order it prints them.
+INBOX_GROUPS: tuple[str, ...] = ("running", "ready", "attention")
+_GROUP_TITLES = {"running": "Running", "ready": "Ready", "attention": "Attention"}
+#: An accepted candidate's newest integration in one of these: its next command moves it on as
+#: usual - apply a ready one (or merge it by hand), prepare again once the target moved on
+#: (``stale``) or another integration took its place (``superseded``).
+_ROUTINE_INTEGRATIONS = frozenset(
+    {IntegrationState.READY, IntegrationState.STALE, IntegrationState.SUPERSEDED}
+)
+#: What the inbox prints for a run the hints name no command for: its detailed view.
+_NOTHING_TO_RUN = "nothing left for HFlow to run; read what it recorded"
+
+
+def inbox_group(facts: RunFacts, *, now: datetime | None = None) -> str:
+    """The inbox group of a run :func:`attention` names, from the same stored facts and clock.
+
+    ``running``: a live run whose recorded deadline the clock has not passed (or that recorded
+    none), and an accepted candidate an integration process may still be working on - looking
+    again later is the usual move. ``ready``: an accepted Git candidate with nothing else in the
+    way, whose next command takes it towards a branch - no integration yet, one ready to apply or
+    to merge by hand, or one that went stale or was superseded and is prepared again.
+    ``attention``: the rest - a live run past its deadline (probably interrupted), a blocked run
+    (``outcome_unknown`` included), ledger entries left open or unresolved, an integration that
+    ended ``conflict``/``checks_failed``/``interrupted``/``failed``, an interrupted cleanup.
+    """
+    if facts.task_state in _LIVE_STATES:
+        return "attention" if _past_deadline(facts, now or datetime.now(UTC)) else "running"
+    if (
+        facts.task_state is TaskState.BLOCKED
+        or facts.open_entries
+        or facts.settleable_entries
+        or facts.worktree_state == "REMOVING"
+    ):
+        return "attention"
+    if any(record.state in INTEGRATION_ACTIVE_STATES for record in facts.integrations):
+        return "running"
+    if not facts.integrations or facts.integrations[-1].state in _ROUTINE_INTEGRATIONS:
+        return "ready"
+    return "attention"
+
+
+@dataclass(frozen=True)
+class InboxEntry:
+    """One run in the inbox: its group, its listing line, and the one command printed for it."""
+
+    group: str
+    line: RunLine
+    #: The one ``next:`` command the text prints: the first hint, else the run's ``status``.
+    next: str
+
+    def as_json(self) -> dict[str, object]:
+        """``runs --json``'s entry for the run, plus its group."""
+        return {**self.line.as_json(), "group": self.group}
+
+
+def inbox(
+    store: Store, *, now: datetime | None = None
+) -> tuple[list[InboxEntry], list[Unreadable]]:
+    """Every run whose stored facts name something for the operator, in :data:`INBOX_GROUPS`
+    order and newest first within a group.
+
+    Every run in the ledger is looked at, so a run that cannot be read is named, never silently
+    left out. Pure ledger reads and the clock (plus what :func:`steps_for` reads); nothing probed.
+    """
+    moment = now or datetime.now(UTC)
+    entries: list[InboxEntry] = []
+    unreadable: list[Unreadable] = []
+    # SQLite reads a negative LIMIT as "no limit".
+    for row in store.list_runs(limit=-1):
+        run_id = str(row["run_id"])
+        try:
+            facts = run_facts(store, run_id)
+            reasons = attention(facts, now=moment)
+            if not reasons:
+                continue
+            line = _line(store, row, facts, reasons)
+        except UNREADABLE_ERRORS as exc:
+            unreadable.append(Unreadable(run_id, unreadable_reason(exc)))
+            continue
+        first = (
+            line.next[0]
+            if line.next
+            else f"{hflow_command(store, 'status', word(run_id))}  # {_NOTHING_TO_RUN}"
+        )
+        entries.append(InboxEntry(inbox_group(facts, now=moment), line, first))
+    entries.sort(key=lambda entry: INBOX_GROUPS.index(entry.group))  # stable: newest first stays
+    return entries, unreadable
+
+
+def inbox_json(entries: list[InboxEntry], unreadable: list[Unreadable]) -> list[dict[str, object]]:
+    """``status --json`` without a run id: each entry, then each unreadable run (``attention``)."""
+    return [entry.as_json() for entry in entries] + [
+        {**item.as_json(), "group": "attention"} for item in unreadable
+    ]
+
+
+def render_inbox(entries: list[InboxEntry], *, unreadable: bool = False) -> str:
+    """Each group with entries: its title and count, then per run one line of facts (run, task,
+    state, why it needs you) and one ``next:`` line. One line when nothing needs the operator."""
+    if not entries:
+        return "nothing readable needs you" if unreadable else "nothing needs you"
+    cells = [(entry.line.run_id, entry.line.task_id, entry.line.outcome) for entry in entries]
+    widths = [max(len(row[index]) for row in cells) for index in range(3)]
     out: list[str] = []
-    for row, line in zip((header, *rows), (None, *lines)):
-        out.append("  ".join([*(cell.ljust(width) for cell, width in zip(row, widths)), row[4]]))
-        if needs_you and line is not None:
-            out.append("  needs you: " + "; ".join(line.needs_you))
-    return "\n".join(text.rstrip() for text in out)
+    for group in INBOX_GROUPS:
+        members = [(entry, row) for entry, row in zip(entries, cells) if entry.group == group]
+        if not members:
+            continue
+        out.append(f"{_GROUP_TITLES[group]} ({len(members)})")
+        for entry, row in members:
+            columns = "  ".join(cell.ljust(width) for cell, width in zip(row, widths))
+            out.append(f"  {columns}  {'; '.join(entry.line.needs_you)}")
+            out.append(f"    next: {entry.next}")
+    return "\n".join(out)
 
 
 # --------------------------------------------------------------------------
@@ -376,18 +507,14 @@ def diff_argv(rng: CandidateRange, *, stat: bool) -> tuple[list[str], Path]:
 
 
 def run_diff(rng: CandidateRange, *, stat: bool, timeout: float = 300.0) -> tuple[int, bytes, str]:
-    """Run the diff in HFlow's inert Git environment: ``(returncode, stdout bytes, stderr)``."""
-    from .gitworkspace import _base_env  # the one hardened Git environment HFlow uses
+    """Run the diff through HFlow's one git runner: ``(returncode, stdout bytes, stderr)``.
+
+    Git's output is passed through as bytes, never decoded. Git that cannot start or times out
+    raises :class:`~hflow.gitworkspace.GitError`.
+    """
+    from .gitworkspace import git_process
 
     argv, cwd = diff_argv(rng, stat=stat)
-    completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
-        argv,
-        cwd=str(cwd),
-        capture_output=True,
-        stdin=subprocess.DEVNULL,
-        timeout=timeout,
-        check=False,
-        env=_base_env(),
-    )
+    completed = git_process(argv[1:], cwd=cwd, timeout=timeout)
     return completed.returncode, completed.stdout, completed.stderr.decode("utf-8", "replace")
 

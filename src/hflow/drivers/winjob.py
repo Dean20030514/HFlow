@@ -53,6 +53,9 @@ ERROR_INVALID_PARAMETER = 87
 #: The longest single blocking wait in :func:`wait_interruptibly`, and so the longest a console
 #: Ctrl+C waits before it reaches the controller.
 WAIT_SLICE_SECONDS = 0.1
+#: How long :func:`popen_in_boundary` waits for a child it killed because it could not be put in
+#: its boundary or resumed. The child never ran, so its exit is immediate in practice.
+FAILED_START_WAIT_SECONDS = 5.0
 
 
 class JobBoundaryError(RuntimeError):
@@ -154,6 +157,12 @@ _SIGNATURES: dict[str, tuple[Any, list[Any]]] = {
     "Thread32Next": (wintypes.BOOL, [wintypes.HANDLE, ctypes.POINTER(_ThreadEntry32)]),
     "OpenThread": (wintypes.HANDLE, [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]),
     "ResumeThread": (wintypes.DWORD, [wintypes.HANDLE]),
+    # ``hflow.ownership``'s process identity: the creation time of this or another process.
+    "GetCurrentProcess": (wintypes.HANDLE, []),
+    "GetProcessTimes": (
+        wintypes.BOOL,
+        [wintypes.HANDLE, *([ctypes.POINTER(wintypes.FILETIME)] * 4)],
+    ),
 }
 
 
@@ -162,7 +171,7 @@ def _kernel32() -> Any:
     """kernel32 with every signature in :data:`_SIGNATURES` declared, loaded once per process.
 
     ``use_last_error=True`` so ``ctypes.get_last_error`` reads the error of the last call made
-    through this binding. ``hflow.ownership`` declares the few it adds on this same object.
+    through this binding. The one binding of the package: ``hflow.ownership`` calls through it too.
     """
     api = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
     for name, (restype, argtypes) in _SIGNATURES.items():
@@ -308,12 +317,17 @@ def suspending_flags() -> int:
 
 
 def resume(pid: int) -> None:
-    """Resume a process created with CREATE_SUSPENDED.
+    """Resume a process created with CREATE_SUSPENDED: every thread it has.
 
     We do not hold the primary thread handle (``Popen`` does not expose it), so this uses
     the documented thread snapshot path. That is deliberate: it keeps the boundary logic in
     the standard library, and the window it closes - "boundary assigned before the target
     runs" - is already closed by CREATE_SUSPENDED itself.
+
+    Every thread the snapshot lists for ``pid`` is resumed, not the first one found: the snapshot
+    does not promise the primary thread comes first, and resuming a thread that is not suspended
+    changes nothing. A thread that cannot be opened fails the resume - it may be the one left
+    suspended - unless Windows says it no longer exists (``ERROR_INVALID_PARAMETER``).
     """
     if not IS_WINDOWS:
         return
@@ -325,25 +339,29 @@ def resume(pid: int) -> None:
         )
     entry = _ThreadEntry32()
     entry.dwSize = ctypes.sizeof(_ThreadEntry32)
-    resumed = False
+    resumed = 0
     try:
-        if api.Thread32First(snapshot, ctypes.byref(entry)):
-            while True:
-                if entry.th32OwnerProcessID == pid:
-                    thread = api.OpenThread(THREAD_SUSPEND_RESUME, False, entry.th32ThreadID)
-                    if thread:
-                        try:
-                            if api.ResumeThread(thread) == RESUME_THREAD_FAILED:
-                                raise JobBoundaryError(
-                                    f"ResumeThread failed for process {pid}: "
-                                    f"{ctypes.get_last_error()}"  # type: ignore[attr-defined]
-                                )
-                        finally:
-                            api.CloseHandle(thread)
-                        resumed = True
-                        break
-                if not api.Thread32Next(snapshot, ctypes.byref(entry)):
-                    break
+        more = bool(api.Thread32First(snapshot, ctypes.byref(entry)))
+        while more:
+            if entry.th32OwnerProcessID == pid:
+                thread = api.OpenThread(THREAD_SUSPEND_RESUME, False, entry.th32ThreadID)
+                if not thread:
+                    error = ctypes.get_last_error()  # type: ignore[attr-defined]
+                    if error != ERROR_INVALID_PARAMETER:
+                        raise JobBoundaryError(
+                            f"OpenThread({entry.th32ThreadID}) failed for process {pid}: {error}"
+                        )
+                else:
+                    try:
+                        if api.ResumeThread(thread) == RESUME_THREAD_FAILED:
+                            raise JobBoundaryError(
+                                f"ResumeThread failed for process {pid}: "
+                                f"{ctypes.get_last_error()}"  # type: ignore[attr-defined]
+                            )
+                    finally:
+                        api.CloseHandle(thread)
+                    resumed += 1
+            more = bool(api.Thread32Next(snapshot, ctypes.byref(entry)))
     finally:
         api.CloseHandle(snapshot)
     if not resumed:
@@ -387,9 +405,24 @@ def popen_in_boundary(
         boundary.assign(child.pid)
         resume(child.pid)
     except BaseException:
-        # The boundary is the safety net: closing it kills the suspended child.
+        # The boundary is the safety net: terminating it kills the suspended child. Nobody gets
+        # this child back, so the pipes ``Popen`` made for it are closed here and its exit is
+        # waited for (bounded) rather than left to the garbage collector.
         boundary.terminate()
-        child.kill()
+        try:
+            child.kill()
+        except OSError:
+            pass
+        for stream in (child.stdin, child.stdout, child.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
+        try:
+            child.wait(timeout=FAILED_START_WAIT_SECONDS)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
         raise
     return child
 

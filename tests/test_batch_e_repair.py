@@ -2636,6 +2636,11 @@ def test_a_root_that_cannot_cover_the_worst_case_refuses_before_the_first_dispat
         with pytest.raises(RefusedError) as excinfo:
             controller.run_task(_request(project=project, spec=spec, project_root=sample_repo))
         assert "needs 4 more" in excinfo.value.message, excinfo.value.message
+        # The count is named for what it is: the repair's worst case, not "implementer + reviewer".
+        assert (
+            "(4 in all: worst case implementer + reviewer, then the repair round's implementer "
+            "+ reviewer)" in excinfo.value.message
+        ), excinfo.value.message
         assert "Nothing was dispatched" in excinfo.value.message
         view = store.root_budget_view(controller.root_binding.root_id)
         assert view is not None and view.used_top_level_submissions == 0, (
@@ -3321,6 +3326,17 @@ def test_the_reviewer_packet_states_the_deadline_the_reviewer_is_given(
             "the reviewer must be told the deadline its invocation is given: what the root had "
             "left when it was launched"
         )
+        # The packet was rendered twice (600 s, then 595 s) and sent once: exactly one reviewer
+        # packet note, naming the packet that was actually handed over.
+        from hflow.packet import packet_digest
+
+        reviewer_notes = [
+            note
+            for note in store.notes_for(outcome.run_id)
+            if note.startswith("role_input_packet: role=reviewer ")
+        ]
+        assert len(reviewer_notes) == 1, reviewer_notes
+        assert reviewer_notes[0].endswith(f"digest={packet_digest(driver.packets[reviewer])}")
     finally:
         store.close()
 

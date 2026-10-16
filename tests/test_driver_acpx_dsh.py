@@ -222,13 +222,13 @@ def test_client_argv_uses_the_right_interpreter_for_the_entry_point(tmp_path: Pa
     # A Node entry's package.json is a launch entry file bound by content (H6).
     (node_cli.parent.parent / "package.json").write_text('{"name": "acpx"}', encoding="utf-8")
     node_entry = AcpxDshDriver(data_dir=tmp_path, acpx_cli=node_cli)
-    argv = node_entry._client_argv(tmp_path, tmp_path, 60)
+    argv = node_entry._client_argv(tmp_path, 60)
     assert argv[0] == node_entry.launch.node
     assert argv[1].endswith("cli.js")
     assert "exec" in argv and argv[-2:] == ["-f", "-"]
 
     python_entry = AcpxDshDriver(data_dir=tmp_path, acpx_cli=FAKE_CLIENT)
-    argv = python_entry._client_argv(tmp_path, tmp_path, 60)
+    argv = python_entry._client_argv(tmp_path, 60)
     assert argv[0] == python_entry.launch.python
     assert argv[1] == "-u"
     assert argv[2].endswith("fake_acpx_client.py")
@@ -237,7 +237,7 @@ def test_client_argv_uses_the_right_interpreter_for_the_entry_point(tmp_path: Pa
     shim.parent.mkdir(parents=True)
     shim.write_text("@echo off\n", encoding="utf-8")
     shim_entry = AcpxDshDriver(data_dir=tmp_path, acpx_cli=shim)
-    argv = shim_entry._client_argv(tmp_path, tmp_path, 60)
+    argv = shim_entry._client_argv(tmp_path, 60)
     assert argv[0].endswith("acpx.cmd"), "a real executable is launched directly"
 
 
@@ -284,7 +284,7 @@ def test_a_launch_that_bound_no_dsh_home_keeps_it_out_of_the_child(
     )
     monkeypatch.setenv("DSH_HOME", "appeared-after-resolution")
 
-    assert "DSH_HOME" not in driver._child_env(tmp_path)
+    assert "DSH_HOME" not in driver._child_env()
 
     observed = _observe_child_env(driver, tmp_path)
     assert observed["dsh_home_present"] is False, observed
@@ -306,7 +306,7 @@ def test_a_launch_that_bound_a_dsh_home_keeps_it_after_the_environment_changes(
     )
     monkeypatch.setenv("DSH_HOME", str(tmp_path / "something-else"))
 
-    assert driver._child_env(tmp_path)["DSH_HOME"] == str(bound_home)
+    assert driver._child_env()["DSH_HOME"] == str(bound_home)
 
     observed = _observe_child_env(driver, tmp_path)
     assert observed["dsh_home_present"] is True, observed
@@ -330,7 +330,7 @@ def test_ambient_dsh_mode_variables_never_reach_the_child(
         data_dir=tmp_path, launch=launch, extra_env={"DSH_PERMISSION_MODE": "danger-full-access"}
     )
 
-    env = driver._child_env(tmp_path)
+    env = driver._child_env()
     assert "DSH_PERMISSION_MODE" not in env
     assert "DSH_TOOLS_MODE" not in env
 
@@ -361,12 +361,73 @@ def test_repository_locating_git_variables_never_reach_the_agent(
         data_dir=tmp_path, launch=launch, extra_env={smuggled: "from-extra-env"}
     )
 
-    env = driver._child_env(tmp_path)
+    env = driver._child_env()
     assert not [key for key in env if key.upper() in _REPOSITORY_LOCATING_ENV], env
     assert {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"} <= set(_REPOSITORY_LOCATING_ENV)
 
     observed = _observe_child_env(driver, tmp_path)
     assert observed["git_locating_present"] == [], observed
+
+
+#: Set in the parent for the withholding test. Not a secret, and never expected in any record.
+STAND_IN_SECRET_VALUE = "hflow-stand-in-not-a-secret"
+
+
+def test_secret_like_variables_other_than_the_dsh_credential_never_reach_the_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """User ruling 2026-10-16: the agent child does not inherit secret-like variables. A denylist
+    (``artifacts.is_secret_like``, the check environment's fragments) with one exception,
+    ``DEEPSEEK_API_KEY``, which DSH needs; proxy variables and the rest pass as before. What was
+    withheld is recorded by name only, the way a check reports ``withheld_secret_like=``."""
+    from hflow.drivers.acpx_dsh import AGENT_CREDENTIAL_ENV, credential_source_problem
+    from hflow.drivers.dsh_surfaces import observe_launch_surfaces
+
+    secret_like = {"GH_TOKEN", "AWS_SECRET_ACCESS_KEY", "OPENAI_API_KEY", "MY_PASSWORD"}
+    for name in secret_like:
+        monkeypatch.setenv(name, STAND_IN_SECRET_VALUE)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
+    launch = resolve_launch_config(data_dir=tmp_path, acpx_cli=ENV_REPORT_CLIENT)
+    driver = AcpxDshDriver(
+        data_dir=tmp_path, launch=launch, extra_env={"EXTRA_ACCESS_TOKEN": STAND_IN_SECRET_VALUE}
+    )
+
+    env = driver._child_env()
+    upper = {key.upper() for key in env}
+    assert not (secret_like | {"EXTRA_ACCESS_TOKEN"}) & upper, "withheld from source and extra_env"
+    assert {AGENT_CREDENTIAL_ENV, "HTTPS_PROXY", "PATH"} <= upper
+    withheld = list(env.withheld_secret_like)
+    assert (secret_like | {"EXTRA_ACCESS_TOKEN"}) <= set(withheld) and withheld == sorted(withheld)
+    assert AGENT_CREDENTIAL_ENV not in withheld
+
+    # What the process actually saw.
+    observed = _observe_child_env(driver, tmp_path)
+    assert observed["names_present"] == {
+        "GH_TOKEN": False,
+        "AWS_SECRET_ACCESS_KEY": False,
+        "OPENAI_API_KEY": False,
+        "MY_PASSWORD": False,
+        "DEEPSEEK_API_KEY": True,
+        "HTTPS_PROXY": True,
+    }, observed
+
+    # The credential check judges the same environment: the kept key is a source.
+    assert credential_source_problem(
+        env, dsh_home_kind="per_invocation", dsh_home=tmp_path / "home" / ".dsh"
+    ) == ""
+
+    # Recorded on the launch record (the probe, and so doctor; prepare's preview builds the same
+    # record from the same function), names only.
+    notes = driver.probe(AgentBinding(harness="dsh", driver=DRIVER_ID)).notes
+    (line,) = [note for note in notes if "withheld_secret_like=" in note]
+    listed = line.split("withheld_secret_like=", 1)[1].split(" ", 1)[0].split(",")
+    assert listed == withheld
+    assert STAND_IN_SECRET_VALUE not in "\n".join(notes)
+    record = observe_launch_surfaces(
+        launch, dsh_home=tmp_path / "h", dsh_home_kind="per_invocation", child_env=env
+    )
+    assert line in record.notes
+    assert STAND_IN_SECRET_VALUE not in record.model_dump_json()
 
 
 @pytest.mark.parametrize("bound", ["", "C:\\bound-dsh-home" if os.name == "nt" else "/bound"])
@@ -688,7 +749,7 @@ def test_the_child_never_searches_its_working_directory_for_a_program(
         extra_env={"nodefaultcurrentdirectoryinexepath": ""},
     )
 
-    env = driver._child_env(tmp_path)
+    env = driver._child_env()
 
     spellings = [key for key in env if key.upper() == "NODEFAULTCURRENTDIRECTORYINEXEPATH"]
     assert spellings == ["NoDefaultCurrentDirectoryInExePath"], spellings
@@ -1207,19 +1268,19 @@ def test_client_argv_carries_a_bound_model_as_one_fixed_global_flag(tmp_path: Pa
         data_dir=tmp_path, acpx_cli=FAKE_CLIENT, binding=_model_binding("native_profile")
     )
     assert native.launch.model == ""
-    assert "--model" not in native._client_argv(tmp_path, tmp_path, 60)
+    assert "--model" not in native._client_argv(tmp_path, 60)
 
     chosen = AcpxDshDriver(
         data_dir=tmp_path, acpx_cli=FAKE_CLIENT, binding=_model_binding(STAND_IN_OTHER_MODEL)
     )
-    argv = chosen._client_argv(tmp_path, tmp_path, 60)
+    argv = chosen._client_argv(tmp_path, 60)
     assert chosen.launch.model == STAND_IN_OTHER_MODEL
     assert argv.count("--model") == 1
     flag = argv.index("--model")
     assert argv[flag + 1] == STAND_IN_OTHER_MODEL
     assert flag < argv.index("exec"), "--model is a global flag: it goes before the subcommand"
     assert argv[-2:] == ["-f", "-"], "the task still travels on stdin"
-    assert chosen._agent_argv() == native._agent_argv()
+    assert chosen.launch.agent_argv == native.launch.agent_argv
 
 
 def test_the_stand_in_stream_with_a_grouped_catalog_yields_the_effective_model(
@@ -1740,8 +1801,55 @@ def test_the_retention_budget_bounds_what_hflow_keeps(harness_factory) -> None:
         assert capture.retained_bytes <= protocol_share
         assert capture.total_bytes == raw_bytes
         assert capture.truncated is True
+        # The record carries the measurement, not only the driver's memory.
+        noted = [note for note in result.limitations if note.startswith("client protocol file ")]
+        assert len(noted) == 1, result.limitations
+        assert str(invocation / "stdout.ndjson") in noted[0]
+        assert f": {raw_bytes} bytes read from it (measured, not bounded" in noted[0]
+        assert f"retained {capture.retained_bytes} of {raw_bytes} bytes at" in noted[0]
+        assert "(truncated: the retained file is the head only)" in noted[0]
     finally:
         harness.driver.release(handle.invocation_id)
+
+
+def test_a_setup_failure_before_or_inside_the_spawn_gate_leaves_no_boundary_open(
+    harness_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reproduced: the boundary was opened before the per-invocation home was prepared, so a
+    failing ``mkdir``/``copyfile`` left a Job Object handle open that nothing would ever close.
+    It is now opened just before the spawn gate, and a check that raises inside the gate closes it.
+    """
+    from hflow.drivers import acpx_dsh as module
+    from hflow.drivers import launch as launch_module
+
+    opened: list[winjob.ProcessBoundary] = []
+
+    class Recording(winjob.ProcessBoundary):
+        def open(self) -> winjob.ProcessBoundary:
+            opened.append(self)
+            return super().open()
+
+    monkeypatch.setattr(module, "ProcessBoundary", Recording)
+    harness = harness_factory("cooperative")
+
+    def no_room(*_args: object, **_kwargs: object) -> None:
+        raise OSError("no room for the client config")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module.shutil, "copyfile", no_room)
+        with pytest.raises(OSError, match="no room"):
+            harness.start("I-setup")
+    assert opened == [], "nothing may open a boundary before the setup that can fail is done"
+
+    def check_failed(*_args: object, **_kwargs: object) -> str:
+        raise RuntimeError("a gate check failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(launch_module, "credential_source_problem", check_failed)
+        with pytest.raises(RuntimeError, match="gate check failed"):
+            harness.start("I-gate")
+    assert len(opened) == 1 and opened[0].handle is None, "the boundary is closed again"
+    assert harness.driver._handles == {} and harness.driver._processes == {}
 
 
 def test_stderr_is_read_from_a_pipe_and_really_recorded(harness_factory) -> None:

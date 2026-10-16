@@ -5,8 +5,8 @@
     {
       "id": "unit",
       "kind": "command",
-      "argv": ["python", "-m", "pytest", "-q", "tests"],
-      "timeout_seconds": 600,
+      "argv": ["python", "-m", "pytest", "-q", "tests/test_contracts.py"],
+      "timeout_seconds": 120,
       "cacheable": true
     },
     {

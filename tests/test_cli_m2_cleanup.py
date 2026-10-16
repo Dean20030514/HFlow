@@ -240,7 +240,7 @@ def test_cli_run_builds_the_worktree_from_the_base_it_resolved(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`run` resolves ``--base-commit main`` once and hands the controller that commit.
+    """`run` resolves the task's ``base_commit: main`` once and hands the controller that commit.
 
     The branch moves right after `run` resolved it - the moment its approval is checked against -
     and before the controller creates the worktree. Resolving the name a second time there would
@@ -260,7 +260,10 @@ def test_cli_run_builds_the_worktree_from_the_base_it_resolved(
         return resolved
 
     monkeypatch.setattr(prepare_module, "resolve_run", resolve_then_move)
-    code, _ = _run_cli(cli_project, "--base-commit", "main")
+    task = json.loads(cli_project["task"].read_text(encoding="utf-8"))
+    task["workspace"]["base_commit"] = "main"
+    cli_project["task"].write_text(json.dumps(task), encoding="utf-8")
+    code, _ = _run_cli(cli_project)
     assert code == EXIT_OK
     payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert payload["task_state"] == "ACCEPTED", payload.get("block_reason")
@@ -468,11 +471,16 @@ def test_clean_preview_changes_nothing(
         "the preview must not create a ref"
     )
 
-    # --dry-run is the same preview, and combining it with --apply is refused
+    # --dry-run is the same preview; --apply, --dry-run and --reconcile exclude each other, so
+    # no two of them can be given and one silently ignored
     code, dry = _cli_json(capsys, cli_project, "clean", run_id, "--dry-run")
     assert code == EXIT_OK and dry["allowed"] is True
-    code = main(["clean", run_id, "--apply", "--dry-run", "--data-dir", str(cli_project["data"])])
-    assert code == EXIT_USAGE
+    for pair in (("--apply", "--dry-run"), ("--reconcile", "--apply"), ("--reconcile", "--dry-run")):
+        with pytest.raises(SystemExit) as usage:
+            main(["clean", run_id, *pair, "--data-dir", str(cli_project["data"])])
+        assert usage.value.code == EXIT_USAGE, pair
+        assert "not allowed with argument" in capsys.readouterr().err
+    assert worktree.exists(), "nothing was removed"
 
 
 # --------------------------------------------------------------------------

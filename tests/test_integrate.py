@@ -38,7 +38,7 @@ from hflow.contracts import (
 )
 from hflow.controller import Controller
 from hflow.drivers.fake import FakeDriver, FakeScript
-from hflow.gitworkspace import GitError, GitRepo
+from hflow.gitworkspace import GIT_METADATA_CHANGED, GitError, GitRepo
 from hflow.hints import shell_word
 from hflow.integrate import (
     apply_integration,
@@ -585,7 +585,7 @@ def _ref_reads_fail(monkeypatch: pytest.MonkeyPatch, ref: str) -> None:
 
     def flaky(argv, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003 - subprocess.run shape
         if argv[:2] == ["git", "rev-parse"] and "--quiet" in argv and argv[-1] == ref:
-            return subprocess.CompletedProcess(argv, 0xC0000142, "", "")
+            return subprocess.CompletedProcess(argv, 0xC0000142, b"", b"")
         return real_run(argv, *args, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", flaky)
@@ -753,7 +753,9 @@ def test_cli_prepare_defaults_to_the_recorded_contract_only_while_it_still_match
     assert "--project <project.json>" in status
     default.write_text(scene.project.model_dump_json(), encoding="utf-8")
     assert main(["status", run_id, *data]) == 0
-    [hint] = [line for line in capsys.readouterr().out.splitlines() if "integrate prepare" in line]
+    [hint] = [
+        line for line in capsys.readouterr().out.splitlines() if f"integrate {run_id}" in line
+    ]
     assert "--project" not in hint
 
     assert main(["integrate", "prepare", run_id, "--target", "main", "--json", *data]) == 0
@@ -1013,6 +1015,82 @@ def test_a_target_spelled_in_another_case_is_refused(scene_on_main: Scene) -> No
     assert scene.tip() == scene.base
 
 
+def test_checks_that_change_the_shared_git_metadata_stop_hflows_own_git(
+    scene: Scene, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A check is candidate code. A clean filter it configures in the shared config would run
+    inside HFlow's own ``git status`` and ``git worktree remove`` of the integration worktree,
+    so the metadata is compared first - as a run compares it at acceptance."""
+    run_id = scene.accept()
+    real_verify = integrate_module.verify_candidate
+    real_run = GitRepo.run
+    configured: list[bool] = []
+    after_checks: list[tuple[str, ...]] = []
+
+    def verify_then_configure(**kwargs):  # noqa: ANN003
+        result = real_verify(**kwargs)
+        _git(Path(kwargs["project_root"]), "config", "filter.hflowprobe.clean", "cat")
+        configured.append(True)
+        return result
+
+    def recording_run(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        if configured:
+            after_checks.append(args)
+        return real_run(self, *args, **kwargs)
+
+    monkeypatch.setattr(integrate_module, "verify_candidate", verify_then_configure)
+    monkeypatch.setattr(GitRepo, "run", recording_run)
+    record = scene.prepare(run_id).record
+    monkeypatch.undo()
+
+    assert record.state is IntegrationState.CHECKS_FAILED, record.detail
+    assert record.detail.startswith(GIT_METADATA_CHANGED), record.detail
+    assert "config@worktree:filter.*.clean" in record.detail
+    assert record.worktree_state == "LEFT"
+    assert Path(record.worktree_path).exists(), "the worktree is left for the operator"
+    assert after_checks and not any(
+        args[0] in {"status", "worktree"} for args in after_checks
+    ), after_checks
+    [note] = [
+        note for note in scene.store.notes_for(run_id)
+        if note.startswith(f"git_metadata: changed during integration {record.integration_id}")
+    ]
+    assert "config@worktree:filter.*.clean" in note and "hflow clean" in note
+    with pytest.raises(RefusedError):
+        scene.apply(record.integration_id, scene.base)
+    assert scene.tip() == scene.base
+    # Settled: a reconcile reports it and runs no removal either.
+    outcome = reconcile_integration(
+        scene.store, integration_id=record.integration_id, controller_build=BUILD
+    )
+    assert outcome.record.state is IntegrationState.CHECKS_FAILED
+    assert Path(record.worktree_path).exists()
+
+
+def test_a_target_a_checkout_holds_under_another_spelling_is_handed_off_not_moved(
+    scene: Scene, tmp_path: Path
+) -> None:
+    """``git checkout Main`` on NTFS leaves HEAD naming ``refs/heads/Main``, which reads ``main``.
+
+    The exact-name comparison found no checkout, and the compare-and-set moved ``main`` under
+    that checkout's index and files (docs/batch-i-integration-plan.md §2.2.4, AGENTS rule 12).
+    """
+    run_id = scene.accept()
+    prepared = scene.prepare(run_id).record
+    assert prepared.state is IntegrationState.READY, prepared.detail
+    other = tmp_path / "other checkout"
+    _git(scene.repo, "worktree", "add", "-q", "--detach", str(other), "main")
+    _git(other, "symbolic-ref", "HEAD", "refs/heads/Main")
+
+    outcome = scene.apply(prepared.integration_id, scene.base)
+
+    assert outcome.record.state is IntegrationState.READY
+    assert scene.tip() == scene.base, "a branch held under another spelling is never moved"
+    assert any("checked out" in note and str(other.resolve()) in note for note in outcome.notes)
+    assert outcome.handoff[0].startswith("git -C ")
+    assert prepared.integration_commit in outcome.handoff[0]
+
+
 def test_a_failed_ref_update_returns_to_ready_and_does_not_exit_zero(
     scene: Scene, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1044,6 +1122,29 @@ def test_a_failed_ref_update_returns_to_ready_and_does_not_exit_zero(
     finally:
         store.close()
     assert scene.tip() == scene.base
+
+
+def test_a_locked_target_fails_the_compare_and_set_and_stays_ready(scene: Scene) -> None:
+    """Git's own lock decides: a lock left by another process fails the update with git's words."""
+    run_id = scene.accept()
+    prepared = scene.prepare(run_id).record
+    lock = scene.repo / ".git" / "refs" / "heads" / "main.lock"
+    lock.write_bytes(b"")
+    try:
+        outcome = scene.apply(prepared.integration_id, scene.base)
+        assert lock.exists(), "HFlow never deletes a Git lock file"
+    finally:
+        lock.unlink()
+    assert outcome.record.state is IntegrationState.READY, outcome.record.detail
+    assert "the ref update failed" in outcome.record.detail
+    assert "main.lock" in outcome.record.detail, "git's own words name the lock"
+    assert outcome.record.applied_by == ""
+    assert outcome.handoff and outcome.handoff[0].startswith("hflow integrate apply ")
+    assert scene.tip() == scene.base
+
+    done = scene.apply(prepared.integration_id, scene.base)
+    assert done.record.state is IntegrationState.INTEGRATED
+    assert scene.tip() == prepared.integration_commit
 
 
 def test_a_prepare_that_dies_inside_worktree_add_is_found_by_its_staging_name(

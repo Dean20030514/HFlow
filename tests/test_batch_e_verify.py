@@ -303,13 +303,12 @@ def test_force_refresh_re_runs_every_check_while_the_default_still_reuses(
 
         assert first.status == "passed", first.detail
         assert runner.calls == ["unit", "docs-check"]
-        assert runner.cache_hits == 0
 
         second = verify_candidate(**kwargs)
         rows_after_second = [dict(row) for row in store.evidence_for(run_id, "verification")]
 
+        # Both checks reused: no runner call, and the first round's evidence handed back.
         assert runner.calls == ["unit", "docs-check"], "the default must not run a check again"
-        assert runner.cache_hits == 2
         assert second.evidence_ids == first.evidence_ids
         assert [row["evidence_id"] for row in rows_after_second] == [
             row["evidence_id"] for row in rows_after_first
@@ -318,8 +317,9 @@ def test_force_refresh_re_runs_every_check_while_the_default_still_reuses(
         third = verify_candidate(**kwargs, force_refresh=True)
         rows_after_third = [dict(row) for row in store.evidence_for(run_id, "verification")]
 
-        assert runner.calls == ["unit", "docs-check", "unit", "docs-check"]
-        assert runner.cache_hits == 2, "a forced refresh is not a cache hit"
+        assert runner.calls == ["unit", "docs-check", "unit", "docs-check"], (
+            "a forced refresh runs every check again"
+        )
         assert len(rows_after_third) == 4, "the forced run records its own two rows"
         assert [row["evidence_id"] for row in rows_after_third[:2]] == [
             row["evidence_id"] for row in rows_after_first

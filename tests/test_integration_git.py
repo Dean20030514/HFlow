@@ -495,6 +495,50 @@ def test_checked_out_at_reads_hand_written_operation_state(repo: Path, tmp_path:
     assert git.checked_out_at(ref) == [linked.resolve()]
 
 
+def test_checked_out_at_ignores_letter_case_in_the_name_head_holds(repo: Path, tmp_path: Path) -> None:
+    """On NTFS ``refs/heads/Main`` reads ``main``'s loose file: that HEAD holds ``main``.
+
+    An exact comparison listed no checkout, and a compare-and-set then moved the branch under
+    that checkout's index and files. On a case-sensitive file system the two names are two refs;
+    calling ``main`` checked out there only hands the operator a merge command.
+    """
+    git = GitRepo(repo)
+    _git(repo, "symbolic-ref", "HEAD", "refs/heads/Main")
+    assert git.checked_out_at("refs/heads/main") == [repo.resolve()]
+    _git(repo, "symbolic-ref", "HEAD", "refs/heads/main")
+
+    linked = tmp_path / "spelled"
+    _git(repo, "worktree", "add", "-q", "--detach", str(linked), "main")
+    _git(linked, "symbolic-ref", "HEAD", "refs/heads/MAIN")
+    assert git.checked_out_at("refs/heads/main") == [repo.resolve(), linked.resolve()]
+
+
+def test_checked_out_at_ignores_letter_case_in_operation_state(repo: Path, tmp_path: Path) -> None:
+    head = _git(repo, "rev-parse", "HEAD").strip()
+    linked = tmp_path / "detached"
+    _git(repo, "worktree", "add", "-q", "--detach", str(linked), head)
+    admin = _admin_dir(linked)
+    git = GitRepo(repo)
+    ref = "refs/heads/sim"
+
+    (admin / "rebase-merge").mkdir()
+    (admin / "rebase-merge" / "head-name").write_bytes(b"refs/heads/SIM\n")
+    assert git.checked_out_at(ref) == [linked.resolve()]
+    (admin / "rebase-merge" / "head-name").write_bytes(b"detached HEAD\n")
+    assert git.checked_out_at(ref) == []
+    (admin / "rebase-merge" / "update-refs").write_bytes(
+        f"refs/heads/Sim\n{head}\n{head}\n".encode()
+    )
+    assert git.checked_out_at(ref) == [linked.resolve()]
+    for name in ("update-refs", "head-name"):
+        (admin / "rebase-merge" / name).unlink()
+    (admin / "rebase-merge").rmdir()
+
+    (admin / "BISECT_LOG").write_bytes(b"")
+    (admin / "BISECT_START").write_bytes(b"Sim\n")
+    assert git.checked_out_at(ref) == [linked.resolve()]
+
+
 def test_checked_out_at_reads_main_worktree_state_from_the_common_dir(repo: Path) -> None:
     common = repo / ".git"
     (common / "rebase-merge").mkdir()

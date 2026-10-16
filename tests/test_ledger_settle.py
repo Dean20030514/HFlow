@@ -588,11 +588,16 @@ def test_cli_exit_codes_and_output(
     assert main([*base, "I-missing", "--attest", ATTEST]) == EXIT_USAGE
     assert "unknown invocation" in capsys.readouterr().err
 
-    # refused: void on unknown, blank attestation
+    # refused: void on unknown
     assert main([*base, "I-cu", "--as", "void", "--attest", ATTEST]) == EXIT_REFUSED
     assert "refused:" in capsys.readouterr().err
-    assert main([*base, "I-cu", "--attest", "   "]) == EXIT_REFUSED
-    capsys.readouterr()
+    # usage: a blank or placeholder attestation, checked before the ledger is read - so an
+    # unknown invocation with one is answered the same way, never "unknown invocation" first
+    for invocation in ("I-cu", "I-missing"):
+        for text in ("   ", "<what you know and why>"):
+            assert main([*base, invocation, "--attest", text]) == EXIT_USAGE
+            err = capsys.readouterr().err
+            assert err.startswith("refusing: ") and "nothing was done" in err, err
 
     # success: consumed is the default
     assert main([*base, "I-cu", "--attest", ATTEST]) == EXIT_OK
@@ -1024,7 +1029,7 @@ def test_a_pre_v6_run_with_a_recorded_controller_settles_only_on_an_explicit_att
         "--attest", "x" * (room + 1), "--legacy-owner-gone",
     ])
     err = capsys.readouterr().err
-    assert code == EXIT_REFUSED and f"at most {room} characters" in err, err
+    assert code == EXIT_USAGE and f"at most {room} characters" in err, err
     assert settlement_for(store, "I-legacy") is None
 
     code = main([

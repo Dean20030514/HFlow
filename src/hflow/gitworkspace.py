@@ -30,9 +30,10 @@ from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
+from typing import NamedTuple
 
 from .contracts import RefusalCode, RefusedError, digest_of
-from .workspace import BUILTIN_WRITE_DENY, matches_pattern
+from .workspace import BUILTIN_WRITE_DENY, hash_regular_file, matches_pattern
 
 #: Porcelain v1 status codes that this module refuses to interpret. Anything unmerged, or a
 #: submodule change, changes what "the paths in this worktree" even means, so the caller gets
@@ -221,7 +222,13 @@ GIT_OUTPUT_ENCODING = "utf-8"
 
 
 def _path_key(path: str | os.PathLike[str]) -> str:
+    """One spelling per file system location: links resolved, letter case as the platform reads it."""
     return os.path.normcase(os.path.realpath(path))
+
+
+def same_path(left: str | os.PathLike[str], right: str | os.PathLike[str]) -> bool:
+    """Do two paths name the same location, links and junctions resolved (:func:`_path_key`)?"""
+    return _path_key(left) == _path_key(right)
 
 
 def _read_state_file(path: Path) -> str | None:
@@ -240,19 +247,34 @@ def _read_state_file(path: Path) -> str | None:
     return text or None
 
 
+def _same_ref(left: str, right: str) -> bool:
+    """Do two ref names name the same ref? Letter case is ignored - erring towards "the same".
+
+    On a case-insensitive file system ``refs/heads/Main`` reads the loose file of
+    ``refs/heads/main``: ``git checkout Main`` or ``git symbolic-ref HEAD refs/heads/Main`` leaves
+    a HEAD that holds ``main`` under another spelling, and an exact comparison would let a
+    compare-and-set move that checkout's branch under its index and files. On a case-sensitive
+    one the two names are two refs, and calling one checked out because of the other only hands
+    the operator a merge command instead of moving it.
+    """
+    return left.casefold() == right.casefold()
+
+
 def _state_names_branch(name: str | None, branch: str) -> bool:
     """Does a rebase ``head-name`` or ``BISECT_START`` value name ``branch`` (no ``refs/heads/``)?
 
     Mirrors git's ``get_branch``: ``refs/heads/<b>`` names ``<b>``; any other ``refs/...`` value,
     or a bare branch name (``BISECT_START`` stores one), is kept as written; ``detached HEAD``
     names nothing. An object id is shown abbreviated by git, so it is matched as a prefix (four
-    hex digits or more) - erring towards "checked out".
+    hex digits or more) - erring towards "checked out", as letter case is (:func:`_same_ref`).
     """
     if not name or name == "detached HEAD":
         return False
     if is_full_oid(name):
-        return re.fullmatch(r"[0-9a-f]{4,}", branch) is not None and name.startswith(branch)
-    return name.removeprefix("refs/heads/") == branch
+        folded = branch.casefold()
+        return re.fullmatch(r"[0-9a-f]{4,}", folded) is not None and name.startswith(folded)
+    held = name[len("refs/heads/") :] if name.casefold().startswith("refs/heads/") else name
+    return _same_ref(held, branch)
 
 
 def _update_refs_state(path: Path) -> list[str]:
@@ -276,7 +298,8 @@ def _worktree_state_holds(admin: Path, ref: str) -> bool:
     ``wt_status_check_bisect``): a rebase in progress (``rebase-apply`` that is not an ``am``,
     or ``rebase-merge``) names its branch in ``head-name``; a bisect (``BISECT_LOG`` present)
     names the branch it started from in ``BISECT_START``; a ``rebase --update-refs`` lists the
-    branches it will move in ``rebase-merge/update-refs``.
+    branches it will move in ``rebase-merge/update-refs``. Ref names are compared without letter
+    case (:func:`_same_ref`).
     """
     branch = ref.removeprefix("refs/heads/") if ref.startswith("refs/heads/") else None
     if branch is not None:
@@ -294,7 +317,7 @@ def _worktree_state_holds(admin: Path, ref: str) -> bool:
             _read_state_file(admin / "BISECT_START"), branch
         ):
             return True
-    return ref in _update_refs_state(admin / "rebase-merge" / "update-refs")
+    return any(_same_ref(held, ref) for held in _update_refs_state(admin / "rebase-merge" / "update-refs"))
 
 
 #: Ignored paths a *check* may legitimately leave behind in a run worktree. Naming them is
@@ -312,18 +335,26 @@ IGNORED_ARTIFACT_ALLOWLIST = (
 )
 
 
+def _bytecode(path: str) -> tuple[bool, bool]:
+    """``(is path a .pyc file, does a __pycache__ directory hold it at any depth)``.
+
+    Letter case is ignored, as Windows imports ignore it.
+    """
+    parts = path.replace("\\", "/").rstrip("/").split("/")
+    return parts[-1].casefold().endswith(".pyc"), any(
+        part.casefold() == "__pycache__" for part in parts[:-1]
+    )
+
+
 def is_sourceless_bytecode(path: str) -> bool:
     """Is ``path`` a ``.pyc`` file that does not sit in a ``__pycache__`` directory?
 
     Python imports such a file as the module itself when no source file is beside it, and
     CPython 3 never writes one there on its own (its cache lives in ``__pycache__``). So it is
-    allowlisted by ``**/*.pyc`` and yet cannot be a check byproduct. Letter case is ignored,
-    as Windows imports ignore it.
+    allowlisted by ``**/*.pyc`` and yet cannot be a check byproduct.
     """
-    parts = path.replace("\\", "/").rstrip("/").split("/")
-    return parts[-1].casefold().endswith(".pyc") and not any(
-        part.casefold() == "__pycache__" for part in parts[:-1]
-    )
+    is_pyc, cached = _bytecode(path)
+    return is_pyc and not cached
 
 
 @dataclass(frozen=True)
@@ -340,6 +371,19 @@ class CandidateFreeze:
 #: :meth:`GitRepo.metadata_snapshot`). Every such reason starts with it, so an operator, a test and
 #: the docs grep the same words.
 GIT_METADATA_CHANGED = "shared Git metadata changed"
+
+#: The run note kind for the shared Git metadata HFlow's own git reads
+#: (:meth:`GitRepo.metadata_snapshot`). The digest is taken before the first dispatch
+#: (``git_metadata: snapshot before dispatch <digest> ...``); each later comparison that found a
+#: change records the digests and the changed keys and files, never values.
+NOTE_GIT_METADATA = "git_metadata"
+#: The ``git_metadata`` notes that warn rather than record a baseline: a comparison that found the
+#: metadata changed or unreadable. ``inspect_run`` projects exactly these for ``status``/``report``,
+#: and ``hflow clean`` refuses a run that carries one until the metadata matches its baseline again.
+GIT_METADATA_WARNING_PREFIXES = (
+    f"{NOTE_GIT_METADATA}: changed",
+    f"{NOTE_GIT_METADATA}: unreadable",
+)
 
 
 @dataclass(frozen=True)
@@ -411,7 +455,7 @@ def _config_records(listing: str) -> list[tuple[str, str, str, str | None]]:
 
 def _metadata_path(cwd: Path, text: str) -> str:
     """One spelling per file, whichever context named it; a relative origin is relative to ``cwd``."""
-    return Path(os.path.normcase(os.path.abspath(Path(cwd) / text.strip()))).as_posix()
+    return Path(_path_key(Path(cwd) / text.strip())).as_posix()
 
 
 def _file_digest(path: Path) -> str:
@@ -419,29 +463,17 @@ def _file_digest(path: Path) -> str:
 
     A FIFO, a device (``/dev/zero``) or a directory is recorded by its type and never opened:
     reading one can block forever or never end, before any refusal is written. A changed type
-    still counts as a change. Present but unreadable raises, because it cannot be shown unchanged.
+    still counts as a change. Present but unreadable raises, because it cannot be shown unchanged -
+    and so does a file swapped for something else between the type check and the read
+    (:func:`~hflow.workspace.hash_regular_file` checks the opened handle again).
     """
     try:
         info = os.stat(path)
+        if not stat.S_ISREG(info.st_mode):
+            return f"not-a-regular-file:{stat.S_IFMT(info.st_mode):o}"
+        return hash_regular_file(path)[1]
     except (FileNotFoundError, NotADirectoryError):
         return "absent"
-    except OSError as exc:
-        raise GitError(f"cannot read {path}: {exc}") from exc
-    if not stat.S_ISREG(info.st_mode):
-        return f"not-a-regular-file:{stat.S_IFMT(info.st_mode):o}"
-    try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0))
-    except (FileNotFoundError, NotADirectoryError):
-        return "absent"
-    except OSError as exc:
-        raise GitError(f"cannot read {path}: {exc}") from exc
-    try:
-        with os.fdopen(fd, "rb") as handle:
-            # Swapped for something else between the stat and the open: record what is there now.
-            opened = os.fstat(handle.fileno()).st_mode
-            if not stat.S_ISREG(opened):
-                return f"not-a-regular-file:{stat.S_IFMT(opened):o}"
-            return "sha256:" + hashlib.file_digest(handle, "sha256").hexdigest()
     except OSError as exc:
         raise GitError(f"cannot read {path}: {exc}") from exc
 
@@ -685,94 +717,89 @@ def exit_status(returncode: int) -> str:
     return str(returncode)
 
 
-def _run_git(
+def git_process(
     args: Sequence[str],
     *,
     cwd: str | os.PathLike[str] | None,
-    timeout: float,
+    timeout: float = 300.0,
+    stdin: bytes | None = None,
     env: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    """``git <args>`` in text mode; the caller interprets the exit code.
+) -> subprocess.CompletedProcess[bytes]:
+    """``git <args>`` with binary pipes: the one place HFlow runs git to completion.
 
-    Every text-mode git call in HFlow goes through here, so each reader gets the same guards: git
-    that cannot start (a missing ``cwd``, no ``git`` at all) and a timeout raise
-    :class:`GitError`, and so does standard output that is not UTF-8 (:data:`GIT_OUTPUT_ENCODING`,
-    strict) - on POSIX ``subprocess`` raises the ``UnicodeDecodeError`` in this thread, on Windows
-    it decodes in a reader thread whose failure comes back as ``None``. Reading either as empty
-    would make "unreadable" look like "nothing there" (a configuration value is raw bytes, so a
-    worker can write any). Standard error is only ever quoted in a message, so on Windows an
-    undecodable one reads as empty instead of failing a call that succeeded. Git reads no standard
-    input: Git for Windows would otherwise ask "Should I try again? (y/n)" on the operator's
-    terminal when it cannot delete a file. ``env`` defaults to :func:`_base_env`.
+    Git that cannot start (a missing ``cwd``, no ``git`` at all) and a timeout raise
+    :class:`GitError`. Input reaches git byte for byte (a text-mode stdin on Windows writes
+    ``\\r\\n`` for ``\\n``); with nothing to feed, git reads no terminal and no inherited pipe - Git
+    for Windows would otherwise ask "Should I try again? (y/n)" on the operator's terminal when it
+    cannot delete a file. The output is returned as git wrote it: :func:`git_query` and
+    :func:`git_run` decode it, and a caller that passes git's bytes through unread (``hflow diff``)
+    takes them as they are. ``env`` defaults to :func:`_base_env`.
     """
     try:
-        completed = subprocess.run(  # noqa: S603,S607 - fixed argv, no shell
+        return subprocess.run(  # noqa: S603,S607 - fixed argv, no shell
             ["git", *args],
             cwd=None if cwd is None else str(cwd),
-            stdin=subprocess.DEVNULL,
+            input=stdin,
+            stdin=subprocess.DEVNULL if stdin is None else None,
             capture_output=True,
-            text=True,
-            encoding=GIT_OUTPUT_ENCODING,
-            errors="strict",
             timeout=timeout,
             check=False,
             env=_base_env() if env is None else env,
         )
     except subprocess.TimeoutExpired as exc:
         raise GitError(f"git {' '.join(args)} timed out after {exc.timeout}s") from exc
-    except UnicodeDecodeError as exc:
-        raise GitError(_undecodable(tuple(args), exc.reason)) from exc
     except OSError as exc:
         raise GitError(f"git {' '.join(args)} could not start: {exc}") from exc
-    if completed.stdout is None:
-        raise GitError(_undecodable(tuple(args), "decoding failed"))
-    if completed.stderr is None:
-        completed.stderr = ""
-    return completed
 
 
-def _git_bytes(
+class GitResult(NamedTuple):
+    """One finished git call: its exit code and its decoded output."""
+
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+def git_query(
     args: Sequence[str],
     *,
     cwd: str | os.PathLike[str] | None,
-    stdin: bytes | None = None,
     timeout: float = 300.0,
-) -> tuple[int, str, str]:
-    """``git <args>`` with binary pipes; ``(returncode, stdout, stderr)``.
+    stdin: bytes | None = None,
+    env: dict[str, str] | None = None,
+) -> GitResult:
+    """``git <args>`` decoded; the caller interprets the exit code (:func:`git_run` raises on any).
 
-    For callers that read the exit code themselves or feed stdin, and for ``-z`` output. The pipes
-    are binary: input reaches git byte for byte (a text-mode stdin on Windows writes ``\\r\\n``
-    for ``\\n``), and stdout is decoded strictly as :data:`GIT_OUTPUT_ENCODING` without newline
-    translation, so a path holding ``\\r`` arrives as git printed it. The guards of
-    :func:`_run_git` apply: git that cannot start, a timeout and output that is not text raise
-    :class:`GitError` on every platform - unreadable must never look like empty.
+    Standard output is decoded strictly as :data:`GIT_OUTPUT_ENCODING`, without newline
+    translation: a path or a configuration value holding ``\\r`` arrives as git printed it (a
+    text-mode pipe reads ``a\\r\\nb`` as ``a\\nb``, so a changed value could look unchanged), and
+    output that is not UTF-8 raises :class:`GitError` - read as empty, "unreadable" would look like
+    "nothing there", and a configuration value is raw bytes a worker can write. Standard error is
+    only ever quoted in a message, so bytes in it that are not UTF-8 are replaced instead of
+    failing a call that succeeded.
     """
-    try:
-        completed = subprocess.run(  # noqa: S603,S607 - fixed argv, no shell
-            ["git", *args],
-            cwd=None if cwd is None else str(cwd),
-            input=stdin,
-            # Nothing to feed: git reads no terminal and no inherited pipe.
-            stdin=subprocess.DEVNULL if stdin is None else None,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-            env=_base_env(),
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise GitError(f"git {' '.join(args)} timed out after {exc.timeout}s") from exc
-    except UnicodeDecodeError as exc:
-        raise GitError(_undecodable(tuple(args), exc.reason)) from exc
-    except OSError as exc:
-        raise GitError(f"git {' '.join(args)} could not start: {exc}") from exc
-    if completed.stdout is None:
-        raise GitError(_undecodable(tuple(args), "decoding failed"))
+    completed = git_process(args, cwd=cwd, timeout=timeout, stdin=stdin, env=env)
     try:
         stdout = completed.stdout.decode(GIT_OUTPUT_ENCODING)
     except UnicodeDecodeError as exc:
         raise GitError(_undecodable(tuple(args), exc.reason)) from exc
     stderr = (completed.stderr or b"").decode(GIT_OUTPUT_ENCODING, errors="replace")
-    return completed.returncode, stdout, stderr
+    return GitResult(completed.returncode, stdout, stderr)
+
+
+def git_run(
+    args: Sequence[str],
+    *,
+    cwd: str | os.PathLike[str] | None,
+    timeout: float = 300.0,
+    stdin: bytes | None = None,
+    env: dict[str, str] | None = None,
+) -> str:
+    """:func:`git_query` that raises :class:`GitError`, with git's own words, on a non-zero exit."""
+    result = git_query(args, cwd=cwd, timeout=timeout, stdin=stdin, env=env)
+    if result.returncode != 0:
+        raise _git_failure(args, result.returncode, result.stderr)
+    return result.stdout
 
 
 def _git_failure(args: Sequence[str], returncode: int, stderr: str) -> GitError:
@@ -810,10 +837,27 @@ def registered_worktrees(common_dir: str) -> list[dict[str, str]]:
     directory, so the answer never depends on any worktree, the one being removed included.
     """
     args = ("--git-dir", common_dir, "worktree", "list", "--porcelain", "-z")
-    returncode, stdout, stderr = _git_bytes(args, cwd=common_dir, timeout=60)
-    if returncode != 0:
-        raise _git_failure(args, returncode, stderr)
-    return _worktree_list_records(stdout)
+    return _worktree_list_records(git_run(args, cwd=common_dir, timeout=60))
+
+
+def _registered_at(records: list[dict[str, str]], path: str | os.PathLike[str]) -> int | None:
+    """The position in ``records`` of the worktree registered at ``path`` (0 is the main one)."""
+    for index, record in enumerate(records):
+        recorded = record.get("worktree")
+        if recorded and same_path(recorded, path):
+            return index
+    return None
+
+
+def registration_for(common_dir: str, path: str | os.PathLike[str]) -> dict[str, str] | None:
+    """The registration the git directory ``common_dir`` holds for ``path``, or ``None``.
+
+    Asked of the common directory alone (:func:`registered_worktrees`), so the answer holds when
+    the worktree's own ``.git`` file is gone.
+    """
+    records = registered_worktrees(common_dir)
+    index = _registered_at(records, path)
+    return None if index is None else records[index]
 
 
 #: How git says "there is no repository here" (``setup.c``), read with git's messages untranslated.
@@ -861,7 +905,7 @@ class GitRepo:
             "HEAD",
         )
         env = {**_base_env(), "LC_ALL": "C"} if discovering else None
-        completed = _run_git(args, cwd=cwd, timeout=30, env=env)
+        completed = git_query(args, cwd=cwd, timeout=30, env=env)
         if (
             discovering
             and completed.returncode == 128
@@ -909,15 +953,23 @@ class GitRepo:
         """
         return self.run("rev-parse", "--verify", "--end-of-options", revision, cwd=cwd).strip()
 
-    def run(self, *args: str, cwd: Path | None = None, literal_pathspecs: bool = False) -> str:
+    def run(
+        self,
+        *args: str,
+        cwd: Path | None = None,
+        literal_pathspecs: bool = False,
+        stdin: bytes | None = None,
+    ) -> str:
+        """``git <args>`` in ``cwd`` (the repository root by default): :func:`git_run`."""
         env = _base_env()
         if literal_pathspecs:
             # A scope entry is a path, never a pattern: '*', '?', '[' and ':(magic)' mean themselves.
             env["GIT_LITERAL_PATHSPECS"] = "1"
-        completed = _run_git(args, cwd=cwd or self.root, timeout=300, env=env)
-        if completed.returncode != 0:
-            raise _git_failure(args, completed.returncode, completed.stderr)
-        return completed.stdout
+        return git_run(args, cwd=cwd or self.root, stdin=stdin, env=env)
+
+    def query(self, *args: str, cwd: Path | None = None, timeout: float = 300.0) -> GitResult:
+        """``git <args>`` in ``cwd`` whose exit code the caller interprets: :func:`git_query`."""
+        return git_query(args, cwd=cwd or self.root, timeout=timeout)
 
     def status_report(self, cwd: Path | None = None) -> StatusReport:
         """Raw, machine-parsed status. Raises rather than guessing on odd records."""
@@ -964,8 +1016,8 @@ class GitRepo:
                 continue
             if relative != ".":
                 excluded.append(relative.casefold() if fold_case else relative)
-        stash = self._git_query(self.root, "rev-parse", "-q", "--verify", "refs/stash")
-        head_name = self._git_query(self.root, "symbolic-ref", "-q", "HEAD")
+        stash = self.query("rev-parse", "-q", "--verify", "refs/stash", timeout=30)
+        head_name = self.query("symbolic-ref", "-q", "HEAD", timeout=30)
         index = self.run("ls-files", "-s", "-z")
         raw = self.run(
             "--no-optional-locks",
@@ -1018,12 +1070,12 @@ class GitRepo:
         if not target.is_dir() or not (target / ".git").is_file():
             raise GitError(f"worktree reuse refused: {target} is not a linked Git worktree")
         actual = GitRepo.discover(target)
-        if (
-            actual.root != target.resolve()
-            or actual.absolute_common_dir != self.absolute_common_dir
+        if not same_path(actual.root, target) or not same_path(
+            actual.absolute_common_dir, self.absolute_common_dir
         ):
             raise GitError("worktree reuse refused: repository identity differs")
-        if self.worktree_registration(target) is None or self.is_main_worktree(target):
+        registration, is_main = self.registration(target)
+        if registration is None or is_main:
             raise GitError("worktree reuse refused: missing registration or source checkout")
         if actual.resolve_commit("HEAD") != base_commit:
             raise GitError("worktree reuse refused: HEAD differs from the admitted base")
@@ -1103,8 +1155,7 @@ class GitRepo:
         """
         if not commit:
             return False
-        completed = _run_git(("cat-file", "-e", f"{commit}^{{commit}}"), cwd=self.root, timeout=300)
-        return completed.returncode == 0
+        return self.query("cat-file", "-e", f"{commit}^{{commit}}").returncode == 0
 
     def diff_paths(self, base: str, candidate: str, *, cwd: Path | None = None) -> list[str]:
         """Every path in which ``candidate`` differs from ``base``.
@@ -1139,12 +1190,7 @@ class GitRepo:
         out = self.run(
             "ls-tree", "-r", "-z", "--name-only", "--end-of-options", _revision(commit, "commit")
         )
-        return [
-            path
-            for path in out.split("\0")
-            if path.casefold().endswith(".pyc")
-            and any(part.casefold() == "__pycache__" for part in path.split("/")[:-1])
-        ]
+        return [path for path in out.split("\0") if path and all(_bytecode(path))]
 
     def diff_text_bounded(
         self,
@@ -1246,16 +1292,9 @@ class GitRepo:
                 flagged.append(path)
         return flagged
 
-    def _git_query(self, cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
-        """A read-only git query whose exit code the caller interprets (``run`` raises on any).
-
-        A timeout and output that cannot be decoded raise :class:`GitError` (:func:`_run_git`).
-        """
-        return _run_git(args, cwd=cwd, timeout=30)
-
     def _global_attributes_file(self, cwd: Path) -> str:
         """The global attributes file git reads in ``cwd``, or ``""`` when it reads none."""
-        query = self._git_query(cwd, "var", "GIT_ATTR_GLOBAL")
+        query = self.query("var", "GIT_ATTR_GLOBAL", cwd=cwd, timeout=30)
         if query.returncode == 0:
             return query.stdout.strip()
         if query.returncode == 1 and not query.stdout.strip():
@@ -1267,7 +1306,9 @@ class GitRepo:
         # 129: a Git older than 2.42, which does not know the variable. Git's own rule, by hand:
         # ``core.attributesFile``, else ``$XDG_CONFIG_HOME/git/attributes``, else
         # ``~/.config/git/attributes``.
-        configured = self._git_query(cwd, "config", "--type=path", "--get", "core.attributesFile")
+        configured = self.query(
+            "config", "--type=path", "--get", "core.attributesFile", cwd=cwd, timeout=30
+        )
         if configured.returncode == 0:
             return configured.stdout.strip()
         if configured.returncode != 1:
@@ -1279,14 +1320,15 @@ class GitRepo:
             return (Path(xdg) / "git" / "attributes").as_posix()
         # Git expands ``~`` with its own idea of HOME, which Git for Windows derives when HOME is
         # unset; with no home at all the expansion fails and git reads no global file.
-        default = self._git_query(
-            cwd,
+        default = self.query(
             "config",
             "--type=path",
             "--default",
             "~/.config/git/attributes",
             "--get",
             "core.attributesFile",
+            cwd=cwd,
+            timeout=30,
         )
         return default.stdout.strip() if default.returncode == 0 else ""
 
@@ -1310,8 +1352,8 @@ class GitRepo:
         ``git rev-parse --git-path`` and the global attributes file, present or not. Read-only:
         none of these commands runs a filter. Any failure, a timeout included, raises
         :class:`GitError` - and so does output that is not text (a configuration value is raw
-        bytes a worker can write): every read goes through ``run`` or ``_git_query``, which
-        convert both on either platform (:func:`_run_git`).
+        bytes a worker can write): every read goes through ``run`` or ``query``
+        (:func:`git_query`).
 
         Needs Git 2.31+ (``rev-parse --path-format=absolute``; ``--show-scope`` is 2.26). The
         global attributes file comes from ``git var GIT_ATTR_GLOBAL`` on Git 2.42+ and from git's
@@ -1540,7 +1582,7 @@ class GitRepo:
         never pass for a deleted branch (an integration would be recorded stale on it).
         """
         args = ("rev-parse", "--verify", "--quiet", "--end-of-options", ref)
-        completed = _run_git(args, cwd=self.root, timeout=30)
+        completed = self.query(*args, timeout=30)
         target = completed.stdout.strip()
         if completed.returncode == 1 and not target:
             return None
@@ -1600,23 +1642,6 @@ class GitRepo:
     # Plumbing only: none of these reads or writes an index or a working tree, so the user's
     # checkout is never touched. Revisions are refused when they could read as an option.
 
-    def _git_call(
-        self, *args: str, stdin: bytes | None = None, timeout: float = 300.0
-    ) -> tuple[int, str, str]:
-        """:func:`_git_bytes` in the repository root: binary pipes, ``(returncode, stdout, stderr)``.
-
-        For callers that read the exit code themselves (``run`` raises on any non-zero), feed
-        stdin, or read ``-z`` output that must keep a ``\\r`` in a path.
-        """
-        return _git_bytes(args, cwd=self.root, stdin=stdin, timeout=timeout)
-
-    def _git_checked(self, *args: str, stdin: bytes | None = None) -> str:
-        """:meth:`_git_call` that raises :class:`GitError`, with git's words, on a non-zero exit."""
-        returncode, stdout, stderr = self._git_call(*args, stdin=stdin)
-        if returncode != 0:
-            raise _git_failure(args, returncode, stderr)
-        return stdout
-
     @staticmethod
     def _object_id(stdout: str, args: tuple[str, ...]) -> str:
         oid = stdout.strip()
@@ -1626,7 +1651,7 @@ class GitRepo:
 
     def git_version(self) -> tuple[int, int, int]:
         """The running git's version, ``(major, minor, patch)``; see :func:`parse_git_version`."""
-        return parse_git_version(self._git_checked("version"))
+        return parse_git_version(self.run("version"))
 
     def is_ancestor(self, ancestor: str, descendant: str) -> bool:
         """``git merge-base --is-ancestor``: exit 0 is yes, 1 is no, anything else raises.
@@ -1640,7 +1665,7 @@ class GitRepo:
             _revision(ancestor, "ancestor"),
             _revision(descendant, "descendant"),
         )
-        returncode, _, stderr = self._git_call(*args)
+        returncode, _, stderr = self.query(*args)
         if returncode in (0, 1):
             return returncode == 0
         raise _git_failure(args, returncode, stderr)
@@ -1663,7 +1688,7 @@ class GitRepo:
             or any(char in branch for char in "\0\n\r")
         ):
             raise GitError(f"refusing branch name {branch!r}")
-        returncode, stdout, stderr = self._git_call("check-ref-format", "--branch", branch)
+        returncode, stdout, stderr = self.query("check-ref-format", "--branch", branch)
         if returncode != 0 or stdout.removesuffix("\n") != branch:
             raise GitError(f"refusing branch name {branch!r}: {stderr.strip()[:200] or stdout.strip()[:200]}")
         return f"refs/heads/{branch}"
@@ -1671,7 +1696,7 @@ class GitRepo:
     def tree_of(self, commit: str) -> str:
         """The tree object id of ``commit`` (``rev-parse --verify <commit>^{tree}``)."""
         args = ("rev-parse", "--verify", "--end-of-options", f"{_revision(commit, 'commit')}^{{tree}}")
-        return self._object_id(self._git_checked(*args), args)
+        return self._object_id(self.run(*args), args)
 
     def merge_tree(self, *, base: str, ours: str, theirs: str) -> MergeTreeResult:
         """Three-way merge of ``ours`` and ``theirs`` over ``base``, as objects only.
@@ -1693,7 +1718,7 @@ class GitRepo:
             _revision(ours, "ours"),
             _revision(theirs, "theirs"),
         )
-        returncode, stdout, stderr = self._git_call(*args)
+        returncode, stdout, stderr = self.query(*args)
         if returncode not in (0, 1):
             raise _git_failure(args, returncode, stderr)
         return _merge_tree_result(stdout, clean=returncode == 0, args=args)
@@ -1724,7 +1749,7 @@ class GitRepo:
         for parent in parent_list:
             args += ["-p", parent]
         args += ["-F", "-"]
-        return self._object_id(self._git_checked(*args, stdin=body), tuple(args))
+        return self._object_id(self.run(*args, stdin=body), tuple(args))
 
     def update_ref_cas(self, ref: str, new: str, expected_old: str, *, reason: str) -> None:
         """Move branch ``ref`` from ``expected_old`` to ``new``, atomically, or raise.
@@ -1748,12 +1773,12 @@ class GitRepo:
         if not isinstance(reason, str) or not reason.strip() or any(c in reason for c in "\0\n\r"):
             raise GitError(f"refusing to update {ref}: the reflog reason must be one non-empty line")
         args = ("symbolic-ref", "-q", ref)
-        returncode, stdout, stderr = self._git_call(*args)
+        returncode, stdout, stderr = self.query(*args)
         if returncode == 0:
             raise GitError(f"refusing to update {ref}: it is a symbolic ref to {stdout.strip()}")
         if returncode != 1:
             raise _git_failure(args, returncode, stderr)
-        self._git_checked("update-ref", "--no-deref", "-m", reason, ref, new, expected_old)
+        self.run("update-ref", "--no-deref", "-m", reason, ref, new, expected_old)
 
     def worktree_blocks(self) -> list[dict[str, str]]:
         """All worktree registrations, in git's order (the main worktree comes first).
@@ -1761,7 +1786,7 @@ class GitRepo:
         One dict per worktree from ``git worktree list --porcelain -z``
         (:func:`_worktree_list_records`).
         """
-        return _worktree_list_records(self._git_checked("worktree", "list", "--porcelain", "-z"))
+        return _worktree_list_records(self.run("worktree", "list", "--porcelain", "-z"))
 
     def checked_out_at(self, ref: str) -> list[Path]:
         """Every worktree that holds ``ref`` checked out, as git itself counts it.
@@ -1773,14 +1798,15 @@ class GitRepo:
         ``is_worktree_being_rebased`` / ``is_worktree_being_bisected`` / ``find_shared_symref``
         check. The main worktree's state lives in the common git directory, a linked worktree's in
         ``worktrees/<id>``, found as git finds it: by the ``gitdir`` file there. A bare main
-        worktree is skipped, as git skips it.
+        worktree is skipped, as git skips it. A ref name that differs only in letter case counts
+        as ``ref`` (:func:`_same_ref`): on NTFS a HEAD naming ``refs/heads/Main`` holds ``main``.
 
         Returns resolved paths, deduplicated, in ``git worktree list`` order; a worktree whose
         state names the branch but that the listing does not show comes last. Read-only.
         """
         records = self.worktree_blocks()
         common = Path(
-            self._git_checked("rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+            self.run("rev-parse", "--path-format=absolute", "--git-common-dir").strip()
         )
         # Linked worktree administrative directories, by the worktree path git derives from each
         # ``gitdir`` file (``worktree.c`` ``get_linked_worktree``). One whose file is unreadable
@@ -1823,7 +1849,9 @@ class GitRepo:
             if "bare" in record:
                 continue
             admin = common if index == 0 else linked.get(key, (None, ""))[0]
-            if record.get("branch") == ref or (admin is not None and _worktree_state_holds(admin, ref)):
+            if _same_ref(record.get("branch", ""), ref) or (
+                admin is not None and _worktree_state_holds(admin, ref)
+            ):
                 add(path_text)
         for key, (admin, path_text) in linked.items():
             if key not in listed and _worktree_state_holds(admin, ref):
@@ -1845,18 +1873,21 @@ class GitRepo:
         recorded = blocks[0].get("worktree")
         return Path(recorded).resolve() if recorded else None
 
+    def registration(self, worktree: Path) -> tuple[dict[str, str] | None, bool]:
+        """``(the registration git holds for this path or None, whether it is the main worktree)``.
+
+        One ``git worktree list``: the main worktree is the first one git lists.
+        """
+        records = self.worktree_blocks()
+        index = _registered_at(records, worktree)
+        return (None, False) if index is None else (records[index], index == 0)
+
     def is_main_worktree(self, candidate: Path) -> bool:
-        main = self.main_worktree()
-        return main is not None and Path(candidate).resolve() == main
+        return self.registration(candidate)[1]
 
     def worktree_registration(self, worktree: Path) -> dict[str, str] | None:
         """The registration git actually holds for this path, or ``None`` when absent."""
-        target = Path(worktree).resolve()
-        for block in self.worktree_blocks():
-            recorded = block.get("worktree")
-            if recorded and Path(recorded).resolve() == target:
-                return block
-        return None
+        return self.registration(worktree)[0]
 
     def remove_worktree_checked(self, worktree: Path) -> None:
         """``git worktree remove`` with no force and no fallback deletion.

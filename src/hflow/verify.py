@@ -150,21 +150,23 @@ def remove_worker_bytecode(root: Path, *, keep: Iterable[str] = ()) -> BytecodeR
             name = entry.name.casefold()
             if name == ".git":
                 continue
+            # Bytecode Python would load in place of a source: directly in this cache directory.
+            cached_bytecode = is_cache and name.endswith(".pyc")
             if _is_link(entry):
-                if name == "__pycache__" or (is_cache and name.endswith(".pyc")):
+                if name == "__pycache__" or cached_bytecode:
                     refused.append(f"{relative(entry.path)} (a link or junction; not followed)")
                 continue
             try:
                 is_dir = entry.is_dir(follow_symlinks=False)
                 is_file = entry.is_file(follow_symlinks=False)
             except OSError as exc:
-                if is_cache and name.endswith(".pyc"):
+                if cached_bytecode:
                     refused.append(f"{relative(entry.path)} (unreadable: {exc})")
                 continue
             if is_dir:
                 pending.append(entry.path)
                 continue
-            if not (is_cache and is_file and name.endswith(".pyc")):
+            if not (cached_bytecode and is_file):
                 continue
             if key(relative(entry.path)) in kept:
                 continue
@@ -264,7 +266,6 @@ class FakeCheckRunner:
         self.verdicts = verdicts or {}
         self.exit_reasons = dict(exit_reasons or {})
         self.calls: list[str] = []
-        self.cache_hits = 0
         #: Optional side effect applied the first time each check runs. Tests use it to
         #: model "the candidate changed while we were verifying" without a real harness.
         self.after_run: dict[str, object] | None = None
@@ -1011,9 +1012,6 @@ def verify_candidate(
                     break
         if reusable is not None:
             evidence_ids.append(reusable["evidence_id"])
-            for runner in runners.runners.values():
-                if isinstance(runner, FakeCheckRunner):
-                    runner.cache_hits += 1
             continue
 
         evidence_id = new_evidence_id()
@@ -1172,7 +1170,9 @@ def _detail_with_references(outcome: CheckOutcome) -> str:
 #
 # The ``artifact``/``stdout``/``stderr`` references are decoded from the detail text that
 # ``_detail_with_references`` writes. The reader lives next to the writer, and the controller
-# imports this one reader for the reviewer packet, so the format has exactly one reader.
+# imports this one reader for the reviewer packet, so the format has exactly one reader. The packet
+# renderer imports :func:`free_text` from here for the same reason: what follows the block is
+# found by the reader that knows where the block ends.
 
 #: The marker the check's own stderr head is written under, inside the free-text detail. It is
 #: deliberately *not* a reference spelling: a check controls these bytes, so they must never read
@@ -1203,6 +1203,13 @@ _ARTIFACT_END = re.compile(rf" (?=[a-z_]+(?::\s|=){_STREAM_VALUE}(?: |$)|env_nam
 #: The free text a command check's detail starts with. It bounds an artifact value that no block
 #: segment follows, so the value never runs on into text the check wrote.
 _FREE_TEXT_START = re.compile(r" (?=check \S)")
+#: The environment summary that closes the block (``artifacts.environment_summary``):
+#: ``env_names=N: A, B, C`` and, when anything was withheld, ``; withheld_secret_like=X,Y``. A
+#: variable name holds no space, so the summary ends at the first space that is not part of its
+#: ``, `` separator - which is where the free text begins.
+_BLOCK_ENVIRONMENT = re.compile(
+    r"env_names=\d+: (?:[^\s,;]+(?:, [^\s,;]+)*)?(?:; withheld_secret_like=\S*)?(?= |$)"
+)
 
 
 def _reference_block(detail: str) -> dict[str, str]:
@@ -1215,6 +1222,11 @@ def _reference_block(detail: str) -> dict[str, str]:
     of these. So nothing a check wrote (a ``stderr=`` or ``stdout:`` look-alike in its stderr, for
     example) can stand in for, or hide, HFlow's own reference.
     """
+    return _read_reference_block(detail)[0]
+
+
+def _read_reference_block(detail: str) -> tuple[dict[str, str], int]:
+    """:func:`_reference_block`, and the index just past its last stream reference."""
     fields: dict[str, str] = {}
     position = 0
     match = _BLOCK_REASON.match(detail, position)
@@ -1236,7 +1248,24 @@ def _reference_block(detail: str) -> dict[str, str]:
         # The first reference of a name wins; a repeated name never overwrites it.
         fields.setdefault(match.group("name"), match.group("value"))
         position = match.end() + 1
-    return fields
+    return fields, position
+
+
+def free_text(detail: str) -> str:
+    """What an evidence row's detail says **after** HFlow's leading block: the check's own text.
+
+    The block (reason, artifact, stream references, environment summary) is skipped exactly as
+    :func:`_reference_block` reads it, so a packet that already prints those references does not
+    print them a second time - on a machine with a long environment summary the repeat used to fill
+    the whole excerpt and the failure itself (``exit=1 ... stderr_excerpt=...``) never reached the
+    reader. A detail with no block is returned whole. The result still carries bytes the check
+    wrote, so a caller renders it quoted.
+    """
+    _, position = _read_reference_block(detail)
+    match = _BLOCK_ENVIRONMENT.match(detail, position)
+    if match is not None:
+        position = match.end() + 1
+    return detail[position:]
 
 
 def _reference_field(detail: str, field: str) -> str:

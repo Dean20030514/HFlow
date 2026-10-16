@@ -11,7 +11,6 @@ nothing about real DSH/acpx interoperability (plan 18, M4 boundary).
 
 from __future__ import annotations
 
-import os
 import platform
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,7 +30,6 @@ from ..contracts import (
     SpawnFact,
     SpawnKind,
 )
-from ..ids import utc_now
 
 DRIVER_ID = "fake-offline"
 DRIVER_VERSION = "0.1.0"
@@ -225,19 +223,3 @@ class FakeDriver:
             outcome=ReconcileOutcome.UNKNOWN,
             detail="fake driver cannot prove whether work happened; staying unknown",
         )
-
-
-class ProcessGuard:
-    """Records a process identity for an attempt.
-
-    The controller stores PID *plus* start time *plus* a managed-instance marker,
-    because a bare PID can be reused by an unrelated process (plan 9.3).
-    """
-
-    def __init__(self, owner_id: str) -> None:
-        self.owner_id = owner_id
-
-    def identity(self) -> tuple[int, str, str]:
-        pid = os.getpid()
-        started_at = utc_now()
-        return pid, started_at, f"{self.owner_id}:{pid}:{started_at}"

@@ -463,11 +463,13 @@ class DshContextRecord(BaseModel):
 class BudgetRequest(BaseModel):
     """How many top-level invocations one run may buy.
 
-    ``max_repair_cycles`` keeps its historical default of 1 and **authorizes nothing**: a numeric
+    ``max_repair_cycles`` keeps its historical default of 1 and **arms nothing**: a numeric
     budget field is not a policy, and repairing because an old task file happens to say ``1``
     would spend money on a behaviour nobody approved. A repair needs an explicit
     :class:`RepairPolicy`, and E2's worst case (a repair after a reviewer rejection) is covered by
-    ``max_agent_turns`` like every other dispatch.
+    ``max_agent_turns`` like every other dispatch. The number is still a requested ceiling:
+    admission refuses one above ``ProjectLimits.max_repair_cycles`` (a task may ask for less,
+    never for more), and the run row records it as ``repair_limit``, which nothing reads.
     """
 
     model_config = Strict
@@ -797,6 +799,9 @@ LaunchFileKind = Literal[
     # The Electron archive (``*.asar``) a Desktop carrier entry lies inside, bound in place of
     # the entry and its package.json, which exist only inside it.
     "carrier_archive",
+    # The node an npm carrier's shim runs: the node.exe beside it, else the first node on the
+    # child's PATH (looked up again in the child's environment at the spawn gate).
+    "carrier_interpreter",
 ]
 #: The ``LaunchConfig`` fields that record content. They are left out of
 #: :meth:`EffectiveConfig.digest`, because an approval binds them through its own
@@ -1197,7 +1202,7 @@ class InvocationRequest(BaseModel):
     invocation_id: str
     attempt_id: str
     run_id: str
-    role: Literal["implementer", "reviewer", "planner"]
+    role: Literal["implementer", "reviewer"]
     task_id: str
     task_revision: int
     goal: str
@@ -1584,7 +1589,7 @@ class InvocationIntent(BaseModel):
     root_id: str
     run_id: str
     attempt_id: str
-    role: Literal["implementer", "reviewer", "planner"]
+    role: Literal["implementer", "reviewer"]
     authorization_id: str = ""
     round: int = 0
     state: InvocationStartState = InvocationStartState.RESERVED
@@ -1872,16 +1877,11 @@ class DriverHandle(BaseModel):
     run_id: str
     role: str
     workspace: str
-    started_at: str
-    process_identity: str
     boundary_kind: str
     pid: int | None = None
     session_id: str | None = None
     dispatched: bool = False
-    dispatched_at: str | None = None
     event_log: str = ""
-    #: Set once the invocation reached a terminal state, so repeated calls are cheap.
-    finished: bool = False
     #: The invocation was stopped *before* its process was created, so there is no child and
     #: none will be made. A driver must publish the handle before spawning and check the stop
     #: inside that same coordination, which is what turns "a stop arrived while we were about
@@ -2438,10 +2438,12 @@ class PlanArguments(BaseModel):
 
     ``approve --plan`` and ``run --plan`` resolve from exactly these values, through the same
     function ``prepare`` used, so a plan is "run with identical flags" written down once. Paths are
-    absolute (resolved against the directory ``prepare`` ran in). ``base_commit`` is kept as given
-    - a ref stays a ref - so the later resolution resolves it the way ``prepare`` did, and a branch
-    that moved in between shows up as a changed binding rather than being hidden by a stored SHA.
-    ``profile`` is the profile ``prepare`` selected (``--profile``, else ``HFLOW_PROFILE``).
+    absolute (resolved against the directory ``prepare`` ran in). ``profile`` is the profile
+    ``prepare`` selected (``--profile``, else ``HFLOW_PROFILE``). ``authorization_mode`` has no
+    flag any more; it stays so an older plan that recorded ``stop-trial`` still loads.
+    ``allow_writes`` is the write opt-in ``prepare`` resolved (``--allow-writes``, else
+    ``HFLOW_ALLOW_WRITES``): ``approve --plan`` and ``run --plan`` use it and never read the
+    environment for it, and it reaches the binding through ``EffectiveConfig.implementer_writes``.
     """
 
     model_config = Strict
@@ -2451,11 +2453,10 @@ class PlanArguments(BaseModel):
     project_root: str
     profile: str | None = None
     driver: str | None = None
-    base_commit: str | None = None
-    workspace: Literal["worktree", "in_place"] | None = None
     authorization_mode: Literal["stop-trial", "m2-live-change"] = "m2-live-change"
     root_budget_file: str | None = None
     repair_policy_file: str | None = None
+    allow_writes: bool = False
     data_dir: str
 
 

@@ -208,3 +208,131 @@ def test_the_kernel32_binding_is_loaded_once_with_every_signature_declared() -> 
         assert list(function.argtypes) == argtypes, name
     assert api.CreateToolhelp32Snapshot.restype is wintypes.HANDLE
     assert api.ResumeThread.restype is wintypes.DWORD
+
+
+def test_ownership_calls_kernel32_through_the_one_binding() -> None:
+    from hflow import ownership
+
+    assert {"GetCurrentProcess", "GetProcessTimes"} <= set(winjob._SIGNATURES)
+    assert not hasattr(ownership, "_api"), "no second set of signature declarations"
+    assert ownership.current_identity().created is not None
+
+
+def _threads_stand_in(
+    threads: list[tuple[int, int]], *, open_errors: dict[int, int] | None = None
+) -> tuple[types.SimpleNamespace, list[str]]:
+    """A kernel32 whose thread snapshot lists ``(owner pid, thread id)`` in this order.
+
+    ``open_errors`` maps a thread id to the error ``OpenThread`` reports for it.
+    """
+    calls: list[str] = []
+    remaining = list(threads)
+
+    def fill(entry_ref: object) -> int:
+        if not remaining:
+            return 0
+        owner, thread_id = remaining.pop(0)
+        entry = entry_ref._obj  # type: ignore[attr-defined] - ctypes.byref keeps its object
+        entry.th32OwnerProcessID = owner
+        entry.th32ThreadID = thread_id
+        return 1
+
+    def open_thread(access: int, inherit: bool, thread_id: int) -> int | None:
+        calls.append(f"OpenThread({thread_id})")
+        error = (open_errors or {}).get(thread_id)
+        if error is not None:
+            ctypes.set_last_error(error)  # type: ignore[attr-defined]
+            return None
+        return 1000 + thread_id
+
+    def resume_thread(handle: int) -> int:
+        calls.append(f"ResumeThread({handle - 1000})")
+        return 1
+
+    def close_handle(handle: int) -> int:
+        calls.append(f"CloseHandle({handle})")
+        return 1
+
+    api = types.SimpleNamespace(
+        CreateToolhelp32Snapshot=lambda flags, owner: 55,
+        Thread32First=lambda handle, entry_ref: fill(entry_ref),
+        Thread32Next=lambda handle, entry_ref: fill(entry_ref),
+        OpenThread=open_thread,
+        ResumeThread=resume_thread,
+        CloseHandle=close_handle,
+    )
+    return api, calls
+
+
+def test_every_thread_of_the_process_is_resumed_not_only_the_first(monkeypatch) -> None:
+    """The snapshot does not promise the primary thread comes first: stopping at the first thread
+    of the pid could leave the suspended one suspended."""
+    api, calls = _threads_stand_in([(1234, 7), (999, 8), (1234, 9), (1234, 10)])
+    monkeypatch.setattr(winjob, "_kernel32", lambda: api)
+
+    winjob.resume(1234)
+    assert [call for call in calls if call.startswith("ResumeThread")] == [
+        "ResumeThread(7)", "ResumeThread(9)", "ResumeThread(10)"
+    ]
+    assert "OpenThread(8)" not in calls, "another process's thread is never touched"
+    assert calls.count("CloseHandle(55)") == 1
+
+
+def test_a_thread_that_cannot_be_opened_fails_the_resume_unless_it_is_gone(monkeypatch) -> None:
+    gone, _ = _threads_stand_in(
+        [(1234, 7), (1234, 9)], open_errors={7: winjob.ERROR_INVALID_PARAMETER}
+    )
+    monkeypatch.setattr(winjob, "_kernel32", lambda: gone)
+    winjob.resume(1234)  # thread 7 no longer exists; thread 9 is resumed
+
+    denied, calls = _threads_stand_in([(1234, 7), (1234, 9)], open_errors={9: ERROR_ACCESS_DENIED})
+    monkeypatch.setattr(winjob, "_kernel32", lambda: denied)
+    with pytest.raises(winjob.JobBoundaryError, match="OpenThread\\(9\\)"):
+        winjob.resume(1234)
+    assert "CloseHandle(55)" in calls, "the snapshot is closed on every path"
+
+    other, _ = _threads_stand_in([(999, 8)])
+    monkeypatch.setattr(winjob, "_kernel32", lambda: other)
+    with pytest.raises(winjob.JobBoundaryError, match="could not resume"):
+        winjob.resume(1234)
+
+
+def test_a_child_that_cannot_be_resumed_is_killed_waited_for_and_its_pipes_closed(
+    monkeypatch, tmp_path
+) -> None:
+    """Real kernel: nobody gets the child back from a failed start, so nothing it was given may be
+    left open - the stdin and stderr pipes ``Popen`` made are closed and its exit is reaped."""
+    import os
+    import subprocess
+    import sys
+
+    made: list[subprocess.Popen] = []
+
+    class Recording(subprocess.Popen):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+            made.append(self)
+
+    def refuse(pid: int) -> None:
+        raise winjob.JobBoundaryError(f"stand-in: could not resume {pid}")
+
+    monkeypatch.setattr(winjob.subprocess, "Popen", Recording)
+    monkeypatch.setattr(winjob, "resume", refuse)
+    boundary = winjob.ProcessBoundary().open()
+    try:
+        with (tmp_path / "out.txt").open("wb") as stdout_handle:
+            with pytest.raises(winjob.JobBoundaryError, match="stand-in"):
+                winjob.popen_in_boundary(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    cwd=str(tmp_path),
+                    env=dict(os.environ),
+                    boundary=boundary,
+                    stdout_handle=stdout_handle,
+                    stderr_handle=subprocess.PIPE,
+                )
+    finally:
+        boundary.close()
+    (child,) = made
+    assert child.returncode is not None, "the killed child was waited for"
+    assert child.stdin is not None and child.stdin.closed
+    assert child.stderr is not None and child.stderr.closed

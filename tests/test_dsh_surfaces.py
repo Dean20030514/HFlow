@@ -142,8 +142,48 @@ def test_a_bound_home_is_examined_from_a_fixed_list_and_its_stored_credentials_a
     assert {path.name for path in reads} <= {"cordis.patch.yml", "AGENTS.md", "package.json"}
     dumped = surfaces.model_dump_json()
     assert "cred-sentinel" not in dumped and "unrelated.txt" not in dumped
-    assert ".credentials" not in dumped
+    # Named in one note (found by stat), never listed as a file DSH reads, never sized or hashed.
+    assert ".credentials" not in surfaces.model_copy(update={"notes": []}).model_dump_json()
+    assert [note for note in surfaces.notes if ".credentials" in note] == [
+        dsh_surfaces.STORED_CREDENTIALS_REWRITE_NOTE
+    ]
     assert not [note for note in surfaces.notes if "workspace-changes" in note]
+
+
+def test_a_stored_credentials_file_in_a_bound_home_is_noted_by_stat_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DSH 0.2.0-rc.2 rewrites a pre-release flat credentials file in place at boot (#9845). The
+    record says so when a bound home holds one - found by stat, never opened - and says nothing
+    for a home without one or for the per-invocation home."""
+    note = dsh_surfaces.STORED_CREDENTIALS_REWRITE_NOTE
+    assert "#9845" in note and "98d70ee1" in note and "never opens" in note
+    home = tmp_path / "bound"
+    home.mkdir()
+    reads = _record_reads(monkeypatch)
+
+    def notes(kind: str = "bound") -> list[str]:
+        return observe_launch_surfaces(
+            _launch(dsh_home=str(home)), dsh_home=home, dsh_home_kind=kind, child_env={}  # type: ignore[arg-type]
+        ).notes
+
+    assert note not in notes()
+    (home / ".credentials.yaml").write_text("token: cred-sentinel\n", encoding="utf-8")
+    assert note in notes()
+    assert note not in notes("per_invocation")
+    assert ".credentials.yaml" not in {path.name for path in reads}
+    (home / ".credentials.yaml").unlink()
+    (home / ".credentials.yaml").mkdir()  # not a file: DSH could not read a credential from it
+    assert note not in notes()
+
+
+def test_the_sandbox_mode_note_says_the_launch_time_mode_is_final() -> None:
+    """ACP exposes no session modes (DSH #9735): whatever mode a session starts in, it keeps."""
+    surfaces = observe_launch_surfaces(
+        _launch(), dsh_home=Path("unused"), dsh_home_kind="per_invocation", child_env={}
+    )
+    (mode,) = [note for note in surfaces.notes if note.startswith("DSH sandbox mode:")]
+    assert "final for it (DSH #9735)" in mode
 
 
 def test_a_bound_home_whose_profile_loads_the_web_bundle_is_noted_not_refused(

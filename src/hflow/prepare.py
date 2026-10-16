@@ -326,25 +326,19 @@ def root_budget_preview(
     )
 
 
-def effective_spec(
-    spec: TaskSpec,
-    *,
-    base_commit: str | None = None,
-    workspace_mode: str | None = None,
-    repair_policy: RepairPolicy | None = None,
-) -> TaskSpec:
-    """Apply command-line overrides *before* admission.
+def effective_spec(spec: TaskSpec, *, repair_policy: RepairPolicy | None = None) -> TaskSpec:
+    """Apply the one command-line override, ``--repair-policy-file``, *before* admission.
 
-    The overrides become part of the effective TaskSpec, so the stored spec, its digest, the
-    rendered packet and the authorization binding all describe the same task. This used to
-    live in ``cmd_run``; ``prepare`` needs the identical rule or its preview would describe a
-    different spec than the run it previews.
+    The override becomes part of the effective TaskSpec, so the stored spec, its digest, the
+    rendered packet and the authorization binding all describe the same task; ``prepare`` and
+    ``run`` share this rule, or a preview would describe a different spec than the run it
+    previews. The workspace mode and base commit are the task file's alone.
 
-    ``--repair-policy-file`` is the same kind of override, with one extra rule: a task that
-    already names a repair policy and a flag that names another are two sources disagreeing about
-    what may buy a repair, and this build refuses that rather than silently preferring one. The
-    same policy written twice is not a disagreement - comparing digests keeps the resolution
-    idempotent, so re-running an already-policied task with its own policy file works.
+    A task that already names a repair policy and a flag that names another are two sources
+    disagreeing about what may buy a repair, and this build refuses that rather than silently
+    preferring one. The same policy written twice is not a disagreement - comparing digests keeps
+    the resolution idempotent, so re-running an already-policied task with its own policy file
+    works.
     """
     if repair_policy is not None and spec.repair_policy is not None:
         if repair_policy.digest() != spec.repair_policy.digest():
@@ -355,18 +349,9 @@ def effective_spec(
                 "disagreeing about what may buy a repair is not something this build resolves by "
                 "preferring one: nothing was dispatched and no allowance was consumed.",
             )
-    if not base_commit and not workspace_mode and repair_policy is None:
+    if repair_policy is None:
         return spec
-    overrides: dict[str, Any] = {}
-    if base_commit or workspace_mode:
-        mode = workspace_mode or spec.workspace.mode
-        overrides["workspace"] = {
-            "mode": mode,
-            "base_commit": base_commit or spec.workspace.base_commit,
-            "keep": True if mode == "worktree" else spec.workspace.keep,
-        }
-    if repair_policy is not None:
-        overrides["repair_policy"] = repair_policy.model_dump(mode="json")
+    overrides: dict[str, Any] = {"repair_policy": repair_policy.model_dump(mode="json")}
     try:
         return TaskSpec.model_validate({**spec.model_dump(mode="json"), **overrides})
     except ValidationError as exc:
@@ -584,18 +569,24 @@ def launch_credential_problem(
 
 
 def resolve_permissions(
-    spec: TaskSpec, env: Mapping[str, str] | None = None
+    spec: TaskSpec, env: Mapping[str, str] | None = None, *, allow_writes: bool | None = None
 ) -> tuple[bool, bool]:
     """(implementer_writes, reviewer_writes), decided in one place.
 
-    A run that must change files needs both an explicit local opt-in and an isolated worktree:
-    without a worktree the change would land in the user's own checkout. A reviewer never
-    writes, because it checks what the implementer produced. Both facts are part of the
-    effective configuration, so an approval covers them.
+    A run that must change files needs both an explicit opt-in and an isolated worktree: without
+    a worktree the change would land in the user's own checkout. The opt-in is ``allow_writes``
+    when the caller has it (``--allow-writes``, recorded in a plan), else ``HFLOW_ALLOW_WRITES``
+    in ``env``. A reviewer never writes, because it checks what the implementer produced. Both
+    facts are part of the effective configuration, so an approval covers them.
     """
-    source = env if env is not None else os.environ
-    opted_in = source.get(ENV_ALLOW_WRITES, "").strip().lower() in _WRITE_OPT_IN
+    opted_in = writes_opted_in(env) if allow_writes is None else allow_writes
     return (opted_in and spec.workspace.mode == "worktree"), False
+
+
+def writes_opted_in(env: Mapping[str, str] | None = None) -> bool:
+    """Whether ``env`` (else this process's environment) enables the write opt-in."""
+    source = env if env is not None else os.environ
+    return source.get(ENV_ALLOW_WRITES, "").strip().lower() in _WRITE_OPT_IN
 
 
 def _role_config(
@@ -818,10 +809,9 @@ def resolve_run(
     project_path: Path | None = None,
     profile_id: str | None = None,
     driver: str | None = None,
-    base_commit: str | None = None,
-    workspace_mode: str | None = None,
     repair_policy: RepairPolicy | None = None,
     env: Mapping[str, str] | None = None,
+    allow_writes: bool | None = None,
     root_bound: bool = False,
     root_limits: RootBudgetLimits | None = None,
     machine: MachineBindings | None = None,
@@ -842,12 +832,7 @@ def resolve_run(
     root = Path(project_root).resolve()
     spec_path = Path(task_path)
     spec = load_task_spec(spec_path)
-    spec = effective_spec(
-        spec,
-        base_commit=base_commit,
-        workspace_mode=workspace_mode,
-        repair_policy=repair_policy,
-    )
+    spec = effective_spec(spec, repair_policy=repair_policy)
 
     resolved_project_path = (
         Path(project_path) if project_path else root / ".hflow" / "project.json"
@@ -858,7 +843,9 @@ def resolve_run(
         machine = resolve_machine_bindings(
             data_dir=data_dir, profile_id=profile_id, driver=driver, env=env
         )
-    implementer_writes, reviewer_writes = resolve_permissions(spec, env)
+    implementer_writes, reviewer_writes = resolve_permissions(
+        spec, env, allow_writes=allow_writes
+    )
     workspaces = launch_workspaces(spec, root)
     if machine.profile is not None:
         effective = _effective_from_profile(
@@ -943,7 +930,9 @@ def resolve_arguments(
     refuses before the task is opened, with nothing printed and nothing dispatched - and then the
     task, the contract and the machine are resolved by :func:`resolve_run`, with the root's
     ceilings, so a root that cannot pay for an armed repair is a dispatch precondition here for
-    every caller. ``machine`` is passed through to :func:`resolve_run`.
+    every caller. ``machine`` is passed through to :func:`resolve_run`. The write opt-in is
+    ``arguments.allow_writes`` alone: the environment is never read for it here (the command line
+    folds ``HFLOW_ALLOW_WRITES`` in before a plan records it).
     """
     root_plan = (
         load_root_budget_plan(Path(arguments.root_budget_file))
@@ -965,10 +954,9 @@ def resolve_arguments(
         project_path=Path(arguments.project) if arguments.project else None,
         profile_id=arguments.profile,
         driver=arguments.driver,
-        base_commit=arguments.base_commit,
-        workspace_mode=arguments.workspace,
         repair_policy=repair_policy,
         env=env,
+        allow_writes=arguments.allow_writes,
         root_bound=root_plan is not None,
         root_limits=root_plan.limits if root_plan is not None else None,
         machine=machine,

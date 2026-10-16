@@ -49,7 +49,16 @@ from .contracts import (
     TaskState,
     VerificationResult,
 )
-from .gitworkspace import MIN_INTEGRATION_GIT, GitError, GitRepo, brief_list
+from .gitworkspace import (
+    GIT_METADATA_CHANGED,
+    MIN_INTEGRATION_GIT,
+    NOTE_GIT_METADATA,
+    GitError,
+    GitMetadataSnapshot,
+    GitRepo,
+    brief_list,
+    same_path,
+)
 from .hints import hflow_command, shell_word
 from .ids import new_integration_id, utc_now
 from .ownership import ProcessIdentity, current_identity, probe
@@ -532,6 +541,9 @@ def _build_and_check(
         worktree_path=str(worktree),
         worktree_state="PRESENT",
     )
+    # Taken after HFlow's own ``worktree add`` and before the checks - candidate code - run, as the
+    # run path takes it before dispatch.
+    metadata_before = repo.metadata_snapshot(worktree)
     fingerprint = candidate_fingerprint(worktree, spec.scope)
 
     def artifact_dir(check_id: str, evidence_id: str) -> Path:
@@ -558,6 +570,12 @@ def _build_and_check(
         evidence_kind=EVIDENCE_KIND,
     )
     after = candidate_fingerprint(worktree, spec.scope)
+    change = _metadata_changed(repo, worktree, metadata_before)
+    if change is not None:
+        return _checks_changed_metadata(
+            store, record, change=change, verification=verification, fingerprint=fingerprint,
+            notes=notes,
+        )
     tracked = repo.run(
         "status", "--porcelain=v1", "-z", "--untracked-files=no", cwd=worktree
     ).strip("\x00")
@@ -606,20 +624,81 @@ def _build_and_check(
     return outcome
 
 
+def _metadata_changed(
+    repo: GitRepo, worktree: Path, before: GitMetadataSnapshot
+) -> tuple[str, str] | None:
+    """``(note kind, what changed)`` when the shared Git metadata differs from ``before``, else ``None``.
+
+    The checks are candidate code, and the shared metadata they can write names programs HFlow's
+    own ``git status`` and ``git worktree remove`` would run (a clean filter and the attribute
+    mapping that selects it), so it is compared before either - as a run compares it at
+    acceptance. Unreadable now, after it was readable before the checks, counts as changed. What
+    changed is named by key and file, never by value.
+    """
+    try:
+        changes = repo.metadata_snapshot(worktree).changes_since(before)
+    except GitError as exc:
+        return "unreadable", f"{GIT_METADATA_CHANGED} or became unreadable ({exc})"
+    if not changes:
+        return None
+    return "changed", f"{GIT_METADATA_CHANGED} ({brief_list(changes)})"
+
+
+def _checks_changed_metadata(
+    store: Store,
+    record: IntegrationRecord,
+    *,
+    change: tuple[str, str],
+    verification: VerificationResult,
+    fingerprint: str,
+    notes: list[str],
+) -> IntegrationOutcome:
+    """Record ``checks_failed`` after the checks changed the shared Git metadata; run no more git.
+
+    No status is read in the integration worktree and it is not removed (``LEFT``): both are
+    HFlow's own git on that metadata. Nothing is restored, since that would write the user's
+    repository. The run gets a ``git_metadata`` note too, so ``hflow clean`` of its worktree waits
+    until the metadata matches the run's baseline again.
+    """
+    kind, what = change
+    detail = (
+        f"{what} while the approved checks ran on the integration tree. It is configuration or "
+        "attribute data that can name a program HFlow's own git would run, so HFlow read no "
+        "status in the integration worktree, left it in place and restored nothing: inspect and "
+        "restore it (git config --list --show-origin --show-scope), then remove "
+        f"{record.worktree_path} yourself (git worktree remove)"
+    )
+    store.record_note(
+        record.run_id,
+        f"{NOTE_GIT_METADATA}: {kind} during integration {record.integration_id}: {what}; restore "
+        "it before hflow clean or the next worktree run",
+    )
+    record = store.update_integration(
+        record.integration_id,
+        expected=IntegrationState.CHECKING,
+        state=IntegrationState.CHECKS_FAILED,
+        fingerprint=fingerprint,
+        evidence_ids=list(verification.evidence_ids),
+        worktree_state="LEFT",
+        detail=detail[:2000],
+    )
+    return IntegrationOutcome(record=record, notes=[*notes, detail])
+
+
 def _integration_worktrees(repo: GitRepo, record: IntegrationRecord) -> list[Path]:
     """Registered worktrees this integration may have created, including a staging path.
 
     ``create_worktree`` adds ``<id>.staging-<pid>-<random>`` and then moves it to ``<id>``, so a
     process that died in between leaves a registration under the staging name.
     """
-    parent = repo.worktree_parent().resolve()
+    parent = repo.worktree_parent()
     found: list[Path] = []
     for block in repo.worktree_blocks():
         recorded = block.get("worktree")
         if not recorded:
             continue
         path = Path(recorded).resolve()
-        if path.parent == parent and (
+        if same_path(path.parent, parent) and (
             path.name == record.integration_id
             or path.name.startswith(f"{record.integration_id}.staging-")
         ):
@@ -754,13 +833,10 @@ def apply_integration(
         return _settle_moved_target(
             store, repo, record, current, expected=IntegrationState.READY, build=controller_build
         )
-    lock = Path(record.git_common_dir) / (record.target_ref + ".lock")
-    if lock.exists():
-        raise RefusedError(
-            RefusalCode.TARGET_CHECKED_OUT,
-            f"{lock} exists: another Git process may be updating {record.target_ref}, or one "
-            "crashed and left its lock. HFlow never deletes a Git lock file; nothing was written",
-        )
+    # No lock file is looked for here: the compare-and-set below takes exactly the locks git needs
+    # for this update, whatever the ref backend. A ref another Git process holds locked - or one a
+    # crashed process left locked - fails it with git's own words and leaves the integration
+    # ready. HFlow never deletes a Git lock file.
     checked_out = repo.checked_out_at(record.target_ref)
     if checked_out:
         where = ", ".join(str(path) for path in checked_out)
@@ -1116,3 +1192,41 @@ def _reconcile(
     return _settle_moved_target(
         store, repo, record, current, expected=IntegrationState.READY, build=controller_build
     )
+
+
+# --------------------------------------------------------------------------
+# the confirmation `hflow integrate <run-id>` asks for at a terminal
+# --------------------------------------------------------------------------
+
+#: How many hex characters of :func:`confirmation_code` a person types back - as many as
+#: ``approve``'s approval code (``plan.APPROVAL_CODE_LENGTH``).
+CONFIRMATION_CODE_LENGTH = 8
+
+
+def confirmation_code(record: IntegrationRecord) -> str:
+    """The code a person types back before ``hflow integrate <run-id>`` applies ``record``.
+
+    Derived the way ``approve`` derives its approval code - the first hex characters of a SHA-256
+    digest of what is being approved - here over the facts the confirmation shows: the
+    integration, the target branch and the tip ``T`` it was checked against, the commit ``M``, the
+    checks digest, the content fingerprint and the evidence. It is shown next to those facts, so
+    it can only be typed by someone looking at them; it differs for every integration and every
+    tip, so a reflexive ``y`` - or the code of an earlier integration - never matches.
+    """
+    import hashlib
+
+    material = json.dumps(
+        {
+            "integration_id": record.integration_id,
+            "run_id": record.run_id,
+            "target_ref": record.target_ref,
+            "target_tip": record.target_tip,
+            "integration_commit": record.integration_commit,
+            "checks_digest": record.checks_digest,
+            "fingerprint": record.fingerprint,
+            "evidence_ids": list(record.evidence_ids),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:CONFIRMATION_CODE_LENGTH]

@@ -104,19 +104,36 @@ def test_a_live_run_is_looked_at_again_and_resumed_only_from_a_dead_owner(state)
 def test_an_accepted_candidate_with_no_integration_is_prepared() -> None:
     steps = plan_next(_accepted())
     assert steps == [
-        f"hflow integrate prepare R-1 --target {BRANCH_PLACEHOLDER} --project {PROJECT_PLACEHOLDER}"
+        f"hflow integrate R-1 --target {BRANCH_PLACEHOLDER} --project {PROJECT_PLACEHOLDER}"
     ], "the worktree is released only after the integration"
     with_project = plan_next(_accepted(), project_file="project.json")
     assert with_project == [
-        f"hflow integrate prepare R-1 --target {BRANCH_PLACEHOLDER} "
+        f"hflow integrate R-1 --target {BRANCH_PLACEHOLDER} "
         f"--project {shell_word(os.path.abspath('project.json'))}"
     ]
 
 
-def test_a_ready_integration_is_applied_against_the_tip_it_was_checked_on() -> None:
+def test_a_ready_integration_is_continued_by_integrate_run_id() -> None:
+    """``integrate <run-id>`` confirms and applies it, or hands off and later records the merge."""
     steps = plan_next(_accepted(integrations=(_record(IntegrationState.READY),)))
-    assert _commands(steps) == [f"hflow integrate apply G-1 --expect-target {TIP}"]
-    assert "reconcile" in steps[0], "the hand-off alternative apply prints is named"
+    assert _commands(steps) == ["hflow integrate R-1"]
+    assert "code" in steps[0] and "merge" in steps[0], steps
+    with_data = plan_next(
+        _accepted(integrations=(_record(IntegrationState.READY),)), data_dir=DATA
+    )
+    assert _commands(with_data) == [f"hflow integrate R-1 --data-dir {shell_word(DATA)}"]
+
+
+def test_a_ready_integration_onto_a_checked_out_branch_says_where_the_merge_goes() -> None:
+    """``integrate <run-id>`` stays the one command; when the target is checked out the line says
+    where, since that command will print the merge to run there instead of moving the branch."""
+    ready = _record(IntegrationState.READY, integration_commit="d" * 40)
+    steps = plan_next(_accepted(integrations=(ready,), target_checkout="/repo"), data_dir=DATA)
+    assert _commands(steps) == [f"hflow integrate R-1 --data-dir {shell_word(DATA)}"]
+    assert steps[0].endswith(
+        "# main is checked out at /repo: after you type the code it prints the merge to run "
+        "there, then run this again"
+    ), steps
 
 
 @pytest.mark.parametrize(
@@ -141,8 +158,7 @@ def test_an_active_integration_is_reconciled_once_its_process_is_gone(state) -> 
 def test_a_settled_integration_that_can_succeed_again_is_prepared_on_its_branch(state) -> None:
     steps = plan_next(_accepted(integrations=(_record(state),)), project_file="p.json")
     assert _commands(steps) == [
-        "hflow integrate prepare R-1 --target main "
-        f"--project {shell_word(os.path.abspath('p.json'))}"
+        f"hflow integrate R-1 --project {shell_word(os.path.abspath('p.json'))}"
     ]
 
 
@@ -331,7 +347,7 @@ def test_the_printed_next_commands_walk_an_accepted_run_to_a_released_worktree(
 
     assert main(["status", run_id, *data]) == EXIT_OK
     assert _next(capsys.readouterr().out) == [
-        f"hflow integrate prepare {run_id} --target {BRANCH_PLACEHOLDER} --project "
+        f"hflow integrate {run_id} --target {BRANCH_PLACEHOLDER} --project "
         f"{PROJECT_PLACEHOLDER} --data-dir {shell_word(data_dir)}"
     ]
     assert main(["status", run_id, "--json", *data]) == EXIT_OK
@@ -341,7 +357,9 @@ def test_the_printed_next_commands_walk_an_accepted_run_to_a_released_worktree(
     assert main(["integrate", "prepare", run_id, "--target", "main", "--project",
                  str(project_file), *data]) == EXIT_OK
     [apply] = _next(capsys.readouterr().out)
-    assert main(_paste(apply)) == EXIT_OK
+    # Kept on purpose here, to walk the printed clean commands; without the flag the apply
+    # releases the worktree itself (tests/test_integrate_run.py).
+    assert main([*_paste(apply), "--keep-worktree"]) == EXIT_OK
     preview, release = _next(capsys.readouterr().out)
     assert _paste(preview) == ["clean", run_id, "--data-dir", data_dir]
     assert _paste(release) == ["clean", run_id, "--apply", "--data-dir", data_dir]
@@ -514,18 +532,18 @@ def test_next_lines_are_one_per_step() -> None:
 
 
 # --------------------------------------------------------------------------
-# integrate prepare --target, prefilled from the task's base branch
+# integrate <run-id>: the target defaults to the task's base branch
 # --------------------------------------------------------------------------
 
 
 def test_the_target_is_prefilled_only_from_a_base_branch_that_exists() -> None:
     steps = plan_next(_accepted(base_branch="main"))
     assert steps == [
-        f"hflow integrate prepare R-1 --target main --project {PROJECT_PLACEHOLDER}  # from the "
-        "task's base"
+        f"hflow integrate R-1 --project {PROJECT_PLACEHOLDER}  # prepares it against main (the "
+        "task's base), then asks for its code at a terminal"
     ]
     assert _commands(plan_next(_accepted())) == [
-        f"hflow integrate prepare R-1 --target {BRANCH_PLACEHOLDER} --project {PROJECT_PLACEHOLDER}"
+        f"hflow integrate R-1 --target {BRANCH_PLACEHOLDER} --project {PROJECT_PLACEHOLDER}"
     ]
 
 
@@ -554,6 +572,75 @@ def test_existing_branch_reads_the_ref_files_and_never_guesses(tmp_path: Path) -
     assert existing_branch("main", str(tmp_path / "no-such-dir")) == ""
 
 
+def test_checked_out_worktree_reads_the_head_files_and_never_guesses(tmp_path: Path) -> None:
+    from hflow.hints import checked_out_worktree
+    from tests.test_integrate import _git
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "a.txt").write_text("a\n", encoding="utf-8")
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    _git(repo, "branch", "feature/x")
+    _git(repo, "branch", "idle")
+    linked = tmp_path / "linked"
+    _git(repo, "worktree", "add", "-q", str(linked), "feature/x")
+    common = str(repo / ".git")
+
+    def same(found: str, expected: Path) -> bool:
+        return os.path.normcase(os.path.realpath(found)) == os.path.normcase(
+            os.path.realpath(expected)
+        )
+
+    assert same(checked_out_worktree("refs/heads/main", common), repo)
+    assert same(checked_out_worktree("refs/heads/MAIN", common), repo), "refs fold case on Windows"
+    assert same(checked_out_worktree("refs/heads/feature/x", common), linked)
+    for ref in ("refs/heads/idle", "refs/heads/gone", "main", "HEAD", ""):
+        assert checked_out_worktree(ref, common) == "", ref
+    assert checked_out_worktree("refs/heads/main", "") == ""
+    assert checked_out_worktree("refs/heads/main", str(tmp_path / "no-such-dir")) == ""
+
+
+def test_status_says_where_a_ready_integrations_checked_out_target_is(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``init task`` bases a task on the current branch, so its target is usually checked out:
+    the one ``next:`` line, ``hflow integrate <run-id>``, says where (read from HEAD files only),
+    and after the merge is run there the same pasted line records it."""
+    import io
+
+    from tests.test_integrate import _git
+
+    scene = Scene(tmp_path, user_branch="main")
+    try:
+        run_id = scene.accept()
+        data = ["--data-dir", str(scene.data_dir)]
+        project_file = tmp_path / "project.json"
+        project_file.write_text(scene.project.model_dump_json(), encoding="utf-8")
+        assert main(["integrate", "prepare", run_id, "--target", "main", "--project",
+                     str(project_file), *data]) == EXIT_OK
+        out = capsys.readouterr().out
+        [detail] = [line[14:] for line in out.splitlines() if line.startswith("detail        ")]
+        assert out.count(detail) == 1, "the record's detail is not repeated as a note"
+
+        assert main(["status", run_id, *data]) == EXIT_OK
+        [step] = _next(capsys.readouterr().out)
+        assert _paste(step)[:2] == ["integrate", run_id], step
+        where = step.split("  # main is checked out at ", 1)[1].split(": after you type", 1)[0]
+        assert os.path.normcase(os.path.realpath(where)) == os.path.normcase(
+            os.path.realpath(scene.repo)
+        ), step
+
+        [record] = scene.store.integrations_for(run_id)
+        _git(scene.repo, "merge", "-q", "--ff-only", record.integration_commit)
+        monkeypatch.setattr("sys.stdin", io.StringIO())  # not a terminal: none is needed
+        assert main(_paste(step)) == EXIT_OK
+        assert "INTEGRATED (operator_merge_observed)" in capsys.readouterr().out
+    finally:
+        scene.store.close()
+
+
 def test_a_stored_run_based_on_a_branch_names_it_as_the_target(
     scene: Scene, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -580,7 +667,9 @@ def test_a_stored_run_based_on_a_branch_names_it_as_the_target(
     )
     assert outcome.task_state is TaskState.ACCEPTED, outcome.block_reason
     [step] = next_steps(scene.store, outcome.run_id)
-    assert " --target main " in step and step.endswith("# from the task's base"), step
+    assert " --target " not in step and step.endswith(
+        "# prepares it against main (the task's base), then asks for its code at a terminal"
+    ), step
 
     _git(scene.repo, "branch", "-D", "main")
     [step] = next_steps(scene.store, outcome.run_id)

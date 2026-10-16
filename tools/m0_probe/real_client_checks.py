@@ -206,7 +206,7 @@ def check_mock(node: str, *, deadline_seconds: int = 60) -> dict:
     return {
         "check": "mock",
         "status": status,
-        "client_argv": driver._client_argv(Path(data_dir), workspace, deadline_seconds),
+        "client_argv": driver._client_argv(workspace, deadline_seconds),
         "outcome": result_invocation.outcome.value,
         "stop_reason_seen": EventKind.COMPLETED.value in kinds,
         "event_kinds": kinds,

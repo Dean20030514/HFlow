@@ -20,7 +20,7 @@ import json
 import os
 import weakref
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -102,10 +102,11 @@ from .prepare import resolve_permissions, start_workspace_client_config
 from .review import REVIEW_MISSING, review_input_error
 from .drivers.base import assert_driver_shape
 from .drivers.acpx_dsh import ENV_ALLOW_WRITES
-from .drivers.fake import ProcessGuard
 from .gitworkspace import (
     GIT_METADATA_CHANGED,
+    GIT_METADATA_WARNING_PREFIXES,
     IGNORED_ARTIFACT_ALLOWLIST,
+    NOTE_GIT_METADATA,
     CandidateFreeze,
     GitError,
     GitMetadataSnapshot,
@@ -149,30 +150,38 @@ from .workspace import (
     undeclared_dsh_context_paths,
 )
 
-#: How long a reservation may stay open before it is considered abandoned.
+#: The expiry stamped on each reservation's attempt row (``reserved_expires_at``), as a record of
+#: intent only: nothing reads it and nothing expires a reservation. An open or unknown dispatch is
+#: closed by ``resume`` or an operator's ``ledger settle``, never by time.
 RESERVATION_TTL_SECONDS = 1800
+
+#: The reviewer's configured deadline; every reviewer invocation gets this, capped by what is left
+#: of the root's clock (``Controller._capped_deadline``).
+REVIEWER_DEADLINE_SECONDS = 900
 
 #: A role-packet renderer: the signature every renderer in ``hflow.packet`` shares.
 Renderer = Callable[..., RenderedPacket]
 
 
+@dataclass(frozen=True, kw_only=True, slots=True)
 class PreparedPacket:
     """One implementer packet rendered for one run identity, plus the workspace it names.
 
-    The workspace is kept next to the packet so ``_drive`` can tell whether the packet it was
+    The workspace is read next to the packet so ``_drive`` can tell whether the packet it was
     handed describes the workspace the run actually got: if the path changed (a lost insert
     race, a different worktree), the packet is re-rendered rather than sent under a stale path.
     ``deadline_seconds`` is the deadline the packet states, kept for the same reason: a packet
     whose stated deadline is not the one the invocation is given is re-rendered, never sent.
     """
 
-    __slots__ = ("deadline_seconds", "packet", "run_id", "workspace")
+    run_id: str
+    packet: RenderedPacket
+    deadline_seconds: int
 
-    def __init__(self, *, run_id: str, packet: RenderedPacket, deadline_seconds: int) -> None:
-        self.run_id = run_id
-        self.packet = packet
-        self.workspace = _packet_workspace(packet)
-        self.deadline_seconds = int(deadline_seconds)
+    @property
+    def workspace(self) -> str:
+        """The workspace path the packet names (:func:`_packet_workspace`)."""
+        return _packet_workspace(self.packet)
 
 
 def _packet_workspace(packet: RenderedPacket) -> str:
@@ -185,6 +194,33 @@ def _packet_workspace(packet: RenderedPacket) -> str:
         if line.startswith("- work in this directory: "):
             return line[len("- work in this directory: ") :].strip()
     return ""
+
+
+def _fingerprinted_paths(worktree: Path, scope: Scope) -> set[str]:
+    """The worktree-relative paths the scoped fingerprint hashes, as ``/``-separated strings.
+
+    Expanded from the worktree's real path, the way the fingerprint reads them. Raises
+    ``RefusedError`` when a scoped entry resolves outside the worktree, as ``expand_scope`` does.
+    """
+    root = Path(os.path.realpath(worktree))
+    return {path.relative_to(root).as_posix() for path in expand_scope(root, scope)}
+
+
+class ProcessGuard:
+    """Records a process identity for an attempt: the controller process that dispatches it.
+
+    The controller stores PID *plus* a time *plus* a managed-instance marker, because a bare PID
+    can be reused by an unrelated process (plan 9.3). The time is when the identity was read, not
+    the process's creation time.
+    """
+
+    def __init__(self, owner_id: str) -> None:
+        self.owner_id = owner_id
+
+    def identity(self) -> tuple[int, str, str]:
+        pid = os.getpid()
+        started_at = utc_now()
+        return pid, started_at, f"{self.owner_id}:{pid}:{started_at}"
 
 
 # The evidence-reference reader is the one ``verify`` defines next to the writer: it reads only
@@ -232,65 +268,39 @@ NOTE_DISPATCH = "dispatch"
 #: record *and* as a note, so an operator grepping a run finds the decision where they look while
 #: `status`/`report` can still print it as a decision rather than a log line.
 NOTE_REPAIR = "repair"
-#: The shared Git metadata HFlow's own git reads (``GitRepo.metadata_snapshot``). The digest is
-#: taken before the first dispatch; each later comparison that found a change records the digests
-#: and the changed keys and files, never values.
-NOTE_GIT_METADATA = "git_metadata"
 #: An operator's attestation that ``hflow resume --legacy-owner-gone`` acted on: who (the OS user,
 #: recorded, not authenticated) attested that a pre-v6 run's controller has exited, and their own
 #: words, verbatim. Written only when the attestation was what let ``resume`` close entries; it is
 #: an attestation, never an observation.
 NOTE_OPERATOR_ATTESTATION = "operator_attestation"
-#: The ``git_metadata`` notes that warn rather than record a baseline: a comparison that found the
-#: metadata changed or unreadable. ``inspect_run`` projects exactly these for ``status``/``report``.
-GIT_METADATA_WARNING_PREFIXES = (
-    f"{NOTE_GIT_METADATA}: changed",
-    f"{NOTE_GIT_METADATA}: unreadable",
-)
 
 
+@dataclass(eq=False, kw_only=True)
 class RunOutcome:
     """What ``run`` returns. Mirrors ``ResultReceipt`` but also covers refusals."""
 
-    def __init__(
-        self,
-        *,
-        run_id: str,
-        task_state: TaskState,
-        phase: CheckPhase | None,
-        delivery_state: DeliveryState,
-        receipt: ResultReceipt | None = None,
-        block_code: RefusalCode | None = None,
-        block_reason: str | None = None,
-        turns_reserved: int = 0,
-        turns_limit: int = 0,
-        implementer_invocations: int = 0,
-        reviewer_invocations: int = 0,
-        workspace_matches_receipt: bool | None = None,
-        notes: list[str] | None = None,
-    ) -> None:
-        self.run_id = run_id
-        self.task_state = task_state
-        self.phase = phase
-        self.delivery_state = delivery_state
-        self.receipt = receipt
-        self.block_code = block_code
-        self.block_reason = block_reason
-        self.turns_reserved = turns_reserved
-        self.turns_limit = turns_limit
-        self.implementer_invocations = implementer_invocations
-        self.reviewer_invocations = reviewer_invocations
-        #: ``None`` means it could not be evaluated (no receipt / workspace gone).
-        #: This is a drift check against the recorded scope fingerprint, not re-verification.
-        self.workspace_matches_receipt = workspace_matches_receipt
-        self.notes = notes or []
-        #: ``resume`` refused to act on this *ended* run because its owner is not proven gone - one
-        #: that may still be alive, or a pre-v6 owner nobody attested gone - and wrote nothing: the
-        #: reconcile of an ``outcome_unknown`` run, or the closure of an ended run's open entries.
-        #: The run's own state says it ended (``BLOCKED``, ``ACCEPTED``), so ``hflow resume`` exits
-        #: ``5`` ("another process is or may still be working on it") instead of the state's code.
-        #: A refused takeover of a live run needs no flag: its state already exits ``5``.
-        self.waiting_on_owner = False
+    run_id: str
+    task_state: TaskState
+    phase: CheckPhase | None
+    delivery_state: DeliveryState
+    receipt: ResultReceipt | None = None
+    block_code: RefusalCode | None = None
+    block_reason: str | None = None
+    turns_reserved: int = 0
+    turns_limit: int = 0
+    implementer_invocations: int = 0
+    reviewer_invocations: int = 0
+    #: ``None`` means it could not be evaluated (no receipt / workspace gone).
+    #: This is a drift check against the recorded scope fingerprint, not re-verification.
+    workspace_matches_receipt: bool | None = None
+    notes: list[str] = field(default_factory=list)
+    #: ``resume`` refused to act on this *ended* run because its owner is not proven gone - one
+    #: that may still be alive, or a pre-v6 owner nobody attested gone - and wrote nothing: the
+    #: reconcile of an ``outcome_unknown`` run, or the closure of an ended run's open entries.
+    #: The run's own state says it ended (``BLOCKED``, ``ACCEPTED``), so ``hflow resume`` exits
+    #: ``5`` ("another process is or may still be working on it") instead of the state's code.
+    #: A refused takeover of a live run needs no flag: its state already exits ``5``.
+    waiting_on_owner: bool = False
 
     @property
     def driver_invocations(self) -> int:
@@ -662,6 +672,60 @@ def _nothing_dispatched(store: Store, run_id: str) -> bool:
     return not store.attempts_for(run_id)
 
 
+#: The takeover rule's answers for a live run another owner holds (:func:`takeover_verdict`):
+#: the owner is provably gone, so ``resume`` takes the run over ...
+TAKEOVER_OWNER_GONE = "owner_gone"
+#: ... no owner and no controller process were recorded and nothing was dispatched, so ``resume``
+#: takes it over - only because nothing was in flight, never as a proof of death ...
+TAKEOVER_NOTHING_RECORDED = "nothing_recorded"
+#: ... no owner was recorded but work was dispatched, so nothing takes it over ...
+TAKEOVER_REFUSED_DISPATCHED = "refused_dispatched"
+#: ... or the owner may be alive (a held lock, ``matching``, ``unknown``), so nothing changes.
+TAKEOVER_REFUSED_MAY_BE_ALIVE = "refused_may_be_alive"
+
+
+@dataclass(frozen=True)
+class TakeoverVerdict:
+    """The takeover rule applied once to a live run's owner: three facts, one answer.
+
+    ``verdict`` is one of the ``TAKEOVER_*`` constants. The facts are kept next to it because the
+    texts that word the answer name them: ``assessment`` (the owner probe) and ``dispatched``
+    (whether the run has an attempt, :func:`_nothing_dispatched`). ``permitted`` is the answer
+    ``resume`` acts on.
+    """
+
+    verdict: str
+    assessment: OwnerAssessment
+    dispatched: bool
+
+    @property
+    def permitted(self) -> bool:
+        return self.verdict in {TAKEOVER_OWNER_GONE, TAKEOVER_NOTHING_RECORDED}
+
+
+def takeover_verdict(
+    store: Store, row: Any, assessment: OwnerAssessment | None = None
+) -> TakeoverVerdict:
+    """The one statement of the takeover rule. Read-only; never calls a model.
+
+    Shared by ``resume``'s takeover (:meth:`Controller._take_over`), the note a controller writes
+    about a run another owner holds (:meth:`Controller._foreign_owner_note`) and the owner line
+    ``status`` prints (:func:`_owner_takeover_words`), so the three cannot disagree. ``gone`` and
+    ``not_recorded`` exclude each other (:func:`hflow.ownership.assess_owner`). ``assessment`` is
+    a probe the caller already made of this row, so its words and this verdict describe one probe.
+    """
+    if assessment is None:
+        assessment = assess_run_owner(store, row)
+    dispatched = not _nothing_dispatched(store, str(row["run_id"]))
+    if assessment.gone:
+        verdict = TAKEOVER_OWNER_GONE
+    elif assessment.probe.verdict == "not_recorded":
+        verdict = TAKEOVER_REFUSED_DISPATCHED if dispatched else TAKEOVER_NOTHING_RECORDED
+    else:
+        verdict = TAKEOVER_REFUSED_MAY_BE_ALIVE
+    return TakeoverVerdict(verdict, assessment, dispatched)
+
+
 class Controller:
     def __init__(
         self,
@@ -852,36 +916,37 @@ class Controller:
 
     def _foreign_owner_note(self, row: Any) -> str:
         """Why this controller does not drive a run another owner holds, naming that owner."""
-        assessment = assess_run_owner(self.store, row)
-        dispatched = not _nothing_dispatched(self.store, str(row["run_id"]))
-        if assessment.gone and dispatched:
+        takeover = takeover_verdict(self.store, row)
+        not_recorded = (
+            "no owner was recorded, which is not proof that one is gone, so nothing here "
+            "drives the run"
+        )
+        if takeover.verdict == TAKEOVER_OWNER_GONE and takeover.dispatched:
             tail = (
                 "that owner is provably gone, but the run has dispatched work, so it is not "
                 "continued here; `hflow resume` takes the run over and blocks it "
                 f"{RefusalCode.OWNER_LOST.value} (it never re-dispatches)"
             )
-        elif assessment.gone:
+        elif takeover.verdict == TAKEOVER_OWNER_GONE:
             tail = (
                 "that owner is provably gone and nothing was dispatched; resubmitting this "
                 "TaskSpec adopts and continues the run"
             )
-        elif assessment.probe.verdict == "not_recorded":
+        elif takeover.verdict == TAKEOVER_NOTHING_RECORDED:
             tail = (
-                "no owner was recorded, which is not proof that one is gone, so nothing here "
-                "drives the run"
-                + (
-                    "; `hflow resume` takes it over and blocks it "
-                    f"{RefusalCode.OWNER_LOST.value} only because nothing was dispatched"
-                    if not dispatched
-                    else "; `hflow cancel` (which blocks it outcome_unknown) and then "
-                    "`hflow resume` reconcile it"
-                )
+                f"{not_recorded}; `hflow resume` takes it over and blocks it "
+                f"{RefusalCode.OWNER_LOST.value} only because nothing was dispatched"
+            )
+        elif takeover.verdict == TAKEOVER_REFUSED_DISPATCHED:
+            tail = (
+                f"{not_recorded}; `hflow cancel` (which blocks it outcome_unknown) and then "
+                "`hflow resume` reconcile it"
             )
         else:
             tail = "the owner may be alive, so nothing here drives, blocks or changes the run"
         return (
             f"run {row['run_id']} is claimed by another controller ({_owner_words(row)}; "
-            f"{assessment.summary}); it is not driven from here: {tail}"
+            f"{takeover.assessment.summary}); it is not driven from here: {tail}"
         )
 
     def _take_over(self, run_id: str, row: Any) -> RunOutcome:
@@ -905,9 +970,10 @@ class Controller:
                 notes=["this controller owns the run; resume takes nothing over and re-dispatches "
                        "nothing"],
             )
-        assessment = assess_run_owner(self.store, row)
-        not_recorded = assessment.probe.verdict == "not_recorded"
-        if not_recorded and not _nothing_dispatched(self.store, run_id):
+        takeover = takeover_verdict(self.store, row)
+        assessment = takeover.assessment
+        not_recorded = takeover.verdict == TAKEOVER_NOTHING_RECORDED
+        if takeover.verdict == TAKEOVER_REFUSED_DISPATCHED:
             return self._outcome_for(
                 run_id,
                 notes=[
@@ -917,7 +983,7 @@ class Controller:
                     "reconciles it"
                 ],
             )
-        if not assessment.gone and not not_recorded:
+        if not takeover.permitted:
             return self._outcome_for(
                 run_id,
                 notes=[
@@ -1152,16 +1218,14 @@ class Controller:
             # The deadline the first invocation will actually be given (capped by the root), so
             # the worker is never told it has more time than is enforced.
             deadline_seconds=self._capped_deadline(request.deadline_seconds),
-            writes_allowed=resolve_permissions(spec)[0],
+            writes_allowed=self._implementer_writes(spec),
         )
         # Every refusal that can be decided by reading runs before anything is written, so a
         # refused run records nothing: no root row, no authorization, no run row. A root row
         # written first would lock the root at the ceilings the run was refused for (there is no
         # top-up path), and a run row would turn an identical resubmission into a history query
         # returning the blocked run - either way the refusal's own advice could not work.
-        self._assert_dispatch_preconditions(
-            spec, project, request.deadline_seconds, base_commit=request.base_commit
-        )
+        self._assert_dispatch_preconditions(spec, project, base_commit=request.base_commit)
         self._assert_allowance_for(run_id, spec, project)
         if self.root_binding is not None:
             # A root recorded with other ceilings (or another root for this task) is reported as
@@ -1269,22 +1333,22 @@ class Controller:
                 run_id,
                 notes=[f"identical TaskSpec: existing run is {state.value}, not re-dispatched"],
             )
+        # ``open_attempt`` is the newest attempt in any state, so past this point the run has no
+        # attempt - and so no invocation (see :func:`_nothing_dispatched`): nothing was dispatched.
         if self.store.open_attempt(run_id) is not None:
             return self._outcome_for(
                 run_id,
                 notes=[
-                    "identical TaskSpec already has a live attempt; no second dispatch "
-                    "(explicit new-run override is deferred to M3)"
+                    "identical TaskSpec already has an attempt; no second dispatch - `hflow resume` "
+                    "reconciles a run with dispatched work and never re-dispatches"
                 ],
             )
         adopt = False
         if not self._claimable(existing):
             assessment = assess_run_owner(self.store, existing)
-            if not (assessment.gone and _nothing_dispatched(self.store, run_id)):
+            if not assessment.gone:
                 return self._outcome_for(run_id, notes=[self._foreign_owner_note(existing)])
             adopt = True
-        if not _nothing_dispatched(self.store, run_id):
-            return self._outcome_for(run_id, notes=["this run already dispatched work; use resume to reconcile, never re-dispatch"])
         problem, binding = self._continuation_problem(run_id, request)
         if problem:
             return self._outcome_for(run_id, notes=[
@@ -1302,9 +1366,7 @@ class Controller:
             ])
         request = request.model_copy(update={"project_root": Path(binding.project_root), "base_commit": binding.base_commit})
         self.project_root = Path(binding.project_root)
-        self._assert_dispatch_preconditions(
-            spec, project, request.deadline_seconds, base_commit=request.base_commit
-        )
+        self._assert_dispatch_preconditions(spec, project, base_commit=request.base_commit)
         if self.authorization is not None:
             self._authorization_registration(register=False)
             self._assert_preflight()
@@ -1598,11 +1660,9 @@ class Controller:
         attested: LegacyOwnerAttestation | None = None
         if blocker == OWNER_LEGACY_UNPROVEN and legacy_owner_gone is not None:
             # The one blocker an operator's attestation passes, by the rule ``ledger settle``
-            # applies with the same flag.
-            blocker, assessment = ended_run_owner_blocker(
-                self.store, row, legacy_owner_gone_attested=True
-            )
-            attested = legacy_owner_gone if blocker is None else None
+            # applies with the same flag (``ended_run_owner_blocker`` with
+            # ``legacy_owner_gone_attested`` passes exactly this blocker).
+            blocker, attested = None, legacy_owner_gone
         if blocker is not None:
             if blocker == OWNER_LEGACY_UNPROVEN:
                 why = (
@@ -2250,17 +2310,15 @@ class Controller:
         return f"driver={driver_id}{agent}"
 
     def _driver_cancel(self, driver: HarnessDriver, invocation_id: str) -> CancellationReceipt:
-        """Prefer the handle API when the driver offers it; degrade to the plain contract.
+        """Ask the driver that owns ``invocation_id`` to stop it; a raise is an ``unknown`` stop.
 
         Takes the driver explicitly: with per-role bindings the invocation is owned by one
         role's driver, and asking the other one would report "nothing was stopped" for a
-        process that is still running.
+        process that is still running. The plain contract is enough: a driver with live handles
+        looks its own handle up in ``cancel`` (``AcpxDshDriver.cancel`` does so under its spawn
+        gate, recording the stop first), so nothing here reads a driver's private state.
         """
-        handles = getattr(driver, "_handles", None)
-        cancel_handle = getattr(driver, "cancel_handle", None)
         try:
-            if isinstance(handles, dict) and callable(cancel_handle) and invocation_id in handles:
-                return cancel_handle(handles[invocation_id])  # type: ignore[no-any-return]
             return driver.cancel(invocation_id)
         except Exception as exc:  # noqa: BLE001 - a broken stop must not look like success
             return CancellationReceipt(
@@ -2273,12 +2331,7 @@ class Controller:
     # -- the state machine ---------------------------------------------------
 
     def _assert_dispatch_preconditions(
-        self,
-        spec: TaskSpec,
-        project: ProjectConfig,
-        deadline_seconds: int,
-        *,
-        base_commit: str = "",
+        self, spec: TaskSpec, project: ProjectConfig, *, base_commit: str = ""
     ) -> None:
         """Refuse a run that is already known to be unable to finish, before anything is spent.
 
@@ -2296,7 +2349,7 @@ class Controller:
             spec,
             project,
             production=self.production,
-            implementer_writes=resolve_permissions(spec)[0],
+            implementer_writes=self._implementer_writes(spec),
             launches=self._resolved_launches(),
             real_transport=real_transport,
             root_bound=self.root_binding is not None,
@@ -2384,6 +2437,15 @@ class Controller:
             return False
         return any(entry.driver_id not in FAKE_ALIASES for entry in self.effective_config.roles)
 
+    def _implementer_writes(self, spec: TaskSpec) -> bool:
+        """The implementer's write permission: the one the run's resolution recorded in its
+        effective configuration - what the approval covers, and for ``run --plan`` the plan's
+        ``--allow-writes`` - else ``prepare.resolve_permissions`` from the environment, for a
+        controller built without one."""
+        if self.effective_config is not None:
+            return self.effective_config.implementer_writes
+        return resolve_permissions(spec)[0]
+
     def _resolved_launches(self) -> list[LaunchConfig]:
         """The launches this run would perform, as resolved before any approval.
 
@@ -2438,11 +2500,14 @@ class Controller:
         required = loop_turns_required(spec, project)
         needed = max(0, required - sum(self.store.invocation_counts(run_id)))
         if needed > remaining:
+            loop = "implementer + reviewer" if spec.needs_review(project) else "implementer only"
+            if spec.repair_policy is not None:
+                loop = f"worst case {loop}, then the repair round's {loop}"
             raise RefusedError(
                 RefusalCode.BUDGET_EXHAUSTED,
                 f"authorization {self.authorization.authorization_id} has {remaining}/{limit} "
-                f"top-level submission(s) left, but this task's fixed loop needs {needed} more "
-                f"({required} for implementer + reviewer). "
+                f"top-level submission(s) left, but this task's loop needs {needed} more "
+                f"({required} in all: {loop}). "
                 "Nothing was dispatched and no allowance was consumed; obtain a new "
                 "authorization for this task or reduce it to a single invocation.",
             )
@@ -2713,6 +2778,14 @@ class Controller:
             # ``from exc`` is load-bearing: ``_lost_dispatch_race`` reads the store's typed
             # refusal back from ``__cause__``.
             raise RefusedError(self._dispatch_refusal_code(exc), str(exc)) from exc
+        if not reservation.is_new:
+            # A replay of an invocation id the ledger already records: that dispatch stands and may
+            # only be coordinated, never launched a second time (``DispatchReservation.is_new``).
+            raise RefusedError(
+                RefusalCode.INTERNAL_ERROR,
+                f"invocation {invocation_id} is already recorded in the ledger, so this call "
+                f"reserved nothing and no {role} was launched for it; the recorded dispatch stands",
+            )
         self._held_attempts.setdefault(run_id, set()).add(str(reservation.attempt_id))
         if self.authorization is not None:
             self.store.record_note(
@@ -2806,16 +2879,58 @@ class Controller:
 
         return report
 
-    def _mark_launch_requested(self, reservation: DispatchReservation) -> None:
-        """Record that a driver is about to be asked to launch this invocation.
+    def _mark_launch_requested(self, reservation: DispatchReservation) -> bool:
+        """Record that a driver is about to be asked to launch this invocation; may it be asked?
 
         Deliberately not a start. The last moment at which "no process exists" is certainly true
         is this one, so recording a request here is honest; recording a start here is what made a
         driver-suppressed launch look like a running model call. The process fact comes from the
         driver through the spawn report wired into the request.
+
+        ``False`` means the ledger entry is no longer ``reserved``: another writer closed it after
+        this reservation - a confirmed stop (``not_started``), a takeover by another owner or a
+        reconcile (``launch_unknown``) - so the driver must not be asked. ``True`` on the legacy
+        path, which has no ledger entry (its registration is the conditional write there).
         """
-        if reservation.invocation is not None:
-            self.store.mark_invocation_launch_requested(reservation.invocation.invocation_id)
+        if reservation.invocation is None:
+            return True
+        return self.store.mark_invocation_launch_requested(reservation.invocation.invocation_id)
+
+    def _handoff_refusal_code(self, run_id: str) -> RefusalCode:
+        """The code a role's refused handoff asks for: a launch, a registration or a result write.
+
+        ``cancelled_by_operator`` when a stop is recorded; otherwise the run was ended or taken
+        over by another owner, which this controller did not decide, so it is ``internal_error``.
+        Either way ``_blocked`` keeps a stop's or a terminal run's own recorded state.
+        """
+        if self._stop_recorded(run_id):
+            return RefusalCode.CANCELLED_BY_OPERATOR
+        return RefusalCode.INTERNAL_ERROR
+
+    def _implementer_not_launched(
+        self, run_id: str, attempt_id: str, reason: str
+    ) -> _CycleResult:
+        """End a round whose implementer handoff was refused after its reservation.
+
+        No driver was asked. The attempt is finished as cancelled when it is still this owner's
+        and live (a stop's own bookkeeping, or a takeover, may have finished it first), and the
+        run is blocked through the stop-conditional :meth:`_blocked`, which keeps a stop's or an
+        ended run's recorded state. The ledger entry keeps whatever closed it.
+        """
+        try:
+            self.store.finish_attempt(
+                run_id=run_id,
+                attempt_id=attempt_id,
+                state=AttemptState.CANCELLED,
+                outcome=InvocationOutcome.CANCELLED,
+                result={"error": reason},
+                block_code=self._handoff_refusal_code(run_id),
+                fence=self._fence(run_id),
+            )
+        except StoreError:
+            pass  # a stop's bookkeeping or a takeover finished it first, or superseded this owner
+        code = self._handoff_refusal_code(run_id)
+        return _CycleResult(outcome=self._blocked(run_id, code, reason))
 
     def _settle_invocation(
         self, reservation: DispatchReservation, outcome: InvocationOutcome | None, detail: str = ""
@@ -3095,7 +3210,13 @@ class Controller:
                 # (``extensions.relativeWorktrees`` under ``worktree.useRelativePaths``) and the
                 # run's ``config.worktree`` - and before anything HFlow does not control runs.
                 git_metadata_before = repo.metadata_snapshot(worktree)
-            except (GitError, RefusedError) as exc:
+                # The user has uncommitted work. That is theirs: never stashed, reset or
+                # committed. It is recorded on acceptance, where the note survives; the
+                # isolated worktree already started from the base commit regardless. Read inside
+                # this ``try``: a status read that fails blocks the run like any other git step
+                # here, instead of escaping ``run_task`` as a traceback.
+                dirty_target = repo.is_dirty()
+            except (GitError, GitStatusParseError, RefusedError) as exc:
                 return self._blocked(run_id, RefusalCode.INTERNAL_ERROR, f"git workspace failed: {exc}")
             self.store.record_note(
                 run_id,
@@ -3104,11 +3225,6 @@ class Controller:
             )
             if base_name != resolved_base:
                 self.store.record_note(run_id, f"base {base_name!r} -> {resolved_base}")
-            if repo.is_dirty():
-                # The user has uncommitted work. That is theirs: never stashed, reset or
-                # committed. It is recorded on acceptance, where the note survives; the
-                # isolated worktree already started from the base commit regardless.
-                dirty_target = True
         execution_root = worktree or project_root
 
         try:
@@ -3140,7 +3256,7 @@ class Controller:
         # The rule itself lives in `prepare.resolve_permissions`, which is also what the
         # effective configuration reports - so the permission an approval covers and the
         # permission the dispatch uses are one value, not two copies of one idea.
-        implementer_writes, _reviewer_writes = resolve_permissions(spec)
+        implementer_writes = self._implementer_writes(spec)
         self.store.record_note(
             run_id,
             "effective permissions - implementer: "
@@ -3150,10 +3266,10 @@ class Controller:
         if not implementer_writes:
             self.store.record_note(
                 run_id,
-                f"writes are off for this run (workspace.mode={spec.workspace.mode}, "
-                f"{ENV_ALLOW_WRITES}='{os.environ.get(ENV_ALLOW_WRITES, '')}'); a task that needs "
-                "to change files will block at verification instead of being granted permission "
-                "implicitly",
+                f"writes are off for this run (workspace.mode={spec.workspace.mode}; no write "
+                f"opt-in: --allow-writes, or {ENV_ALLOW_WRITES}=1 for run --task); a task that "
+                "needs to change files will block at verification instead of being granted "
+                "permission implicitly",
             )
 
         # The original Base is fixed before the first dispatch and never changes: it is what the
@@ -3233,7 +3349,6 @@ class Controller:
         round_number: int,
         original_base_commit: str,
         original_base_ref: str,
-        previous: CandidateIdentity | None,
         identity: CandidateIdentity,
         trigger_candidate: RepairTrigger,
         failure_facts: list[dict[str, Any]],
@@ -3454,8 +3569,8 @@ class Controller:
 
         A role asked to work for longer than the root has left is being asked to work past a
         deadline the run already recorded. Capping here is what makes the root's clock a bound on
-        the work rather than a note beside it - and it is why the reviewer's default of 900 seconds
-        is a ceiling, not a promise.
+        the work rather than a note beside it - and it is why the reviewer's
+        :data:`REVIEWER_DEADLINE_SECONDS` is a ceiling, not a promise.
 
         Before the root's clock has started, the root's own ``deadline_seconds`` is the cap: the
         clock starts at the first reservation with exactly that much time, so no role on this
@@ -3664,10 +3779,7 @@ class Controller:
                 "repair is refused rather than resetting or overwriting it, and nothing was bought"
             ), ()
         try:
-            root = Path(os.path.realpath(worktree))
-            fingerprinted = {
-                path.relative_to(root).as_posix() for path in expand_scope(root, scope)
-            }
+            fingerprinted = _fingerprinted_paths(worktree, scope)
         except RefusedError as exc:
             return f"the worktree's scoped files could not be listed: {exc.message}", ()
         covered = [path for path in report.ignored if path in fingerprinted]
@@ -3679,6 +3791,29 @@ class Controller:
                 "repair is refused rather than deleting them, and nothing was bought"
             ), ()
         return None, tuple(report.ignored)
+
+    @staticmethod
+    def _compare_git_metadata(
+        repo: GitRepo,
+        worktree: Path,
+        before: GitMetadataSnapshot,
+        *,
+        tolerate: tuple[type[Exception], ...],
+    ) -> tuple[str, list[str], str]:
+        """Snapshot the shared Git metadata again and compare it with ``before``.
+
+        Returns ``(after_digest, changes, unreadable)``. ``unreadable`` is the failure's text when
+        the snapshot could not be taken - one of ``tolerate``; anything else propagates - and
+        ``after_digest`` is then ``""`` and ``changes`` empty. ``changes`` names keys and files,
+        never values. Shared by :meth:`_git_metadata_refusal` (which decides) and
+        :meth:`_note_git_metadata_at_exit` (which only records).
+        """
+        try:
+            after = repo.metadata_snapshot(worktree)
+        except tolerate as exc:
+            detail = str(exc) if isinstance(exc, GitError) else f"{type(exc).__name__}: {exc}"
+            return "", [], detail or type(exc).__name__  # never empty: "" means readable
+        return after.digest, list(after.changes_since(before)), ""
 
     def _git_metadata_refusal(
         self,
@@ -3713,27 +3848,27 @@ class Controller:
             "--show-origin --show-scope) before hflow clean or the next worktree run, which read "
             "it again"
         )
-        try:
-            after = repo.metadata_snapshot(worktree)
-        except GitError as exc:
+        after_digest, changes, unreadable = self._compare_git_metadata(
+            repo, worktree, before, tolerate=(GitError,)
+        )
+        if unreadable:
             # It was readable before dispatch, so a read that fails now is treated as a change.
             self.store.record_note(
                 run_id,
-                f"{NOTE_GIT_METADATA}: unreadable {where}: {before.digest} -> ({exc}); restore it "
-                "before hflow clean or the next worktree run",
+                f"{NOTE_GIT_METADATA}: unreadable {where}: {before.digest} -> ({unreadable}); "
+                "restore it before hflow clean or the next worktree run",
             )
             return RefusalCode.SCOPE_VIOLATION, (
                 f"{GIT_METADATA_CHANGED} or became unreadable since the pre-dispatch snapshot "
-                f"({exc}); found {where}, so {consequence}. {tail}"
+                f"({unreadable}); found {where}, so {consequence}. {tail}"
             )
-        changes = after.changes_since(before)
         if not changes:
             return None
         # The note carries the change list too: when a stop already decided the run, ``_blocked``
         # keeps the stop's reason and this note is the only place the change is named.
         self.store.record_note(
             run_id,
-            f"{NOTE_GIT_METADATA}: changed {where}: {before.digest} -> {after.digest} "
+            f"{NOTE_GIT_METADATA}: changed {where}: {before.digest} -> {after_digest} "
             f"({_change_list(changes)}); restore it before hflow clean or the next worktree run",
         )
         return RefusalCode.SCOPE_VIOLATION, (
@@ -3753,22 +3888,22 @@ class Controller:
         """
         if before is None:
             return None
-        try:
-            after = repo.metadata_snapshot(worktree)
-        except Exception as exc:  # noqa: BLE001 - a note, never a decision
-            detail = str(exc) if isinstance(exc, GitError) else f"{type(exc).__name__}: {exc}"
+        # Any failure is a note, never a decision.
+        after_digest, changes, unreadable = self._compare_git_metadata(
+            repo, worktree, before, tolerate=(Exception,)
+        )
+        if unreadable:
             note = (
                 f"{NOTE_GIT_METADATA}: unreadable when the run ended: {before.digest} -> "
-                f"({detail}); the run's block is unchanged - inspect and restore it before hflow "
-                "clean or the next worktree run"
+                f"({unreadable}); the run's block is unchanged - inspect and restore it before "
+                "hflow clean or the next worktree run"
             )
+        elif not changes:
+            return None
         else:
-            changes = after.changes_since(before)
-            if not changes:
-                return None
             note = (
                 f"{NOTE_GIT_METADATA}: changed when the run ended: {before.digest} -> "
-                f"{after.digest} ({_change_list(changes)}); the run's block is unchanged - inspect "
+                f"{after_digest} ({_change_list(changes)}); the run's block is unchanged - inspect "
                 "and restore it (git config --list --show-origin --show-scope) before hflow clean "
                 "or the next worktree run, which read it again"
             )
@@ -3806,19 +3941,85 @@ class Controller:
 
         The parameter list is long on purpose: everything this cycle must *not* re-derive from
         ambient state (the worktree, the original base, which round it is) is passed in, so a
-        repair round cannot quietly behave like a first round.
+        repair round cannot quietly behave like a first round. It travels to each phase as one
+        :class:`_Round`.
+
+        The phases, in order; each one that can end the round returns its ``_CycleResult``:
+        :meth:`_open_round` (and the repair round's reopen), :meth:`_dispatch_implementer`,
+        :meth:`_apply_implementer_result`, :meth:`_freeze_round_candidate`,
+        :meth:`_refuse_unchanged_candidate`, and :meth:`_verify_and_decide`.
         """
-
-        spec = request.task
-        project = request.project
-        project_root = Path(request.project_root)
-        reservation_id = new_reservation_id()
-        attempt_id = new_attempt_id()
-        invocation_id = new_invocation_id()
-
         # The workspace, the run's state and the permissions were established once in
         # ``_drive`` before this cycle was entered. Repeating any of it here would create
         # a second worktree for a repair and re-record facts that are already the run's.
+        rnd = _Round(
+            run_id=run_id,
+            request=request,
+            repo=repo,
+            worktree=worktree,
+            execution_root=execution_root,
+            user_tree_before=user_tree_before,
+            dirty_target=dirty_target,
+            implementer_writes=implementer_writes,
+            implementer_packet=implementer_packet,
+            previous=previous,
+            trigger=trigger,
+            round_number=round_number,
+            original_base_commit=original_base_commit,
+            original_base_ref=original_base_ref,
+            policy=policy,
+            repair_context=repair_context,
+            git_metadata_before=git_metadata_before,
+        )
+        opened = self._open_round(rnd)
+        if isinstance(opened, _CycleResult):
+            return opened
+        turn = self._dispatch_implementer(rnd)
+        if isinstance(turn, _CycleResult):
+            return turn
+        ended = self._apply_implementer_result(rnd, turn)
+        if ended is not None:
+            return ended
+        frozen = self._freeze_round_candidate(rnd, turn, carried_ignored=opened)
+        if isinstance(frozen, _CycleResult):
+            return frozen
+        freeze = frozen.freeze
+        post_fingerprint = frozen.fingerprint
+
+        # The three identities a repair has to keep apart: the task's original base, the
+        # candidate this round started from, and the candidate this round produced. The scoped
+        # *fingerprint* decides whether the checked content changed - a fresh commit SHA is not
+        # progress, and neither is a tree change the fingerprint cannot see.
+        identity = CandidateIdentity(
+            round=round_number,
+            attempt_id=turn.attempt_id,
+            base_commit=original_base_commit,
+            parent_commit=previous.git_commit if previous is not None else "",
+            git_commit=freeze.candidate_commit if freeze is not None else "",
+            git_tree=freeze.tree if freeze is not None else "",
+            fingerprint=post_fingerprint,
+            paths=list(freeze.paths) if freeze is not None else [],
+            is_repair=previous is not None,
+            unchanged_from_parent=bool(
+                previous is not None and previous.fingerprint == post_fingerprint
+            ),
+        )
+        unchanged = self._refuse_unchanged_candidate(rnd, identity)
+        if unchanged is not None:
+            return unchanged
+        return self._verify_and_decide(rnd, turn, frozen, identity)
+
+    def _open_round(self, rnd: _Round) -> _CycleResult | tuple[str, ...]:
+        """Refuse a round that cannot start, and reopen the run for a repair round.
+
+        Returns the ignored paths the previous round's checks left in the worktree, which this
+        round's freeze accepts (literally) - empty for a first round, which starts from a fresh
+        worktree - or the ``_CycleResult`` that ends the round before anything is bought.
+        """
+        run_id, spec = rnd.run_id, rnd.spec
+        repo, worktree, previous = rnd.repo, rnd.worktree, rnd.previous
+        trigger, policy, round_number = rnd.trigger, rnd.policy, rnd.round_number
+        git_metadata_before = rnd.git_metadata_before
 
         # --- a repair round reopens the run for its single new attempt --------------------
         # Before anything is bought, the worktree must still be exactly the candidate that was
@@ -3904,12 +4105,29 @@ class Controller:
                 return _CycleResult(
                     outcome=self._blocked(run_id, self._dispatch_refusal_code(exc), str(exc))
                 )
+        return carried_ignored
+
+    def _dispatch_implementer(self, rnd: _Round) -> _CycleResult | _ImplementerTurn:
+        """Render the round's packet, buy its dispatch, and hand it to the implementer's driver.
+
+        Every predictable refusal happens before the dispatch transaction and costs nothing; every
+        failure after it is recorded against the invocation it belongs to. Returns the turn - the
+        reservation, the packet sent and the driver's result - or the ``_CycleResult`` that ends
+        the round.
+        """
+        run_id, request = rnd.run_id, rnd.request
+        spec, project = rnd.spec, rnd.project
+        execution_root, implementer_writes = rnd.execution_root, rnd.implementer_writes
+        implementer_packet, previous = rnd.implementer_packet, rnd.previous
+        reservation_id = new_reservation_id()
+        attempt_id = new_attempt_id()
+        invocation_id = new_invocation_id()
 
         # The structured input of a repair attempt: the context the decision that allowed it
         # recorded. ``None`` for a first attempt, which is why the first attempt's packet is
         # byte-identical to what it was before E2 - and why an offline agent can tell the two
         # rounds apart from the packet it actually received.
-        repair = repair_context
+        repair = rnd.repair_context
         if previous is not None and repair is None:
             # A repair round without the context it was allowed on is not a repair: it is an agent
             # being asked to change a candidate it cannot see, on evidence nobody handed it. The
@@ -4009,24 +4227,12 @@ class Controller:
             if not self.store.register_attempt_invocation_unless_stopped(
                 run_id, attempt_id, column="invocation_id", invocation_id=invocation_id
             ):
-                reason = (
-                    "a cancellation intent was recorded between the reservation and the "
-                    "implementer's registration; no invocation was started and the reserved "
-                    "turn and authorization submission stay consumed"
-                )
-                try:
-                    self.store.finish_attempt(
-                        run_id=run_id,
-                        attempt_id=attempt_id,
-                        state=AttemptState.CANCELLED,
-                        outcome=InvocationOutcome.CANCELLED,
-                        result={"error": reason},
-                        block_code=RefusalCode.CANCELLED_BY_OPERATOR,
-                    )
-                except StoreError:
-                    pass  # the stop's own bookkeeping finished it first
-                return _CycleResult(
-                    outcome=self._blocked(run_id, RefusalCode.CANCELLED_BY_OPERATOR, reason)
+                return self._implementer_not_launched(
+                    run_id,
+                    attempt_id,
+                    "the run was stopped, ended or taken over by another owner between the "
+                    "reservation and the implementer's registration; no invocation was started "
+                    "and the reserved turn and authorization submission stay consumed",
                 )
 
         # The reservation may have started the root's clock, or the clock moved on since the
@@ -4068,9 +4274,13 @@ class Controller:
                     outcome=self._block_attempt(run_id, attempt_id, exc.code, str(exc))
                 )
 
-        pid, started_at, identity = ProcessGuard(self.controller_id).identity()
+        pid, started_at, process_identity = ProcessGuard(self.controller_id).identity()
         self.store.record_process_identity(
-            attempt_id, pid=pid, started_at=started_at, identity=identity, session_id=attempt_id
+            attempt_id,
+            pid=pid,
+            started_at=started_at,
+            identity=process_identity,
+            session_id=attempt_id,
         )
 
         # Recorded before the worker runs: what the workspace looked like, so a change outside
@@ -4108,8 +4318,17 @@ class Controller:
         # From here on, failures must not re-dispatch: the model may already have run. The
         # ledger records how far this dispatch got before it is handed over - a launch *requested*
         # and nothing more - so a crash here is visible as an unconfirmed launch rather than
-        # rounded up to a model call.
-        self._mark_launch_requested(dispatch)
+        # rounded up to a model call. A refused request is the root path's handoff refusal: the
+        # entry was closed after the reservation, so no driver is asked and nothing re-dispatches.
+        if not self._mark_launch_requested(dispatch):
+            return self._implementer_not_launched(
+                run_id,
+                attempt_id,
+                "the run was stopped, ended or taken over by another owner after invocation "
+                f"{invocation_id} was reserved and before its launch was requested, so its ledger "
+                "entry was already closed; the implementer was not launched, no stop is claimed "
+                "for it, and the reserved submission stays consumed",
+            )
         # Read between the launch request and the handoff: only a stop recorded by now proves the
         # driver's gate refused, which is what lets a silent driver's empty return mean "never
         # launched" (see ``_confirm_driver_ran``).
@@ -4135,7 +4354,27 @@ class Controller:
             raise
         else:
             self._confirm_driver_ran(dispatch, result, stop_before_launch=stop_before_launch)
+        return _ImplementerTurn(
+            attempt_id=attempt_id,
+            invocation_id=invocation_id,
+            dispatch=dispatch,
+            prepared=prepared,
+            pre_manifest=pre_manifest,
+            result=result,
+        )
 
+    def _apply_implementer_result(
+        self, rnd: _Round, turn: _ImplementerTurn
+    ) -> _CycleResult | None:
+        """Apply the implementer's result, unless it ends the round; ``None`` lets it go on.
+
+        Only a completed result applied to the live attempt continues to the freeze. An unknown
+        outcome, a prompt-digest mismatch, a non-completed outcome and a result that arrived after
+        the run's stop each end the round with the run's own recorded state.
+        """
+        run_id = rnd.run_id
+        attempt_id, invocation_id = turn.attempt_id, turn.invocation_id
+        dispatch, prepared, result = turn.dispatch, turn.prepared, turn.result
         if result.outcome is InvocationOutcome.OUTCOME_UNKNOWN:
             self._apply_result_or_stay_stopped(
                 run_id=run_id,
@@ -4220,6 +4459,25 @@ class Controller:
             # note, the attempt and the ledger entry keep the state the stop left, and the run
             # keeps the decision the operator made; nothing here freezes or resumes the loop.
             return _CycleResult(outcome=self._outcome_for(run_id))
+        return None
+
+    def _freeze_round_candidate(
+        self, rnd: _Round, turn: _ImplementerTurn, *, carried_ignored: tuple[str, ...]
+    ) -> _CycleResult | _FrozenCandidate:
+        """Hold the worker's change to its scope and freeze it as this round's candidate.
+
+        The shared Git metadata is compared first, then the scoped fingerprint and the two
+        manifests, then a stop, then (in a worktree run) the freeze itself, the cumulative diff
+        from the task's base, the DSH context files and the candidate ref. Returns the frozen
+        candidate, or the ``_CycleResult`` that ends the round with nothing checked.
+        """
+        run_id, spec, project = rnd.run_id, rnd.spec, rnd.project
+        project_root = Path(rnd.request.project_root)
+        repo, worktree, execution_root = rnd.repo, rnd.worktree, rnd.execution_root
+        previous, round_number = rnd.previous, rnd.round_number
+        original_base_commit = rnd.original_base_commit
+        git_metadata_before = rnd.git_metadata_before
+        attempt_id, pre_manifest = turn.attempt_id, turn.pre_manifest
 
         # The freeze's ``git status`` / ``git add`` read the shared Git metadata. A filter the
         # worker configured there would run inside them, in this process, after the worker's own
@@ -4302,10 +4560,7 @@ class Controller:
                     # Every round, the first included: an allowlisted ignored file the scoped
                     # fingerprint hashes refuses the freeze, as ``_reconcile_repair_workspace``
                     # refuses one left by a previous round's checks.
-                    fingerprinted={
-                        path.relative_to(Path(os.path.realpath(worktree))).as_posix()
-                        for path in expand_scope(Path(os.path.realpath(worktree)), spec.scope)
-                    },
+                    fingerprinted=_fingerprinted_paths(worktree, spec.scope),
                     # The commit this round started from. A worker that committed, amended or
                     # reset inside the worktree moved HEAD away from it and is refused there.
                     expected_head=(
@@ -4407,66 +4662,80 @@ class Controller:
                         run_id, RefusalCode.SCOPE_VIOLATION, f"candidate freeze refused: {exc}"
                     )
                 )
-
-        # The three identities a repair has to keep apart: the task's original base, the
-        # candidate this round started from, and the candidate this round produced. The scoped
-        # *fingerprint* decides whether the checked content changed - a fresh commit SHA is not
-        # progress, and neither is a tree change the fingerprint cannot see.
-        identity = CandidateIdentity(
-            round=round_number,
-            attempt_id=attempt_id,
-            base_commit=original_base_commit,
-            parent_commit=previous.git_commit if previous is not None else "",
-            git_commit=freeze.candidate_commit if freeze is not None else "",
-            git_tree=freeze.tree if freeze is not None else "",
-            fingerprint=post_fingerprint,
-            paths=list(freeze.paths) if freeze is not None else [],
-            is_repair=previous is not None,
-            unchanged_from_parent=bool(
-                previous is not None and previous.fingerprint == post_fingerprint
-            ),
+        return _FrozenCandidate(
+            fingerprint=post_fingerprint, freeze=freeze, context_files=context_files
         )
-        if identity.unchanged_from_parent:
-            # No content change: the scoped fingerprint is the one of the round we are repairing.
-            # Buying a reviewer for that would be paying to be told nothing happened, so the run
-            # stops here and records why. A tree that moved anyway changed something the scope's
-            # fingerprint does not cover (denied paths are refused before the freeze), which is a
-            # violation rather than progress.
-            parent_tree = previous.git_tree if previous is not None else ""
-            if parent_tree != identity.git_tree:
-                moved = ", ".join(identity.paths[:5]) or "(no staged paths)"
-                reason = (
-                    f"the repair attempt changed the candidate tree ({parent_tree or '(none)'} -> "
-                    f"{identity.git_tree}; {moved}) but not the scoped fingerprint "
-                    f"{identity.fingerprint}: no checked content changed, and a tree change the "
-                    "fingerprint cannot see is refused as a scope violation, so no reviewer was "
-                    "bought"
-                )
-                block_code = RefusalCode.SCOPE_VIOLATION
-                block_reason = (
-                    f"the repair attempt changed the candidate tree ({moved}) but not its scoped "
-                    "fingerprint; that is not progress, and nothing was reviewed or accepted"
-                )
-            else:
-                reason = (
-                    "the repair attempt produced no content change: candidate tree "
-                    f"{identity.git_tree or '(none)'} and fingerprint {identity.fingerprint} are "
-                    "unchanged from the round it was repairing, so no reviewer was bought"
-                )
-                block_code = RefusalCode.VERIFICATION_FAILED
-                block_reason = (
-                    "the repair attempt left the candidate unchanged; nothing was reviewed and "
-                    "nothing was accepted"
-                )
-            self._record_repair(
-                run_id,
-                RepairDecision.NO_CONTENT_CHANGE,
-                trigger=trigger,
-                reason=reason,
-                policy=policy,
-                round_number=round_number,
+
+    def _refuse_unchanged_candidate(
+        self, rnd: _Round, identity: CandidateIdentity
+    ) -> _CycleResult | None:
+        """End a repair round whose candidate did not change the checked content; else ``None``."""
+        if not identity.unchanged_from_parent:
+            return None
+        previous = rnd.previous
+        # No content change: the scoped fingerprint is the one of the round we are repairing.
+        # Buying a reviewer for that would be paying to be told nothing happened, so the run
+        # stops here and records why. A tree that moved anyway changed something the scope's
+        # fingerprint does not cover (denied paths are refused before the freeze), which is a
+        # violation rather than progress.
+        parent_tree = previous.git_tree if previous is not None else ""
+        if parent_tree != identity.git_tree:
+            moved = ", ".join(identity.paths[:5]) or "(no staged paths)"
+            reason = (
+                f"the repair attempt changed the candidate tree ({parent_tree or '(none)'} -> "
+                f"{identity.git_tree}; {moved}) but not the scoped fingerprint "
+                f"{identity.fingerprint}: no checked content changed, and a tree change the "
+                "fingerprint cannot see is refused as a scope violation, so no reviewer was "
+                "bought"
             )
-            return _CycleResult(outcome=self._blocked(run_id, block_code, block_reason))
+            block_code = RefusalCode.SCOPE_VIOLATION
+            block_reason = (
+                f"the repair attempt changed the candidate tree ({moved}) but not its scoped "
+                "fingerprint; that is not progress, and nothing was reviewed or accepted"
+            )
+        else:
+            reason = (
+                "the repair attempt produced no content change: candidate tree "
+                f"{identity.git_tree or '(none)'} and fingerprint {identity.fingerprint} are "
+                "unchanged from the round it was repairing, so no reviewer was bought"
+            )
+            block_code = RefusalCode.VERIFICATION_FAILED
+            block_reason = (
+                "the repair attempt left the candidate unchanged; nothing was reviewed and "
+                "nothing was accepted"
+            )
+        self._record_repair(
+            rnd.run_id,
+            RepairDecision.NO_CONTENT_CHANGE,
+            trigger=rnd.trigger,
+            reason=reason,
+            policy=rnd.policy,
+            round_number=rnd.round_number,
+        )
+        return _CycleResult(outcome=self._blocked(rnd.run_id, block_code, block_reason))
+
+    def _verify_and_decide(
+        self,
+        rnd: _Round,
+        turn: _ImplementerTurn,
+        frozen: _FrozenCandidate,
+        identity: CandidateIdentity,
+    ) -> _CycleResult:
+        """Check the frozen candidate, review it when the task needs that, and decide the round.
+
+        A failed check or a reviewer's ``changes_requested`` goes to :meth:`_repairable_failure`,
+        which either blocks the run or returns the context of its single repair; an accepted
+        candidate goes to :meth:`_accept`, which writes the receipt.
+        """
+        run_id, request = rnd.run_id, rnd.request
+        spec, project = rnd.spec, rnd.project
+        repo, worktree, execution_root = rnd.repo, rnd.worktree, rnd.execution_root
+        previous, trigger, policy = rnd.previous, rnd.trigger, rnd.policy
+        round_number = rnd.round_number
+        original_base_commit, original_base_ref = rnd.original_base_commit, rnd.original_base_ref
+        attempt_id, result = turn.attempt_id, turn.result
+        post_fingerprint, freeze = frozen.fingerprint, frozen.freeze
+        context_files = frozen.context_files
 
         try:
             self.store.advance_to_checking(
@@ -4565,7 +4834,6 @@ class Controller:
                 round_number=round_number,
                 original_base_commit=original_base_commit,
                 original_base_ref=original_base_ref,
-                previous=previous,
                 identity=identity,
                 trigger_candidate=RepairTrigger.BUSINESS_CHECK_FAILED,
                 failure_facts=[
@@ -4620,7 +4888,6 @@ class Controller:
                 round_number=round_number,
                 original_base_commit=original_base_commit,
                 original_base_ref=original_base_ref,
-                previous=previous,
                 identity=identity,
                 trigger_candidate=RepairTrigger.REVIEW_CHANGES_REQUESTED,
                 failure_facts=[],
@@ -4648,22 +4915,19 @@ class Controller:
             # The run's total: the sum of every applied implementer round's self-report, so a
             # repaired delivery's receipt does not show the last round alone.
             observed_turns=self.store.get_run(run_id)["turns_observed"],
-            # The delivery diff covers the *whole* change from the task's original base to this
-            # final candidate, so a repaired delivery cannot be read as a delivery of the last
-            # patch alone. The agent's own claim is not used for this.
-            base_ref=original_base_ref,
             limitations=list(result.limitations),
             freeze=freeze,
             repo=repo,
-            target_repo_root=project_root,
-            user_tree_before=user_tree_before,
-            dirty_target=dirty_target,
-            identity=identity,
+            user_tree_before=rnd.user_tree_before,
+            dirty_target=rnd.dirty_target,
+            # The delivery diff covers the *whole* change from the task's original base to this
+            # final candidate, so a repaired delivery cannot be read as a delivery of the last
+            # patch alone. The agent's own claim is not used for this.
             original_base_commit=original_base_commit,
             project_write_deny=list(project.write_deny),
-            git_metadata_before=git_metadata_before,
+            git_metadata_before=rnd.git_metadata_before,
         )
-        return _CycleResult(outcome=accepted, identity=identity)
+        return _CycleResult(outcome=accepted)
 
     # -- review ----------------------------------------------------------------
 
@@ -4724,13 +4988,13 @@ class Controller:
         candidate_fp: str,
         checks_digest: str,
         *,
-        verification: VerificationResult | None = None,
-        freeze: CandidateFreeze | None = None,
-        project: ProjectConfig | None = None,
-        repo: GitRepo | None = None,
-        original_base_commit: str = "",
-        round_number: int = 1,
-        context_files: list[str] | None = None,
+        verification: VerificationResult,
+        freeze: CandidateFreeze | None,
+        project: ProjectConfig,
+        repo: GitRepo | None,
+        original_base_commit: str,
+        round_number: int,
+        context_files: list[str],
     ) -> ReviewResult:
         """Buy the review turn, run the reviewer, then interpret its structured verdict.
 
@@ -4791,11 +5055,13 @@ class Controller:
                 "status": r["status"],
                 "exit_code": r["exit_code"],
                 "command": " ".join(json.loads(r["command_json"])) if r["command_json"] else "",
+                # The stored detail; the packet renders only what follows its reference block.
                 "detail": r["detail"],
+                # The structured reason column, not a re-reading of the detail text.
+                "reason": r["exit_reason"] or "",
                 # References, extracted from the row rather than left inside the detail text: the
                 # packet renders them unshortened, so a long artifact path still reaches the
                 # reviewer in full.
-                "reason": _reference_field(r["detail"], "reason"),
                 "artifact": _reference_field(r["detail"], "artifact"),
                 "stdout": _stream_reference(r["detail"], "stdout"),
                 "stderr": _stream_reference(r["detail"], "stderr"),
@@ -4830,11 +5096,7 @@ class Controller:
             if base != freeze.base_commit:
                 # This round started from an earlier round's candidate, not from the base: the
                 # paths are the cumulative ones, computed by Git exactly as ``_accept`` does.
-                if repo is None:  # pragma: no cover - a freeze only exists in a worktree run
-                    raise RefusedError(
-                        RefusalCode.INTERNAL_ERROR,
-                        "a repair round's candidate has no repository to diff it against its base",
-                    )
+                assert repo is not None  # a freeze is made only in a worktree run, with its repo
                 try:
                     cumulative = repo.diff_paths(base, freeze.candidate_commit, cwd=project_root)
                 except GitError as exc:
@@ -4850,12 +5112,12 @@ class Controller:
                     "round_parent_commit": freeze.base_commit,
                     "round_paths": list(freeze.paths),
                 }
-        # The deadline the packet states is the one the invocation is given: the reviewer's 900
-        # seconds capped by what is left of the root's clock, read now and again after the
-        # dispatch transaction below (which re-renders the packet if the clock moved).
-        stated_deadline = self._capped_deadline(900)
+        # The deadline the packet states is the one the invocation is given: the reviewer's
+        # configured deadline capped by what is left of the root's clock, read now and again after
+        # the dispatch transaction below (which re-renders the packet if the clock moved).
+        stated_deadline = self._capped_deadline(REVIEWER_DEADLINE_SECONDS)
         context_changes = self._context_file_changes(
-            repo, freeze, candidate_identity, list(context_files or []), project_root
+            repo, freeze, candidate_identity, list(context_files), project_root
         )
 
         def render_packet(deadline_seconds: int) -> RenderedPacket:
@@ -4871,8 +5133,8 @@ class Controller:
                     candidate_fingerprint=candidate_fp,
                     deadline_seconds=deadline_seconds,
                     candidate=candidate_identity,
-                    verification_status=verification.status if verification else "not_run",
-                    verification_detail=verification.detail if verification else "",
+                    verification_status=verification.status,
+                    verification_detail=verification.detail,
                     check_summaries=check_summaries,
                     evidence_rows=evidence_rows,
                     context_changes=context_changes,
@@ -4882,7 +5144,6 @@ class Controller:
                     RefusalCode.INVALID_SPEC,
                     f"the reviewer input packet could not be built, so no review was bought: {exc}",
                 ) from exc
-            self._note_packet(run_id, "reviewer", packet)
             return packet
 
         reviewer_packet = render_packet(stated_deadline)
@@ -4904,9 +5165,7 @@ class Controller:
             role="reviewer",
             purpose="reviewer invocation",
             spec=spec,
-            # ``_drive`` always passes the project through; the default only keeps a direct
-            # caller from crashing on this path, and it fails closed rather than open.
-            project=project if project is not None else ProjectConfig(project_id="", checks=[]),
+            project=project,
             # A review is never the repair: the repair is an implementer attempt, and the root's
             # repair counter is charged by that dispatch, not by the reviewer that follows it.
             is_repair=False,
@@ -4930,7 +5189,7 @@ class Controller:
         # turn was bought, so the invocation gets what is left now and the packet is brought into
         # agreement with it - never sent stating more time than the invocation is given. The value
         # can only shrink, so the re-rendered packet is never larger than the one already checked.
-        deadline_seconds = min(stated_deadline, self._capped_deadline(900))
+        deadline_seconds = min(stated_deadline, self._capped_deadline(REVIEWER_DEADLINE_SECONDS))
         if deadline_seconds <= 0:
             # As for the implementer: the clock ran out during the reservation. The review turn
             # stays spent, and no reviewer is started that could only time out.
@@ -4974,7 +5233,19 @@ class Controller:
             # review turn was bought.
             on_spawn=self._spawn_reporter(dispatch),
         )
-        self._mark_launch_requested(dispatch)
+        # Noted once, for the packet actually handed over: a packet re-rendered because the root's
+        # clock moved replaced the first one, which was never sent.
+        self._note_packet(run_id, "reviewer", reviewer_packet)
+        if not self._mark_launch_requested(dispatch):
+            # As for the implementer: the entry was closed after the reservation (a stop, a
+            # takeover by another owner, a reconcile), so no reviewer is asked to start.
+            raise RefusedError(
+                self._handoff_refusal_code(run_id),
+                "the run was stopped, ended or taken over by another owner after reviewer "
+                f"invocation {invocation_id} was reserved and before its launch was requested, so "
+                "its ledger entry was already closed; no reviewer was started, no stop is claimed "
+                "for it, and the reserved submission stays consumed",
+            )
         # The same ordering fact as the implementer's: only a stop recorded before the handoff
         # proves the driver's gate refused.
         stop_before_launch = self._stop_recorded(run_id)
@@ -5036,10 +5307,6 @@ class Controller:
                 outcome=review_invocation.outcome,
             )
         self._release_invocation(self.reviewer_driver, run_id, invocation_id)
-        pid, started_at, identity = ProcessGuard(self.controller_id).identity()
-        self.store.record_process_identity(
-            attempt_id, pid=pid, started_at=started_at, identity=identity, session_id=attempt_id
-        )
         if review_invocation.outcome is InvocationOutcome.OUTCOME_UNKNOWN:
             # Nobody knows how this turn ended - it may not even have ended. That is an unknown
             # outcome, not a wire failure: the ledger and the run both say so, the root stays
@@ -5142,32 +5409,35 @@ class Controller:
         invocation_id: str,
         outcome: InvocationOutcome,
     ) -> RefusedError:
-        """Record a reviewer result that arrived after the run's stop, and return the refusal.
+        """Record a reviewer result the run no longer takes, and return the refusal.
 
-        The reviewer's half of :meth:`_apply_result_or_stay_stopped`: the result decides nothing
-        any more, so it is a ``late_result`` note. No verdict is attached, no evidence and no
-        process identity are recorded, and the ledger entry is **not settled** - after an
-        unconfirmed stop it stays open and keeps blocking the root until ``resume`` reconciles
-        it; an entry the stop already closed keeps that state, and the refused settlement is
-        noted. The driver is still released: the result is on record, as a note.
+        The reviewer's half of :meth:`_apply_result_or_stay_stopped`: the run was stopped, ended
+        or taken over by another owner before the result's first write, so the result decides
+        nothing any more and is a ``late_result`` note. No verdict is attached, no evidence is
+        recorded, and the ledger entry is **not settled** - after an unconfirmed stop it stays
+        open and keeps blocking the root until ``resume`` reconciles it; an entry a stop or a
+        takeover already closed keeps that state, and the refused settlement is noted. The driver
+        is still released: the result is on record, as a note.
 
-        The caller raises the returned error; ``_blocked`` then keeps the block the stop recorded.
+        The caller raises the returned error; ``_blocked`` then keeps the run's recorded state.
         """
         self.store.record_note(
             run_id,
             f"{NOTE_LATE_RESULT}: the {outcome.value} result of reviewer invocation "
-            f"{invocation_id} for attempt {attempt_id} arrived after the run's stop was "
-            "recorded; no verdict or evidence was recorded, the ledger entry keeps the state the "
-            "stop left, the run keeps its recorded decision and nothing is re-dispatched",
+            f"{invocation_id} for attempt {attempt_id} arrived after the run was stopped, ended "
+            "or taken over by another owner; no verdict or evidence was recorded, the ledger "
+            "entry keeps the state it had, the run keeps its recorded decision and nothing is "
+            "re-dispatched",
         )
         self._release_invocation(self.reviewer_driver, run_id, invocation_id)
         recorded = self.store.invocation(invocation_id)
         if recorded is not None and recorded.state.value not in INVOCATION_OPEN_STATES:
             self._note_not_settled(run_id, invocation_id, outcome)
         return RefusedError(
-            RefusalCode.CANCELLED_BY_OPERATOR,
-            f"the reviewer's {outcome.value} result arrived after the stop was recorded; it is "
-            "recorded as a late_result note and decides nothing",
+            self._handoff_refusal_code(run_id),
+            f"the reviewer's {outcome.value} result arrived after the run was stopped, ended or "
+            "taken over by another owner; it is recorded as a late_result note and decides "
+            "nothing",
         )
 
     def _unusable_review(
@@ -5233,14 +5503,11 @@ class Controller:
         verification: VerificationResult,
         review: ReviewResult,
         observed_turns: int | None,
-        base_ref: str,
         limitations: list[str],
         freeze: CandidateFreeze | None = None,
         repo: GitRepo | None = None,
-        target_repo_root: Path | None = None,
         user_tree_before: str = "",
         dirty_target: bool = False,
-        identity: CandidateIdentity | None = None,
         original_base_commit: str = "",
         project_write_deny: list[str] | None = None,
         git_metadata_before: GitMetadataSnapshot | None = None,
@@ -5252,10 +5519,10 @@ class Controller:
         built-in deny list always apply. A delivery that names a path the scope does not allow is
         refused as a scope violation instead of being written into a receipt.
 
-        Accepts the frozen *identity of this round* so the receipt and the run's notes name the
-        candidate that was actually verified, and the task's *original base* so the delivery it
-        describes is the cumulative change a repaired run actually produced - base to final
-        candidate - rather than the last round's patch.
+        The receipt names the candidate that was actually verified - this round's ``freeze`` and
+        the scope fingerprinted again here - and ``original_base_commit``, the task's original
+        base, makes the delivery it describes the cumulative change a repaired run actually
+        produced - base to final candidate - rather than the last round's patch.
 
         The DSH context limitation is re-derived from that same Git delivery diff, never read
         back from the stored ``dsh_context`` records, so a bad note cannot fail an acceptance.
@@ -5494,12 +5761,24 @@ class Controller:
         # The comparison is stat-level (see ``GitRepo.user_change_fingerprint``): "left untouched"
         # is written only when it found no difference, and a difference gets the WARNING alone.
         if repo is not None:
-            user_tree_changed = bool(user_tree_before) and (
-                repo.user_change_fingerprint(
-                    exclude=(self.data_dir, owner_ledger_dir(self.store) or default_data_dir())
+            try:
+                user_tree_changed = bool(user_tree_before) and (
+                    repo.user_change_fingerprint(
+                        exclude=(self.data_dir, owner_ledger_dir(self.store) or default_data_dir())
+                    )
+                    != user_tree_before
                 )
-                != user_tree_before
-            )
+            except (GitError, GitStatusParseError, OSError) as exc:
+                # The receipt is already written: a checkout that cannot be read again (a git
+                # timeout, a moved or broken checkout) is a fact about the user's tree, not about
+                # the candidate, and neither "left untouched" nor the WARNING can be claimed.
+                note = (
+                    "the target repository could not be re-read after acceptance "
+                    f"({type(exc).__name__}: {exc}), so whether its own state changed during the "
+                    "run is not known; the receipt stands, and the user's tree needs a look"
+                )
+                self.store.record_note(run_id, note)
+                return self._outcome_for(run_id, notes=[note])
             if spec.workspace.mode == "worktree" and dirty_target and not user_tree_changed:
                 self.store.record_note(
                     run_id,
@@ -5767,9 +6046,10 @@ class Controller:
         ):
             return
         raise RefusedError(
-            RefusalCode.CANCELLED_BY_OPERATOR,
-            "a cancellation intent was recorded while the reviewer invocation was being "
-            "registered, so the registration was refused and no reviewer was started",
+            self._handoff_refusal_code(run_id),
+            "the run was stopped, ended or taken over by another owner while the reviewer "
+            "invocation was being registered, so the registration was refused and no reviewer "
+            "was started",
         )
 
     def _advance_to_review(self, run_id: str) -> RunOutcome | None:
@@ -5822,7 +6102,7 @@ class Controller:
             implementer_invocations=implementer,
             reviewer_invocations=reviewer,
             workspace_matches_receipt=self.workspace_matches_receipt(run_id),
-            notes=notes,
+            notes=list(notes or []),
         )
 
     def workspace_matches_receipt(self, run_id: str) -> bool | None:
@@ -5832,27 +6112,85 @@ class Controller:
         return workspace_drift(self.store, run_id, self.project_root)
 
 
+@dataclass(frozen=True, kw_only=True, slots=True)
 class _CycleResult:
     """What one implementer attempt ended as, in terms the driver loop can act on.
 
     ``outcome`` is set when the run is finished - accepted, blocked, stopped, unknown. Otherwise
     ``repair`` says the attempt may be followed by exactly one repair, and carries the trigger and
-    the structured context that repair needs. Exactly one of the two is set, which is what keeps
-    "the run is over" and "the run may continue" from being inferred from a null somewhere.
+    the structured context that repair needs, and ``identity`` the candidate it repairs. Exactly
+    one of ``outcome`` and ``repair`` is set, which is what keeps "the run is over" and "the run
+    may continue" from being inferred from a null somewhere.
     """
 
-    __slots__ = ("identity", "outcome", "repair")
+    outcome: RunOutcome | None = None
+    repair: RepairContext | None = None
+    identity: CandidateIdentity | None = None
 
-    def __init__(
-        self,
-        *,
-        outcome: RunOutcome | None = None,
-        repair: RepairContext | None = None,
-        identity: CandidateIdentity | None = None,
-    ) -> None:
-        self.outcome = outcome
-        self.repair = repair
-        self.identity = identity
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class _Round:
+    """One implementer round's fixed inputs: ``Controller._attempt_cycle``'s parameters.
+
+    Everything a phase of the round must *not* re-derive from ambient state (the worktree, the
+    original base, which round it is) travels here, so a repair round cannot quietly behave like
+    a first round.
+    """
+
+    run_id: str
+    request: RunRequest
+    repo: GitRepo | None
+    worktree: Path | None
+    execution_root: Path
+    user_tree_before: str
+    dirty_target: bool
+    implementer_writes: bool
+    implementer_packet: PreparedPacket | None
+    previous: CandidateIdentity | None
+    trigger: RepairTrigger | None
+    round_number: int
+    original_base_commit: str
+    original_base_ref: str
+    policy: RepairPolicy | None
+    repair_context: RepairContext | None
+    git_metadata_before: GitMetadataSnapshot | None
+
+    @property
+    def spec(self) -> TaskSpec:
+        return self.request.task
+
+    @property
+    def project(self) -> ProjectConfig:
+        return self.request.project
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class _ImplementerTurn:
+    """The implementer invocation a round dispatched, and what its driver returned.
+
+    ``prepared`` is the packet actually sent (re-rendered when the root's clock moved), and
+    ``pre_manifest`` the workspace as it was before the worker ran.
+    """
+
+    attempt_id: str
+    invocation_id: str
+    dispatch: DispatchReservation
+    prepared: PreparedPacket
+    pre_manifest: dict[str, str]
+    result: InvocationResult
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class _FrozenCandidate:
+    """A round's candidate once held to its scope: its fingerprint, its freeze, its DSH files.
+
+    ``freeze`` is ``None`` for an in-place run, which has no Git identity; ``context_files`` are
+    the declared DSH context files the candidate changes from the task's base (empty in place).
+    """
+
+    fingerprint: str
+    freeze: CandidateFreeze | None
+    context_files: list[str]
 
 
 def _stored_result_facts(row: Any, column: str, prefix: str) -> dict[str, Any]:
@@ -5964,14 +6302,15 @@ def inspect_run(store: Store, run_id: str, *, project_root: Path | None = None) 
 
 def _owner_takeover_words(store: Store, row: Any, assessment: OwnerAssessment) -> str:
     """What ``hflow resume`` would do with this live run's owner, from the same rule it applies."""
-    if assessment.probe.verdict == "not_recorded":
-        if _nothing_dispatched(store, str(row["run_id"])):
-            return (
-                "; not proven gone - `hflow resume` would take it over only because nothing was "
-                "dispatched"
-            )
+    verdict = takeover_verdict(store, row, assessment).verdict
+    if verdict == TAKEOVER_NOTHING_RECORDED:
+        return (
+            "; not proven gone - `hflow resume` would take it over only because nothing was "
+            "dispatched"
+        )
+    if verdict == TAKEOVER_REFUSED_DISPATCHED:
         return "; not proven gone and work was dispatched, so `hflow resume` would change nothing"
-    if assessment.gone:
+    if verdict == TAKEOVER_OWNER_GONE:
         return "; a takeover by `hflow resume` is permitted"
     return "; the owner may be alive, so `hflow resume` would change nothing"
 

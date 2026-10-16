@@ -34,7 +34,6 @@ creation time there, so a takeover is never proven on such a host.
 from __future__ import annotations
 
 import ctypes
-import functools
 import os
 import re
 import secrets
@@ -139,28 +138,13 @@ def filetime_iso(value: int | None) -> str:
 # -- Windows process queries -------------------------------------------------------------------
 
 
-@functools.cache
-def _api() -> Any:
-    """kernel32 with the signatures this module calls, declared once per process."""
-    from ctypes import wintypes
-
-    api: Any = winjob._kernel32()  # noqa: SLF001 - same package, one kernel32 loader
-    api.OpenProcess.restype = wintypes.HANDLE
-    api.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    api.GetCurrentProcess.restype = wintypes.HANDLE
-    api.GetCurrentProcess.argtypes = []
-    api.WaitForSingleObject.restype = wintypes.DWORD
-    api.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-    api.GetProcessTimes.restype = wintypes.BOOL
-    api.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
-    api.CloseHandle.restype = wintypes.BOOL
-    api.CloseHandle.argtypes = [wintypes.HANDLE]
-    return api
+# Every kernel32 call goes through ``winjob._kernel32``, the package's one binding, where each
+# function's signature is declared once (``winjob._SIGNATURES``).
 
 
 def _open_process(pid: int) -> tuple[Any, int]:
     """``(handle, 0)`` or ``(None, win32_error)``. A seam: tests inject access denied here."""
-    api = _api()
+    api = winjob._kernel32()  # noqa: SLF001 - same package, one kernel32 binding
     handle = api.OpenProcess(
         winjob.PROCESS_QUERY_LIMITED_INFORMATION | winjob.SYNCHRONIZE, False, pid
     )
@@ -171,7 +155,7 @@ def _open_process(pid: int) -> tuple[Any, int]:
 
 def _close(handle: Any) -> None:
     try:
-        _api().CloseHandle(handle)
+        winjob._kernel32().CloseHandle(handle)  # noqa: SLF001
     except OSError:  # pragma: no cover - closing a handle we own
         pass
 
@@ -180,7 +164,9 @@ def _creation_time(handle: Any) -> int | None:
     from ctypes import wintypes
 
     times = [wintypes.FILETIME() for _ in range(4)]
-    ok = _api().GetProcessTimes(handle, *(ctypes.byref(item) for item in times))
+    ok = winjob._kernel32().GetProcessTimes(  # noqa: SLF001
+        handle, *(ctypes.byref(item) for item in times)
+    )
     if not ok:
         return None
     created = times[0]
@@ -189,7 +175,7 @@ def _creation_time(handle: Any) -> int | None:
 
 def _exited(handle: Any) -> bool | None:
     """``True`` exited, ``False`` running, ``None`` the wait itself failed."""
-    result = _api().WaitForSingleObject(handle, 0)
+    result = winjob._kernel32().WaitForSingleObject(handle, 0)  # noqa: SLF001
     if result == winjob.WAIT_OBJECT_0:
         return True
     if result == winjob.WAIT_TIMEOUT:
@@ -201,8 +187,7 @@ def current_identity() -> ProcessIdentity:
     """This process. ``created`` is ``None`` off Windows or when the query failed."""
     created: int | None = None
     if winjob.IS_WINDOWS:
-        api = _api()
-        created = _creation_time(api.GetCurrentProcess())
+        created = _creation_time(winjob._kernel32().GetCurrentProcess())  # noqa: SLF001
     return ProcessIdentity(pid=os.getpid(), created=created, host=current_host())
 
 

@@ -18,7 +18,7 @@ from hflow.contracts import (
     SpawnKind,
 )
 from hflow.ids import utc_now
-from hflow.store import _EFFECTIVE_CONFIG_PREFIX, RunNotFound, Store
+from hflow.store import _EFFECTIVE_CONFIG_PREFIX, RunNotFound, Store, _model_from_row
 
 
 def pending_invocations(store: Store, root_id: str) -> list[InvocationIntent]:
@@ -152,4 +152,4 @@ def settlement_for(store: Store, invocation_id: str) -> InvocationSettlement | N
     row = store._fetchone(  # noqa: SLF001
         "SELECT * FROM invocation_settlements WHERE invocation_id = ?", (invocation_id,)
     )
-    return Store._settlement_from_row(row) if row is not None else None  # noqa: SLF001
+    return _model_from_row(InvocationSettlement, row) if row is not None else None

@@ -19,8 +19,8 @@ binds nothing. The home's patch layers are read as bounded text for two notes (t
 tokens are recorded. :func:`_read_regular` is the only place a file is opened. :func:`carrier_files`
 and :func:`package_manifest_for` only *name* files; the binding by content is
 ``launch_content``'s. :func:`credential_sources` reports which credential sources a launch would
-have (a variable's name, two home files by stat); the refusal built on it lives in the driver
-(``acpx_dsh.credential_source_problem``).
+have (a variable's name, two home files by stat); the refusal built on it lives in the launch
+checks (``launch.credential_source_problem``).
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ import json
 import os
 import re
 import stat
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Literal, NamedTuple
 
@@ -38,8 +38,16 @@ from ..contracts import ClientIdentity, LaunchConfig, LaunchSurfaces, SurfaceFil
 from ..ids import utc_now
 from ..report import surface_summary
 from ..workspace import DSH_INSTRUCTION_FILE_NAMES, DSH_SKILL_DIRS, DSH_WORKSPACE_ENV_FILE
-from .acpx_dsh import DSH_AGENTS_HOME_ENV, _client_module_tree, env_key, path_inside
-from .launch_content import RegularFileError, read_regular
+from .primitives import (
+    DSH_AGENTS_HOME_ENV,
+    INVOCATION_ID_PLACEHOLDER,
+    RegularFileError,
+    _client_module_tree,
+    env_key,
+    find_on_path,
+    path_inside,
+    read_regular,
+)
 
 #: The paths DSH reads in its home (pinned to dsh-v0.2.0-rc.2). The profile entry is formatted
 #: with the launch's profile and skipped when it has none.
@@ -51,7 +59,7 @@ DSH_HOME_SURFACE_NAMES = (
     "skills",
 )
 #: DSH's user-level agents file: ``$DSH_AGENTS_HOME/AGENTS.md``, the environment-only
-#: ``DSH_AGENTS_HOME`` (``acpx_dsh.DSH_AGENTS_HOME_ENV``) defaulting to ``<home>/.agents`` (see
+#: ``DSH_AGENTS_HOME`` (``primitives.DSH_AGENTS_HOME_ENV``) defaulting to ``<home>/.agents`` (see
 #: :data:`USER_AGENTS_SOURCE`).
 USER_AGENTS_DEFAULT_DIR = ".agents"
 USER_AGENTS_FILE_NAME = "AGENTS.md"
@@ -76,8 +84,12 @@ ENV_FILE_NAME = DSH_WORKSPACE_ENV_FILE
 SURFACE_HASH_LIMIT_BYTES = 4 * 1024 * 1024
 #: A package.json, a shim or a manifest above this size is not read.
 MANIFEST_READ_LIMIT_BYTES = 256 * 1024
-#: DSH's credential variable. Only whether the name reaches the child is recorded.
+#: DSH's credential variable. Only whether the name reaches the child is recorded; it is the one
+#: secret-like name the child keeps (``launch.child_environment``).
 DEEPSEEK_API_KEY_NAME = "DEEPSEEK_API_KEY"
+#: How the launch record names the secret-like variables withheld from the child, as a check's
+#: environment summary does (``artifacts.environment_summary``): sorted names after one ``=``.
+WITHHELD_SECRET_LIKE_PREFIX = "withheld_secret_like="
 #: DSH's stored-credentials file in its home (documented at dsh-v0.2.0-rc.2, not observed). Like a
 #: ``.env`` it is never opened, sized or hashed: only whether it exists is checked, by stat.
 STORED_CREDENTIALS_NAME = ".credentials.yaml"
@@ -87,6 +99,15 @@ STORED_CREDENTIALS_NAME = ".credentials.yaml"
 HOME_CREDENTIAL_FILE_NAMES = (STORED_CREDENTIALS_NAME, ENV_FILE_NAME)
 #: :func:`stat_presence`'s answer for a regular file - the only answer that counts as a source.
 PRESENT = "present"
+#: What DSH does to a bound home's stored-credentials file at boot (DSH discussion #9845;
+#: dsh-v0.2.0-rc.2 ``packages/credentials/credentials-local/src/index.ts``, blob 98d70ee1:
+#: documented from source, not observed).
+STORED_CREDENTIALS_REWRITE_NOTE = (
+    f"the bound DSH home holds {STORED_CREDENTIALS_NAME} (found by stat; HFlow never opens, sizes "
+    "or hashes it): DSH 0.2.0-rc.2 rewrites a pre-release flat credentials file in place at boot "
+    "(DSH discussion #9845; credentials-local/src/index.ts blob 98d70ee1; documented from source, "
+    "not observed), so the first launch may change that file's format; recorded, never enforced"
+)
 #: The acpx version ADR 0001 recorded. A different version is noted, never refused.
 RECORDED_ACPX_VERSION = "0.17.1"
 #: The @agentclientprotocol/sdk versions the pinned acpx has passed the model-free client checks
@@ -137,7 +158,7 @@ def _read_regular(path: Path, limit: int) -> tuple[bytes | None, int | None, str
     """``(bytes, size, detail)`` of a regular file of at most ``limit`` bytes.
 
     The only function in this module that opens a file, through the drivers' one bounded reader
-    (``launch_content.read_regular``: non-blocking, so a FIFO cannot hold the spawn path); a file
+    (``primitives.read_regular``: non-blocking, so a FIFO cannot hold the spawn path); a file
     that is not regular, too large or unreadable gives ``None`` and why.
     """
     chunks: list[bytes] = []
@@ -250,10 +271,10 @@ def credential_sources(
     ``$DSH_HOME/.credentials.yaml``, then ``<cwd>/.env``, then ``$DSH_HOME/.env``. The workspace
     ``.env`` is not looked at here: a real launch never starts on one (``workspace_env_file``).
     ``child_env`` is the environment the child is (or would be) started with
-    (``acpx_dsh.child_environment``); ``DEEPSEEK_API_KEY`` is looked up by name only
-    (``acpx_dsh.env_key``). A bound home that is not absolute is not looked into - where DSH
+    (``launch.child_environment``); ``DEEPSEEK_API_KEY`` is looked up by name only
+    (``primitives.env_key``). A bound home that is not absolute is not looked into - where DSH
     resolves it depends on its working directory - so its files read ``unknown``. Records only:
-    the refusal built on it is ``acpx_dsh.credential_source_problem``.
+    the refusal built on it is ``launch.credential_source_problem``.
     """
     home = Path(dsh_home)
     files: tuple[tuple[str, str], ...] = ()
@@ -354,6 +375,25 @@ def npm_package_dir(shim: Path, text: str) -> Path | None:
     ):
         return shim.parent.parent / "@deepseek-ai" / "dsh"
     return None
+
+
+#: The interpreter an npm shim runs when it sits beside it (``IF EXIST "%dp0%\node.exe"``).
+NPM_SHIM_NODE_NAME = "node.exe"
+
+
+def npm_shim_node(shim: Path, env: Mapping[str, str]) -> str:
+    """The node an npm dsh shim runs in a child started with ``env``, or ``""``. Names only.
+
+    npm's shim runs ``%dp0%\\node.exe`` when that path exists and otherwise a bare ``node``, which
+    cmd.exe looks up on PATH with each PATHEXT extension - never in its working directory, the
+    workspace, because the driver sets NoDefaultCurrentDirectoryInExePath on every child - so the
+    second step is ``primitives.find_on_path("node", env)``. ``env`` must be the child's: the node a
+    launch runs depends on the PATH it starts with, which is why the spawn gate looks it up again.
+    """
+    beside = shim.parent / NPM_SHIM_NODE_NAME
+    if os.path.exists(beside):
+        return str(beside)
+    return find_on_path("node", env)
 
 
 def observe_client_identity(launch: LaunchConfig) -> ClientIdentity:
@@ -612,8 +652,9 @@ def carrier_files(launch: LaunchConfig) -> CarrierFiles:
         "the Desktop shim's DeepSeek Harness.exe (the program that runs the carrier entry) is "
         "bound by path only"
         if carrier == "desktop"
-        else "the npm shim starts node from its own directory or from PATH; that node is bound by "
-        "path only"
+        else "the npm shim runs the node.exe beside it, else the first node on the child's PATH: "
+        "that file is bound by content (carrier_interpreter) and looked up again in the child's "
+        "environment at the spawn gate"
     )
     scripts: dict[str, Path] = {}
     for match in _SHIM_SCRIPT.finditer(read.text):
@@ -690,8 +731,8 @@ def child_user_home(child_env: Mapping[str, str], child_home: Path | None = None
     """The directory DSH's ``os.homedir()`` returns in a child started with ``child_env``.
 
     ``child_home`` when given: the driver points every child's USERPROFILE/HOME at its
-    invocation's own home (``acpx_dsh.child_home_for``). Otherwise Node's rule - USERPROFILE on
-    Windows, HOME elsewhere - read from ``child_env`` (``acpx_dsh.env_key``, an exact spelling
+    invocation's own home (``launch.child_home_for``). Otherwise Node's rule - USERPROFILE on
+    Windows, HOME elsewhere - read from ``child_env`` (``primitives.env_key``, an exact spelling
     first), and failing that this process's home.
     """
     if child_home is not None:
@@ -706,16 +747,14 @@ def user_agents_file(
 ) -> SurfaceFile:
     """DSH's user-level agents file at this launch (:data:`USER_AGENTS_SOURCE`). Records only.
 
-    ``$DSH_AGENTS_HOME/AGENTS.md`` when that variable reaches the child (``acpx_dsh.env_key``, an
+    ``$DSH_AGENTS_HOME/AGENTS.md`` when that variable reaches the child (``primitives.env_key``, an
     exact spelling first), else ``<home>/.agents/AGENTS.md`` with ``<home>`` from
     :func:`child_user_home`. Examined like every other surface (:func:`surface_file`: presence,
     size, and a digest within :data:`SURFACE_HASH_LIMIT_BYTES`); never enforced and never a
     reason to refuse. An empty or relative ``DSH_AGENTS_HOME`` is not looked into - how DSH
     resolves one is not verified - and neither is a default path in a per-invocation home that
-    does not exist yet (its path holds ``acpx_dsh.INVOCATION_ID_PLACEHOLDER``).
+    does not exist yet (its path holds ``primitives.INVOCATION_ID_PLACEHOLDER``).
     """
-    from .acpx_dsh import INVOCATION_ID_PLACEHOLDER
-
     configured_key = env_key(child_env, DSH_AGENTS_HOME_ENV, exact_first=True)
     if configured_key is not None:
         configured = child_env[configured_key]
@@ -810,7 +849,7 @@ SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access")
 #: ``pinInitialPermission``). Documented from upstream source, not observed.
 DSH_DEFAULT_SANDBOX_MODE = "workspace-write"
 #: The variable that fallback reads. The driver removes it from every child
-#: (``acpx_dsh.STRIPPED_DSH_ENV``), and DSH refuses a ``DSH_*`` name from any ``.env``
+#: (``launch.STRIPPED_DSH_ENV``), and DSH refuses a ``DSH_*`` name from any ``.env``
 #: (bootstrap-only names, packages/boot/app-boot/src/index.ts:156-177 at dsh-v0.2.0-rc.2).
 DSH_PERMISSION_MODE_NAME = "DSH_PERMISSION_MODE"
 #: The base-bundle rows that decide a new session's mode. The ``permission`` row's
@@ -830,7 +869,7 @@ SCHEMA_DEFAULT_PRESET_MODES = ("workspace-write", "danger-full-access")
 ACP_SANDBOX_MODE_FACT = (
     "an ACP client cannot change it per session: DSH's ACP server offers no session mode, and "
     "session/set_config_option takes only model and reasoning_effort (dsh-v0.2.0-rc.2 and "
-    "-alpha.2 source)"
+    "-alpha.2 source), so the mode the session starts in is final for it (DSH #9735)"
 )
 #: What the mode is not: a boundary for DSH's own file tools. DSH #9693 (documented from
 #: dsh-v0.2.0-rc.2 ``packages/acp/acp/src/index.ts`` L200-203, blob 44ef4741: ACP sessions do no
@@ -1103,10 +1142,14 @@ def observe_launch_surfaces(
 
     ``workspace`` is the directory DSH starts in (``None`` before dispatch, when a worktree does
     not exist yet). ``child_home`` is the home the child's USERPROFILE/HOME point at, when the
-    caller knows it (see :func:`child_user_home`). Records only: it refuses nothing and changes
-    nothing.
+    caller knows it (see :func:`child_user_home`). When ``child_env`` was built by
+    ``launch.child_environment`` (a ``ChildEnvironment``), the secret-like names it withheld are
+    noted (names only). Records only: it refuses nothing and changes nothing.
     """
     notes: list[str] = []
+    withheld = getattr(child_env, "withheld_secret_like", None)
+    if withheld is not None:
+        notes.append(withheld_note(withheld))
     home = Path(dsh_home)
     ws = Path(os.path.abspath(workspace)) if workspace is not None else None
     if not home.is_absolute():
@@ -1139,6 +1182,8 @@ def observe_launch_surfaces(
                 surface_file(home, name, digest=Path(name).name != ENV_FILE_NAME)
             )
         notes.extend(turn_git_notes(home, launch.profile))
+        if dsh_home_kind == "bound" and stat_presence(home / STORED_CREDENTIALS_NAME) == PRESENT:
+            notes.append(STORED_CREDENTIALS_REWRITE_NOTE)
     client = observe_client_identity(launch)
     notes.extend(
         sandbox_mode_notes(
@@ -1195,6 +1240,17 @@ def observe_launch_surfaces(
         client=client,
         notes=notes,
     )
+
+
+def withheld_note(withheld: Sequence[str]) -> str:
+    """The launch record's line for the secret-like names kept out of the agent child."""
+    rule = (
+        f"every secret-like variable but {DEEPSEEK_API_KEY_NAME} is kept out of the agent child "
+        "(names only, never values; not a credential sandbox)"
+    )
+    if not withheld:
+        return f"agent environment: no secret-like variable to withhold - {rule}"
+    return f"agent environment: {WITHHELD_SECRET_LIKE_PREFIX}{','.join(sorted(withheld))} - {rule}"
 
 
 def probe_notes(surfaces: LaunchSurfaces) -> list[str]:

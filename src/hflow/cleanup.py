@@ -18,7 +18,9 @@ undone by re-running something:
    receipt whose HEAD is not its base needs a branch, tag or HFlow ref that contains HEAD;
    otherwise the commit would be dropped, and cleanup refuses ``unretained_commit``;
 5. untracked and ignored files are refused unless they match the explicit artifact policy -
-   an ignored `.env` is a user's file, not garbage.
+   an ignored `.env` is a user's file, not garbage;
+6. a run that recorded a change to the shared Git metadata must have it restored first: the
+   status read and ``git worktree remove`` would run what it names (checked before either).
 
 Anything unclear refuses and keeps the scene, which is the correct outcome.
 """
@@ -38,13 +40,16 @@ from .contracts import (
     WorkspaceProvenance,
 )
 from .gitworkspace import (
+    GIT_METADATA_CHANGED,
+    GIT_METADATA_WARNING_PREFIXES,
     IGNORED_ARTIFACT_ALLOWLIST,
+    NOTE_GIT_METADATA,
     GitError,
     GitRepo,
     StatusReport,
     brief_list,
     is_full_oid,
-    registered_worktrees,
+    registration_for,
 )
 from .hints import hflow_command, shell_word
 from .store import Store, StoreError
@@ -132,6 +137,10 @@ _BASE_NOTE = re.compile(r"base .+ -> (?P<commit>[0-9a-f]{40}(?:[0-9a-f]{24})?)")
 _RETAINING_NAMESPACES = ("refs/heads", "refs/tags", "refs/hflow")
 #: What shows a moved HEAD: the commits it now names, and anything uncommitted on top.
 _HEAD_DRIFT_INSPECT = ("log --oneline -5", "status --short --ignored")
+#: The baseline the controller records right after creating the run's worktree.
+_METADATA_BASELINE = re.compile(
+    rf"{re.escape(NOTE_GIT_METADATA)}: snapshot before dispatch (?P<digest>\S+)"
+)
 
 
 def _recorded_base_commit(store: Store, run_id: str, spec: TaskSpec) -> str:
@@ -295,6 +304,8 @@ def plan_cleanup(store: Store, run_id: str) -> CleanPlan:
     if repo is None:
         return plan
     attempt = _check_execution_state(plan, store, run_id, str(row["task_state"]))
+    if not _check_git_metadata(plan, store, worktree):
+        return plan
     base_commit = _check_head(plan, store, repo, worktree, receipt=receipt, spec=spec, attempt=attempt)
     if base_commit is None:
         return plan
@@ -370,8 +381,7 @@ def _open_owned_worktree(plan: CleanPlan, worktree: Path, source_common: str) ->
         _refuse(plan, "provenance_mismatch", "Git common directory differs from its recorded source")
         return None
     try:
-        registration = repo.worktree_registration(worktree)
-        is_main = registration is not None and repo.is_main_worktree(worktree)
+        registration, is_main = repo.registration(worktree)
     except GitError as exc:
         _refuse(plan, "git_query_failed", str(exc))
         return None
@@ -437,6 +447,60 @@ def _check_execution_state(
             f"the run is {task_state}; only a settled run's workspace may be released",
         )
     return attempt
+
+
+def _check_git_metadata(plan: CleanPlan, store: Store, worktree: Path) -> bool:
+    """6. Shared Git metadata a run recorded as changed must match its baseline again first.
+
+    A run that carries a ``git_metadata: changed`` or ``unreadable`` note was told to restore the
+    metadata before ``hflow clean``: it can name a program (a clean filter) that the status read
+    below and ``git worktree remove`` would run. Its digest, read as the controller read it (the
+    user's checkout and this worktree), must equal the ``snapshot before dispatch`` digest the run
+    recorded; until then the plan refuses ``git_metadata_changed`` and stops, so no status is read.
+    A run without such a note is not compared: nothing it recorded says the metadata moved.
+    Returns ``False`` when refused.
+    """
+    notes = store.notes_for(plan.run_id)
+    if not any(note.startswith(GIT_METADATA_WARNING_PREFIXES) for note in notes):
+        return True
+    baselines = [match["digest"] for note in notes if (match := _METADATA_BASELINE.match(note))]
+    restore = (
+        "HFlow ran no status read and no removal here and restored nothing: inspect and restore "
+        "it (git config --list --show-origin --show-scope; `hflow status` names what changed), "
+        "then run clean again"
+    )
+    if not baselines:
+        _refuse(
+            plan,
+            "git_metadata_changed",
+            f"{GIT_METADATA_CHANGED}: the run recorded a change but no pre-dispatch snapshot to "
+            f"compare with, so it cannot be shown restored. {restore}",
+        )
+        return False
+    assert plan.source is not None  # opened by _open_recorded_source before this step
+    try:
+        current = plan.source.metadata_snapshot(worktree).digest
+    except GitError as exc:
+        _refuse(
+            plan,
+            "git_metadata_changed",
+            f"{GIT_METADATA_CHANGED} or became unreadable since the run's pre-dispatch snapshot "
+            f"({exc}). {restore}",
+        )
+        return False
+    if current != baselines[-1]:
+        _refuse(
+            plan,
+            "git_metadata_changed",
+            f"{GIT_METADATA_CHANGED} since the run's pre-dispatch snapshot and is not restored "
+            f"({baselines[-1]} -> {current}); it can name a program HFlow's own git status and "
+            f"worktree removal would run. {restore}",
+        )
+        return False
+    plan.reasons.append(
+        "the shared Git metadata this run recorded as changed matches its pre-dispatch snapshot again"
+    )
+    return True
 
 
 def _check_head(
@@ -712,11 +776,7 @@ def apply_cleanup(store: Store, run_id: str, *, operator: str = "local-controlle
 
 def git_registration_exists(common_dir: str, worktree: Path) -> bool:
     """Is this path still registered, judged from the repository's own metadata?"""
-    target = worktree.resolve()
-    return any(
-        record.get("worktree") and Path(record["worktree"]).resolve() == target
-        for record in registered_worktrees(common_dir)
-    )
+    return registration_for(common_dir, worktree) is not None
 
 
 def _left_behind(worktree: Path) -> str:

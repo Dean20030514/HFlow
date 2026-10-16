@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 import hflow.cli as cli
+import hflow.doctor as doctor
 from hflow.cli import (
     EXIT_BLOCKED,
     EXIT_IN_PROGRESS,
@@ -300,7 +301,7 @@ def test_doctor_judges_git_against_the_integration_minimum(
         probed.append(program)
         return reported if Path(program).parent == git_dir else "v0.0.0"
 
-    monkeypatch.setattr(cli, "_doctor_version", version)
+    monkeypatch.setattr(doctor, "_doctor_version", version)
 
     code, payload = _doctor(tmp_path / "data", capsys)
 
@@ -365,6 +366,72 @@ def test_doctor_says_plainly_that_acpx_is_not_found_and_where_it_is_looked_for(
     assert "acpx client   NOT FOUND" in text and install in text, text
 
 
+def test_doctor_never_calls_acpx_on_path_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A launch never resolves acpx from PATH, so its absence there is not a "NOT FOUND" that
+    contradicts a found acpx client line below it."""
+    entry = _acpx_package(tmp_path / "acpx-install")
+    monkeypatch.setenv("HFLOW_ACPX_CLI", str(entry))
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+
+    code, payload = _doctor(tmp_path / "data", capsys)
+    assert code == EXIT_OK
+    assert payload["executables"]["acpx"]["path"] is None
+    assert "never used by a launch" in payload["executables"]["acpx"]["note"]
+
+    assert main(["doctor", "--data-dir", str(tmp_path / "data")]) == EXIT_OK
+    lines = capsys.readouterr().out.splitlines()
+    [path_line] = [line for line in lines if line.startswith("acpx          ")]
+    assert path_line.startswith("acpx          not on PATH  (PATH lookup only"), path_line
+    assert "NOT FOUND" not in path_line
+
+
+@pytest.mark.parametrize("enabled", [True, False], ids=["enabled", "not-enabled"])
+def test_doctor_says_whether_this_shell_enables_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    enabled: bool,
+) -> None:
+    if enabled:
+        monkeypatch.setenv("HFLOW_ALLOW_WRITES", "1")
+    else:
+        monkeypatch.delenv("HFLOW_ALLOW_WRITES", raising=False)
+    code, payload = _doctor(tmp_path / "data", capsys)
+    assert code == EXIT_OK, "readiness never changes doctor's exit code"
+    writes = payload["readiness"]["writes"]
+    assert writes["variable"] == "HFLOW_ALLOW_WRITES" and writes["enabled"] is enabled
+    assert "--allow-writes" in writes["detail"]
+    assert ("is enabled in this shell" in writes["detail"]) is enabled, writes["detail"]
+    if enabled:
+        assert "approve --plan and run --plan never read the variable" in writes["detail"]
+
+    assert main(["doctor", "--data-dir", str(tmp_path / "data")]) == EXIT_OK
+    assert f"writes        {writes['detail']}" in capsys.readouterr().out
+
+
+def test_doctor_says_a_problem_two_roles_share_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live_profile: MachineProfile,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Both roles resolve one launch, so a missing launcher is one problem, printed once."""
+    monkeypatch.setenv("HFLOW_ACPX_CLI", str(tmp_path / "missing" / "cli.js"))
+    data_dir = tmp_path / "data"
+    write_profile(data_dir, live_profile)
+
+    code, payload = _doctor(data_dir, capsys, "--profile", "dsh-local")
+    assert code == EXIT_REFUSED
+    roles = payload["profile"]["roles"]
+    problem = roles["implementer"]["detail"]
+    assert problem and roles["reviewer"]["detail"] == problem
+    assert payload["profile"]["detail"].startswith("implementer, reviewer: ")
+    assert payload["profile"]["detail"].count("acpx CLI not found") == 1
+
+    assert main(["doctor", "--profile", "dsh-local", "--data-dir", str(data_dir)]) == EXIT_REFUSED
+    text = capsys.readouterr().out
+    assert text.count("acpx CLI not found") == 1, text
+    assert "               same as implementer" in text
+
+
 def test_doctor_shows_the_acpx_entry_and_version_a_profile_would_use(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -415,7 +482,7 @@ def test_doctor_points_at_the_desktop_dsh_shim_when_dsh_is_not_on_path(
     installed: bool,
 ) -> None:
     local = tmp_path / "LocalAppData"
-    shim = local / cli.DESKTOP_DSH_SHIM_RELATIVE
+    shim = local / doctor.DESKTOP_DSH_SHIM_RELATIVE
     marker = tmp_path / "desktop-shim-ran.txt"
     if installed:
         shim.parent.mkdir(parents=True)

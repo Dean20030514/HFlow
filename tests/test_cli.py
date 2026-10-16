@@ -503,21 +503,21 @@ def test_run_has_no_force_flag(
 def test_top_level_help_names_every_subcommand_and_the_live_driver(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The description prose must not claim everything is offline or omit a subcommand."""
+    """The help must not claim everything is offline or omit a subcommand."""
     import argparse
 
     from hflow.cli import build_parser
 
     parser = build_parser()
-    description = parser.description or ""
+    text = parser.format_help()
     subcommands = next(
         action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
     ).choices
     assert len(subcommands) == 15
     for name in subcommands:
-        assert name in description, name
-    assert "offline in M1" not in description
-    assert "acpx-dsh" in description
+        assert name in text, name
+    assert "offline in M1" not in text
+    assert "acpx-dsh" in text
 
 
 def test_unknown_check_kind_blocks_rather_than_reports_success(
@@ -1077,8 +1077,8 @@ def test_zero_model_preflight_refuses_an_unanswered_client_exit() -> None:
         ["run"],
         ["frob"],
         ["run", "--task", "task.json", "--bogus"],
-        ["status"],
-        ["prepare", "--task", "task.json", "--workspace", "nowhere"],
+        ["resume"],  # `status` without a run id is the inbox (batch N)
+        ["ledger", "settle", "I-1", "--attest", "a reason", "--as", "refund"],
         ["--data-dir"],
     ],
     ids=["missing-required", "unknown-subcommand", "unknown-flag", "missing-positional",
@@ -1098,12 +1098,56 @@ def test_a_usage_error_exits_usage_not_refused(
     assert not (_isolated_default_data_dir / "hflow.sqlite").exists()
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["run", "--task", "task.json", "--controller-id", "me"],
+        ["cancel", "R-1", "--controller-id", "me"],
+        ["resume", "R-1", "--controller-id", "me"],
+        ["clean", "R-1", "--apply", "--controller-id", "me"],
+        ["run", "--task", "task.json", "--receipt-out", "receipt.json"],
+        ["prepare", "--task", "task.json", "--authorization-mode", "stop-trial"],
+        ["prepare", "--task", "task.json", "--workspace", "in_place"],
+        ["run", "--task", "task.json", "--base-commit", "HEAD"],
+    ],
+    ids=["run-controller-id", "cancel-controller-id", "resume-controller-id",
+         "clean-controller-id", "receipt-out", "authorization-mode", "workspace", "base-commit"],
+)
+def test_retired_flags_are_usage_errors(
+    argv: list[str], capsys: pytest.CaptureFixture[str], _isolated_default_data_dir: Path
+) -> None:
+    """``--controller-id`` was only a label, ``--receipt-out`` is ``run --json``'s receipt, the
+    authorization mode has one value, and the task file carries its workspace mode and base."""
+    with pytest.raises(SystemExit) as excinfo:
+        main(argv)
+    assert excinfo.value.code == EXIT_USAGE
+    assert "unrecognized arguments" in capsys.readouterr().err
+    assert not (_isolated_default_data_dir / "hflow.sqlite").exists()
+
+
 def test_help_still_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
     for argv in (["--help"], ["run", "--help"]):
         with pytest.raises(SystemExit) as excinfo:
             main(argv)
         assert excinfo.value.code == EXIT_OK
         assert "usage:" in capsys.readouterr().out
+
+
+def test_top_level_help_is_one_line_then_the_verbs_then_the_operator_path(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The module docstring is for readers of the code; ``--help`` is for the operator."""
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    out = capsys.readouterr().out
+    assert "``" not in out, "no reStructuredText markup in the help"
+    head, _, rest = out.partition("positional arguments:")
+    assert "Subcommands:" not in head and len(head.strip().splitlines()) <= 6, head
+    verbs, _, epilog = rest.partition("operator path:")
+    assert "integrate" in verbs and "hflow approve --task T --allow-writes --run" in epilog
+    assert "hflow status " in epilog and "hflow integrate R " in epilog
+    assert "--last" not in epilog and "--needs-you" not in epilog
+    assert "exit codes: 0 done, 2 refused" in epilog
 
 
 def test_every_task_state_has_an_explicit_exit_code() -> None:
@@ -1440,7 +1484,7 @@ def test_last_reads_the_newest_run_on_the_read_only_commands_only(
 ) -> None:
     data_dir = cli_env["data_dir"]
     data = ["--data-dir", str(data_dir)]
-    assert main(["status", "--last", *data]) == EXIT_USAGE
+    assert main(["report", "--last", *data]) == EXIT_USAGE
     assert "no run for --last: there is no ledger at" in capsys.readouterr().err
     assert not data_dir.exists(), "--last created nothing"
 
@@ -1449,7 +1493,7 @@ def test_last_reads_the_newest_run_on_the_read_only_commands_only(
     second = _fake_run(cli_env, project_root, capsys, task=later)
     assert first != second
 
-    assert main(["status", "--last", *data]) == EXIT_OK
+    assert main(["report", "--last", *data]) == EXIT_OK
     lines = capsys.readouterr().out.splitlines()
     assert lines[0] == f"run: {second}" and f"run           {second}" in lines
 
@@ -1463,8 +1507,9 @@ def test_last_reads_the_newest_run_on_the_read_only_commands_only(
     captured = capsys.readouterr()
     assert captured.out.splitlines()[0] == f"run: {second}"
 
-    for argv in (["status", first, "--last"], ["status"], ["resume", "--last"],
-                 ["cancel", "--last"], ["clean", "--last"]):
+    # `status --last` was removed (batch N): `status` without a run id is the inbox.
+    for argv in (["report", first, "--last"], ["report"], ["diff"], ["status", "--last"],
+                 ["resume", "--last"], ["cancel", "--last"], ["clean", "--last"]):
         with pytest.raises(SystemExit) as usage:
             main([*argv, *data])
         assert usage.value.code == EXIT_USAGE, argv
@@ -1477,7 +1522,7 @@ def test_doctor_reports_ledger_health_read_only(
 ) -> None:
     """``PRAGMA quick_check(1)`` over a read-only connection: never a write, never a migration;
     a check the time bound stops is ``incomplete``, not a finding."""
-    import hflow.cli as cli_module
+    import hflow.doctor as doctor_module
     from hflow.migrate import SUPPORTED_STORAGE_VERSION
 
     def doctor(data_dir: Path) -> dict:
@@ -1497,8 +1542,8 @@ def test_doctor_reports_ledger_health_read_only(
     assert main(["doctor", "--data-dir", str(cli_env["data_dir"])]) == EXIT_OK
     assert "ledger health " in capsys.readouterr().out
 
-    monkeypatch.setattr(cli_module, "DOCTOR_LEDGER_CHECK_SECONDS", -1.0)
-    monkeypatch.setattr(cli_module, "DOCTOR_LEDGER_CHECK_STEPS", 1)
+    monkeypatch.setattr(doctor_module, "DOCTOR_LEDGER_CHECK_SECONDS", -1.0)
+    monkeypatch.setattr(doctor_module, "DOCTOR_LEDGER_CHECK_STEPS", 1)
     stopped = doctor(cli_env["data_dir"])
     assert stopped["status"] == "incomplete" and "not a finding" in stopped["detail"], stopped
     monkeypatch.undo()

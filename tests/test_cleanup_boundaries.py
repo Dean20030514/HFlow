@@ -13,12 +13,12 @@ import pytest
 import hflow.cleanup as cleanup
 from hflow.contracts import TaskState, WorkspaceProvenance, WorkspaceSpec, canonical_json, digest_of
 from hflow.drivers.fake import FakeDriver, FakeScript
-from hflow.gitworkspace import GitError, GitRepo
+from hflow.gitworkspace import GIT_METADATA_CHANGED, GitError, GitRepo
 from hflow.hints import shell_word
 from hflow.store import Store
 from tests.test_batch_e_repair import (
-    FIXED_SOURCE, FailingOnceThenPassing, _controller, _git, _project, _request,
-    _scoped_spec, scoped_repo,  # noqa: F401 - pytest fixture
+    FIXED_SOURCE, CommittingDriver, FailingOnceThenPassing, _controller, _git, _isolate_git_home,
+    _project, _request, _scoped_spec, scoped_repo,  # noqa: F401 - pytest fixture
 )
 from hflow.verify import CheckRunners
 from tests.owner_exit import owner_exits
@@ -278,6 +278,96 @@ def test_postclaim_plan_cannot_redirect_deletion_to_another_valid_worktree(store
     assert result["status"] == "REFUSED" and not result["applied"]
     assert worktree.exists() and other.exists()
     assert store.get_run("R-clean")["cleanup_intent_at"] is None
+
+
+def _record_metadata_baseline(store, provenance, worktree: Path) -> None:
+    """The note the controller writes right after creating a run's worktree."""
+    snapshot = GitRepo.discover(Path(provenance.project_root)).metadata_snapshot(worktree)
+    store.record_note(
+        "R-clean",
+        f"git_metadata: snapshot before dispatch {snapshot.digest} ({len(snapshot.entries)} entries)",
+    )
+
+
+def test_clean_waits_until_shared_git_metadata_the_run_saw_change_is_restored(
+    store, managed, monkeypatch
+):
+    """The controller tells the operator to restore the metadata "before hflow clean": clean's
+    status read and ``git worktree remove`` would run the filter it names."""
+    _, worktree, provenance = managed
+    _record_metadata_baseline(store, provenance, worktree)
+    config = Path(provenance.git_common_dir) / "config"
+    original = config.read_bytes()
+    _git(worktree, "config", "filter.hflowprobe.clean", "cat")
+    assert cleanup.plan_cleanup(store, "R-clean").allowed, "no note: nothing says it moved"
+    store.record_note(
+        "R-clean",
+        "git_metadata: changed when the run ended: sha256:a -> sha256:b "
+        "(config@worktree:filter.*.clean); restore it before hflow clean",
+    )
+    status_reads: list[object] = []
+    real_status = GitRepo.status_report
+
+    def recording_status(self, cwd=None):  # noqa: ANN001
+        status_reads.append(cwd)
+        return real_status(self, cwd)
+
+    monkeypatch.setattr(GitRepo, "status_report", recording_status)
+    plan = cleanup.plan_cleanup(store, "R-clean")
+    assert not plan.allowed
+    assert [item["reason"] for item in plan.refusals] == ["git_metadata_changed"]
+    assert plan.refusals[0]["detail"].startswith(GIT_METADATA_CHANGED), plan.refusals
+    assert status_reads == [], "no status read runs on changed metadata"
+    assert cleanup.apply_cleanup(store, "R-clean")["status"] == "REFUSED"
+    assert worktree.exists() and store.get_run("R-clean")["cleanup_intent_at"] is None
+
+    def unreadable(self, path):  # noqa: ANN001
+        raise GitError("git config --list timed out after 300s")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(GitRepo, "metadata_snapshot", unreadable)
+        plan = cleanup.plan_cleanup(store, "R-clean")
+        assert [item["reason"] for item in plan.refusals] == ["git_metadata_changed"]
+        assert "unreadable" in plan.refusals[0]["detail"]
+
+    config.write_bytes(original)
+    plan = cleanup.plan_cleanup(store, "R-clean")
+    assert plan.allowed, plan.refusals
+    assert any("matches its pre-dispatch snapshot again" in reason for reason in plan.reasons)
+    assert cleanup.apply_cleanup(store, "R-clean")["status"] == "REMOVED"
+
+
+def test_clean_compares_with_the_baseline_a_real_run_recorded(
+    tmp_path, scoped_repo, monkeypatch,  # noqa: F811 - pytest fixture
+):
+    """The digest clean computes is the one the controller recorded, once the metadata is restored."""
+    _isolate_git_home(tmp_path, monkeypatch)
+    config = scoped_repo / ".git" / "config"
+    original = config.read_bytes()
+    store = Store(tmp_path / "hflow.sqlite")
+    base = _git(scoped_repo, "rev-parse", "HEAD").strip()
+    spec = _scoped_spec(base, allow=["src"])
+    driver = CommittingDriver(
+        scoped_repo, base=base, first_git=[["config", "filter.hflowprobe.clean", "cat"]],
+        first_plan={"src/parser.py": FIXED_SOURCE}, repair_plan={},
+    )
+    controller = _controller(
+        store, project_root=scoped_repo, spec=spec, driver=driver,
+        runners=CheckRunners({"fake": FailingOnceThenPassing(fail_first=None)}),
+    )
+    try:
+        outcome = controller.run_task(_request(project=_project(), spec=spec, project_root=scoped_repo))
+        assert outcome.task_state is TaskState.BLOCKED
+        assert (outcome.block_reason or "").startswith(GIT_METADATA_CHANGED), outcome.block_reason
+        reasons = [item["reason"] for item in cleanup.plan_cleanup(store, outcome.run_id).refusals]
+        assert reasons == ["git_metadata_changed"]
+        config.write_bytes(original)
+        plan = cleanup.plan_cleanup(store, outcome.run_id)
+        # The worker's uncommitted edit is still refused; the metadata no longer is.
+        assert "git_metadata_changed" not in [item["reason"] for item in plan.refusals]
+        assert any("matches its pre-dispatch snapshot again" in reason for reason in plan.reasons)
+    finally:
+        store.close()
 
 
 @contextlib.contextmanager

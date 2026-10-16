@@ -112,7 +112,8 @@ def test_a_check_cannot_forge_or_hide_its_stream_references(tmp_path: Path) -> N
         "exit_code": row["exit_code"],
         "command": "",
         "detail": detail,
-        "reason": controller_module._reference_field(detail, "reason"),
+        # The reason is the stored column, as the controller reads it.
+        "reason": row["exit_reason"] or "",
         "artifact": controller_module._reference_field(detail, "artifact"),
         "stdout": controller_module._stream_reference(detail, "stdout"),
         "stderr": controller_module._stream_reference(detail, "stderr"),

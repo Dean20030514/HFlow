@@ -4,16 +4,19 @@ What is bound, and nothing more: SHA-256 of the client interpreter (``node.exe``
 acpx; the Python interpreter for the test stand-in), the acpx entry file and the package.json of
 the package it lies in, the ``@agentclientprotocol/sdk`` package.json Node resolves from that entry (the SDK is not
 pinned, so its version is bound instead), the dsh launcher file the agent argv starts, and - for a
-Desktop or npm
-carrier - the carrier entry file its shim runs and that file's package.json. When that entry's
-path passes through a regular file named ``*.asar`` (the installed Desktop app's
+Desktop or npm carrier - the carrier entry file its shim runs and that file's package.json. When
+that entry's path passes through a regular file named ``*.asar`` (the installed Desktop app's
 ``resources/app.asar``), the entry and its package.json exist only inside that Electron archive;
-the archive file itself is bound in their place (``carrier_archive``) and is not parsed.
+the archive file itself is bound in their place (``carrier_archive``) and is not parsed. For the
+npm carrier the ``node`` its shim runs is bound too (``carrier_interpreter``): the ``node.exe``
+beside the shim, else the first ``node`` on the child's PATH - so it depends on the environment,
+and the spawn gate looks it up again in the child's.
 
 What is NOT bound: ``node_modules`` trees, the modules Node resolves at runtime, DSH's own code
-loading, the Desktop carrier's ``DeepSeek Harness.exe`` / the npm shim's ``node``, the files
-Electron reads from an archive's ``.unpacked`` directory, and ``cmd.exe``. Those remain bound by path. The label everywhere is therefore "launch entry files
-bound by content", never "binary verified".
+loading, the Desktop carrier's ``DeepSeek Harness.exe`` (named by path in the bound shim), the
+files Electron reads from an archive's ``.unpacked`` directory, and ``cmd.exe``. Those remain
+bound by path. The label everywhere is therefore "launch entry files bound by content", never
+"binary verified".
 
 Each file's final path is resolved once (links and junctions followed once); that path is the
 one hashed and the one the launch spawns or names. The driver re-derives the list and re-hashes
@@ -25,11 +28,20 @@ from __future__ import annotations
 
 import hashlib
 import os
-import stat
-from collections.abc import Callable
+from collections.abc import Mapping
 from pathlib import Path
 
 from ..contracts import LaunchConfig, LaunchFileDigest
+from .dsh_surfaces import (
+    NODE_SCRIPT_SUFFIXES,
+    NPM_SHIM_NODE_NAME,
+    carrier_files,
+    npm_shim_node,
+    package_manifest_for,
+    sdk_manifest_for,
+)
+# The drivers' one bounded reader is a leaf helper; re-exported for existing importers.
+from .primitives import HASH_CHUNK_BYTES, RegularFileError, read_regular  # noqa: F401
 
 #: The label prepare, doctor, the probe and the README use. Exact wording matters: it states the
 #: limit in the same sentence as the claim.
@@ -39,7 +51,6 @@ CONTENT_BINDING_LABEL = (
 )
 #: A launch entry file above this size is refused rather than hashed (node.exe is ~90 MB).
 LAUNCH_HASH_LIMIT_BYTES = 1024 * 1024 * 1024
-HASH_CHUNK_BYTES = 1024 * 1024
 
 
 class LaunchContentError(Exception):
@@ -62,58 +73,6 @@ def final_path(path: str) -> str:
     return real
 
 
-class RegularFileError(Exception):
-    """Why :func:`read_regular` gave up. ``kind``: ``open``, ``not_regular``, ``too_large``,
-    ``grew`` or ``read``; ``cause`` names the ``OSError`` class for ``open``/``read``; ``size`` is
-    the size seen, for ``too_large``/``grew``."""
-
-    def __init__(self, kind: str, *, cause: str = "", size: int | None = None) -> None:
-        super().__init__(kind)
-        self.kind = kind
-        self.cause = cause
-        self.size = size
-
-
-def read_regular(
-    path: str | os.PathLike[str],
-    limit: int,
-    consume: Callable[[bytes], object],
-    *,
-    chunk_bytes: int = HASH_CHUNK_BYTES,
-) -> int:
-    """Stream one regular file of at most ``limit`` bytes into ``consume``; return its size.
-
-    The one bounded reader of the drivers (the launch content binding hashes through it,
-    ``dsh_surfaces`` reads manifests and shims through it). The open is non-blocking, so a FIFO
-    cannot hold the caller; the type and size are taken from the open descriptor, and a file that
-    grows past ``limit`` while it is read is refused rather than cut. Raises
-    :class:`RegularFileError`; nothing past ``limit`` is ever passed to ``consume``.
-    """
-    try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0))
-    except OSError as exc:
-        raise RegularFileError("open", cause=type(exc).__name__) from exc
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise RegularFileError("not_regular")
-        if info.st_size > limit:
-            raise RegularFileError("too_large", size=info.st_size)
-        total = 0
-        while True:
-            chunk = os.read(fd, min(chunk_bytes, limit + 1 - total))
-            if not chunk:
-                return total
-            total += len(chunk)
-            if total > limit:
-                raise RegularFileError("grew", size=total)
-            consume(chunk)
-    except OSError as exc:
-        raise RegularFileError("read", cause=type(exc).__name__) from exc
-    finally:
-        os.close(fd)
-
-
 def hash_file(path: str) -> tuple[str, int]:
     """``("sha256:<hex>", size)`` of one regular file, streamed. Raises :class:`LaunchContentError`."""
     digest = hashlib.sha256()
@@ -132,21 +91,16 @@ def hash_file(path: str) -> tuple[str, int]:
 
 
 def launch_entry_files(
-    launch: LaunchConfig,
+    launch: LaunchConfig, env: Mapping[str, str] | None = None
 ) -> tuple[list[tuple[str, str]], list[str], list[str]]:
     """``(files, problems, notes)``: which files this launch binds, as ``(kind, final path)``.
 
     A problem means the binding cannot cover what it says it covers (a Node client entry with no
-    package.json, a classified carrier whose entry cannot be named); the launch is then not
-    resolvable. A note says what is deliberately left bound by path.
+    package.json, a classified carrier whose entry or interpreter cannot be named); the launch is
+    then not resolvable. A note says what is deliberately left bound by path. ``env`` is the
+    environment the child starts with (default: this process's), where the npm shim's ``node`` is
+    looked up.
     """
-    from .dsh_surfaces import (
-        NODE_SCRIPT_SUFFIXES,
-        carrier_files,
-        package_manifest_for,
-        sdk_manifest_for,
-    )
-
     files: list[tuple[str, str]] = []
     problems: list[str] = []
     notes: list[str] = []
@@ -187,6 +141,17 @@ def launch_entry_files(
             files.append(("carrier_entry", final_path(str(carrier.entry))))
         if carrier.package_json is not None:
             files.append(("carrier_package_json", final_path(str(carrier.package_json))))
+        if carrier.carrier == "npm" and carrier.launcher is not None:
+            node = npm_shim_node(carrier.launcher, os.environ if env is None else env)
+            if node:
+                files.append(("carrier_interpreter", final_path(node)))
+            else:
+                problems.append(
+                    f"the npm dsh shim {carrier.launcher} runs {NPM_SHIM_NODE_NAME} from its own "
+                    "directory, else node from PATH, and neither has one (only absolute PATH "
+                    "entries are searched): DSH could not start, and the launch cannot be bound "
+                    "by content"
+                )
     notes.extend(carrier.notes)
     if launch.agent_argv and launch.agent_argv[0] != launch.dsh_executable and (
         launch.dsh_executable in launch.agent_argv
@@ -196,10 +161,11 @@ def launch_entry_files(
 
 
 def bind_launch_content(
-    launch: LaunchConfig,
+    launch: LaunchConfig, env: Mapping[str, str] | None = None
 ) -> tuple[list[LaunchFileDigest], list[str], list[str]]:
-    """``(digests, problems, notes)`` for this launch. Nothing is executed."""
-    files, problems, notes = launch_entry_files(launch)
+    """``(digests, problems, notes)`` for this launch in ``env`` (:func:`launch_entry_files`).
+    Nothing is executed."""
+    files, problems, notes = launch_entry_files(launch, env)
     digests: list[LaunchFileDigest] = []
     for kind, path in files:
         try:
@@ -211,17 +177,20 @@ def bind_launch_content(
     return digests, problems, notes
 
 
-def launch_content_changes(launch: LaunchConfig) -> list[str]:
+def launch_content_changes(
+    launch: LaunchConfig, env: Mapping[str, str] | None = None
+) -> list[str]:
     """What differs now from the content this launch recorded; empty when nothing does.
 
-    The list of files is derived again from the launch (so a link swapped into a path, or a shim
-    edited to run another script, shows up as a different path) and every file is hashed again.
-    A launch that recorded no content (built by hand, not by ``resolve_launch_config``) has
+    The list of files is derived again from the launch (so a link swapped into a path, a shim
+    edited to run another script, or another ``node`` first on the PATH of ``env`` - the child's
+    environment, default this process's - shows up as a different path) and every file is hashed
+    again. A launch that recorded no content (built by hand, not by ``resolve_launch_config``) has
     nothing to compare and returns an empty list; the caller states that it is unbound.
     """
     if not launch.content_digests:
         return []
-    current, problems, _notes = bind_launch_content(launch)
+    current, problems, _notes = bind_launch_content(launch, env)
     changes = list(problems)
     # Each kind appears at most once in a launch.
     now = {item.kind: item for item in current}

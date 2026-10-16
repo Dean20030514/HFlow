@@ -487,6 +487,55 @@ def test_a_zombie_owners_reserve_dispatch_is_refused_after_a_takeover(
     ) is None
 
 
+def test_a_zombie_owner_cannot_register_a_launch_or_a_review_after_a_takeover(
+    store: Store, project_root: Path, fake_script: FakeScript, run_request: RunRequest
+) -> None:
+    """The zombie reserved before the takeover; its launch registration and its reviewer result
+    after it are refused (``False``, nothing written), so it never reaches ``driver.start``."""
+    zombie = _controller(store, project_root, fake_script)
+    run_id = _create_run(store, run_request)
+    assert zombie._claim(run_id)
+    fence = zombie._fence(run_id)
+    assert fence is not None
+    store.reserve_dispatch(
+        run_id=run_id,
+        controller_id=zombie.controller_id,
+        invocation_id="I-zombie",
+        role="implementer",
+        reservation_id="B-zombie",
+        reserved_turns=1,
+        reservation_expires_at=EXPIRES_AT,
+        attempt_id="A-zombie",
+        fence=fence,
+    )
+    successor = _controller(store, project_root, fake_script)
+    assert store.take_over_run(
+        run_id,
+        expected_token=zombie.owner_token,
+        expected_generation=fence.generation,
+        controller_id=LABEL,
+        token=successor.owner_token,
+        identity=successor.owner_identity,
+        reason="owner_lost: taken over between reservation and launch",
+        detail="test",
+    ) is not None
+    before = _snapshot(store, run_id)
+
+    for column in ("invocation_id", "review_invocation_id"):
+        assert not store.register_attempt_invocation_unless_stopped(
+            run_id, "A-zombie", column=column, invocation_id="I-zombie"
+        )
+    assert not store.attach_review_result_unless_stopped(
+        run_id, "A-zombie", {"outcome": "completed"}
+    )
+
+    attempt = store.attempts_for(run_id)[0]
+    assert attempt["invocation_id"] is None
+    assert attempt["review_invocation_id"] is None
+    assert attempt["review_json"] is None
+    assert _snapshot(store, run_id) == before
+
+
 @windows_only
 def test_a_zombie_owners_result_is_not_applied_after_a_takeover(
     store: Store, project_root: Path, fake_script: FakeScript, run_request: RunRequest

@@ -639,8 +639,11 @@ def test_the_controller_records_a_reservation_whose_spawn_a_stop_suppressed(
     assert intent.started_at is None, "the suppressed launch must not carry a start time"
     counts = store.invocation_state_counts(outcome.run_id)
     assert counts.ever_started == 0, "a start that was suppressed is not a call to the model"
-    assert driver.stopped_before_start == [intent.invocation_id], (
-        "the driver must see the stop inside its own gate, before it does any work"
+    # The confirmed stop closed the entry (``not_started``) before the launch was requested, so
+    # the controller's launch request is refused and no driver is asked at all - not even to
+    # refuse inside its own gate (a stop landing after the request still reaches that gate).
+    assert driver.started == [] and driver.stopped_before_start == [], (
+        "a launch whose ledger entry a stop already closed is never handed to a driver"
     )
     assert store.root_budget_view(binding.root_id).used_top_level_submissions == 1, (
         "the reservation is kept: a suppressed launch is not a refund"
@@ -649,6 +652,76 @@ def test_the_controller_records_a_reservation_whose_spawn_a_stop_suppressed(
     row = store.get_run(outcome.run_id)
     assert row["turns_reserved"] == 1
     assert int(row["turns_observed"] or 0) == 0, "a suppressed launch observed no agent turn"
+
+
+@pytest.mark.parametrize("role", ["implementer", "reviewer"])
+def test_a_superseded_owner_never_launches_a_dispatch_it_reserved_before_the_takeover(
+    store: Store,
+    project,
+    task_spec: TaskSpec,
+    project_root: Path,
+    run_request: RunRequest,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    role: str,
+) -> None:
+    """Owner A reserves a dispatch, owner B takes the run over, then A reaches its launch step.
+
+    The takeover closes A's reserved entry (``launch_unknown``) and blocks the run ``owner_lost``.
+    A's launch request is then refused by the ledger, so A asks no driver: nothing is started,
+    no stop is claimed, nothing is re-dispatched, and the run keeps B's ``owner_lost`` block.
+    """
+    from hflow.ownership import current_identity, new_owner_token
+
+    binding = _binding(store, task_spec, project_root)
+    limits = _limits()
+    driver = FakeDriver(project_root, FakeScript(write_plan=FAKE_WRITE_PLAN, agent_turns=1))
+    controller = _root_controller(
+        store,
+        driver,
+        binding=binding,
+        limits=limits,
+        authorization=_authorization(
+            spec=task_spec, binding=binding, limits=limits, project_root=project_root
+        ),
+        data_dir=tmp_path / "data",
+    )
+    original = store.reserve_dispatch
+    taken: list[str] = []
+
+    def reserve_then_take_over(**kwargs):  # noqa: ANN003, ANN201 - the store method's own shape
+        reservation = original(**kwargs)
+        if kwargs["role"] == role and reservation.is_new:
+            run_id = kwargs["run_id"]
+            result = store.take_over_run(
+                run_id,
+                expected_token=controller.owner_token,
+                expected_generation=controller._claims[run_id],  # noqa: SLF001
+                controller_id="successor-B",
+                token=new_owner_token(),
+                identity=current_identity(),
+                reason="owner_lost: taken over by B in this test",
+                detail="taken over by B in this test",
+            )
+            assert result is not None, "B's takeover must succeed"
+            taken.append(reservation.invocation.invocation_id)
+        return reservation
+
+    monkeypatch.setattr(store, "reserve_dispatch", reserve_then_take_over)
+    outcome = controller.run_task(run_request)
+
+    assert len(taken) == 1, "the takeover happened right after A's reservation"
+    started_roles = [request.role for request in driver.started]
+    assert started_roles == ([] if role == "implementer" else ["implementer"]), (
+        f"A must not launch the {role} it reserved before the takeover: {started_roles}"
+    )
+    assert outcome.task_state is TaskState.BLOCKED
+    assert outcome.block_code is RefusalCode.OWNER_LOST, outcome.block_reason
+    entry = store.invocation(taken[0])
+    assert entry is not None and entry.state is InvocationStartState.LAUNCH_UNKNOWN, entry
+    assert entry.launch_requested_at is None and entry.started_at is None, entry
+    notes = " ".join(store.notes_for(outcome.run_id)) + " ".join(outcome.notes)
+    assert "taken over by another owner" in notes, notes
 
 
 class SilentSpawnDriver(FakeDriver):
@@ -1412,6 +1485,35 @@ def test_a_reviewer_dispatch_before_the_review_phase_is_refused_with_nothing_cha
     ) == before, "a refused review reservation must not charge the review turn"
     assert store.get_run(run_id)["turns_reserved"] == 1
     assert [entry.invocation_id for entry in store.invocations_for(run_id)] == ["I-implementer"]
+    assert store.attempts_for(run_id)[0]["review_invocation_id"] is None
+
+
+def test_a_role_this_build_does_not_implement_is_refused_with_nothing_charged(
+    store: Store, project, task_spec: TaskSpec, project_root: Path
+) -> None:
+    """Only the implementer and the reviewer dispatch: any other role would take the reviewer's
+    branch and spend the one review of the attempt with no phase gate."""
+    binding = _binding(store, task_spec, project_root)
+    limits = _limits()
+    run_id = _seed(
+        store, project=project, spec=task_spec, binding=binding, limits=limits,
+        project_root=project_root,
+    )
+    _reserve(
+        store, run_id=run_id, binding=binding, limits=limits,
+        role="implementer", invocation_id="I-implementer",
+    )
+    before = _counters(store, run_id=run_id, binding=binding, authorization_id=AUTHORIZATION_ID)
+
+    with pytest.raises(StoreError, match="unknown dispatch role 'planner'"):
+        _reserve(
+            store, run_id=run_id, binding=binding, limits=limits,
+            role="planner", invocation_id="I-planner",
+        )
+
+    assert _counters(
+        store, run_id=run_id, binding=binding, authorization_id=AUTHORIZATION_ID
+    ) == before
     assert store.attempts_for(run_id)[0]["review_invocation_id"] is None
 
 

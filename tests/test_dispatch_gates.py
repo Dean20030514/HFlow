@@ -264,6 +264,59 @@ def test_a_write_task_without_the_write_opt_in_is_refused_before_dispatch(
     assert driver.invocations == []
 
 
+def test_the_write_gate_reads_the_recorded_permission_not_the_environment(
+    tmp_path: Path, project: ProjectConfig, task_spec: TaskSpec, project_root: Path, monkeypatch
+) -> None:
+    """``run --plan`` resolves the opt-in its plan recorded; the controller gates on that value
+    (the effective configuration an approval covers), never on what this shell sets."""
+    from hflow.drivers.acpx_dsh import ENV_ALLOW_WRITES
+    from hflow.prepare import resolve_run
+
+    monkeypatch.delenv(ENV_ALLOW_WRITES, raising=False)
+    command_project = _command_project(project)
+    spec = unit_only(task_spec).model_copy(
+        update={
+            # One turn for a reviewed task: refused by the next gate, after the write gate.
+            "budget": BudgetRequest(max_agent_turns=1, max_repair_cycles=0),
+            "workspace": WorkspaceSpec(mode="worktree", base_commit=_git_repo(project_root)),
+        }
+    )
+    resolved = resolve_run(
+        task_path=write_task(tmp_path / "task.json", spec),
+        project_root=project_root,
+        data_dir=tmp_path / "data",
+        project_path=write_project(tmp_path / "project.json", command_project),
+        allow_writes=True,
+    )
+    assert resolved.effective.implementer_writes is True
+    store = Store(tmp_path / "hflow.sqlite")
+    driver = RecordingDriver()
+    controller = Controller(
+        store,
+        driver,
+        controller_build="gate-test",
+        runners=CheckRunners({"fake": FakeCheckRunner()}),
+        data_dir=tmp_path / "data",
+        production=True,
+        effective_config=resolved.effective,
+    )
+    try:
+        with pytest.raises(RefusedError) as excinfo:
+            controller.run_task(
+                RunRequest(
+                    task=spec,
+                    project=command_project,
+                    project_root=project_root,
+                    workspace_root=project_root,
+                )
+            )
+    finally:
+        store.close()
+
+    assert excinfo.value.code is RefusalCode.BUDGET_EXCEEDED, excinfo.value.message
+    assert driver.invocations == []
+
+
 def test_a_reviewed_task_whose_budget_covers_one_turn_is_refused(
     tmp_path: Path, project: ProjectConfig, task_spec: TaskSpec, project_root: Path, monkeypatch
 ) -> None:
@@ -413,6 +466,7 @@ def test_a_reviewed_task_is_refused_when_the_authorization_cannot_cover_both(
 
     assert excinfo.value.code is RefusalCode.BUDGET_EXHAUSTED
     assert "1/1" in excinfo.value.message and "2" in excinfo.value.message
+    assert "(2 in all: implementer + reviewer)" in excinfo.value.message, excinfo.value.message
     assert driver.invocations == [], "the implementer must not run when the review cannot be bought"
     assert runs_after == [], "nothing may be created for a dispatch the authorization cannot cover"
     assert state is None, "the artifact must not even be registered for a refused dispatch"

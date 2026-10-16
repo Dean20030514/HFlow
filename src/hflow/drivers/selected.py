@@ -88,28 +88,21 @@ def resolve_driver_id(binding: AgentBinding) -> str:
 
 
 def default_refusal_reason() -> str:
-    """Why an unconfigured driver refuses, in one sentence a operator can act on."""
+    """Why an unconfigured driver refuses, in one sentence an operator can act on."""
     return (
         f"the selected transport is {SELECTED_DRIVER_ID}; pass a real binding (or --driver fake "
         "for offline work). No unattended production execution is approved yet: cooperative "
-        "cancellation on this launch path is unverified."
+        "cancellation is unsupported on this launch path (the cancel capability is recorded "
+        "unsupported; a stop is the managed process boundary's forced teardown)."
     )
 
 
-def local_probe(
-    binding: AgentBinding | None = None,
-    *,
-    driver: AcpxDshDriver | None = None,
-) -> CapabilityReport:
-    """Static capability record for this machine. Sends no task and calls no model.
+def local_probe() -> CapabilityReport:
+    """The conservative capability record used before any driver is constructed.
 
-    With a driver instance the report is the driver's own probe (it knows its executable
-    path and launch argv); without one, this returns the deliberately conservative record
-    used before any driver is constructed.
+    Static: sends no task and calls no model. A constructed driver reports its own probe
+    (``AcpxDshDriver.probe``), which also knows its launch.
     """
-    if driver is not None and binding is not None:
-        return driver.probe(binding)
-
     return CapabilityReport(
         driver_id=SELECTED_DRIVER_ID,
         driver_version=ACPX_DSH_DRIVER_VERSION,

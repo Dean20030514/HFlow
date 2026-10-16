@@ -95,7 +95,8 @@ def _failing(monkeypatch: pytest.MonkeyPatch, matches, outcome) -> list[list[str
     return seen
 
 
-def _completed(returncode: int, stdout: str | None = "", stderr: str | None = "") -> subprocess.CompletedProcess:
+def _completed(returncode: int, stdout: bytes = b"", stderr: bytes = b"") -> subprocess.CompletedProcess:
+    """What ``subprocess.run`` returns to HFlow's git runner, whose pipes are binary."""
     return subprocess.CompletedProcess([], returncode, stdout, stderr)
 
 
@@ -172,7 +173,9 @@ def test_git_that_fails_for_another_reason_is_a_git_error_not_a_scope_refusal(
     repo: Path, monkeypatch: pytest.MonkeyPatch, returncode: int, stderr: str, named: str
 ) -> None:
     """Under load git can fail to start at all (empty stderr); that is not "no repository here"."""
-    seen = _failing(monkeypatch, lambda argv: "--show-toplevel" in argv, _completed(returncode, "", stderr))
+    seen = _failing(
+        monkeypatch, lambda argv: "--show-toplevel" in argv, _completed(returncode, b"", stderr.encode())
+    )
     with pytest.raises(GitError, match=named):
         GitRepo.discover(repo)
     assert seen, "the discovery call was the one that failed"
@@ -182,7 +185,7 @@ def test_not_a_git_repository_from_git_itself_is_the_scope_refusal(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     message = "fatal: not a git repository (or any of the parent directories): .git\n"
-    _failing(monkeypatch, lambda argv: "--show-toplevel" in argv, _completed(128, "", message))
+    _failing(monkeypatch, lambda argv: "--show-toplevel" in argv, _completed(128, b"", message.encode()))
     with pytest.raises(RefusedError) as refused:
         GitRepo.discover(repo)
     assert refused.value.code is RefusalCode.SCOPE_VIOLATION
@@ -251,9 +254,9 @@ def test_ref_target_is_none_only_for_a_ref_that_does_not_exist(repo: Path, monke
         git.ref_target("refs/heads/main")
 
 
-@pytest.mark.parametrize("stdout", ["", "not-an-object-id\n"])
+@pytest.mark.parametrize("stdout", [b"", b"not-an-object-id\n"])
 def test_ref_target_refuses_an_answer_that_is_not_an_object_id(
-    repo: Path, monkeypatch: pytest.MonkeyPatch, stdout: str
+    repo: Path, monkeypatch: pytest.MonkeyPatch, stdout: bytes
 ) -> None:
     git = GitRepo(repo)
     _failing(monkeypatch, lambda argv: "--quiet" in argv, _completed(0, stdout))
@@ -280,24 +283,28 @@ def _readers(git: GitRepo, repo: Path) -> dict[str, tuple]:
 @pytest.mark.parametrize(
     "reader", ["discover", "construct", "resolve_commit", "commit_exists", "ref_target", "registration"]
 )
-@pytest.mark.parametrize("how", ["timeout", "posix-raises", "windows-returns-none"])
+@pytest.mark.parametrize(
+    ("how", "named"),
+    [("timeout", "timed out"), ("cannot-start", "could not start"), ("not-text", "could not be decoded")],
+)
 def test_every_git_reader_turns_an_unreadable_answer_into_a_git_error(
-    repo: Path, monkeypatch: pytest.MonkeyPatch, reader: str, how: str
+    repo: Path, monkeypatch: pytest.MonkeyPatch, reader: str, how: str, named: str
 ) -> None:
-    """Never ``AttributeError`` (``None.strip()``), ``TimeoutExpired`` or ``UnicodeDecodeError``.
+    """Never ``TimeoutExpired``, ``OSError`` or ``UnicodeDecodeError``, and never "empty".
 
     Each of those escaped the ``except (GitError, RefusedError, OSError)`` handlers around these
     calls and left a run, a cleanup or an integration with a traceback instead of a recorded state.
+    Every reader goes through the one binary-pipe runner, which decodes standard output strictly.
     """
     git = GitRepo(repo)
     call, marker = _readers(git, repo)[reader]
     outcome = {
         "timeout": subprocess.TimeoutExpired(["git"], 30),
-        "posix-raises": UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
-        "windows-returns-none": _completed(0, None, None),
+        "cannot-start": FileNotFoundError(2, "The system cannot find the file specified"),
+        "not-text": _completed(0, b"\xff\xfe\n"),
     }[how]
     seen = _failing(monkeypatch, lambda argv: marker in argv, outcome)
-    with pytest.raises(GitError, match="timed out" if how == "timeout" else "could not be decoded"):
+    with pytest.raises(GitError, match=named):
         call()
     assert seen
 
@@ -307,5 +314,16 @@ def test_an_undecodable_stderr_does_not_fail_a_call_that_succeeded(
 ) -> None:
     """Standard error is only quoted in a message; standard output is the answer."""
     git = GitRepo(repo)
-    _failing(monkeypatch, lambda argv: "--quiet" in argv, _completed(0, git.head + "\n", None))
+    answer = (git.head + "\n").encode()
+    _failing(monkeypatch, lambda argv: "--quiet" in argv, _completed(0, answer, b"\xff\xfe"))
     assert git.ref_target("refs/heads/main") == git.head
+
+
+def test_git_output_keeps_a_carriage_return_as_git_printed_it(repo: Path) -> None:
+    """Text-mode pipes read ``a\\r\\nb`` as ``a\\nb``: a value changed only in that would look unchanged."""
+    git = GitRepo(repo)
+    with (repo / ".git" / "config").open("ab") as handle:
+        # A lone CR (not before LF) is part of the value; backslash-n is git's escape for a newline.
+        handle.write(b"[hflowprobe]\n\tvalue = a\r\\nb\n")
+    assert git.run("config", "--get", "hflowprobe.value") == "a\r\nb\n"
+    assert git.query("config", "--get", "hflowprobe.value").stdout == "a\r\nb\n"

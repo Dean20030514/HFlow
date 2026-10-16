@@ -34,12 +34,23 @@ def _git_sha(repo_root: Path) -> str | None:
     return sha or None
 
 
+def _source_checkout_root(module_file: Path) -> Path | None:
+    """The repository root when this module runs from a source checkout (``<root>/src/hflow``).
+
+    An installed copy (``site-packages/hflow``) is not HFlow's checkout: the repository that
+    happens to contain the install - a virtualenv inside some project - is not this build, so its
+    HEAD must not be recorded as one.
+    """
+    package = module_file.resolve().parent
+    return package.parent.parent if package.parent.name == "src" else None
+
+
 @lru_cache(maxsize=1)
 def controller_build() -> str:
     """Stable identifier: explicit override, else package version + optional git sha."""
     override = os.environ.get(ENV_BUILD_ID)
     if override:
         return override
-    repo_root = Path(__file__).resolve().parents[2]
-    sha = _git_sha(repo_root)
+    repo_root = _source_checkout_root(Path(__file__))
+    sha = _git_sha(repo_root) if repo_root is not None else None
     return f"hflow/{PACKAGE_VERSION}+{sha}" if sha else f"hflow/{PACKAGE_VERSION}"

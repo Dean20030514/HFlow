@@ -231,6 +231,35 @@ def test_acceptance_committed_first_is_not_rewritten_by_a_later_cancel(
         store.close()
 
 
+@pytest.mark.parametrize(
+    ("update", "message"),
+    [
+        ({"run_id": "R-other"}, "receipt is for run R-other"),
+        ({"attempt_id": "A-other"}, "unknown attempt A-other"),
+        ({"task_revision": 2}, "receipt is for revision 2"),
+    ],
+)
+def test_a_receipt_bound_to_another_run_attempt_or_revision_is_not_accepted(
+    tmp_path: Path, project, task_spec: TaskSpec, update: dict[str, object], message: str
+) -> None:
+    store = Store(tmp_path / "hflow.sqlite")
+    try:
+        run_id = _seed_checking(store, project, task_spec)
+        before = dict(store.get_run(run_id))
+        receipt = _receipt(run_id, task_spec, attempt_id="A-race").model_copy(update=update)
+        with pytest.raises(StoreError, match=message):
+            store.finalize_acceptance(run_id, receipt, checks_digest=project.checks_digest())
+        assert dict(store.get_run(run_id)) == before, "a refused acceptance writes nothing"
+
+        store.finalize_acceptance(
+            run_id, _receipt(run_id, task_spec, attempt_id="A-race"),
+            checks_digest=project.checks_digest(),
+        )
+        assert store.get_run(run_id)["task_state"] == TaskState.ACCEPTED.value
+    finally:
+        store.close()
+
+
 # --------------------------------------------------------------------------
 # the background-wait requirement: cancel must still land while work is running
 # --------------------------------------------------------------------------
@@ -414,6 +443,65 @@ def test_lock_is_released_when_a_transaction_body_raises(tmp_path: Path, project
         # Still usable, and still able to take a real transaction.
         reserve_turn(store, run_id, "local-controller", turns=1)
         assert store.get_run(run_id)["turns_reserved"] == 2
+    finally:
+        store.close()
+
+
+class _FailingCommit:
+    """A store connection whose next ``COMMIT`` fails the way SQLite reports one.
+
+    ``rolled_back`` is SQLite rolling the transaction back itself (an I/O error, a full disk);
+    without it the transaction stays open, as ``database is locked`` leaves it.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, *, rolled_back: bool) -> None:
+        self._conn = conn
+        self._rolled_back = rolled_back
+        self._armed = True
+
+    def execute(self, sql: str, *args: object) -> sqlite3.Cursor:
+        if self._armed and sql == "COMMIT":
+            self._armed = False
+            if self._rolled_back:
+                self._conn.execute("ROLLBACK")
+                raise sqlite3.OperationalError("disk I/O error")
+            raise sqlite3.OperationalError("database is locked")
+        return self._conn.execute(sql, *args)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._conn, name)
+
+
+@pytest.mark.parametrize(
+    ("rolled_back", "error"), [(False, "database is locked"), (True, "disk I/O error")]
+)
+def test_a_failed_commit_is_rolled_back_and_the_store_stays_usable(
+    tmp_path: Path,
+    project,
+    task_spec: TaskSpec,
+    monkeypatch: pytest.MonkeyPatch,
+    rolled_back: bool,
+    error: str,
+) -> None:
+    """The commit's own error is raised, the write is gone, the file lock is released and the
+    next transaction on the same store commits."""
+    path = tmp_path / "hflow.sqlite"
+    store = Store(path)
+    try:
+        run_id = _seed_checking(store, project, task_spec, run_id="R-commit", turn_limit=4)
+        monkeypatch.setattr(store, "conn", _FailingCommit(store.conn, rolled_back=rolled_back))
+        with pytest.raises(sqlite3.OperationalError, match=error):
+            reserve_turn(store, run_id, "local-controller", turns=1)
+
+        assert not store.conn.in_transaction
+        assert store.get_run(run_id)["turns_reserved"] == 1, "the failed write is not visible"
+        other = Store(path)
+        try:
+            reserve_turn(other, run_id, "local-controller", turns=1)
+        finally:
+            other.close()
+        reserve_turn(store, run_id, "local-controller", turns=1)
+        assert store.get_run(run_id)["turns_reserved"] == 3
     finally:
         store.close()
 

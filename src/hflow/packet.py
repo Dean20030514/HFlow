@@ -35,6 +35,7 @@ from .contracts import (
     canonical_json,
     digest_of,
 )
+from .verify import free_text
 
 PacketRole = Literal["implementer", "reviewer"]
 
@@ -48,7 +49,8 @@ MAX_PACKET_BYTES = 32 * 1024
 MAX_COMMAND_CHARS = 400
 
 #: Longest stored check detail copied into a packet. The complete text stays in the evidence
-#: row and in the run's own logs, so truncating the *summary* hides nothing.
+#: row and in the run's own logs, so truncating the *summary* hides nothing. A check's own text
+#: is measured in its quoted form (:func:`_quoted_check_text`), escapes included.
 MAX_DETAIL_CHARS = 600
 
 #: How many evidence rows are rendered before the list is closed with an explicit marker.
@@ -157,7 +159,8 @@ def _check_lines(check_ids: list[str], summaries: list[dict[str, object]]) -> st
       obtain the path cannot read the log, so a clipped reference is worse than a long line;
     * **prose** - the command line and the check's own detail text. A long one of these is cut,
       with the cut stated, because it is a summary of something already available in full at the
-      reference.
+      reference. The detail is only what follows the row's reference block (:func:`free_text`),
+      and it is quoted, because the check's stderr travels in it.
 
     The whole packet is still bounded; if the references themselves do not fit, the packet is
     refused by :func:`_finish` rather than having a path cut in half.
@@ -197,16 +200,43 @@ def _check_lines(check_ids: list[str], summaries: list[dict[str, object]]) -> st
             command = command[:MAX_COMMAND_CHARS] + "… (command truncated for display)"
         if command:
             summary_parts.append(f"argv={command}")
-        detail = str(row.get("detail", "") or "")
-        if len(detail) > MAX_DETAIL_CHARS:
-            detail = detail[:MAX_DETAIL_CHARS] + "… (detail truncated; see the artifact reference)"
+        # Only the text after the reference block: its references are the line above, and its
+        # environment summary stays in the evidence row rather than filling the excerpt.
+        detail = free_text(str(row.get("detail", "") or "")).strip()
         if detail:
-            summary_parts.append(f"detail={detail}")
+            summary_parts.append(f"detail={_quoted_check_text(detail)}")
         lines.append(reference_line)
         if summary_parts:
             # Indented under the reference, so a reader can see which line must not be cut.
             lines.append("  " + " ".join(summary_parts))
     return "\n".join(lines) if lines else "- (no approved check is referenced by the acceptance criteria)"
+
+
+#: Line separators :func:`json.dumps` leaves raw under ``ensure_ascii=False``. A reader that breaks
+#: lines at them (``str.splitlines`` does) would otherwise see a check-written line of its own.
+_JSON_RAW_LINE_BREAKS = {0x85: "\\u0085", 0x2028: "\\u2028", 0x2029: "\\u2029"}
+
+
+def _json_text(text: str) -> str:
+    return json.dumps(text, ensure_ascii=False).translate(_JSON_RAW_LINE_BREAKS)
+
+
+def _quoted_check_text(text: str) -> str:
+    """A check's own text (its detail after the reference block), capped and JSON-quoted.
+
+    The check controls these bytes - the head of its stderr travels in them - so they are quoted
+    the way a reviewer's finding is: a newline or a line separator it printed stays an escape, and
+    nothing it wrote can start a line of the packet posing as a heading or a rule. The cap counts
+    the escaped form, so output made of control characters (six characters each once escaped)
+    cannot cost the packet more than printable output would.
+    """
+    width = 0
+    for index, char in enumerate(text):
+        width += len(_json_text(char)) - 2
+        if width > MAX_DETAIL_CHARS:
+            text = text[:index] + "… (detail truncated; see the artifact reference)"
+            break
+    return _json_text(text)
 
 
 def _evidence_lines(rows: list[dict[str, object]]) -> str:
@@ -350,10 +380,10 @@ def _capped_finding_value(value: object) -> object:
 def _quoted_finding_text(value: str) -> str:
     """A reviewer-written string, capped and JSON-quoted.
 
-    Quoting keeps a newline in the reviewer's text escaped, so a finding can never open what
-    looks like a new section of this packet.
+    Quoting keeps a newline (or a Unicode line separator) in the reviewer's text escaped, so a
+    finding can never open what looks like a new section of this packet.
     """
-    return json.dumps(_capped_finding_value(value), ensure_ascii=False)
+    return _json_text(_capped_finding_value(value))
 
 
 def _finding_lines(number: int, finding: Finding) -> list[str]:
@@ -557,11 +587,11 @@ def _repair_section(context: RepairContext) -> str:
             f"- check {fact.get('check_id', '?')}: status={fact.get('status', '?')} "
             f"exit={fact.get('exit_code')!r} reason={fact.get('exit_reason') or '(none)'}"
         )
-        detail = str(fact.get("detail", "")).strip()
-        if len(detail) > MAX_DETAIL_CHARS:
-            detail = detail[:MAX_DETAIL_CHARS] + "… (detail truncated; see the artifact reference)"
+        # What the check printed, not the reference block in front of it (the artifact is on its
+        # own line below), quoted because the check's stderr travels in it.
+        detail = free_text(str(fact.get("detail", ""))).strip()
         if detail:
-            failure_lines.append(f"  detail: {detail}")
+            failure_lines.append(f"  detail: {_quoted_check_text(detail)}")
         artifact = str(fact.get("artifact", "")).strip()
         if artifact:
             failure_lines.append(f"  artifact: {artifact}")

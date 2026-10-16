@@ -11,6 +11,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from .contracts import (
+    SCHEMA_VERSION,
     LaunchConfig,
     ProjectConfig,
     ReuseStatus,
@@ -20,7 +21,6 @@ from .contracts import (
     ValidationReport,
 )
 from .paths import ENV_ALLOW_WRITES
-from .store import SCHEMA_VERSION as STORE_SCHEMA_VERSION
 from .workspace import check_scope
 
 # Ordered from least to most demanding; a task may not lower the project's floor.
@@ -52,13 +52,13 @@ def validate_task_spec(
     """
     issues: list[ValidationIssue] = []
 
-    if spec.schema_version != STORE_SCHEMA_VERSION:
+    if spec.schema_version != SCHEMA_VERSION:
         issues.append(
             _issue(
                 RefusalCode.INVALID_SPEC,
                 "schema_version",
                 f"schema_version {spec.schema_version} is not supported by this runtime "
-                f"(expected {STORE_SCHEMA_VERSION})",
+                f"(expected {SCHEMA_VERSION})",
             )
         )
 
@@ -552,10 +552,10 @@ def predictable_dispatch_problems(
                 _issue(
                     RefusalCode.SCOPE_VIOLATION,
                     "scope.write_allow",
-                    f"this task declares write paths but {ENV_ALLOW_WRITES} is not enabled, so "
-                    "the invocation would be launched read-only and could not make the "
-                    "change. Enable writes for this run (see docs/operations.md) or submit a "
-                    "task that changes nothing",
+                    "this task declares write paths but no write opt-in was given, so the "
+                    "implementer would be launched read-only and could not make the change: pass "
+                    "--allow-writes to prepare (the plan records it) or to run --task (which also "
+                    f"accepts {ENV_ALLOW_WRITES}=1)",
                 )
             )
 

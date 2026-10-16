@@ -495,6 +495,46 @@ def test_a_hook_raising_an_unexpected_error_still_rolls_back_and_a_later_open_su
         later.close()
 
 
+class _CommitLocked:
+    """A ledger connection whose migration ``COMMIT`` fails with ``database is locked``, which
+    leaves the transaction open. Everything else is the real connection."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._connection, name)
+
+    def execute(self, sql: str, *args: object) -> sqlite3.Cursor:
+        if sql == "COMMIT":
+            raise sqlite3.OperationalError("database is locked")
+        return self._connection.execute(sql, *args)
+
+
+def test_a_migration_whose_commit_fails_rolls_back_and_releases_the_file(
+    tmp_path: Path, task_spec: TaskSpec
+) -> None:
+    path = tmp_path / "data" / "hflow.sqlite"
+    _build_v1_database(path, task_spec)
+    connection = sqlite3.connect(str(path), isolation_level=None)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            migrate.migrate(_CommitLocked(connection), path)
+        assert not connection.in_transaction
+        assert _stored_version(path) is None
+        assert "root_budgets" not in _tables(path)
+
+        # Opened while the failed connection is still open: it holds no lock any more.
+        later = Store(path)
+        try:
+            assert later.migrated_from == 1
+            _assert_legacy_rows_are_readable(later, task_spec)
+        finally:
+            later.close()
+    finally:
+        connection.close()
+
+
 # --------------------------------------------------------------------------
 # 4. only a whole, verified copy is ever trusted as the pre-migration snapshot
 # --------------------------------------------------------------------------
@@ -589,6 +629,33 @@ def test_a_stale_partial_copy_and_its_journal_do_not_leak_into_the_new_snapshot(
         store.close()
     _assert_valid_snapshot(backup, 1)
     assert _backups_next_to(path) == [backup.name]
+
+
+def test_a_snapshot_copy_another_process_holds_refuses_with_a_retry_and_changes_nothing(
+    tmp_path: Path, task_spec: TaskSpec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two processes opening one old ledger: the second cannot remove the first one's copy."""
+    path = tmp_path / "data" / "hflow.sqlite"
+    _build_v1_database(path, task_spec)
+    before = _content_digest(path)
+    backup = migrate.backup_path_for(path, 1)
+    partial = backup.with_name(backup.name + ".partial")
+    partial.write_bytes(b"another process is writing this copy")
+    real_unlink = Path.unlink
+
+    def held_by_another_process(self: Path, missing_ok: bool = False) -> None:
+        if self == partial:
+            raise PermissionError(13, "The process cannot access the file", str(self))
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", held_by_another_process)
+    with pytest.raises(StoreError, match="open it again once that process has finished"):
+        Store(path)
+    monkeypatch.undo()
+
+    _assert_ledger_untouched(path, before)
+    assert not backup.exists()
+    assert partial.read_bytes() == b"another process is writing this copy"
 
 
 def _plant_empty(path: Path, backup: Path) -> None:

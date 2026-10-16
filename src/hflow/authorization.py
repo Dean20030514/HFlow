@@ -420,94 +420,95 @@ def verify_authorization(
             RefusalCode.RISK_DOWNGRADE,
             "the authorization does not cover this run: " + "; ".join(mismatches),
         )
-    _verify_effective_config(actual, expected)
-    _verify_project_contract(actual, expected)
-    _verify_launch_content(actual, expected)
-    _verify_ledger(actual, expected)
+    _verify_bound(actual, expected)
     _verify_root_budget(actual, expected)
 
 
-def _verify_ledger(actual: AuthorizationBinding, expected: AuthorizationBinding) -> None:
-    """The ledger half of the check: an approval is spent in the ledger it names, and only there.
+#: The bindings an approval must carry once this run resolved them, checked in this order:
+#: ``(field, refusal when the artifact carries none, code and refusal when it carries another)``.
+#:
+#: An artifact written before a binding existed carries none. It stays *readable* - it loads, it
+#: is listed, its ledger row still matches - but it cannot authorize a run that resolved that
+#: binding, because nothing in it says what the user approved there: it is re-issued, never
+#: reused. A different value means what the user approved changed since. The ledger is one of
+#: them: single use is enforced per ledger (``<data-dir>/hflow.sqlite``), so an artifact naming no
+#: ledger could be spent once in every data directory, and pointing ``--data-dir`` or
+#: ``HFLOW_DATA_DIR`` elsewhere opens a ledger with no record of it - not a second allowance.
+#:
+#: The refusals are ``str.format`` templates over ``authorized`` (the artifact's binding) and
+#: ``actual`` (this run's), plus ``authorized_profile`` / ``actual_profile``.
+_BOUND_FIELDS: tuple[tuple[str, str, RefusalCode, str], ...] = (
+    (
+        "effective_config_digest",
+        "this authorization carries no effective-configuration binding, so it does not say "
+        "which profile, model selection or write permission it approves. It predates "
+        "configuration binding and cannot authorize this run; re-issue it against the "
+        "current configuration.",
+        RefusalCode.RISK_DOWNGRADE,
+        "the authorization covers a different configuration than this run resolved: "
+        "authorized profile={authorized_profile} "
+        "digest={authorized.effective_config_digest} != actual "
+        "profile={actual_profile} "
+        "digest={actual.effective_config_digest}. Switching profile, model selection "
+        "or write permission after approval does not extend the approval.",
+    ),
+    (
+        "project_contract_digest",
+        "this authorization carries no project contract binding, so it does not say which "
+        "checks, write-deny rules, limits or review floor it approves. It predates contract "
+        "binding and cannot authorize this run; re-issue it against the current contract.",
+        RefusalCode.RISK_DOWNGRADE,
+        "the project contract changed since approval: authorized "
+        "{authorized.project_contract_digest} != actual {actual.project_contract_digest}. "
+        "Editing a check, write_deny, a limit or review_required after approval does not "
+        "extend the approval; run `hflow prepare` again and re-issue it.",
+    ),
+    (
+        "launch_content_digest",
+        "this authorization carries no launch content binding, so it does not say which "
+        "node.exe, acpx entry or dsh carrier files (by content) it approves. It predates "
+        "launch content binding and cannot authorize this run; re-issue it against the "
+        "digests `hflow prepare` prints.",
+        RefusalCode.LAUNCH_CONTENT_CHANGED,
+        "a launch entry file changed since approval: authorized launch content "
+        "{authorized.launch_content_digest} != actual {actual.launch_content_digest}. "
+        "Replacing node.exe, the acpx entry or its package.json, or the dsh launcher, carrier "
+        "entry or package.json at the same path does not extend the approval; run `hflow "
+        "prepare` again (it prints each file's digest) and re-issue it.",
+    ),
+    (
+        "ledger_path",
+        "this authorization names no ledger, so its single use would be enforced only per "
+        "data directory: it could be spent once in each. It predates ledger binding and "
+        "cannot authorize this run; re-issue it against the binding `hflow prepare` prints "
+        "(ledger {actual.ledger_path}).",
+        RefusalCode.RISK_DOWNGRADE,
+        "the authorization was issued for another ledger: authorized ledger "
+        "{authorized.ledger_path!r} != actual {actual.ledger_path!r}. Single use is enforced "
+        "per ledger, so another data directory (--data-dir or HFLOW_DATA_DIR) is not a "
+        "second allowance; run against the data directory it was issued for, or prepare "
+        "and approve this one.",
+    ),
+)
 
-    Single use is enforced per ledger (``<data-dir>/hflow.sqlite``). A run that names its ledger
-    therefore refuses an artifact that names none - nothing in it stops it being spent once in
-    every data directory - and an artifact issued for another ledger: pointing ``--data-dir`` or
-    ``HFLOW_DATA_DIR`` elsewhere opens a ledger with no record of it, which is not a second
-    allowance.
-    """
-    if not expected.ledger_path:
-        return
-    if not actual.ledger_path:
-        raise RefusedError(
-            RefusalCode.RISK_DOWNGRADE,
-            "this authorization names no ledger, so its single use would be enforced only per "
-            "data directory: it could be spent once in each. It predates ledger binding and "
-            "cannot authorize this run; re-issue it against the binding `hflow prepare` prints "
-            f"(ledger {expected.ledger_path}).",
-        )
-    if actual.ledger_path != expected.ledger_path:
-        raise RefusedError(
-            RefusalCode.RISK_DOWNGRADE,
-            "the authorization was issued for another ledger: authorized ledger "
-            f"{actual.ledger_path!r} != actual {expected.ledger_path!r}. Single use is enforced "
-            "per ledger, so another data directory (--data-dir or HFLOW_DATA_DIR) is not a "
-            "second allowance; run against the data directory it was issued for, or prepare "
-            "and approve this one.",
-        )
 
-
-def _verify_launch_content(actual: AuthorizationBinding, expected: AuthorizationBinding) -> None:
-    """The launch-content half of the check, on the same terms as the contract half.
-
-    A run whose launch resolved content digests refuses an artifact that names none: nothing in
-    it says which node.exe, acpx or dsh carrier bytes the user approved, so it is re-issued, not
-    reused. A different digest means a launch entry file changed since approval.
-    """
-    if not expected.launch_content_digest:
-        return
-    if not actual.launch_content_digest:
-        raise RefusedError(
-            RefusalCode.RISK_DOWNGRADE,
-            "this authorization carries no launch content binding, so it does not say which "
-            "node.exe, acpx entry or dsh carrier files (by content) it approves. It predates "
-            "launch content binding and cannot authorize this run; re-issue it against the "
-            "digests `hflow prepare` prints.",
-        )
-    if actual.launch_content_digest != expected.launch_content_digest:
-        raise RefusedError(
-            RefusalCode.LAUNCH_CONTENT_CHANGED,
-            "a launch entry file changed since approval: authorized launch content "
-            f"{actual.launch_content_digest} != actual {expected.launch_content_digest}. "
-            "Replacing node.exe, the acpx entry or its package.json, or the dsh launcher, carrier "
-            "entry or package.json at the same path does not extend the approval; run `hflow "
-            "prepare` again (it prints each file's digest) and re-issue it.",
-        )
-
-
-def _verify_project_contract(actual: AuthorizationBinding, expected: AuthorizationBinding) -> None:
-    """The contract half of the check, on the same terms as the configuration half.
-
-    A run that resolved a contract refuses an artifact that names none: nothing in it says which
-    checks, write-deny rules or review floor the user approved, so it is re-issued, not reused.
-    """
-    if not expected.project_contract_digest:
-        return
-    if not actual.project_contract_digest:
-        raise RefusedError(
-            RefusalCode.RISK_DOWNGRADE,
-            "this authorization carries no project contract binding, so it does not say which "
-            "checks, write-deny rules, limits or review floor it approves. It predates contract "
-            "binding and cannot authorize this run; re-issue it against the current contract.",
-        )
-    if actual.project_contract_digest != expected.project_contract_digest:
-        raise RefusedError(
-            RefusalCode.RISK_DOWNGRADE,
-            "the project contract changed since approval: authorized "
-            f"{actual.project_contract_digest} != actual {expected.project_contract_digest}. "
-            "Editing a check, write_deny, a limit or review_required after approval does not "
-            "extend the approval; run `hflow prepare` again and re-issue it.",
-        )
+def _verify_bound(actual: AuthorizationBinding, expected: AuthorizationBinding) -> None:
+    """Every :data:`_BOUND_FIELDS` binding this run resolved: carried by the artifact, and equal."""
+    values = {
+        "authorized": actual,
+        "actual": expected,
+        "authorized_profile": actual.profile_id or "(command line)",
+        "actual_profile": expected.profile_id or "(command line)",
+    }
+    for field, missing, code, changed in _BOUND_FIELDS:
+        wanted = getattr(expected, field)
+        if not wanted:
+            continue
+        held = getattr(actual, field)
+        if not held:
+            raise RefusedError(RefusalCode.RISK_DOWNGRADE, missing.format(**values))
+        if held != wanted:
+            raise RefusedError(code, changed.format(**values))
 
 
 def _verify_root_budget(actual: AuthorizationBinding, expected: AuthorizationBinding) -> None:
@@ -553,34 +554,4 @@ def _verify_root_budget(actual: AuthorizationBinding, expected: AuthorizationBin
         raise RefusedError(
             RefusalCode.RISK_DOWNGRADE,
             "the authorization's root budget does not cover this run: " + "; ".join(differences),
-        )
-
-
-def _verify_effective_config(actual: AuthorizationBinding, expected: AuthorizationBinding) -> None:
-    """The configuration half of the check, checked only when a configuration was resolved.
-
-    An artifact written before this field existed carries no configuration digest. It stays
-    *readable* - it loads, it is listed, its ledger row still matches - but it cannot start a
-    run that resolved a configuration, because nothing in it says which profile, model or
-    permission the user approved. Re-issue it instead of reusing it.
-    """
-    if not expected.effective_config_digest:
-        return
-    if not actual.effective_config_digest:
-        raise RefusedError(
-            RefusalCode.RISK_DOWNGRADE,
-            "this authorization carries no effective-configuration binding, so it does not say "
-            "which profile, model selection or write permission it approves. It predates "
-            "configuration binding and cannot authorize this run; re-issue it against the "
-            "current configuration.",
-        )
-    if actual.effective_config_digest != expected.effective_config_digest:
-        raise RefusedError(
-            RefusalCode.RISK_DOWNGRADE,
-            "the authorization covers a different configuration than this run resolved: "
-            f"authorized profile={actual.profile_id or '(command line)'} "
-            f"digest={actual.effective_config_digest} != actual "
-            f"profile={expected.profile_id or '(command line)'} "
-            f"digest={expected.effective_config_digest}. Switching profile, model selection "
-            "or write permission after approval does not extend the approval.",
         )

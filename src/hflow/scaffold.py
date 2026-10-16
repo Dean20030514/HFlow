@@ -26,7 +26,6 @@ import json
 import os
 import re
 import shlex
-import subprocess
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -317,7 +316,7 @@ def init_project(
 
 
 def default_profile(profile_id: str) -> MachineProfile:
-    """The two-role profile ``docs/operations.md`` describes ("Configure once, then reuse it").
+    """The two-role profile ``docs/operations.md`` describes ("Machine profile").
 
     Implementer and reviewer are bound to separate agents on the one production driver, with
     ``native_profile``: no ``--model`` flag, so the DSH launcher's own profile decides the model.
@@ -369,33 +368,25 @@ def init_profile(profile_id: str, *, data_dir: Path | None) -> Scaffold:
 # --------------------------------------------------------------------------
 
 
-def _git_query(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    """One read-only ``git`` query in ``root``, in HFlow's inert Git environment."""
-    from .gitworkspace import _base_env  # the one hardened Git environment HFlow uses
-
-    return subprocess.run(  # noqa: S603,S607 - fixed read-only query, no shell
-        ["git", *args],
-        cwd=str(root),
-        capture_output=True,
-        encoding="utf-8",
-        errors="replace",
-        stdin=subprocess.DEVNULL,
-        timeout=30,
-        check=False,
-        env=_base_env(),
-    )
-
-
 def current_base(root: Path) -> tuple[str, bool]:
     """``(the checked-out branch's name, False)``, or ``(the commit, True)`` of a detached ``HEAD``.
 
     The task keeps the name; ``prepare`` resolves it to a commit once and binds that commit, so
-    a branch that moves before ``run`` makes an approval for the old commit stop applying.
+    a branch that moves before ``run`` makes an approval for the old commit stop applying. Git
+    runs through HFlow's one runner, in its inert environment; git that cannot be run or read is
+    a refusal.
     """
-    branch = _git_query(root, "symbolic-ref", "--quiet", "--short", "HEAD")
-    if branch.returncode == 0 and branch.stdout.strip():
-        return branch.stdout.strip(), False
-    detached = _git_query(root, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+    from .gitworkspace import GitError, git_query
+
+    try:
+        branch = git_query(("symbolic-ref", "--quiet", "--short", "HEAD"), cwd=root, timeout=30)
+        if branch.returncode == 0 and branch.stdout.strip():
+            return branch.stdout.strip(), False
+        detached = git_query(
+            ("rev-parse", "--verify", "--quiet", "HEAD^{commit}"), cwd=root, timeout=30
+        )
+    except GitError as exc:
+        raise _refuse(f"the base of {root} could not be read: {exc}") from exc
     if detached.returncode == 0 and detached.stdout.strip():
         return detached.stdout.strip(), True
     raise _refuse(
@@ -537,6 +528,11 @@ def init_task(
         "acceptance: AC-1 is wired to the approved checks "
         f"({', '.join(command_checks)}); restate what done means in its statement"
     )
+    scaffold.notes.append(
+        "writes: the prepare below passes --allow-writes because this task changes files "
+        "(scope.write_allow); the plan records it, so approve and run --plan use it whatever "
+        "the shell sets"
+    )
     if skipped:
         scaffold.notes.append(
             "not wired (kind=fake, refused for a real delivery): " + ", ".join(skipped)
@@ -555,13 +551,14 @@ def init_task(
     words = ["prepare", "--task", shell_word(str(path))]
     if project_file is not None:
         words += ["--project", shell_word(str(contract_path))]
-    stem = path.name.removesuffix(".json").removesuffix(".task")
+    from .plan import default_plan_path
+
     profile, profile_note = _profile_for_hint(data_dir)
     if profile_note:
         scaffold.notes.append(profile_note)
     words += [
-        "--project-root", shell_word(str(root)), "--profile", profile,
-        "--plan-out", shell_word(str(path.with_name(f"{stem}.plan.json"))),
+        "--project-root", shell_word(str(root)), "--profile", profile, "--allow-writes",
+        "--plan-out", shell_word(str(default_plan_path(path))),
     ]
     scaffold.next.append(
         command(data, *words)

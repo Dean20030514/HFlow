@@ -529,3 +529,29 @@ none of them; a shell call that failed is still an `end_turn`, so only HFlow's a
 decide acceptance. #9693 means the recorded `sandbox` line is the shell runner's mode, not a
 boundary for DSH's own file tools on the ACP path: HFlow's scope check and the user-checkout
 fingerprint are what notice an outside write. #9711 does not apply to a per-invocation home.
+
+## Addendum 2026-10-16 — ninth read of the upstreams
+
+Appended; the decision and every capability state above stand. Release metadata, compare views,
+source, discussions and npm dist-tags only; nothing was executed against DSH or a model, so every
+row is *documented*.
+
+| Fact | Label |
+|---|---|
+| acpx: no release or tag after `v0.19.5` (`95adbc56`); npm `latest` 0.19.5. `main` moved `af85b88f` -> `facec6fe` (#876 actions, #879 formatter, #880 text/quiet error rendering prefers `error.data.details` and adds a "usage limit" hint while JSON output keeps the raw ACP error, #881 "prepare acpx 0.19.6" - neither tagged nor on npm). `src/async-control.ts` is still blob `2e318c1d`. On #850 the maintainer said (2026-10-15) that overload text followed by `stopReason: end_turn` still exits 0: acpx will not classify assistant prose as a failure without a structured failure from the adapter | documented |
+| ACP: no release after `schema-v1.25.0` / v1.11.0 (`4cf3dd85`); `main` `9bec5b09` (six commits, all `docs/get-started/registry.mdx`); `schema/v1/schema.json` still blob `d6f7731b`. Release PR #2379 (head `d228e97a`) proposes schema 1.12.0 whose only v1 entry is unstable (#2361). typescript-sdk: no release after 1.8.0 (`f4ea2195`); `main` `b98857b3` merged #282 (`requestSpec` parses `value ?? {}`); release PR #281 (head `33ec87dd`) proposes **1.8.1**, which a fresh acpx 0.17.1 install would resolve under `^1.4.0` | documented |
+| DSH: new prerelease tag **`dsh-v0.2.1-alpha.4`** = `master` `86a40220` (2026-10-15; plugin market, desktop installer/telemetry, Linux-only subprocess containment, reasoning levels). Unchanged at it: `packages/acp/acp/src` tree `5d63d1b7`, `sandbox-local/src/index.ts` `45028746`, `sandbox-windows-acl/src` `5d0facae`, `subprocess/win32-process/src` `1eb328a7`, `shell/pwsh-sandbox/src` `186ed30b` (all identical to rc.2), SDK pin 1.4.0, `DEFAULT_STREAM_IDLE_TIMEOUT_MS` 300 000. `profile.ts` moved `cbece01b` -> `3c7aa747`, adding only an optional plugin-market bundle (offered off). No console/default-DACL fix for #9626, #8497 or #9682 is in the public source. npm `@deepseek-ai/dsh` `latest`/`next` 0.2.0-rc.2 (shasum unchanged), `alpha` 0.2.1-alpha.4; `dsh-acp`/`dsh-headless` `latest` still 0.0.1-rc.1 | documented |
+| Issues are disabled on the DSH repository; every tracked number is a Discussion. Since the eighth read 284 discussions were updated and every post has `authorAssociation` NONE: no maintainer reply anywhere, nothing closed. Additions on tracked threads: #9693 (`AgentOptions` has no sandbox/permission field; a `tools/pre-execute` gate is a policy boundary that does not cover shell or MCP subprocesses), #9682 (a community `AllocConsole` patch), #8497 (a sample on build 26300 where every confined child dies under `workspace-write`; a node.exe broker that owns a console runs it fine on 19045), #9687 (a restricting-SID ladder; `[logon, Everyone]` fails pwsh but not cmd) | documented (unconfirmed) |
+| **#9845**, checked in source: rc.2 `packages/credentials/credentials-local/src/index.ts` (blob `98d70ee1`, L167-234 and L793-834; the same at alpha.4) reads only `version: 1` / `refs` / `records` and **rewrites a pre-release flat `.credentials.yaml` in place at boot** (`writeFileAtomic`, mode 0600) | source documented |
+| Other new reports: #9818 (the first sandbox provisioning of a workspace spreads ACEs and the Low label through the whole tree, synchronously and silently; one report of a 75-minute stall on a large root), #9831 with #9510 (unelevated "temp grant materialization failed"; the ACL README L130 says granted directories must be caller-owned with `WRITE_OWNER`), #9819 (the Low label maps files to the Internet zone), #9735 (dsh-acp offers no ACP session modes, so the launch-time mode is final), #9830 (both casings of proxy variables break pwsh/.NET environment enumeration), #9728 (an image of ~4.5M base64 characters throws) | documented (unconfirmed) |
+
+Nothing here needs a transport change; the acpx 0.17.1 pin and the unpinned-SDK ruling stand.
+When SDK 1.8.1 is published, run `python tools/m0_probe/real_client_checks.py all` before adding it
+to `CHECKED_SDK_VERSIONS`. For the first live task: a bound `DSH_HOME` should already hold the
+version-1 credentials layout (Desktop rc.2 writes it), because a flat file would be rewritten by DSH
+at boot - a write into the bound home that HFlow's stat-only check cannot see (batch N records a
+note; HFlow still never opens the file). Keep the first task's repository small (#9818), make sure
+the worktree parent under the data directory is owned by the user (#9831), and let approved checks
+run an interpreter from outside the worktree (#9666/#9819: after a turn the tree may carry the Low
+label). HFlow already strips `DSH_PERMISSION_MODE`, never treats `end_turn` as acceptance
+(consistent with #850) and sends no images (#9728).

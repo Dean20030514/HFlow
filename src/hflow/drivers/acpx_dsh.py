@@ -1,34 +1,17 @@
 """The single thin production Driver: acpx -> official DSH ACP.
 
-Scope of this module: launch, stdin/stdout framing, neutral event projection, process
+Scope of this module: starting the resolved launch, stdin/stdout framing, the process
 boundary, stop, and conservative reconcile. It does **not** decide whether a task is
 accepted - admission, budget, attempt, evidence, review and ``ResultReceipt`` stay in the
 controller.
 
+Which programs run, with what environment, and what a launch refuses before its process exists
+(the agent argv and its ``cmd.exe`` wrapper, ``.acpxrc.json``, a workspace ``.env``, ``DSH_HOME``,
+the credential presence check, the child environment) are ``launch``'s, resolved once and consumed
+here. The protocol stream's projection and model observation are ``acp_events``'.
+
 Facts baked in from the M0 probe and the installed acpx 0.17.1 bundle (not assumptions):
 
-* On Windows a raw agent command *string* is rejected; the agent must be given as a
-  structured argv in acpx's config file, so the driver writes a per-invocation config
-  instead of passing ``--agent``.
-* ``dsh`` resolves to a ``.CMD`` shim, which ``CreateProcess`` cannot launch; the agent argv
-  is ``[<SystemRoot>\\System32\\cmd.exe, /d, /c, <dsh>, --profile, acp]`` - one wrapper, absolute,
-  so a ``cmd.exe`` in the workspace is never picked up, and ``/d`` so no registry AutoRun command
-  runs before it; a shim path cmd.exe would reinterpret is refused. acpx sees an ``.exe`` as the command
-  and spawns it directly (its own batch-shell wrapping applies only to a ``.cmd``/``.bat``
-  command), so no second ``cmd.exe /c`` is added. The wrapper never carries task text, nonce,
-  prompt or credentials - only the fixed launcher path and profile flag.
-* acpx always loads ``<--cwd>/.acpxrc.json`` and lets it override this driver's config,
-  agent argv included, with no opt-out; a workspace that has one is refused before spawn.
-* DSH loads ``<cwd>/.env`` at launch (documented upstream, not observed), so a workspace whose
-  root holds a ``.env`` is refused before spawn too - by listing only, the file is never opened
-  - and so is a bound ``DSH_HOME`` that is relative, unresolvable, inside the workspace (or the
-  user's checkout and its worktree directory) or around it: the agent could write what DSH
-  loads from its home.
-* Without a credential DSH fails with a no-API-key error before any model work (observed in
-  M0), so a launch whose child environment lacks ``DEEPSEEK_API_KEY`` (by name) and whose DSH
-  home holds neither ``.credentials.yaml`` nor ``.env`` (by stat; an unbound home is the empty
-  per-invocation one) is refused before spawn too (user ruling 2026-10-07). A presence check:
-  it does not prove the credential is valid.
 * The task body goes through acpx's documented stdin path (``-f -``), written from its own
   thread after both output readers started, then the child's stdin is closed so input is
   complete. The ACP stdin between acpx and DSH is acpx's own
@@ -70,10 +53,10 @@ import subprocess
 import threading
 import time
 from collections import deque
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal, NamedTuple, NoReturn
+from typing import Any, NamedTuple, NoReturn
 
 from ..contracts import (
     AgentBinding,
@@ -88,7 +71,6 @@ from ..contracts import (
     LaunchConfig,
     LaunchSurfaces,
     ModelApplied,
-    ModelChange,
     ModelObservation,
     NormalizedEvent,
     ReconcileOutcome,
@@ -99,11 +81,9 @@ from ..contracts import (
     SpawnKind,
     StreamOrder,
     ReviewOutput,
-    launch_model,
 )
 from ..ids import utc_now
 from ..artifacts import BoundedTextSink, StreamCapture
-from ..gitworkspace import _REPOSITORY_LOCATING_ENV
 from ..packet import packet_digest
 from ..paths import ENV_ALLOW_WRITES  # noqa: F401 - re-exported for existing importers
 from ..review import (
@@ -115,8 +95,24 @@ from ..review import (
     ReviewDecodeError,
     decode_review,
 )
-from ..workspace import DSH_WORKSPACE_ENV_FILE
-from .acp_events import V1_STOP_REASONS, project_line
+from . import dsh_surfaces
+from .acp_events import V1_STOP_REASONS, _ModelWatch, _rpc_id, _session_of, project_line
+from .launch import (
+    CHILD_HOME_DIR_NAME,
+    DRIVER_ID,
+    INVOCATIONS_DIR_NAME,
+    STRIPPED_DSH_ENV,
+    ChildEnvironment,
+    DriverSetupError,
+    child_environment,
+    child_home_for,
+    effective_dsh_home,
+    launch_content_refusal,
+    resolve_launch_config,
+    spawn_gate_refusal,
+)
+from .launch_content import CONTENT_BINDING_LABEL, content_lines
+from .primitives import INVOCATION_ID_PLACEHOLDER
 from .winjob import (
     ProcessBoundary,
     close_output_handles,
@@ -125,7 +121,44 @@ from .winjob import (
     wait_interruptibly,
 )
 
-DRIVER_ID = "acpx-dsh-acp"
+# Re-exported: launch resolution and the leaf helpers lived in this module, and other modules and
+# the tests still import them from here.
+from .launch import (  # noqa: F401
+    AGENT_CREDENTIAL_ENV,
+    CMD_METACHARACTERS,
+    DEV_ACPX_RELATIVE,
+    DSH_SOURCE_DATA_DIR,
+    DSH_SOURCE_EXPLICIT,
+    DSH_SOURCE_NOTE_PREFIX,
+    DSH_SOURCE_PATH,
+    ENV_ACPX_CLI,
+    ENV_ACPX_NODE,
+    NO_CWD_EXE_SEARCH_ENV,
+    PROBE_ACPX_RELATIVE,
+    WORKSPACE_CLIENT_CONFIG_NAME,
+    WORKSPACE_ENV_FILE_NAME,
+    WORKTREE_PARENT_SUFFIX,
+    _workspace_client_config,
+    _workspace_env_file,
+    batch_argument_problem,
+    build_agent_argv,
+    credential_source_problem,
+    dsh_home_workspace_problem,
+    dsh_not_found_problem,
+    resolve_dsh,
+    spawn_workspaces,
+    system_command_processor,
+    workspace_root_entry,
+)
+from .primitives import (  # noqa: F401
+    DSH_AGENTS_HOME_ENV,
+    env_key,
+    env_keys,
+    find_in_directory,
+    find_on_path,
+    path_inside,
+)
+
 DRIVER_VERSION = "0.1.0"
 #: What this driver's static probe records for each capability. The one table: the driver's own
 #: probe and ``selected.local_probe`` (the record before any driver exists) both report it, so the
@@ -157,19 +190,6 @@ NO_COOPERATIVE_CANCEL = (
     "SIGBREAK, which acpx does not handle)"
 )
 
-ENV_ACPX_CLI = "HFLOW_ACPX_CLI"
-ENV_ACPX_NODE = "HFLOW_ACPX_NODE"
-#: Opt-in to file writes for a real invocation. Defined once in ``hflow.paths`` (the admission
-#: gate, the resolution path and the controller all have to agree on the name) and re-exported
-#: here for the callers that already import it from this module.
-
-#: Resolution order for the acpx entry point, most explicit first:
-#:   1. ``$HFLOW_ACPX_CLI`` (operator intent; wins over everything);
-#:   2. ``~/.hflow/`` sibling layout used by the repo-local development install;
-#:   3. the M0 probe install inside this checkout.
-#: No step installs, upgrades, or downloads anything.
-DEV_ACPX_RELATIVE = Path("m0/acpx/node_modules/acpx/dist/cli.js")
-PROBE_ACPX_RELATIVE = Path(".probe/acpx/node_modules/acpx/dist/cli.js")
 #: Cap on the retained raw log for one invocation (plan 8.2). Everything the client writes is
 #: read and digested; only this prefix is kept, and the difference is recorded as truncation.
 MAX_RAW_LOG_BYTES = 32 * 1024 * 1024
@@ -197,42 +217,6 @@ STDIN_WRITER_JOIN_SECONDS = 2.0
 #: How much of the prompt the stdin writer hands to the pipe per write, so what was accepted
 #: before a failure can be reported.
 STDIN_WRITE_CHUNK = 64 * 1024
-#: DSH reads these at launch (sandbox mode and approval policy; tool set). They are removed from
-#: every child environment and never set, so an ambient value cannot widen what a role may do.
-STRIPPED_DSH_ENV = ("DSH_PERMISSION_MODE", "DSH_TOOLS_MODE")
-#: Set to ``1`` in every child environment. cmd.exe and Node's process spawn (libuv) honour it:
-#: a bare program name is then not searched for in the working directory - the workspace -
-#: before PATH.
-NO_CWD_EXE_SEARCH_ENV = "NoDefaultCurrentDirectoryInExePath"
-#: acpx's project config file name. acpx always reads ``<--cwd>/.acpxrc.json`` (no walk-up, no
-#: opt-out in 0.17.1; upstream issue #835) and lets it override the global config this driver
-#: writes - including the agent argv, which no CLI flag can override on Windows.
-WORKSPACE_CLIENT_CONFIG_NAME = ".acpxrc.json"
-#: DSH's workspace env file. DSH's app boot reads ``<cwd>/.env`` and applies what it sets to its
-#: own environment and its tool processes (documented at dsh 5badb150, not observed). A real
-#: launch refuses a workspace whose root holds an entry by this name; it is never opened. The
-#: name is defined once, in ``hflow.workspace``.
-WORKSPACE_ENV_FILE_NAME = DSH_WORKSPACE_ENV_FILE
-#: What a launch refusal found at the spawn gate - when the dispatch is already reserved, so the
-#: run stays blocked - tells the operator to do once the cause is removed. Part of the refusal's
-#: message, which the ledger stores.
-_NEW_REVISION_STEP = (
-    "submit a new revision of the task: an identical TaskSpec returns this blocked run, and under "
-    "a root budget the new revision's first implementer counts as a repair, so it needs a repair "
-    "attempt left on the root."
-)
-
-
-def _found_at_launch(starts_with: str) -> str:
-    """The refusal sentence for a cause admission refuses too, found at the spawn gate instead."""
-    return (
-        f"(A run that starts {starts_with} is refused at admission, before anything is reserved; "
-        "this one was found at launch, when the dispatch was already reserved, so the run stays "
-        "blocked.)"
-    )
-#: Where ``GitRepo.worktree_parent`` puts a run's worktrees: ``<checkout>.hflow-worktrees`` beside
-#: the checkout. The spawn gate uses it to name the user's checkout from a worktree's path.
-WORKTREE_PARENT_SUFFIX = ".hflow-worktrees"
 #: Written around a packet so the prompt text a driver actually sent is recoverable, and so a
 #: bare ``goal`` (a direct driver call) is still traceable to the request it came from. The
 #: digest covers the prompt text alone, so this envelope cannot change what the digest means.
@@ -240,14 +224,6 @@ PROMPT_ENVELOPE = "HFLOW-PROMPT-DIGEST"
 #: How much of a JSON-RPC error message answering the prompt is kept: it is agent text, quoted
 #: (repr) in error_message, a limitation and block_reason.
 MAX_PROMPT_ERROR_MESSAGE_CHARS = 500
-#: Where each invocation's files live, under the data directory: ``<data-dir>/invocations/<id>``.
-INVOCATIONS_DIR_NAME = "invocations"
-#: The invocation's own home inside that directory. USERPROFILE, HOME and APPDATA of the child
-#: point here, so acpx's global config - and DSH's default home - are per invocation.
-CHILD_HOME_DIR_NAME = "home"
-#: Stands in for an invocation id that does not exist yet (prepare, doctor, probe). A path that
-#: contains it is a name, never a directory: nothing resolves or creates it.
-INVOCATION_ID_PLACEHOLDER = "<invocation-id>"
 
 
 def effective_prompt(request: InvocationRequest) -> str:
@@ -260,10 +236,6 @@ def effective_prompt(request: InvocationRequest) -> str:
     return request.packet or (
         f"{PROMPT_ENVELOPE}: {packet_digest(request.goal)}\n\n{request.goal}"
     )
-
-
-class DriverSetupError(RuntimeError):
-    """The driver cannot be used as configured. Fail loudly, never silently degrade."""
 
 
 class ExitBoundary(NamedTuple):
@@ -314,997 +286,13 @@ class _TerminalResponse(NamedTuple):
     message_chunks_before: int
 
 
-def _session_of(params: dict[str, Any]) -> str:
-    """The ``sessionId`` a message's params name, or ``""`` when they name none."""
-    session = params.get("sessionId")
-    return session if isinstance(session, str) else ""
-
-
-def _needs_batch_wrapper(dsh_executable: str) -> bool:
-    """Whether the launcher is a Windows batch shim that ``CreateProcess`` cannot start itself."""
-    return os.name == "nt" and dsh_executable.lower().endswith((".cmd", ".bat"))
-
-
-def system_command_processor(env: Mapping[str, str]) -> Path | None:
-    """The absolute ``<SystemRoot>\\System32\\cmd.exe`` named by ``env``, or ``None``.
-
-    Never a bare ``cmd.exe``: the agent is started with the workspace as its cwd, and Node's
-    process spawn (libuv) can resolve a bare name there before ``PATH``, so a ``cmd.exe`` at the
-    worktree root could run as the launcher. The variable is looked up case-insensitively, as
-    Windows does.
-    """
-    system_root = next((env[key] for key in env_keys(env, "SYSTEMROOT") if env[key]), "")
-    if not system_root:
-        return None
-    candidate = Path(system_root) / "System32" / "cmd.exe"
-    return candidate if candidate.is_absolute() and candidate.is_file() else None
-
-
-def env_keys(env: Mapping[str, str], name: str) -> list[str]:
-    """Every key of ``env`` that spells ``name``, in any case.
-
-    Windows reads variable names case-insensitively, so a lookup or a removal that knew only one
-    spelling could be bypassed by another. OS-following callers apply it on Windows only and match
-    the exact name elsewhere, where ``dsh_home`` is not ``DSH_HOME``: :func:`env_key` and
-    :func:`child_environment`'s removal of the DSH variables. :func:`system_command_processor` and
-    :func:`child_environment`'s handling of ``NoDefaultCurrentDirectoryInExePath`` and ``PATH``
-    apply it everywhere.
-    """
-    wanted = name.upper()
-    return [key for key in env if key.upper() == wanted]
-
-
-def env_key(env: Mapping[str, str], name: str, *, exact_first: bool = False) -> str | None:
-    """The key ``env`` holds ``name`` under, or ``None`` when it is unset. Names only.
-
-    Matched as the OS does: any letter case on Windows (:func:`env_keys`), the exact name
-    elsewhere. With several spellings present on Windows, the first in ``env``'s order is
-    returned - or, with ``exact_first``, the exact spelling when it is one of them. The value is
-    never touched, so a presence check (``is not None``) does not read a credential.
-    """
-    if os.name != "nt":
-        return name if name in env else None
-    if exact_first and name in env:
-        return name
-    return next(iter(env_keys(env, name)), None)
-
-
-def find_on_path(name: str, env: Mapping[str, str]) -> str:
-    """The absolute file that PATH lookup finds for ``name``, or ``""``.
-
-    Only the absolute entries of ``env``'s PATH are searched - never the current directory and
-    never a relative entry. ``shutil.which`` cannot be used: on Windows it searches the current
-    directory first, even when given an explicit ``path``, and then returns a *relative* result
-    that a child would resolve against its own cwd - for the agent, the workspace. On Windows the
-    name is tried with each ``PATHEXT`` extension unless it already carries one.
-    """
-    path = env_key(env, "PATH")
-    for entry in (env[path] if path is not None else "").split(os.pathsep):
-        found = find_in_directory(name, entry.strip().strip('"'), env)
-        if found:
-            return found
-    return ""
-
-
-def find_in_directory(name: str, directory: str | Path, env: Mapping[str, str]) -> str:
-    """The file ``name`` names in one absolute ``directory``, by :func:`find_on_path`'s rules.
-
-    ``""`` for a relative or empty directory and when nothing matches: on Windows each ``PATHEXT``
-    extension is tried unless ``name`` carries one, elsewhere the file must be executable.
-    """
-    if not str(directory) or not Path(directory).is_absolute():
-        return ""
-    if os.name == "nt":
-        pathext = env_key(env, "PATHEXT")
-        listed = env[pathext] if pathext is not None else ""
-        extensions = [ext for ext in (listed or ".COM;.EXE;.BAT;.CMD").split(";") if ext]
-        names = (
-            [name]
-            if name.lower().endswith(tuple(ext.lower() for ext in extensions))
-            else [name + ext for ext in extensions]
-        )
-    else:
-        names = [name]
-    for candidate_name in names:
-        candidate = Path(directory) / candidate_name
-        if candidate.is_file() and (os.name == "nt" or os.access(candidate, os.X_OK)):
-            return str(candidate)
-    return ""
-
-
-#: Where a launch found its ``dsh`` (:func:`resolve_dsh`), as its ``content_notes`` record it
-#: (:data:`DSH_SOURCE_NOTE_PREFIX`) and ``prepare``/``doctor`` show it: ``dsh=<source>``.
-DSH_SOURCE_PATH = "PATH"
-DSH_SOURCE_DATA_DIR = "npm (data dir)"
-DSH_SOURCE_EXPLICIT = "explicit"
-DSH_SOURCE_NOTE_PREFIX = "dsh="
-
-
-def resolve_dsh(data_dir: Path, env: Mapping[str, str]) -> tuple[str, str]:
-    """``(absolute dsh, source)`` as a launch finds it, or ``("", "")``. Names and stat only.
-
-    PATH first - what the operator put there is their choice - then exactly the npm CLI HFlow
-    looks for under its data directory (``dsh_surfaces.dsh_npm_bin_dir``), by the same lookup
-    rules. Nothing else: no other version, no Desktop shim, never a bare name.
-    """
-    found = find_on_path("dsh", env)
-    if found:
-        return found, DSH_SOURCE_PATH
-    from .dsh_surfaces import dsh_npm_bin_dir
-
-    found = find_in_directory("dsh", dsh_npm_bin_dir(data_dir), env)
-    return (found, DSH_SOURCE_DATA_DIR) if found else ("", "")
-
-
-def _dsh_source_note(source: str, data_dir: Path) -> str:
-    """The ``content_notes`` entry that records where the launch found its dsh."""
-    from .dsh_surfaces import DSH_NPM_PACKAGE, RECORDED_DSH_NPM_VERSION, dsh_npm_prefix
-
-    why = {
-        DSH_SOURCE_PATH: "the first absolute PATH entry that holds a dsh",
-        DSH_SOURCE_DATA_DIR: (
-            f"PATH has no dsh, so the {DSH_NPM_PACKAGE}@{RECORDED_DSH_NPM_VERSION} install under "
-            f"the data directory ({dsh_npm_prefix(data_dir)}) is the launcher; its shim, carrier "
-            "entry and package.json are bound by content like a PATH-found one"
-        ),
-        DSH_SOURCE_EXPLICIT: "named by the caller, not looked up",
-    }[source]
-    return f"{DSH_SOURCE_NOTE_PREFIX}{source}: {why}"
-
-
-def dsh_not_found_problem(data_dir: Path) -> str:
-    """Why a launch has no dsh, naming both places it looked and the npm install that fixes it."""
-    from .dsh_surfaces import dsh_npm_bin_dir, dsh_npm_install_command
-
-    return (
-        "dsh was not found on PATH (only absolute PATH entries are searched, never the current "
-        f"directory) or in {dsh_npm_bin_dir(data_dir)}, where HFlow looks for the npm CLI under "
-        "its data directory. A bare name would be looked up in the workspace first, so it is "
-        f"never a fallback. Install the npm CLI there - `{dsh_npm_install_command(data_dir)}` - "
-        "or put a dsh on PATH."
-    )
-
-
-def _inside_any(program: str, roots: Sequence[Path]) -> Path | None:
-    """The first of ``roots`` that contains ``program`` (:func:`path_inside`)."""
-    return next((Path(root) for root in roots if path_inside(program, root)), None)
-
-
-#: Characters cmd.exe may act on in a ``/c`` command line. Node quotes an argument by C runtime
-#: rules (only when it holds a space, a tab or a quote), not by cmd's, so a batch launcher argument
-#: holding one of them is refused. Observed with ``cmd /d /c <shim> --profile acp`` (Windows 11,
-#: 2026-10-14): ``&`` splits the command, ``^`` and ``%VAR%`` are consumed, an unquoted ``(``, ``;``,
-#: ``,`` or ``=`` cuts the path there, and an ``@`` in a quoted path makes ``/c`` drop the quotes
-#: and cut it at its first space. ``| < > "`` cannot be in a Windows file name, ``!`` expands under
-#: delayed expansion (a registry default ``/d`` does not turn off), and ``)`` closes a block. One
-#: set, whatever the quoting: some of these were harmless in some positions, which is not a rule.
-CMD_METACHARACTERS = frozenset('&|<>^%!"()@;,=')
-
-
-def batch_argument_problem(argument: str) -> str:
-    """Why ``argument`` cannot go on a ``cmd.exe /c`` command line unchanged, or ``""``."""
-    found = sorted(set(argument) & CMD_METACHARACTERS)
-    if not found:
-        return ""
-    return (
-        f"{argument!r} holds {' '.join(found)}, which cmd.exe interprets in the batch shim's "
-        "command line (Node quotes arguments by C runtime rules, not cmd's), so the agent "
-        "command would not be the one approved; install the launcher under a path without them"
-    )
-
-
-def build_agent_argv(
-    *,
-    dsh_executable: str,
-    profile: str,
-    override: list[str] | None = None,
-    command_processor: str = "",
-) -> list[str]:
-    """The launcher argv as a real command line, wrapped for the Windows batch shim.
-
-    Only the launcher path and the fixed profile flag live here: no task text, no nonce, no
-    user content, no credentials. A batch shim is wrapped in ``command_processor`` - the
-    absolute ``cmd.exe`` from :func:`system_command_processor` - and refused without one. The
-    wrapper runs ``/d``: cmd.exe's registry AutoRun commands would otherwise run first, in the
-    workspace, and write into the ACP stdout stream. An argument cmd.exe would reinterpret
-    (:func:`batch_argument_problem`) is refused.
-    """
-    if override is not None:
-        return list(override)
-    argv = [dsh_executable, "--profile", profile]
-    if _needs_batch_wrapper(dsh_executable):
-        if not command_processor or not Path(command_processor).is_absolute():
-            raise DriverSetupError(
-                f"{dsh_executable} is a batch shim and needs the absolute Windows command "
-                "processor (<SystemRoot>\\System32\\cmd.exe), which was not found; a bare "
-                "cmd.exe would be searched for in the workspace first"
-            )
-        for argument in argv:
-            problem = batch_argument_problem(argument)
-            if problem:
-                raise DriverSetupError(f"the batch launcher argument {problem}")
-        return [command_processor, "/d", "/c", *argv]
-    return argv
-
-
-def resolve_launch_config(
-    *,
-    data_dir: Path,
-    profile: str = "acp",
-    dsh_home: Path | None = None,
-    acpx_cli: Path | None = None,
-    dsh_executable: str | None = None,
-    python_executable: str | None = None,
-    node_executable: str | None = None,
-    agent_argv_override: list[str] | None = None,
-    env: Mapping[str, str] | None = None,
-    binding: AgentBinding | None = None,
-    workspaces: Sequence[Path] = (),
-) -> LaunchConfig:
-    """Resolve every fact that decides *which programs* a real invocation launches.
-
-    No process is started and no model is reachable from here: this is path resolution plus
-    environment lookup, so ``prepare`` and ``doctor`` can call it for free. A missing client is
-    reported (``resolvable=False``) rather than raised, because a preview that died before
-    printing anything would be less useful than one that says which program is missing.
-
-    This is the one place the launch is decided. The driver is later built *from* the returned
-    object, so nothing can re-select a different interpreter after an approval was checked.
-
-    Every program is an absolute path. ``dsh``, ``node`` and ``python`` are looked up in the
-    absolute entries of PATH only (:func:`find_on_path`) - ``dsh`` then in exactly one more place,
-    the npm CLI under the data directory (:func:`resolve_dsh`), and where it came from is recorded
-    as the first content note - and an explicit program (an argument,
-    ``HFLOW_ACPX_NODE``, the first word of ``agent_argv_override``) must already be absolute: acpx
-    starts the agent with the workspace as its cwd, where a bare or relative name would be
-    resolved - so a file in the worktree could run as the agent. A program that is not found is
-    reported, never replaced by its bare name. ``workspaces`` are the directories the run's agent
-    works in (the project root, the worktree parent); a launch program inside one of them - the
-    launcher, ``dsh``, the client interpreter or the acpx entry it runs - is a file the agent
-    can write, and is refused the same way, as is a workspace inside the ``node_modules`` tree
-    the entry loads its modules from.
-
-    ``binding`` is the role's binding; its ``model_selection`` becomes the launch's ``--model``
-    value (none for ``native_profile``). It is validated again here, because a binding can be
-    copied without validation, and an invalid value refuses rather than reaching an argv.
-    """
-    source = env if env is not None else os.environ
-    try:
-        model = launch_model(binding.model_selection) if binding is not None else ""
-    except ValueError as exc:
-        raise RefusedError(RefusalCode.INVALID_SPEC, str(exc)) from exc
-    resolved_data_dir = Path(data_dir)
-
-    from .launch_content import bind_launch_content, final_path
-
-    entry = _resolve_client_entry(
-        data_dir=resolved_data_dir, explicit=acpx_cli, env=source
-    )
-    if entry is not None:
-        # Followed once, here: the path hashed by the content binding is the path spawned.
-        entry = Path(final_path(str(entry)))
-    problems: list[str] = []
-    if entry is None:
-        problems.append(
-            "acpx CLI not found. Set HFLOW_ACPX_CLI to the acpx entry point, or install the "
-            "project-local copy the M0 probe uses. This driver never installs or upgrades it "
-            "silently."
-        )
-
-    def program(label: str, explicit: str | None, name: str, *, needed: bool) -> str:
-        """An absolute program path, or ``""`` (with a problem recorded when it is needed).
-
-        Links and junctions are followed once (:func:`launch_content.final_path`), so the file
-        the content binding hashes is the file that is started.
-        """
-        if explicit:
-            if Path(explicit).is_absolute():
-                return final_path(explicit)
-            if needed:
-                problems.append(
-                    f"{label} {explicit!r} is not an absolute path. A relative program is "
-                    "resolved against the directory that starts it - for the agent, the "
-                    "workspace - so it is never used."
-                )
-            return ""
-        found = find_on_path(name, source)
-        if not found and needed:
-            problems.append(
-                f"{name} was not found on PATH (only absolute PATH entries are searched, never "
-                "the current directory). A bare name would be looked up in the workspace first, "
-                "so it is never a fallback; put it on PATH or name its absolute path."
-            )
-        return final_path(found) if found else found
-
-    suffix = entry.suffix.lower() if entry is not None else ""
-    if dsh_executable:
-        resolved_dsh = program("dsh", dsh_executable, "dsh", needed=agent_argv_override is None)
-        dsh_source = DSH_SOURCE_EXPLICIT
-    else:
-        found_dsh, dsh_source = resolve_dsh(resolved_data_dir, source)
-        resolved_dsh = final_path(found_dsh) if found_dsh else ""
-        if not resolved_dsh and agent_argv_override is None:
-            problems.append(dsh_not_found_problem(resolved_data_dir))
-    resolved_python = program(
-        "python", python_executable, "python", needed=suffix == ".py"
-    )
-    resolved_node = program(
-        "node",
-        node_executable or source.get(ENV_ACPX_NODE),
-        "node",
-        needed=suffix in {".js", ".mjs", ".cjs"},
-    )
-    # An explicit DSH home wins; otherwise the ambient one is *recorded*, because the child
-    # inherits this process's environment and would use it.
-    resolved_home = dsh_home or (Path(source["DSH_HOME"]) if source.get("DSH_HOME") else None)
-
-    command_processor = system_command_processor(source)
-    agent_argv: list[str] = []
-    if agent_argv_override is not None and (
-        not agent_argv_override or not Path(agent_argv_override[0]).is_absolute()
-    ):
-        problems.append(
-            f"the agent launcher {agent_argv_override[:1]!r} is not an absolute path. A relative "
-            "program is resolved in the workspace acpx starts it in, so it is never used."
-        )
-    elif agent_argv_override is not None or resolved_dsh:
-        try:
-            agent_argv = build_agent_argv(
-                dsh_executable=resolved_dsh,
-                profile=profile,
-                override=agent_argv_override,
-                command_processor=str(command_processor) if command_processor is not None else "",
-            )
-        except DriverSetupError as exc:
-            # Reported, not raised, like a missing client: the launch has no argv it may use.
-            problems.append(str(exc))
-    client_prefix = _client_prefix_for(entry, node=resolved_node, python=resolved_python)
-    if client_prefix and not client_prefix[0]:
-        client_prefix = []  # its interpreter was not resolved; the problem is already recorded
-
-    checked: set[str] = set()
-    for label, launched in (
-        ("the agent launcher", agent_argv[0] if agent_argv else ""),
-        ("dsh", resolved_dsh if agent_argv_override is None else ""),
-        ("the client interpreter", client_prefix[0] if client_prefix else ""),
-        # The script that interpreter runs. Its package root (the parent of the node_modules
-        # it lies in) contains it, so a package root inside a workspace is caught here too.
-        ("the acpx client entry", str(entry) if entry is not None else ""),
-    ):
-        if not launched or launched in checked:
-            continue
-        checked.add(launched)
-        inside = _inside_any(launched, workspaces)
-        if inside is not None:
-            problems.append(
-                f"{label} {launched} lies inside the workspace {inside}: a file the agent can "
-                "write must never run as a launch program."
-            )
-    module_tree = _client_module_tree(entry) if entry is not None else None
-    if module_tree is not None:
-        for workspace in workspaces:
-            if _inside_any(str(workspace), [module_tree]) is not None:
-                problems.append(
-                    f"the workspace {workspace} lies inside {module_tree}, the node_modules tree "
-                    f"the acpx client entry {entry} loads its modules from: a file the agent can "
-                    "write must never run as part of a launch program."
-                )
-    resolvable = not problems
-    detail = " ".join(problems)
-    launch = LaunchConfig(
-        driver_id=DRIVER_ID,
-        harness="dsh",
-        agent_argv=agent_argv,
-        client_argv_prefix=client_prefix,
-        client_entry=str(entry) if entry is not None else "",
-        node=resolved_node,
-        python=resolved_python,
-        dsh_executable=resolved_dsh,
-        profile=profile,
-        dsh_home=str(resolved_home) if resolved_home is not None else "",
-        model=model,
-        resolvable=resolvable,
-        detail=detail,
-    )
-    if not resolvable:
-        return launch
-    # H6: the launch entry files bound by content. A file that cannot be hashed, or a binding
-    # that cannot name what it says it covers, makes the launch not resolvable - refused at
-    # prepare, like a missing program.
-    digests, content_problems, content_notes = bind_launch_content(launch)
-    if content_problems:
-        return launch.model_copy(
-            update={"resolvable": False, "detail": " ".join(content_problems)}
-        )
-    if resolved_dsh and resolved_dsh in agent_argv:
-        # Recorded where prepare and the probe already show the launch's binding notes; outside
-        # the effective-configuration digest, like every content note (the path itself is in it).
-        content_notes = [_dsh_source_note(dsh_source, resolved_data_dir), *content_notes]
-    return launch.model_copy(
-        update={"content_digests": digests, "content_notes": content_notes}
-    )
-
-
-def _resolve_client_entry(
-    *, data_dir: Path, explicit: Path | None, env: Mapping[str, str]
-) -> Path | None:
-    """Which acpx entry point this machine has, or ``None``. Never installs anything."""
-    if explicit is not None:
-        candidate = Path(explicit)
-        return candidate if candidate.exists() else None
-    override = env.get(ENV_ACPX_CLI)
-    if override:
-        candidate = Path(override)
-        return candidate if candidate.exists() else None
-    repo_root = Path(__file__).resolve().parents[3]
-    for candidate in (data_dir / DEV_ACPX_RELATIVE, repo_root / PROBE_ACPX_RELATIVE):
-        if candidate.exists():
-            return candidate
-    return None
-
-
-def _client_module_tree(entry: Path) -> Path | None:
-    """The nearest ``node_modules`` directory enclosing ``entry``, or ``None`` for a loose file.
-
-    That is where the client's dependencies are installed and resolved from, so a workspace
-    inside it would let the agent rewrite code the client runs.
-    """
-    for parent in Path(os.path.abspath(entry)).parents:
-        if parent.name.casefold() == "node_modules":
-            return parent
-    return None
-
-
-def _client_prefix_for(entry: Path | None, *, node: str, python: str) -> list[str]:
-    """Interpreter prefix for the client entry point, chosen by its kind."""
-    if entry is None:
-        return []
-    suffix = entry.suffix.lower()
-    if suffix in {".js", ".mjs", ".cjs"}:
-        return [node]
-    if suffix == ".py":
-        return [python, "-u"]
-    return []
-
-
-def child_home_for(data_dir: Path, invocation_id: str) -> Path:
-    """The home directory one invocation's child gets (USERPROFILE, HOME, APPDATA's parent)."""
-    return Path(data_dir) / INVOCATIONS_DIR_NAME / invocation_id / CHILD_HOME_DIR_NAME
-
-
-def effective_dsh_home(
-    launch: LaunchConfig, *, child_home: Path
-) -> tuple[Literal["bound", "per_invocation"], Path]:
-    """The DSH home a child of this launch uses, and how it comes to use it.
-
-    A bound ``DSH_HOME`` is set on every child, so it is that path. With none bound the driver
-    removes ``DSH_HOME`` from the child and points USERPROFILE/HOME at ``child_home``; DSH's
-    upstream resolution is explicit > non-empty ``DSH_HOME`` > ``~/.dsh``, so its home is then
-    ``child_home/.dsh``, created empty for each invocation. That second case is inferred from
-    upstream source (defaultDshHome joins os.homedir(), which reads USERPROFILE first on
-    Windows); not observed. Nothing is created or resolved here: ``child_home`` may contain
-    :data:`INVOCATION_ID_PLACEHOLDER`.
-    """
-    if launch.dsh_home:
-        return "bound", Path(launch.dsh_home)
-    return "per_invocation", Path(child_home) / ".dsh"
-
-
-#: DSH >= 0.2.1-alpha.2 reads ``$DSH_AGENTS_HOME/AGENTS.md`` as user-level instructions (else
-#: ``~/.agents/AGENTS.md``; documented from upstream source, not observed). Removed from every
-#: child environment and never set (:func:`child_environment`).
-DSH_AGENTS_HOME_ENV = "DSH_AGENTS_HOME"
-
-
-def child_environment(
-    source: Mapping[str, str], *, extra_env: Mapping[str, str], dsh_home: str
-) -> dict[str, str]:
-    """The environment a child process is started with, built from ``source``.
-
-    ``DSH_HOME`` is part of the *resolved launch*, so it is set from the bound value or
-    removed - never inherited by accident. Copying the ambient environment and only
-    overriding a non-empty bound home would leave an unset variable unset, and a
-    ``DSH_HOME`` added *after* the launch was resolved would then still reach the child:
-    the approval would say one thing and the process would do another. ``extra_env`` is
-    subject to the same rule, because it is not a way to smuggle a different launch past
-    the binding.
-
-    ``DSH_PERMISSION_MODE`` and ``DSH_TOOLS_MODE`` are removed and never set: DSH reads its
-    sandbox mode, approval policy and tool set from them at launch, so an ambient
-    ``danger-full-access`` would silently unconfine every role. Choosing a value per role is
-    not this driver's decision; inheriting one by accident is ruled out here.
-
-    ``DSH_AGENTS_HOME`` is removed and never set (:data:`DSH_AGENTS_HOME_ENV`): an inherited one
-    would point DSH at an instruction file outside the invocation's own home that no approval
-    binds. Without it DSH falls back to ``~/.agents/AGENTS.md`` under the child's home - the
-    per-invocation home the driver points USERPROFILE/HOME at, created empty.
-
-    The Git variables that locate a repository (``GIT_DIR``, ``GIT_WORK_TREE``, ``GIT_INDEX_FILE``
-    and the rest of ``gitworkspace._REPOSITORY_LOCATING_ENV``) are removed too, as HFlow removes
-    them from its own git calls: inherited, they would point DSH's git and the agent's shell at
-    another repository or index - the user's checkout, say - instead of the workspace's.
-
-    These DSH and Git variables are removed in every spelling on Windows, which reads variable
-    names case-insensitively (:func:`env_keys`), and by their exact name elsewhere; a bound
-    ``DSH_HOME`` is then set in exactly that spelling.
-
-    ``NoDefaultCurrentDirectoryInExePath=1`` is always set, in exactly that spelling, after
-    removing every other spelling: acpx starts the agent with the workspace as its cwd, and
-    without it both cmd.exe (the npm DSH batch shim runs a bare ``node`` unless a node.exe sits
-    beside it; the Desktop shim runs an absolute ``DeepSeek Harness.exe``) and Node's spawn look
-    in that cwd before PATH - a ``node.cmd`` the implementer wrote would then run as the
-    reviewer's agent. For the same reason a relative PATH entry, which would be resolved
-    against the workspace, is not passed on.
-    """
-    env = dict(source)
-    env.update(extra_env)
-    for name in ("DSH_HOME", *STRIPPED_DSH_ENV, DSH_AGENTS_HOME_ENV, *_REPOSITORY_LOCATING_ENV):
-        for key in env_keys(env, name) if os.name == "nt" else [name]:
-            env.pop(key, None)
-    if dsh_home:
-        env["DSH_HOME"] = dsh_home
-    for key in env_keys(env, NO_CWD_EXE_SEARCH_ENV):
-        del env[key]
-    env[NO_CWD_EXE_SEARCH_ENV] = "1"
-    for key in env_keys(env, "PATH"):
-        env[key] = os.pathsep.join(
-            entry
-            for entry in env[key].split(os.pathsep)
-            if entry.strip() and Path(entry.strip().strip('"')).is_absolute()
-        )
-    env.setdefault("PYTHONIOENCODING", "utf-8")
-    return env
-
-
-def _rpc_id(value: Any) -> tuple[str, Any] | None:
-    """A JSON-RPC id as a key that keeps its type: ``2``, ``2.0`` and ``True`` stay distinct."""
-    if value is None or isinstance(value, (dict, list)):
-        return None
-    return type(value).__name__, value
-
-
-def _option_of(config_options: Any, category: str, preferred_id: str) -> dict[str, Any] | None:
-    """The ``select`` option of one category, the way acpx picks it.
-
-    Category match first, and among those the one whose id is ``preferred_id``; an option that
-    only has that id (no category) is the last resort.
-    """
-    if not isinstance(config_options, list):
-        return None
-    chosen: dict[str, Any] | None = None
-    best = -1
-    for option in config_options:
-        if not isinstance(option, dict) or option.get("type") != "select":
-            continue
-        if option.get("category") == category:
-            rank = 2 if option.get("id") == preferred_id else 1
-        elif option.get("id") == preferred_id:
-            rank = 0
-        else:
-            continue
-        if rank > best:
-            chosen, best = option, rank
-    return chosen
-
-
-def _option_values(options: Any) -> set[str]:
-    """The values a ``select`` option offers, from a flat list or from provider groups."""
-    values: set[str] = set()
-    for entry in options if isinstance(options, list) else []:
-        if not isinstance(entry, dict):
-            continue
-        if isinstance(entry.get("value"), str):
-            values.add(entry["value"])
-        values |= _option_values(entry.get("options"))
-    return values
-
-
-class _ModelWatch:
-    """What one invocation's stream shows about its model option. Observation only.
-
-    Reads the ``session/new`` response's ``configOptions``, every ``config_option_update``, and
-    each outbound ``session/set_config_option`` for the model with its response. It never
-    decides an outcome; ``collect`` asks it narrow questions.
-    """
-
-    def __init__(self, requested: str | None) -> None:
-        self.requested = requested
-        self.advertised = False
-        self.config_id = ""
-        #: Every value the advertised model option offers (flat or grouped), verbatim.
-        self.values: set[str] = set()
-        self.initial_value: str | None = None
-        self.effective_value: str | None = None
-        self.source = ""
-        self.thought_level: str | None = None
-        self.changes: list[ModelChange] = []
-        self.session_created = False
-        self.session_id = ""
-        self._prompt_seen = False
-        self._ambiguous = False
-        #: Request ids are only unique within one direction; the raw stream has both.
-        self._seen_request_ids: set[tuple[str, Any]] = set()
-        self._tracked_request_ids: set[tuple[str, Any]] = set()
-        #: Outbound requests awaiting their response: id key -> (method, session).
-        self._pending: dict[tuple[str, Any], tuple[str, str]] = {}
-        self.skipped_updates = 0
-        self.skipped_sets = 0
-        #: Outcomes of the model's set_config_option requests, in order: True = succeeded.
-        self.set_results: list[bool] = []
-        self.set_requests = 0
-        #: The client's own error line: a JSON-RPC error with a null id, as acpx prints it.
-        self.client_error = ""
-
-    def observe(self, message: dict[str, Any]) -> None:
-        method = message.get("method")
-        key = _rpc_id(message.get("id"))
-        if isinstance(method, str):
-            params = message.get("params") if isinstance(message.get("params"), dict) else {}
-            session = _session_of(params)
-            model_set = (
-                method == "session/set_config_option"
-                and params.get("configId") == (self.config_id or "model")
-            )
-            tracked = method == "session/new" or (
-                model_set and bool(self.session_id) and session == self.session_id
-            )
-            if key is not None:
-                if key in self._seen_request_ids and (
-                    tracked or key in self._tracked_request_ids
-                ):
-                    self._ambiguous = True
-                self._seen_request_ids.add(key)
-                if tracked:
-                    self._tracked_request_ids.add(key)
-            if key is not None and method == "session/new" and not self.session_created:
-                self._pending[key] = (method, "")
-            elif model_set:
-                if key is not None and self.session_id and session == self.session_id:
-                    self._pending[key] = (method, session)
-                    self.set_requests += 1
-                else:
-                    self.skipped_sets += 1
-            elif method == "session/update":
-                update = params.get("update") if isinstance(params.get("update"), dict) else {}
-                if update.get("sessionUpdate") == "config_option_update":
-                    if self.session_id and session == self.session_id:
-                        self._read_options(update.get("configOptions"), "config_option_update")
-                    else:
-                        self.skipped_updates += 1
-            return
-        answered = self._pending.pop(key, None) if key is not None else None
-        result = message.get("result")
-        if answered is not None and self._ambiguous:
-            return
-        method, session = answered if answered is not None else (None, "")
-        if (
-            method == "session/new"
-            and not self.session_created
-            and isinstance(result, dict)
-            and "error" not in message
-            and isinstance(result.get("sessionId"), str)
-            and result["sessionId"]
-        ):
-            self.session_created = True
-            self.session_id = result["sessionId"]
-            option = _option_of(result.get("configOptions"), "model", "model")
-            if option is not None:
-                self.advertised = True
-                self.config_id = str(option.get("id") or "")
-                self.values = _option_values(option.get("options"))
-                current = option.get("currentValue")
-                self.initial_value = current if isinstance(current, str) else None
-                self.effective_value = self.initial_value
-                self.source = "session/new"
-            self._read_thought_level(result.get("configOptions"))
-        elif method == "session/set_config_option" and session == self.session_id:
-            # Any JSON-RPC success counts as the agent accepting the request, whatever shape its
-            # result has; the effective value is only taken from a result that reports one.
-            ok = "result" in message and "error" not in message
-            self.set_results.append(ok)
-            if ok and isinstance(result, dict):
-                self._read_options(result.get("configOptions"), "session/set_config_option")
-        elif (
-            answered is None
-            and "id" in message
-            and message.get("id") is None
-            and "error" in message
-            and not self.client_error
-        ):
-            error = message.get("error") if isinstance(message.get("error"), dict) else {}
-            self.client_error = str(error.get("message") or error)[:500]
-
-    def bind_prompt(self, session: str) -> None:
-        """Check the first prompt against the session whose configuration was observed."""
-        if self._prompt_seen:
-            return
-        self._prompt_seen = True
-        if not session or not self.session_id or session != self.session_id:
-            self._ambiguous = True
-
-    def _read_options(self, config_options: Any, source: str) -> None:
-        option = _option_of(config_options, "model", self.config_id or "model")
-        if option is not None and isinstance(option.get("currentValue"), str):
-            value = option["currentValue"]
-            if value != self.effective_value:
-                self.changes.append(ModelChange(source=source, value=value))
-            self.effective_value = value
-            self.source = source
-        self._read_thought_level(config_options)
-
-    def _read_thought_level(self, config_options: Any) -> None:
-        option = _option_of(config_options, "thought_level", "reasoning_effort")
-        if option is not None and isinstance(option.get("currentValue"), str):
-            self.thought_level = option["currentValue"]
-
-    def refused(self) -> bool:
-        """The requested model was refused, as the stream shows it.
-
-        Either the client could not offer it - no model option was advertised, or the value is
-        not among the advertised ones - so no change request went out; or the agent answered the
-        change request with an error. A value that was already current needs no request, so its
-        absence is not a refusal, and a request still awaiting its answer is unknown, not refused.
-        """
-        if self._ambiguous or not self.session_created or self._pending:
-            return False
-        if self.set_requests == 0:
-            return self.requested is not None and (
-                not self.advertised or self.requested not in self.values
-            )
-        return bool(self.set_results) and not any(self.set_results)
-
-    def observation(self) -> ModelObservation:
-        return ModelObservation(
-            advertised=self.advertised,
-            config_id=self.config_id,
-            initial_value=self.initial_value,
-            requested=self.requested,
-            effective_value=self.effective_value,
-            changes=list(self.changes),
-            source=self.source,
-            thought_level=self.thought_level,
-        )
-
-    def applied(self, *, rejected: bool) -> ModelApplied:
-        """Classify the requested model from what the stream showed. Never a guess upward.
-
-        ``rejected`` is ``collect``'s confirmed pre-prompt refusal. Otherwise: an answered change
-        request is ``accepted`` only while the effective value is the request; an unanswered one
-        is ``unknown``. With no change request, ``passed`` is said only while the stream's last
-        reported value is still the request - a refusal the stream shows (not advertised, not in
-        the catalog) that an earlier outcome branch shadowed, or a later
-        ``config_option_update`` that moved the model away, is ``unknown``, not ``passed``.
-        """
-        if not self.requested:
-            return ModelApplied.NOT_PASSED
-        if self._ambiguous or not self.session_created:
-            return ModelApplied.UNKNOWN
-        if rejected or (self.set_results and not any(self.set_results)):
-            return ModelApplied.REJECTED
-        if any(self.set_results):
-            return (
-                ModelApplied.ACCEPTED
-                if self.effective_value == self.requested
-                else ModelApplied.UNKNOWN
-            )
-        if self.set_requests:
-            return ModelApplied.UNKNOWN
-        # No change request went out. The rejection branch did not confirm a refusal (rule 7: no
-        # upgrade without an observation), so a refusal or a different value is unknown.
-        if (
-            self.refused()
-            or self.initial_value != self.requested
-            or self.effective_value != self.requested
-        ):
-            return ModelApplied.UNKNOWN
-        return ModelApplied.PASSED
-
-
-def _workspace_client_config(workspace: Path) -> Path | None:
-    """:func:`_workspace_root_entry` for acpx's project config (an alias ``prepare`` imports)."""
-    return _workspace_root_entry(workspace, WORKSPACE_CLIENT_CONFIG_NAME)
-
-
-def _workspace_env_file(workspace: Path) -> Path | None:
-    """:func:`_workspace_root_entry` for DSH's ``.env`` (an alias ``prepare`` imports)."""
-    return _workspace_root_entry(workspace, WORKSPACE_ENV_FILE_NAME)
-
-
-def _workspace_root_entry(workspace: Path, file_name: str) -> Path | None:
-    """The workspace root's entry named ``file_name`` (any letter case) if one exists, else ``None``.
-
-    ``lstat`` rather than ``exists``: a file, a directory, a broken link or a junction all count,
-    because what acpx would make of any of them is not something to reason about here. The name
-    is matched without regard to case, on every filesystem: where the filesystem ignores case
-    (NTFS by default), acpx's open of ``.acpxrc.json`` finds ``.ACPXRC.JSON`` too, and refusing
-    a lookalike elsewhere is the safe side. The returned path carries the spelling found on disk.
-    Only the workspace root's own entries count; acpx does not walk into subdirectories (nor
-    does DSH for its ``.env``). Nothing is opened: a listing and at most one ``lstat``.
-    """
-    candidate = workspace / file_name
-    try:
-        names = os.listdir(workspace)
-    except (FileNotFoundError, NotADirectoryError):
-        return None
-    except OSError:
-        # Any other failure (access denied, for one) does not show the entry is absent.
-        return candidate
-    wanted = file_name.casefold()
-    for name in names:
-        if name.casefold() == wanted:
-            return workspace / name
-    try:
-        # The listing missed it; a direct lookup is the open the client itself would make.
-        os.lstat(candidate)
-    except (FileNotFoundError, NotADirectoryError):
-        return None
-    except OSError:
-        return candidate
-    return candidate
-
-
-def _path_forms(path: str | Path) -> set[str]:
-    """``path`` as written (made absolute) and with links resolved, both case-folded.
-
-    Raises ``OSError``/``ValueError`` when the path cannot be resolved; a caller refuses then.
-    A NUL is refused here: ``realpath`` does not reject one, and no OS path can hold it.
-    """
-    if "\0" in str(path):
-        raise ValueError("the path contains a NUL character")
-    return {
-        os.path.normcase(os.path.abspath(path)).casefold(),
-        os.path.normcase(os.path.realpath(path)).casefold(),
-    }
-
-
-def _same_or_inside(path: str, root: str) -> bool:
-    return path == root or path.startswith(root.rstrip("\\/") + os.sep)
-
-
-def path_inside(path: str | Path, root: str | Path) -> bool:
-    """``path`` is ``root`` or lies below it, as written or with links resolved.
-
-    The one containment rule of the launch checks. Both forms of both paths are compared
-    case-folded (:func:`_path_forms`), so a refusal built on it cannot be bypassed by spelling
-    a path in another case. Raises like :func:`_path_forms`.
-    """
-    return any(
-        _same_or_inside(form, root_form)
-        for form in _path_forms(path)
-        for root_form in _path_forms(root)
-    )
-
-
-def dsh_home_workspace_problem(dsh_home: str, workspaces: Sequence[Path]) -> str:
-    """Why a bound ``DSH_HOME`` may not be used with these directories, or ``""``.
-
-    DSH loads its patch layers (which can replace the sandbox and approval rows), ``AGENTS.md``,
-    skills and ``.env`` from its home, and never checks where that home is (documented at dsh
-    5badb150, not observed). A home the agent can write is therefore refused: one that equals or
-    lies inside any of ``workspaces`` (the agent's cwd, the user's checkout, the worktree
-    directory) - and one that contains any of them, which puts ``$DSH_HOME/AGENTS.md`` and the
-    home ``.env`` on the project's ancestry. Both the path as written and its links resolved are
-    compared, case-folded, and either one inside refuses: DSH compares the string it was given,
-    while a link or junction can point somewhere else. A path that cannot be resolved refuses.
-
-    A relative value is refused before anything is resolved: DSH would resolve it against the
-    directory it starts in - the workspace - and whether DSH expands a leading ``~`` is not
-    verified, so a ``~`` value is refused as relative too (``Path.is_absolute`` is ``False`` for
-    it). ``dsh_home`` empty (unbound) is no problem: the driver then gives each invocation its own
-    home under the data directory. Read-only: path resolution only, nothing is opened or created.
-    """
-    if not dsh_home:
-        return ""
-    if not Path(dsh_home).is_absolute():
-        return (
-            f"DSH_HOME {dsh_home!r} is not an absolute path: DSH would resolve it against the "
-            "directory it starts in - the workspace - and whether it expands a leading '~' is "
-            "not verified"
-        )
-    try:
-        home_forms = _path_forms(dsh_home)
-    except (OSError, ValueError) as exc:
-        return (
-            f"DSH_HOME {dsh_home} could not be resolved ({type(exc).__name__}: {exc}), so "
-            "whether it lies inside the workspace is unknown"
-        )
-    for workspace in workspaces:
-        try:
-            root_forms = _path_forms(workspace)
-        except (OSError, ValueError) as exc:
-            return (
-                f"the workspace {workspace} could not be resolved ({type(exc).__name__}: "
-                f"{exc}), so whether DSH_HOME {dsh_home} lies inside it is unknown"
-            )
-        if any(_same_or_inside(home, root) for home in home_forms for root in root_forms):
-            return (
-                f"DSH_HOME {dsh_home} is, or lies inside, {workspace}: the agent can write "
-                "there, and DSH loads its patch layers, AGENTS.md, skills and .env from its "
-                "home at the next launch"
-            )
-        if any(_same_or_inside(root, home) for home in home_forms for root in root_forms):
-            return (
-                f"{workspace} lies inside DSH_HOME {dsh_home}: the home's AGENTS.md and .env "
-                "would sit on the project's ancestry, inside what the agent works in"
-            )
-    return ""
-
-
-def credential_source_problem(
-    child_env: Mapping[str, str],
-    *,
-    dsh_home_kind: Literal["bound", "per_invocation"],
-    dsh_home: Path,
-) -> str:
-    """Why DSH started with ``child_env`` and this home would have no credential source, or ``""``.
-
-    User ruling 2026-10-07, "refuse before dispatch". DSH's credential precedence (documented at
-    dsh-v0.2.0-rc.2, not observed) is the launch environment, then ``$DSH_HOME/.credentials.yaml``,
-    then ``<cwd>/.env``, then ``$DSH_HOME/.env``. A real launch never starts on a workspace
-    ``.env`` (``workspace_env_file``), so what is left is ``DEEPSEEK_API_KEY`` among the child's
-    variable *names* and, for a bound home, a regular file by either home name - the facts
-    ``dsh_surfaces.credential_sources`` reports, by name and stat only (nothing is opened, sized
-    or hashed). With ``DSH_HOME`` unbound (``dsh_home_kind="per_invocation"``) the home is the
-    per-invocation one, created empty, so only the environment counts.
-
-    A presence check, not a validity check: an empty or revoked key, or a home file that holds no
-    credential, passes. What it rules out is the launch M0 observed fail with a no-API-key error
-    before any model work - which HFlow would record as ``outcome_unknown``, with the approved
-    submission spent and a ledger entry left for ``hflow ledger settle``.
-    """
-    # Imported here: ``dsh_surfaces`` imports this module.
-    from .dsh_surfaces import DEEPSEEK_API_KEY_NAME, ENV_FILE_NAME, STORED_CREDENTIALS_NAME
-    from .dsh_surfaces import credential_sources
-
-    sources = credential_sources(child_env, dsh_home_kind=dsh_home_kind, dsh_home=dsh_home)
-    if sources.visible:
-        return ""
-    key = (
-        f"{DEEPSEEK_API_KEY_NAME} is not in the launch environment (its name was looked for; no "
-        "value is ever read)"
-    )
-    if sources.dsh_home_kind == "per_invocation":
-        home = (
-            f"DSH_HOME is unbound, so DSH's home is the per-invocation {sources.dsh_home}, created "
-            "empty for each invocation (inferred from upstream source, not observed)"
-        )
-    else:
-        listed = ", ".join(f"{name} {state}" for name, state in sources.home_files)
-        home = (
-            f"the bound DSH home {sources.dsh_home} holds neither {STORED_CREDENTIALS_NAME} nor "
-            f"{ENV_FILE_NAME} as a regular file ({listed}; stat only, never opened)"
-        )
-    return (
-        f"no credential source is visible to DSH: {key}, and {home}; a workspace "
-        f"{ENV_FILE_NAME} is never launched on (workspace_env_file)"
-    )
-
-
-def spawn_workspaces(workspace: Path) -> list[Path]:
-    """The directories a launch in ``workspace`` must keep a bound DSH home out of.
-
-    The workspace itself, and - when it is a run's worktree (``<checkout>.hflow-worktrees/<id>``,
-    :data:`WORKTREE_PARENT_SUFFIX`) - that worktree directory and the user's checkout it was named
-    after. The checkout is derived from the name alone; admission checks the real project root.
-    """
-    absolute = Path(os.path.abspath(workspace))
-    roots = [absolute]
-    parent = absolute.parent
-    suffix = WORKTREE_PARENT_SUFFIX.casefold()
-    if parent.name.casefold().endswith(suffix) and len(parent.name) > len(suffix):
-        roots.append(parent)
-        roots.append(parent.parent / parent.name[: -len(suffix)])
-    return roots
-
-
 class AcpxDshDriver:
     """One implementation, one transport. It refuses rather than guessing."""
 
     driver_id = DRIVER_ID
     driver_version = DRIVER_VERSION
-    #: True only where HFlow can actually reach a protocol cancel for its launch mode. The pinned
-    #: ``exec`` has one (``session/cancel`` on SIGINT/SIGTERM/SIGHUP), but HFlow cannot deliver
-    #: those signals to its ``CREATE_NEW_PROCESS_GROUP`` child on Windows.
+    #: True only where HFlow can actually reach a protocol cancel for its launch mode; it cannot
+    #: here (:data:`NO_COOPERATIVE_CANCEL`).
     protocol_cancel_supported = False
 
     def __init__(
@@ -1435,11 +423,11 @@ class AcpxDshDriver:
         #: Set once all protocol state stopped growing. Only constant-size dispatch and drain
         #: counters may change afterwards; the retained raw file has its independent byte cap.
         self._events_capped: dict[str, bool] = {}
-        #: Highest byte offset ever read from a client's output file. Reported so the retention
-        #: bound is a measured number rather than a claim: the file is trimmed back to the budget,
-        #: but a client can write between two trims.
+        #: Highest byte offset ever read from the client's own protocol file, which HFlow never
+        #: trims: reported in the result's limitations (``_protocol_file_note``) as the measured
+        #: size it is, so "bounded" is claimed only of what HFlow retains.
         self._peak_raw_bytes: dict[str, int] = {}
-        #: Retained protocol stream per invocation, for the same reporting purpose as stderr.
+        #: Retained protocol stream per invocation, reported next to that size like stderr's.
         self._stdout_captures: dict[str, StreamCapture] = {}
         #: Fraction of the retention budget reserved for stderr. A *fraction* rather than a fixed
         #: number of bytes on purpose: with a fixed share, a small configured budget would leave
@@ -1514,11 +502,7 @@ class AcpxDshDriver:
         self._report_spawn(request, created=False, pid=None, detail=message)
         raise RefusedError(code, message)
 
-    def _agent_argv(self) -> list[str]:
-        """The launcher command as a real argv, as resolved before any approval."""
-        return list(self.launch.agent_argv)
-
-    def _child_env(self, handle_workspace: Path) -> dict[str, str]:
+    def _child_env(self) -> ChildEnvironment:
         """The environment a child process is started with: :func:`child_environment` applied
         to this process's environment, this driver's ``extra_env`` and the bound DSH home.
         """
@@ -1533,7 +517,7 @@ class AcpxDshDriver:
         notes = [
             "probe is static: no prompt, no session, no model request",
             f"acpx CLI: {self.acpx_cli}",
-            f"agent argv: {self._agent_argv()}",
+            f"agent argv: {self.launch.agent_argv}",
             NO_COOPERATIVE_CANCEL,
             "stopReason=end_turn is turn settlement, not success: acceptance is decided by "
             "checks and review",
@@ -1549,17 +533,15 @@ class AcpxDshDriver:
         ]
         notes.extend(self._content_notes())
         try:
-            from .dsh_surfaces import observe_launch_surfaces, probe_notes
-
             probe_home = child_home_for(self.data_dir.resolve(), INVOCATION_ID_PLACEHOLDER)
             kind, home = effective_dsh_home(self.launch, child_home=probe_home)
             notes.extend(
-                probe_notes(
-                    observe_launch_surfaces(
+                dsh_surfaces.probe_notes(
+                    dsh_surfaces.observe_launch_surfaces(
                         self.launch,
                         dsh_home=home,
                         dsh_home_kind=kind,
-                        child_env=self._child_env(self.data_dir),
+                        child_env=self._child_env(),
                         workspace=None,
                         look_in_home=kind == "bound",
                         child_home=probe_home,
@@ -1603,7 +585,7 @@ class AcpxDshDriver:
 
     # -- start / observe -----------------------------------------------------
 
-    def _client_argv(self, invocation_dir: Path, workspace: Path, deadline_seconds: int) -> list[str]:
+    def _client_argv(self, workspace: Path, deadline_seconds: int) -> list[str]:
         """The client command line, with the right interpreter for the entry point.
 
         The published acpx CLI is a Node program (``dist/cli.js``), so it must run under
@@ -1617,7 +599,7 @@ class AcpxDshDriver:
         """
         model = ["--model", self.launch.model] if self.launch.model else []
         return [
-            *self._client_prefix(),
+            *self.launch.client_argv_prefix,
             str(self.acpx_cli),
             "--cwd",
             str(workspace),
@@ -1646,8 +628,9 @@ class AcpxDshDriver:
         No session is created, no prompt is sent, no model is reachable from here. Callers
         must be explicit that they are running a metadata probe, never a task.
         """
-        argv = [*self._client_prefix(), str(self.acpx_cli), *(args or ["--version"])]
-        content_refusal = self._launch_content_refusal()
+        argv = [*self.launch.client_argv_prefix, str(self.acpx_cli), *(args or ["--version"])]
+        env = self._child_env()
+        content_refusal = self._launch_content_refusal(env)
         if content_refusal:
             raise RefusedError(RefusalCode.LAUNCH_CONTENT_CHANGED, content_refusal)
         work_dir = self.data_dir / "readonly-check"
@@ -1660,7 +643,7 @@ class AcpxDshDriver:
                 child = popen_in_boundary(
                     argv,
                     cwd=str(work_dir),
-                    env=self._child_env(work_dir),
+                    env=env,
                     boundary=boundary,
                     stdout_handle=stdout_handle,
                     stderr_handle=stderr_handle,
@@ -1694,14 +677,8 @@ class AcpxDshDriver:
             "process_gone": gone,
         }
 
-    def _client_prefix(self) -> list[str]:
-        """Interpreter prefix for the client entry point, as resolved before any approval."""
-        return list(self.launch.client_argv_prefix)
-
     def _content_notes(self) -> list[str]:
         """The probe's (and so doctor's) lines for the launch content binding."""
-        from .launch_content import CONTENT_BINDING_LABEL, content_lines
-
         if not self.launch.content_digests:
             return [
                 "launch content: not bound - this launch recorded no entry-file digests (it was "
@@ -1715,25 +692,10 @@ class AcpxDshDriver:
             *(f"launch content: {note}" for note in self.launch.content_notes),
         ]
 
-    def _launch_content_refusal(self) -> str:
-        """Why the launch entry files no longer match the launch's recorded content, or ``""``.
-
-        Hashes again (node.exe is ~90 MB, ~60 ms warm). Anything unexpected while checking is a
-        refusal too: the check fails closed. A file swapped after this check and before
-        ``CreateProcess`` is not caught - Windows offers no exec-by-handle.
-        """
-        from .launch_content import launch_content_changes
-
-        try:
-            changes = launch_content_changes(self.launch)
-        except Exception as exc:  # noqa: BLE001 - an unchecked launch is not started
-            changes = [f"the content check itself failed: {type(exc).__name__}: {exc}"]
-        if not changes:
-            return ""
-        return (
-            "the launch entry files no longer match the content bound when the launch was "
-            "resolved: " + "; ".join(changes) + "."
-        )
+    def _launch_content_refusal(self, env: Mapping[str, str] | None = None) -> str:
+        """:func:`launch.launch_content_refusal` for this launch, in ``env`` - the environment the
+        child is about to get (default: :meth:`_child_env`)."""
+        return launch_content_refusal(self.launch, env if env is not None else self._child_env())
 
     def _observe_launch(
         self, invocation_id: str, *, workspace: Path, env: Mapping[str, str], child_home: Path
@@ -1744,10 +706,8 @@ class AcpxDshDriver:
         leaves the record missing, with the reason kept for the result's limitations.
         """
         try:
-            from .dsh_surfaces import observe_launch_surfaces
-
             kind, home = effective_dsh_home(self.launch, child_home=child_home)
-            self._launch_surfaces[invocation_id] = observe_launch_surfaces(
+            self._launch_surfaces[invocation_id] = dsh_surfaces.observe_launch_surfaces(
                 self.launch,
                 dsh_home=home,
                 dsh_home_kind=kind,
@@ -1788,8 +748,7 @@ class AcpxDshDriver:
         self._prompt_digests[request.invocation_id] = prompt_digest
         config_path = self._write_config(invocation_dir, writes_allowed=request.writes_allowed)
 
-        boundary = ProcessBoundary().open()
-        argv = self._client_argv(invocation_dir, workspace, request.deadline_seconds)
+        argv = self._client_argv(workspace, request.deadline_seconds)
         # Recorded before the spawn gate: the deadline belongs to the invocation, and a process
         # that is created must already be bounded by it.
         self._invocation_deadlines[request.invocation_id] = (
@@ -1801,12 +760,10 @@ class AcpxDshDriver:
             run_id=request.run_id,
             role=request.role,
             workspace=str(workspace),
-            started_at=utc_now(),
-            process_identity=f"{request.invocation_id}:{os.getpid()}:{utc_now()}",
-            boundary_kind=boundary.kind,
+            boundary_kind="",  # set once the boundary is open, just before the spawn gate
             event_log=str(event_log),
         )
-        env = self._child_env(workspace)
+        env = self._child_env()
         # Absolute, resolved paths only: a relative home would resolve against the child's
         # cwd and silently point the client at the wrong config directory.
         child_home = (invocation_dir / CHILD_HOME_DIR_NAME).resolve()
@@ -1824,6 +781,12 @@ class AcpxDshDriver:
             request.invocation_id, workspace=workspace, env=env, child_home=child_home
         )
 
+        # Opened only now: nothing between here and the gate can fail, and a boundary opened
+        # before the setup above was left open by any failure in it (nothing collects or releases
+        # an invocation that never reached the gate).
+        boundary = ProcessBoundary().open()
+        handle.boundary_kind = boundary.kind
+
         # The child is created *inside* this gate, and both cancel entry points take the same
         # gate to record their request. That is what makes the handoff decidable: either the stop
         # is recorded first and no process is created at all, or the process is published first
@@ -1834,14 +797,21 @@ class AcpxDshDriver:
         # across ``collect`` would make cancellation block on the whole invocation, which is the
         # opposite of what a stop is for.
         with self._gate:
-            if self._stop_requests.get(request.invocation_id) or (
-                request.stop_requested is not None and request.stop_requested()
-            ):
+            try:
+                stopped = bool(self._stop_requests.get(request.invocation_id)) or (
+                    request.stop_requested is not None and request.stop_requested()
+                )
+                refusal = None if stopped else spawn_gate_refusal(
+                    self.launch, workspace=workspace, env=env, child_home=child_home
+                )
+            except BaseException:
+                boundary.close()
+                raise
+            if stopped:
                 # Nothing was created and nothing will be. The invocation is reported as
                 # cancelled without a process, so the controller's stop wins the handoff.
                 self._handles[request.invocation_id] = handle
                 handle.start_cancelled = True
-                handle.finished = True
                 boundary.close()
                 self._report_spawn(
                     request,
@@ -1852,95 +822,10 @@ class AcpxDshDriver:
                     ),
                 )
                 return handle
-            client_config = _workspace_root_entry(workspace, WORKSPACE_CLIENT_CONFIG_NAME)
-            if client_config is not None:
-                # Checked here, at the last moment before the process exists, for every
-                # invocation and both roles: the reviewer runs on the worktree the implementer
-                # wrote. Nothing is created and no handle is published, so a later stop or
-                # reconcile of this id truthfully finds that nothing was started. A file that
-                # is already in the starting workspace is refused earlier, by admission
-                # (``prepare.start_workspace_client_config``), while nothing is spent; one that
-                # appears later is caught here, when this dispatch is already reserved - so the
-                # message names the step that works then, not "submit again".
-                self._refuse_spawn(
-                    request,
-                    boundary,
-                    RefusalCode.WORKSPACE_CLIENT_CONFIG,
-                    f"{client_config} exists in the workspace. acpx always loads it and lets "
-                    "it override HFlow's launch, including the agent command, so no client "
-                    f"process was started. {_found_at_launch('with one')} Remove the file (or "
-                    "directory), then " + _NEW_REVISION_STEP,
-                )
-            env_file = _workspace_root_entry(workspace, WORKSPACE_ENV_FILE_NAME)
-            if env_file is not None:
-                # The same gate and the same reasoning as the client config above: DSH loads
-                # ``<cwd>/.env`` at launch. Listed and lstat'ed only - never opened, so what
-                # it sets is unknown and any entry by that name refuses. One already in the
-                # starting workspace is refused at admission
-                # (``prepare.start_workspace_env_file``).
-                self._refuse_spawn(
-                    request,
-                    boundary,
-                    RefusalCode.WORKSPACE_ENV_FILE,
-                    f"{env_file} exists in the workspace. DSH loads <cwd>/.env at launch "
-                    "into its own environment and its tool processes (documented upstream, "
-                    "not observed); HFlow never opens it, so no client process was started. "
-                    f"{_found_at_launch('with one')} Remove or rename the file (or directory), "
-                    "then " + _NEW_REVISION_STEP,
-                )
-            home_problem = dsh_home_workspace_problem(
-                self.launch.dsh_home, spawn_workspaces(workspace)
-            )
-            if home_problem:
-                # Admission refuses this against the project root and the worktree directory
-                # (``prepare.launch_dsh_home_problem``); checked again here against the
-                # role's actual cwd, for every invocation, before any process exists.
-                self._refuse_spawn(
-                    request,
-                    boundary,
-                    RefusalCode.DSH_HOME_IN_WORKSPACE,
-                    f"{home_problem}. No client process was started. Point DSH_HOME at an "
-                    "absolute directory outside the project, its worktrees and this "
-                    "workspace (or unset it, so each invocation gets its own home), then "
-                    "prepare again: DSH_HOME is part of the approved launch, so a real run "
-                    "needs an authorization for the new binding, and since this dispatch "
-                    "was already reserved the run stays blocked - submit a new revision.",
-                )
-            home_kind, dsh_home = effective_dsh_home(self.launch, child_home=child_home)
-            credential_problem = credential_source_problem(
-                env, dsh_home_kind=home_kind, dsh_home=dsh_home
-            )
-            if credential_problem:
-                # Judged on the environment this child is about to be given and the home it
-                # would use, for every invocation - a repair round's included - so a variable
-                # removed, or a home file deleted, after admission is caught here. Admission
-                # refuses the same rule before anything is reserved
-                # (``prepare.launch_credential_problem``). Names and stat only.
-                self._refuse_spawn(
-                    request,
-                    boundary,
-                    RefusalCode.NO_CREDENTIAL_SOURCE,
-                    f"{credential_problem}. No client process was started: without a "
-                    "credential DSH fails with a no-API-key error before any model work "
-                    f"(observed in M0). {_found_at_launch('without one')} Make "
-                    "a credential visible - DEEPSEEK_API_KEY in the environment hflow runs "
-                    "in, or a .credentials.yaml or .env in a bound DSH home - then "
-                    + _NEW_REVISION_STEP
-                    + " This is a presence check: it does not prove a credential is valid.",
-                )
-            content_refusal = self._launch_content_refusal()
-            if content_refusal:
-                # The last check before the process exists: the entry files are hashed again
-                # and compared with what the launch recorded. Nothing is created and no handle
-                # is published, as for the workspace config above.
-                self._refuse_spawn(
-                    request,
-                    boundary,
-                    RefusalCode.LAUNCH_CONTENT_CHANGED,
-                    f"{content_refusal} No client process was started; the run stays "
-                    "blocked. Run `hflow prepare` again to see the files' current digests and "
-                    "re-issue the authorization for them.",
-                )
+            if refusal is not None:
+                # Nothing is created and no handle is published, so a later stop or reconcile of
+                # this id truthfully finds that nothing was started.
+                self._refuse_spawn(request, boundary, *refusal)
             stdout_handle = None
             try:
                 stdout_handle = stdout_path.open("wb")
@@ -2186,7 +1071,7 @@ class AcpxDshDriver:
             "defaultPermissions": mode,
             "ttl": 30,
             "format": "json",
-            "agents": {DRIVER_ID: {"argv": self._agent_argv()}},
+            "agents": {DRIVER_ID: {"argv": list(self.launch.agent_argv)}},
         }
         path = invocation_dir / "acpx-config.json"
         path.write_text(json.dumps(config, indent=2), encoding="utf-8")
@@ -2220,8 +1105,8 @@ class AcpxDshDriver:
         claimed is a bound on the client's own file (``stdout.ndjson``): the client owns that file
         and keeps writing to it, and HFlow does not truncate a file another process is writing -
         that removes bytes nobody has read and can leave a hole. Its measured size is reported
-        instead (``peak_raw_bytes``), so the difference between "bounded" and "measured" is
-        visible rather than implied.
+        instead, as a limitation of the result (``_protocol_file_note``), so the difference between
+        "bounded" and "measured" is visible rather than implied.
 
         Raw chunks are retained before decoding or framing. An over-long line is discarded
         through its next newline: resetting the buffer alone would turn its tail into a new
@@ -2358,15 +1243,36 @@ class AcpxDshDriver:
         if observed.event is not None:
             self._events[invocation_id].append(observed.event)
 
+    def _protocol_file_note(self, handle: DriverHandle) -> str:
+        """The limitation that reports the client's protocol file as measured, not bounded.
+
+        The client writes ``stdout.ndjson`` itself and HFlow does not trim a file another process
+        is writing (see ``_read_stream``), so its size is reported - the highest offset the reader
+        reached - next to what HFlow retained of it in ``events.ndjson``.
+        """
+        invocation_id = handle.invocation_id
+        client_file = Path(handle.event_log).parent / "stdout.ndjson"
+        note = (
+            f"client protocol file {client_file}: {self._peak_raw_bytes.get(invocation_id, 0)} "
+            "bytes read from it (measured, not bounded: the client writes it and HFlow never "
+            "trims it)"
+        )
+        capture = self._stdout_captures.get(invocation_id)
+        if capture is None:
+            return note + "; the reader did not finish, so no retained copy is recorded"
+        return (
+            f"{note}; retained {capture.retained_bytes} of {capture.total_bytes} bytes at "
+            f"{capture.path}"
+            + (" (truncated: the retained file is the head only)" if capture.truncated else "")
+        )
+
     def _limit_output(self, invocation_id: str, reason: str) -> None:
         self._overflow[invocation_id] = True
         self._events_capped[invocation_id] = True
         self._output_limit_reasons[invocation_id].add(reason)
 
     def _note_dispatch(self, invocation_id: str) -> None:
-        handle = self._handles[invocation_id]
-        handle.dispatched = True
-        handle.dispatched_at = handle.dispatched_at or utc_now()
+        self._handles[invocation_id].dispatched = True
 
     def _consume_stderr(self, invocation_id: str, stderr_path: Path) -> None:
         """Drain the client's stderr from its pipe into a bounded sink.
@@ -2592,7 +1498,6 @@ class AcpxDshDriver:
                 error_message="the invocation was stopped before its process was created",
                 raw_ref=str(handle.event_log),
             )
-            handle.finished = True
             self._results[invocation_id] = result
             return result
         process = self._processes[invocation_id]
@@ -2807,6 +1712,7 @@ class AcpxDshDriver:
                 f"{stderr_capture.total_bytes} bytes at {stderr_capture.path}"
                 + (" (truncated: the retained file is the head only)" if stderr_capture.truncated else "")
             )
+        limitations.append(self._protocol_file_note(handle))
         if overflowed:
             limitations.append(
                 "protocol state stopped accumulating after "
@@ -2917,7 +1823,6 @@ class AcpxDshDriver:
             stream_order=stream_order,
             launch_surfaces=self._launch_surfaces.get(invocation_id),
         )
-        handle.finished = True
         self._results[invocation_id] = result
         return result
 
@@ -2946,6 +1851,7 @@ class AcpxDshDriver:
             "the invocation deadline was reached while waiting for the client; the "
             "managed process boundary was used to stop it",
             stop_detail,
+            self._protocol_file_note(handle),
         ]
         if self._surface_notes.get(invocation_id):
             limitations.append(self._surface_notes[invocation_id])
@@ -3433,9 +2339,7 @@ class AcpxDshDriver:
         exited but left processes in its boundary. The mechanism is identical and the *meaning* is
         not, which is why the caller records the meaning: a stop is "a human ended this", a
         deadline is "we stopped waiting", the last is "the invocation is over, its leftovers are
-        not". None is a cooperative protocol cancel: the pinned ``exec`` cancels only on
-        SIGINT/SIGTERM/SIGHUP, which HFlow cannot deliver to this client (see the module
-        docstring).
+        not". None is a cooperative protocol cancel (:data:`NO_COOPERATIVE_CANCEL`).
 
         Returns ``(stopped, emptied, detail)``. ``stopped`` is true only when the boundary was
         emptied *and* the process is gone; ``emptied`` is reported separately because
@@ -3467,9 +2371,7 @@ class AcpxDshDriver:
             # A bounded wait, not a request: the stdin writer closes the client's stdin once the
             # task is written (``_feed_stdin``), so there is no EOF left to send and nothing here
             # asks it to stop. A client that is about to exit on its own gets this long before the
-            # boundary is terminated. The close is a defensive no-op for that already-closed pipe,
-            # and is skipped while the writer still owns it.
-            self._close_client_stdin(process, invocation_id)
+            # boundary is terminated.
             try:
                 wait_interruptibly(process, FORCE_STOP_GRACE_SECONDS)
             except subprocess.TimeoutExpired:
@@ -3544,18 +2446,6 @@ class AcpxDshDriver:
             if gone is None:
                 # An unanswered check returns immediately: wait out the step a timed check takes.
                 time.sleep(0.05)
-
-    def _close_client_stdin(self, process: subprocess.Popen, invocation_id: str | None = None) -> None:
-        writer = self._threads.get(f"{invocation_id}:stdin") if invocation_id else None
-        if writer is not None and writer.is_alive():
-            # The writer owns stdin while it runs: closing a buffered writer here would wait on
-            # the lock its blocked write holds. The boundary teardown is what unblocks it.
-            return
-        if process.stdin is not None and not process.stdin.closed:
-            try:
-                process.stdin.close()
-            except OSError:
-                pass
 
     def _teardown_lock(self, invocation_id: str) -> threading.Lock:
         """The lock that serializes this invocation's boundary teardown (see ``__init__``)."""
@@ -3715,11 +2605,7 @@ class AcpxDshDriver:
                         "stdin writer still blocked at release; the pipe is left to it and is "
                         "closed when its write ends"
                     )
-                    notes = self._release_notes.setdefault(invocation_id, [])
-                    if note not in notes:
-                        notes.append(note)
-                    continue
-                if (
+                elif (
                     stream is process.stderr
                     and stderr_reader is not None
                     and stderr_reader.is_alive()
@@ -3728,6 +2614,9 @@ class AcpxDshDriver:
                         "stderr reader still blocked at release; the pipe is left to it and is "
                         "closed when its last writer exits"
                     )
+                else:
+                    note = ""
+                if note:
                     notes = self._release_notes.setdefault(invocation_id, [])
                     if note not in notes:
                         notes.append(note)

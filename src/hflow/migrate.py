@@ -710,7 +710,18 @@ def _backup(conn: sqlite3.Connection, database: Path, from_version: int) -> Path
     target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.with_name(target.name + ".partial")
     for stale in (partial, *_sidecars(partial)):
-        stale.unlink(missing_ok=True)
+        try:
+            stale.unlink(missing_ok=True)
+        except OSError as exc:
+            # The snapshot is taken before the migration's write lock, so a second process opening
+            # the same old ledger can be writing this very copy (on Windows its open handle makes
+            # the unlink fail). Fail closed, and say that a retry is the answer.
+            raise MigrationError(
+                f"{database} needs a migration from storage version {from_version}, but the "
+                f"in-progress snapshot copy {stale} cannot be removed ({exc}). Another process is "
+                "probably opening this ledger and taking the same snapshot right now. The ledger "
+                "was not changed; open it again once that process has finished."
+            ) from exc
     try:
         destination = sqlite3.connect(str(partial))
         try:
@@ -1039,10 +1050,13 @@ def migrate(
                 (str(supported),),
             )
             step(f"storage_version={supported}")
+            # Inside the ``try``: a failed COMMIT is rolled back below while the transaction is
+            # still open, and an error that already rolled it back keeps its own exception.
+            conn.execute("COMMIT")
         except BaseException:
-            conn.execute("ROLLBACK")
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             raise
-        conn.execute("COMMIT")
     finally:
         if suspended_foreign_keys:
             conn.execute("PRAGMA foreign_keys = ON")

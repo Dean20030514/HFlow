@@ -78,7 +78,23 @@ Git 最低版本：`merge-tree --write-tree` 需要 2.38，`--merge-base` 需要
 
 ### 2.6 退出码
 
-子命令完成了所要求的事时为 0：`prepare` 得到 `ready`，`apply` 得到 `integrated`，`reconcile` 得到 `ready` 或 `integrated`。需要操作者决定时为 3：`conflict`、`checks_failed`、`stale`、`interrupted`、`superseded`、`failed`，目标被检出时的交接，以及 ref 更新失败后回到 `ready`。另一进程仍在处理、或记录的进程可能仍在运行时为 5。拒绝且未写入时为 2，Git 错误也算在内。未知 id 为 4，存储的记录无法校验为 6。
+子命令（`prepare` / `apply` / `reconcile`）完成了所要求的事时为 0：`prepare` 得到 `ready`，`apply` 得到 `integrated`，`reconcile` 得到 `ready` 或 `integrated`。需要操作者决定时为 3：`conflict`、`checks_failed`、`stale`、`interrupted`、`superseded`、`failed`，目标被检出时的交接，以及 ref 更新失败后回到 `ready`——目标 ref 被锁住（`<ref>.lock` 由另一 Git 进程持有或崩溃遗留）也属此类：HFlow 不预先查找锁文件，由 Git 自己的 compare-and-set 以 "cannot lock" 失败，记录回到 `ready`，锁文件从不删除。另一进程仍在处理、或记录的进程可能仍在运行时为 5。拒绝且未写入时为 2，Git 错误也算在内。未知 id、需要 `--project`、`--owner-gone` 的 `--attest` 不合格时为 4。存储的记录无法校验为 6。
+
+`hflow integrate <run-id>`（见 2.7）：没有交互终端而停在 `ready`、或已 `integrated` 时为 0；确认码不符（什么都没写）、拒绝或 Git 错误为 2；交接、`stale`、`interrupted`、`conflict`、`checks_failed`、`failed`，以及 ref 更新失败后回到 `ready` 为 3；未知 run、没有默认目标、需要 `--project`、`--attest` 不合格为 4；另一进程可能仍在处理为 5；记录无法校验为 6。
+
+### 2.7 追加：`hflow integrate <run-id>` 与自动清理（2026-10-16，原契约之外的增补）
+
+本节是对上述原契约的追加，不改变 2.1–2.5 的规则：它把同样的操作按记录状态串成一条可重入的命令，并在集成完成后释放 run 的工作树。
+
+- 继续的记录：run 若有 `integrated` 的记录就取它，否则取最新的；给了 `--target` 时只看该分支的记录。
+  - 没有记录，或最新记录为 `stale` / `interrupted` / `failed` / `superseded`：执行 `prepare`。目标依次取 `--target`、该记录的分支、任务的 base 分支（须是 run 所记录仓库中的本地分支，否则退出 4，要求 `--target`）。
+  - `ready`：先执行 `reconcile`（交接后的手工合并记为 `integrated`，目标移动记为 `stale`）。仍为 `ready` 时：标准输入不是交互终端（含 NUL 设备）就停下，退出 0，`next:` 提示到交互终端再运行；在终端上，把记录与一个 8 位十六进制确认码打印到 stderr，由人输入确认码（不区分大小写），匹配后才执行 `apply`，`--expect-target` 绑定为刚展示的 tip，期间目标移动则为 `stale`。目标被检出时打印 `git -C <checkout> merge --ff-only <M>`，再提示 `next: hflow integrate <run-id>`（退出 3），合并后再运行一次即记录。
+  - `preparing` / `checking` / `applying`：执行 `reconcile`，`--owner-gone --attest` 原样传递。
+  - `integrated`：只报告。`conflict` / `checks_failed`：只报告（退出 3），不再自动 prepare，是否重新 prepare 由操作者决定。
+- 确认码取集成 id、run id、目标 ref、tip `T`、提交 `M`、checks digest、内容指纹与 evidence 的 SHA-256 前 8 位；它让应用成为看过这些事实之后的有意动作，不是身份认证。
+- 自动清理：`integrate <run-id>`、`integrate apply` 或 `integrate reconcile` 在本进程内把集成推进到 `integrated` 时（`integrate <run-id>` 遇到已 `integrated` 的记录时也是），执行与 `hflow clean <run-id> --apply` 相同的受保护清理（不加 force）；拒绝与 `PARTIAL` 以 `cleanup <STATUS>: ...` 打印，从不改变退出码；`--keep-worktree` 跳过。
+- 集成检查前后对比共享 Git 元数据快照：有变化则记 `checks_failed`（detail 以 "shared Git metadata changed" 开头），集成工作树保留（`LEFT`，不再读 status），并给 run 写 `git_metadata: changed|unreadable during integration ...` 的 note；此后 `hflow clean` 以 `git_metadata_changed` 拒绝该 run，直到元数据与派发前的快照一致。
+- 2.2 第 4 步的"被检出"判断不区分分支名的大小写。
 
 ## 3. I1 账本收口
 

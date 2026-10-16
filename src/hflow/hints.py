@@ -1,16 +1,20 @@
-"""What the operator runs next, derived from stored facts only (batch K).
+"""What the operator runs next, derived from stored facts only.
 
-A run's life after ``hflow run`` is a chain of commands - ``integrate prepare``, ``integrate
-apply`` (or a hand merge and ``integrate reconcile``), ``clean`` and, after an interruption,
-``resume`` and ``ledger settle`` - each needing the right ids and the right ``--data-dir``.
+A run's life after ``hflow run`` is a chain of commands - ``integrate <run-id>`` (which prepares,
+asks for the confirmation code and applies, or hands a checked-out branch's merge over and then
+records it), ``clean`` when the run is not integrated and, after an interruption, ``resume`` and
+``ledger settle`` - each needing the right ids and the right ``--data-dir``.
 :func:`next_steps` reads what the ledger recorded about one run and returns the command(s) that
 come next, ready to paste; ``status``, ``resume``, ``ledger settle`` and ``integrate`` print them
 as ``next: <command>`` lines in their text output (never in ``--json``).
 
 What this module never does: call a model, probe a process, run Git, read a project file or
-write anything. Besides the ledger it reads one thing, for an accepted Git candidate: whether the
-task's base branch still exists, from the ref files of the Git directory the run recorded
-(:func:`existing_branch`), so ``integrate prepare --target`` can name it. A command whose effect
+write anything. Besides the ledger it reads two things, for an accepted Git candidate only, from
+files of the Git directory the run recorded: whether the task's base branch still exists
+(:func:`existing_branch`), so the hint can leave ``--target`` to the command's own default, and
+where a ready
+integration's target branch is checked out (:func:`checked_out_worktree`), so the ``hflow
+integrate <run-id>`` line can say it will hand the merge over there. A command whose effect
 depends on something only the command itself can observe (an owner that may still be alive, a
 branch some worktree has checked out) is printed with a trailing ``# ...`` comment saying so - the
 command decides, the hint does not.
@@ -196,7 +200,7 @@ class RunFacts:
     legacy_owner: bool = False
     #: The task's ``workspace.base_commit`` when it names a local branch that exists in the
     #: repository the run recorded (:func:`existing_branch`); ``""`` otherwise. Read for an
-    #: accepted Git candidate only: it prefills ``integrate prepare --target``.
+    #: accepted Git candidate only: ``integrate <run-id>`` defaults its target to it.
     base_branch: str = ""
     #: A live run's recorded owner process (``runs.owner_pid``) and since when it holds the run
     #: (``claimed_at``, else ``created_at``); ``None`` / ``""`` when not recorded.
@@ -206,6 +210,9 @@ class RunFacts:
     #: recorded (``None`` when there is no readable binding). Read for a live run only.
     updated_at: str = ""
     deadline_seconds: int | None = None
+    #: The worktree that has the newest integration's target branch checked out, when that
+    #: integration is ``ready`` (:func:`checked_out_worktree`); ``""`` otherwise or when unknown.
+    target_checkout: str = ""
 
 
 #: A branch name a hint may prefill: plain path segments - nothing Git would read as a revision
@@ -232,7 +239,7 @@ def existing_branch(base: str, git_common_dir: str) -> str:
     Existence is read from the ref files - a loose ``refs/heads/<name>`` or a ``packed-refs``
     line - never by running Git. A repository whose refs are stored otherwise (reftable), a name
     that is a commit id or not a plain branch name, or a directory that cannot be read gives
-    ``""``: the hint keeps its placeholder, and ``integrate prepare`` checks the branch itself.
+    ``""``: the hint names ``--target`` with a placeholder, and the command checks the branch.
     """
     name = base.removeprefix("refs/heads/")
     if (
@@ -257,6 +264,57 @@ def existing_branch(base: str, git_common_dir: str) -> str:
     except OSError:
         return ""
     return ""
+
+
+def _names_ref(head: Path, wanted: str) -> bool:
+    """Whether the ``HEAD`` file ``head`` is a symbolic ref to ``wanted`` (case-folded)."""
+    try:
+        text = head.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return False
+    return text.startswith("ref:") and text[4:].strip().casefold() == wanted
+
+
+def checked_out_worktree(target_ref: str, git_common_dir: str) -> str:
+    """The worktree that has ``target_ref`` checked out, read from its ``HEAD`` file; else ``""``.
+
+    File-only, like :func:`existing_branch`: the main worktree's ``<common>/HEAD`` and each linked
+    worktree's ``<common>/worktrees/<id>/HEAD``, compared without regard to case (a loose ref on a
+    case-insensitive filesystem is the same branch). The main worktree is named only in the usual
+    layout - the common directory is its ``.git`` - and a linked one by its ``gitdir`` file. A
+    rebase or bisect in progress, a bare or otherwise laid-out repository, or a directory that
+    cannot be read gives ``""``: the hint then carries no location, and ``hflow integrate``
+    checks what Git checks and hands off by itself.
+    """
+    if not git_common_dir or not target_ref.startswith("refs/heads/"):
+        return ""
+    common = Path(git_common_dir)
+    wanted = target_ref.casefold()
+    try:
+        if common.name.casefold() == ".git" and _names_ref(common / "HEAD", wanted):
+            return os.path.normpath(common.parent)
+        linked = common / "worktrees"
+        for admin in sorted(linked.iterdir()) if linked.is_dir() else []:
+            if not admin.is_dir() or not _names_ref(admin / "HEAD", wanted):
+                continue
+            recorded = (admin / "gitdir").read_text(encoding="utf-8", errors="replace").strip()
+            path = recorded.removesuffix(".git").rstrip("/\\")
+            if path:
+                return os.path.normpath(os.path.join(admin, path))
+    except OSError:
+        return ""
+    return ""
+
+
+def _target_checkout(integrations: tuple[IntegrationRecord, ...]) -> str:
+    """:attr:`RunFacts.target_checkout`; ``""`` whenever it cannot be read (a hint never fails)."""
+    if not integrations or integrations[-1].state is not IntegrationState.READY:
+        return ""
+    latest = integrations[-1]
+    try:
+        return checked_out_worktree(latest.target_ref, latest.git_common_dir)
+    except Exception:  # noqa: BLE001 - an unreadable directory means no location, not a failure
+        return ""
 
 
 def _base_branch(store: Store, run_id: str, task_spec_json: str) -> str:
@@ -299,6 +357,8 @@ def run_facts(store: Store, run_id: str) -> RunFacts:
     delivery_state = str(row["delivery_state"] or DeliveryState.NONE.value)
     live = task_state in _LIVE_STATES
     owner_pid = row["owner_pid"] if live and "owner_pid" in keys else None
+    integrations = tuple(store.integrations_for(run_id))
+    can_integrate = integrable(task_state, delivery_state, git_candidate)
     return RunFacts(
         run_id=run_id,
         task_state=task_state,
@@ -307,7 +367,7 @@ def run_facts(store: Store, run_id: str) -> RunFacts:
         git_candidate=git_candidate,
         worktree_state=str(row["worktree_state"] or "NONE"),
         worktree_path=str(row["worktree_path"] or ""),
-        integrations=tuple(store.integrations_for(run_id)),
+        integrations=integrations,
         open_entries=tuple(
             entry.invocation_id for entry in entries if entry.state.value in INVOCATION_OPEN_STATES
         ),
@@ -319,10 +379,9 @@ def run_facts(store: Store, run_id: str) -> RunFacts:
         unreconciled=unreconciled,
         legacy_owner=legacy,
         base_branch=(
-            _base_branch(store, run_id, str(row["task_spec_json"] or ""))
-            if integrable(task_state, delivery_state, git_candidate)
-            else ""
+            _base_branch(store, run_id, str(row["task_spec_json"] or "")) if can_integrate else ""
         ),
+        target_checkout=_target_checkout(integrations) if can_integrate else "",
         owner_pid=int(owner_pid) if owner_pid is not None else None,
         owner_since=str((row["claimed_at"] or row["created_at"]) or "") if live else "",
         updated_at=str(row["updated_at"] or "") if live else "",
@@ -348,8 +407,17 @@ def _branch(target_ref: str) -> str:
     return target_ref.removeprefix("refs/heads/")
 
 
-def _prepare(facts: RunFacts, data_dir: str | None, target: str, project: str | None) -> str:
-    words = ["integrate", "prepare", word(facts.run_id), "--target", target]
+def _integrate(
+    facts: RunFacts, data_dir: str | None, project: str | None, target: str | None = None
+) -> str:
+    """``hflow integrate <run-id>``: it prepares when nothing is ready, then asks for the code.
+
+    ``target`` is named only when the command's own default (the newest integration's branch,
+    else the task's base branch) would not find one.
+    """
+    words = ["integrate", word(facts.run_id)]
+    if target is not None:
+        words += ["--target", target]
     if project is not None:
         words += ["--project", project]
     return command(data_dir, *words)
@@ -383,29 +451,33 @@ def _integration_steps(
             # usual target. Another branch is the operator's to name; prepare checks it either way.
             return [
                 _with_comment(
-                    _prepare(facts, data_dir, word(facts.base_branch), project),
-                    "from the task's base",
+                    _integrate(facts, data_dir, project),
+                    f"prepares it against {facts.base_branch} (the task's base), then asks for "
+                    "its code at a terminal",
                 )
             ], False
-        return [_prepare(facts, data_dir, BRANCH_PLACEHOLDER, project)], False
+        return [_integrate(facts, data_dir, project, BRANCH_PLACEHOLDER)], False
     latest = records[-1]
     if latest.state is IntegrationState.READY:
-        return [
-            _with_comment(
-                command(
-                    data_dir, "integrate", "apply", word(latest.integration_id),
-                    "--expect-target", word(latest.target_tip),
-                ),
-                "a checked-out branch is never moved: apply then prints the merge to run "
-                "yourself and the reconcile that records it",
-            )
-        ], False
+        # `integrate <run-id>` rather than `integrate apply <id> --expect-target <tip>`: it shows
+        # the integration and applies it only once its confirmation code is typed at a terminal,
+        # and after a hand-off the same command records the merge. When the target is checked out
+        # (the usual case: `init task` bases a task on the current branch) the line says where,
+        # since that command will hand the merge over rather than move the branch.
+        why = (
+            f"{_branch(latest.target_ref)} is checked out at {facts.target_checkout}: after you "
+            "type the code it prints the merge to run there, then run this again"
+            if facts.target_checkout
+            else "at a terminal: type the code it shows to apply it; a checked-out branch is "
+            "handed to you to merge, then run this again"
+        )
+        return [_with_comment(command(data_dir, "integrate", word(facts.run_id)), why)], False
     if latest.state in _PREPARE_AGAIN:
         return [
             _with_comment(
-                _prepare(facts, data_dir, word(_branch(latest.target_ref)), project),
-                f"the last integration ended {latest.state.value}; prepare against the "
-                "branch's current tip",
+                _integrate(facts, data_dir, project),
+                f"the last integration ended {latest.state.value}; prepares again against "
+                f"{_branch(latest.target_ref)}'s current tip",
             )
         ], False
     # conflict / checks_failed: nothing HFlow can apply; the decision is the operator's.

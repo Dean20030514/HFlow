@@ -426,8 +426,8 @@ def test_pasting_each_printed_attestation_hint_verbatim_is_refused(
     assert main(_pasted(resume_hint)) == EXIT_USAGE
     err = capsys.readouterr().err
     assert "is a placeholder" in err and "nothing was done" in err, err
-    # The settle hint printed beside it, pasted before resume: refused as well.
-    assert main(_pasted(settle_hint)) == EXIT_REFUSED
+    # The settle hint printed beside it, pasted before resume: refused as well, the same way.
+    assert main(_pasted(settle_hint)) == EXIT_USAGE
     capsys.readouterr()
     assert _recorded(store, run_id) == before, "nothing was closed, settled or noted"
 
@@ -440,7 +440,7 @@ def test_pasting_each_printed_attestation_hint_verbatim_is_refused(
     (settle_hint,) = [s for s in next_steps(store, run_id) if s.startswith("hflow ledger settle")]
     assert f"--attest {ATTEST_PLACEHOLDER} --legacy-owner-gone" in settle_hint, settle_hint
     argv = _pasted(settle_hint)
-    assert main(argv) == EXIT_REFUSED
+    assert main(argv) == EXIT_USAGE
     err = capsys.readouterr().err
     assert "is a placeholder" in err and "replace the placeholder" in err, err
     assert store.invocation("I-legacy").state is InvocationStartState.UNKNOWN

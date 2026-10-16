@@ -47,7 +47,6 @@ from .contracts import (
     RootBudgetLimits,
     RunPlan,
 )
-from .paths import ENV_ALLOW_WRITES
 from .prepare import Resolution, pending_binding, root_binding_for
 from .profiles import (
     ENV_PROFILE,
@@ -72,14 +71,15 @@ RESOLUTION_FLAGS = (
     ("project_root", "--project-root"),
     ("profile", "--profile"),
     ("driver", "--driver"),
-    ("base_commit", "--base-commit"),
-    ("workspace", "--workspace"),
-    ("authorization_mode", "--authorization-mode"),
+    ("allow_writes", "--allow-writes"),
     ("root_budget_file", "--root-budget-file"),
     ("repair_policy_file", "--repair-policy-file"),
 )
 DEFAULT_PROJECT_ROOT = "."
-DEFAULT_AUTHORIZATION_MODE = "m2-live-change"
+#: ``PlanArguments`` keys an older build recorded from flags it no longer has (``--base-commit``,
+#: ``--workspace``): the task file carries both. A plan that set one is refused with the command
+#: that prepares it again; a plan that left them ``null`` loads without them.
+RETIRED_PLAN_ARGUMENTS = {"base_commit": "--base-commit", "workspace": "--workspace"}
 
 
 def prepare_command(arguments: PlanArguments, plan_path: Path) -> str:
@@ -87,20 +87,20 @@ def prepare_command(arguments: PlanArguments, plan_path: Path) -> str:
 
     Rebuilt from the inputs the plan recorded (absolute paths, the profile it named), so
     re-preparing a stale plan does not mean retyping every flag. A profile the plan did not name
-    is left out, so ``HFLOW_PROFILE`` decides again, as it did the first time; the default
-    authorization mode is left out too, and ``--data-dir`` is added when the plan's data
-    directory is not the default one. It resolves afresh: what it prints is a new plan to review.
+    is left out, so ``HFLOW_PROFILE`` decides again, as it did the first time, and
+    ``--data-dir`` is added when the plan's data directory is not the default one (an older
+    plan's ``authorization_mode`` has no flag: a re-prepared plan is for ``m2-live-change``). It
+    resolves afresh: what it prints is a new plan to review. ``--allow-writes`` is printed when
+    the plan recorded the write opt-in, however it was given then.
     """
     from .hints import command, data_dir_word, word
 
     words = ["prepare"]
     for field, flag in RESOLUTION_FLAGS:
         value = getattr(arguments, field)
-        if value is None or (
-            field == "authorization_mode" and value == DEFAULT_AUTHORIZATION_MODE
-        ):
+        if value is None or value is False:
             continue
-        words += [flag, word(str(value))]
+        words += [flag] if value is True else [flag, word(str(value))]
     words += ["--plan-out", word(os.path.abspath(plan_path))]
     return command(data_dir_word(arguments.data_dir), *words)
 
@@ -117,8 +117,8 @@ def frozen_arguments(
     profile records ``None``, and then a later ``HFLOW_PROFILE`` does change what ``approve`` and
     ``run --plan`` resolve. That is not a way round the plan: the binding names the profile, so the
     new resolution is refused as a stale plan, or - an offline plan now resolving to a real driver
-    - as a run with no authorization. ``base_commit`` stays as given: a ref resolves again, and a
-    moved branch then shows as a changed binding.
+    - as a run with no authorization. The task's ``workspace.base_commit`` stays as the task file
+    says: a ref resolves again, and a moved branch then shows as a changed binding.
     """
 
     def absolute(value: str | None) -> str | None:
@@ -247,6 +247,7 @@ def load_plan(path: Path) -> RunPlan:
             f"{path} is not an HFlow plan (no \"kind\": \"hflow-plan\"); write one with "
             "`hflow prepare ... --plan-out <file>`",
         )
+    _upgrade_plan_arguments(raw, Path(path))
     try:
         return RunPlan.model_validate(raw)
     except ValidationError as exc:
@@ -254,6 +255,44 @@ def load_plan(path: Path) -> RunPlan:
             RefusalCode.INVALID_SPEC,
             f"{path} is not a valid plan: {summarize_validation_error(exc)}",
         ) from exc
+
+
+def _upgrade_plan_arguments(raw: dict, path: Path) -> None:
+    """Read an older plan's ``arguments`` as this build records them, or refuse the plan.
+
+    * No ``allow_writes`` (a plan from before ``--allow-writes``): the write permission the plan's
+      own report recorded (``effective_config.implementer_writes``) - the value its binding digest,
+      and any approval of it, already cover. The environment is not read.
+    * :data:`RETIRED_PLAN_ARGUMENTS` left ``null`` are dropped. A plan that set one resolved a task
+      other than its file says, and no flag reproduces that any more, so it is refused - naming the
+      command that prepares it again from the task file - rather than run with the override
+      silently gone (or failing as an unknown field).
+    """
+    arguments = raw.get("arguments")
+    if not isinstance(arguments, dict):
+        return
+    if "allow_writes" not in arguments:
+        report = raw.get("prepare_report")
+        config = report.get("effective_config") if isinstance(report, dict) else None
+        arguments["allow_writes"] = (
+            isinstance(config, dict) and config.get("implementer_writes") is True
+        )
+    given = []
+    for key, flag in RETIRED_PLAN_ARGUMENTS.items():
+        if key in arguments and arguments.pop(key) is not None:
+            given.append(flag)
+    if not given:
+        return
+    try:
+        again = ": " + prepare_command(PlanArguments.model_validate(arguments), path)
+    except ValidationError:
+        again = " with `hflow prepare ... --plan-out <file>`"
+    raise RefusedError(
+        RefusalCode.INVALID_SPEC,
+        f"{path} was prepared with {' and '.join(given)}, which this build no longer has: the "
+        "task file's workspace.mode and workspace.base_commit are the only source. Nothing was "
+        "written or dispatched; put the value in the task file and re-prepare the plan" + again,
+    )
 
 
 #: The binding key whose change :func:`plan_drift` explains field by field.
@@ -266,16 +305,15 @@ def _environment_sources(plan: RunPlan) -> dict[str, str]:
     ``prepare``, ``approve`` and ``run --plan`` each resolve the plan in their own process, so a
     shell with another value of one of these variables resolves another configuration - and the
     plan turns stale with only a digest to show for it. Leaf field name -> the variables it is
-    read from: ``prepare.resolve_permissions`` (the write opt-in) and
-    ``acpx_dsh.resolve_launch_config`` (a real role's launch: ``dsh``/``python``/``node`` are
-    looked up on ``PATH`` - ``dsh`` then in the data directory's npm install - and ``cmd.exe``
-    under ``SystemRoot``). The profile is read from
-    ``HFLOW_PROFILE`` only while the plan names none (:func:`frozen_arguments`).
+    read from: ``acpx_dsh.resolve_launch_config`` (a real role's launch: ``dsh``/``python``/
+    ``node`` are looked up on ``PATH`` - ``dsh`` then in the data directory's npm install - and
+    ``cmd.exe`` under ``SystemRoot``). The profile is read from ``HFLOW_PROFILE`` only while the
+    plan names none (:func:`frozen_arguments`). The write opt-in is not among them: a plan
+    records it (``PlanArguments.allow_writes``).
     """
     from .drivers.acpx_dsh import ENV_ACPX_CLI, ENV_ACPX_NODE
 
     sources = {
-        "implementer_writes": ENV_ALLOW_WRITES,
         "dsh_home": "DSH_HOME",
         "client_entry": ENV_ACPX_CLI,
         "node": f"{ENV_ACPX_NODE}, PATH",
@@ -442,6 +480,15 @@ def stale_plan_error(
     )
 
 
+def default_plan_path(task_path: Path) -> Path:
+    """Where ``approve --task`` writes a task's plan by default: ``<task stem>.plan.json`` next to
+    the task, a trailing ``.task`` dropped from the stem (``T-1.task.json`` -> ``T-1.plan.json``,
+    the name ``init task``'s printed ``prepare --plan-out`` uses too)."""
+    task = Path(os.path.abspath(task_path))
+    stem = task.name.removesuffix(".json").removesuffix(".task")
+    return task.with_name(f"{stem}.plan.json")
+
+
 def default_authorization_path(plan_path: Path, binding_digest: str) -> Path:
     """Where ``approve`` writes, and ``run --plan`` looks for, this plan's approval by default.
 
@@ -470,7 +517,7 @@ APPROVAL_CODE_LENGTH = 8
 
 #: Where a scripted flow is pointed instead: the hand-written artifact.
 HAND_WRITTEN_ARTIFACT_DOCS = (
-    'docs/operations.md, "Running a real Harness task" - "Writing the artifact by hand"'
+    'docs/operations.md, "Appendix: writing the artifact by hand"'
 )
 
 
@@ -488,9 +535,41 @@ def is_terminal(stream: TextIO | None) -> bool:
     if stream is None:
         return False
     try:
-        return bool(stream.isatty())
+        return bool(stream.isatty()) and _console_handle(stream)
     except (AttributeError, OSError, ValueError):
         return False
+
+
+def _console_handle(stream: TextIO) -> bool:
+    """On Windows, whether ``stream``'s handle is a console - ``isatty`` alone is not enough.
+
+    Windows answers ``isatty()`` true for every character device, the ``NUL`` device included
+    (observed: ``python -c "import sys; print(sys.stdin.isatty())" < NUL`` prints ``True``), and
+    ``NUL`` is what a scheduled task, a service or an agent's shell tool often hands a child as
+    standard input. Only a console input handle answers ``GetConsoleMode``. Elsewhere, and for a
+    stream with no operating-system handle (a stand-in that only says it is a terminal), the
+    ``isatty`` answer stands.
+    """
+    if os.name != "nt":
+        return True
+    try:
+        descriptor = stream.fileno()
+    except (AttributeError, OSError, ValueError):  # io.UnsupportedOperation is both
+        return True
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    try:
+        handle = msvcrt.get_osfhandle(descriptor)
+    except OSError:
+        return False
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    get_console_mode = kernel32.GetConsoleMode
+    get_console_mode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    get_console_mode.restype = wintypes.BOOL
+    mode = wintypes.DWORD()
+    return bool(get_console_mode(handle, ctypes.byref(mode)))
 
 
 def require_terminal(stdin: TextIO | None) -> None:

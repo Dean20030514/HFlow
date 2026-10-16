@@ -6,8 +6,9 @@ the driver's own launch path (``readonly_client_check``), so the answer comes fr
 of this machine's process boundary rather than from the in-process mapping that produced it.
 
 It reports ``DSH_HOME``, whether the two DSH mode variables (``DSH_PERMISSION_MODE``,
-``DSH_TOOLS_MODE``) are present, and which repository-locating Git variables are present (names
-only), and nothing else. Dumping the whole environment into a test
+``DSH_TOOLS_MODE``) are present, which repository-locating Git variables are present (names
+only), and whether each of a fixed list of names is present (``REPORTED_NAMES``), and nothing
+else. Dumping the whole environment into a test
 artifact would copy whatever credentials happen to be in it.
 
 Usage (normally spawned by the driver):
@@ -19,6 +20,17 @@ from __future__ import annotations
 import json
 import os
 import sys
+
+#: Variables whose presence (never value) is reported: secret-like names the driver withholds,
+#: the one credential it keeps, and a proxy variable it passes on.
+REPORTED_NAMES = (
+    "GH_TOKEN",
+    "AWS_SECRET_ACCESS_KEY",
+    "OPENAI_API_KEY",
+    "MY_PASSWORD",
+    "DEEPSEEK_API_KEY",
+    "HTTPS_PROXY",
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -37,6 +49,8 @@ def main(argv: list[str] | None = None) -> int:
                     for name in os.environ
                     if name.upper() in {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"}
                 ),
+                # Presence only, for a fixed list of names: never a value.
+                "names_present": {name: name in os.environ for name in REPORTED_NAMES},
             },
             separators=(",", ":"),
         )

@@ -144,7 +144,7 @@ def test_a_bare_repository_planted_in_a_worktree_root_is_never_adopted(
         with pytest.raises(GitError, match="bare repository"):
             call()
     # Read gently (as ``git config`` does), the planted repository is simply not a repository.
-    assert git._git_query(worktree, "config", "--get", "hflow.planted").stdout == ""
+    assert git.query("config", "--get", "hflow.planted", cwd=worktree).stdout == ""
 
 
 def test_a_project_whose_main_repository_is_bare_still_works(tmp_path: Path) -> None:
@@ -386,7 +386,7 @@ def test_a_failed_move_into_place_is_a_git_error_and_removes_the_staging_worktre
         if list(argv[:3]) == ["git", "worktree", "move"]:
             if failure == "os-error":
                 raise PermissionError(13, "The process cannot access the file")
-            return subprocess.CompletedProcess(argv, 1, "", "fatal: move failed")
+            return subprocess.CompletedProcess(argv, 1, b"", b"fatal: move failed")
         return real_run(argv, *args, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", failing_move)
@@ -455,7 +455,7 @@ def test_no_directory_can_ever_exist_where_the_hooks_path_points(repo: Path, tmp
     git.freeze_candidate(worktree, ["app.txt"], expected_head=git.head)
     # Git says nothing about the hooks path or the graft file: no warning, no hint.
     args = ("commit", "--allow-empty", "-q", "-m", "x")
-    completed = gitworkspace._run_git(args, cwd=worktree, timeout=60)
+    completed = gitworkspace.git_query(args, cwd=worktree, timeout=60)
     assert (completed.returncode, completed.stderr) == (0, "")
     assert not marker.exists()
 

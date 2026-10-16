@@ -1,112 +1,100 @@
-# Next-session handoff — 2026-10-14 (after batch M)
+# Next-session handoff — 2026-10-16 (after batch N)
 
 ## User decision (unchanged)
 
 > 先完成“小任务从授权到集成、异常后可恢复”的真实闭环，再扩展 Team，最接近实际可用。
 
-## What batch M delivered (offline only)
+## What batch N delivered (offline only)
 
-Batch M followed the eighth GitHub survey (ADR 0001 addendum "2026-10-14 (evening)": acpx, ACP
-and DSH code unchanged, #9626 unfixed; new reports #9693, #9682/#9687, #9711, #9666) and a
-five-part code audit, built in five parallel lanes.
+Batch N followed the ninth GitHub read (ADR 0001 addendum "2026-10-16": acpx, ACP v1 and DSH's
+ACP/sandbox/Windows-process source unchanged; DSH alpha.4 tagged; #9845, #9818, #9831, #9735 new)
+and a prior-art survey (mergetrain, worktrunk, codex, vibe-kanban, ...). User rulings 2026-10-16
+shaped the operator loop:
 
-- **Ctrl+C works while HFlow waits.** On Windows `Popen.wait(timeout)` holds a console Ctrl+C
-  until it returns (observed: 8 s for an 8 s wait). Every long wait - the agent turn, the force-stop
-  grace, the read-only client check, each approved check - now waits in 0.1 s slices
-  (`winjob.wait_interruptibly`), and an interrupted turn or check has its Job Object terminated at
-  once (nothing recorded as a confirmed stop; `resume` reconciles as before).
-- **No PATH edit for the npm DSH.** A launch looks for `dsh` on PATH, then in
-  `<data-dir>/dsh/0.2.0-rc.2/node_modules/.bin`; `doctor`/`prepare` say which (`dsh=npm (data
-  dir)`), and the content binding is the same as for a PATH-found shim. The Desktop shim is no
-  longer recommended (#9626).
-- **Launch hardening**: `cmd.exe /d /c` (no AutoRun), a batch launcher path with cmd
-  metacharacters is refused, the agent no longer inherits `GIT_DIR`/`GIT_WORK_TREE`/...,
-  `ResumeThread` failure is caught. The `sandbox` line now says it is the shell runner's mode, not
-  a file-tool boundary (#9693).
-- **Workspace and checks**: snapshots never walk into NTFS junctions (a junction loop hung
-  `manifest`/`status`), deny rules also match the resolved spelling (`.git.`, 8.3 names), checks no
-  longer inherit `PYTHONPATH`/`NODE_PATH`/`NODE_OPTIONS` (they get `USERNAME`), a timed-out check
-  stays `timed_out`, acceptance blocks `evidence_stale` when a check changed a tracked file or HEAD.
-- **Git**: the run worktree is created with `git worktree move` (the old `worktree repair`
-  rewrote the user's other worktrees' `.git` files - rule 12), auto-maintenance is off, hooks point
-  under a system file, output is decoded as UTF-8, a half-failed `clean` is reported `PARTIAL` with
-  what is left (was "nothing was removed" and a stuck run), bare-repository worktrees can be
-  cleaned, refusals print read-only inspect commands.
-- **Controller/store**: a continued run passes the same dispatch preconditions and preflight as a
-  new one (a resubmission without credentials used to spend a submission), an authorization-id
-  conflict refuses before any write, typed store refusals replace substring matching, the
-  migration re-reads its version under the write lock.
-- **CLI**: one JSON loader (BOM accepted, UTF-16 and unreadable files refused in one line), ledger
-  errors exit 5/6 instead of a traceback, lookups never create a ledger in a mistyped
-  `--data-dir`, stale-plan refusals print the full `prepare` command, `integrate prepare --target`
-  is prefilled from the task's base branch, `runs --needs-you` lists every live run (and "past
-  its deadline"), `doctor` checks ledger health read-only, `status|report|diff --last`.
+- **Shorter loop.** `hflow approve --task <t.json> --profile <id> --allow-writes --run` resolves,
+  writes the plan, shows it, takes the typed code and approval text, and runs it. `hflow status`
+  with no run id is the inbox (Running / Ready / Attention, one `next:` each); `runs --needs-you`
+  and `status --last` are gone. `hflow integrate <run-id>` continues an integration from any state
+  (prepare -> typed confirmation code -> apply or the hand-off -> reconcile) and cleans the run
+  worktree once integrated (`--keep-worktree` opts out). HFlow still never merges into the user's
+  checkout: a checked-out target is a hand-off the user runs (ruling 2026-10-16).
+- **Write opt-in is recorded.** `prepare/approve --task --allow-writes` puts it in the plan and the
+  binding; `approve/run --plan` no longer read `HFLOW_ALLOW_WRITES`.
+- **Agent environment.** Secret-like variables other than `DEEPSEEK_API_KEY` are withheld from the
+  DSH child (names recorded). The npm shim's `node` is now bound by content.
+- **Fixes**: a branch checked out under another letter case was movable by `integrate apply`; the
+  shared Git metadata is compared around integration checks and before `clean`; a superseded owner
+  could still register a launch; acceptance did not bind the receipt to its run/attempt/revision; a
+  failed COMMIT wedged the store; a git error after acceptance escaped as a traceback; reviewer and
+  repair packets showed only references for a failed check and let check output start packet lines.
+- **Simpler code**: `acpx_dsh.py` split into `drivers/launch.py` + `drivers/primitives.py` (3751 ->
+  ~2640 lines), doctor in `doctor.py`, one git runner, `_attempt_cycle` in phase methods, five dead
+  CLI flags removed, README and operations.md cut down.
 
 ## Next step: the first live small task (needs its own explicit approval and budget)
 
 The live budget is still **0**. Run this checklist only after the user approves this specific
 task (AGENTS rule 10).
 
-0. **DSH sandbox route (#9626) - decided 2026-10-14: the npm CLI.** Through the Desktop shim a
-   `workspace-write` sandbox (DSH's default for a per-invocation home) is reported to make every
-   shell tool call exit `0xC0000142`. The user chose the npm route: `@deepseek-ai/dsh@0.2.0-rc.2`
-   is installed (`--ignore-scripts`) at `%LOCALAPPDATA%\HFlow\dsh\0.2.0-rc.2`, and since batch M a
-   launch finds it there by itself when PATH has no `dsh` - keep the Desktop shim directory off
-   PATH. `doctor`'s `dsh launcher` line and `prepare`'s content note must say `dsh=npm (data dir)`,
-   and no `warning ... DSH #9626` line may appear. If a native module turns out to need an install
-   script, report it rather than re-installing with scripts.
-1. Use a shell where the following holds (`python -m hflow` needs `python -m pip install -e .` once,
-   or `src` on `PYTHONPATH`):
-   - `DEEPSEEK_API_KEY` is set in that shell, or `DSH_HOME` is bound to a home that holds
-     `.credentials.yaml` and boots headless. Never create a home from nothing (DSH #7978).
-   - `HFLOW_ALLOW_WRITES=1` is set.
-   - acpx 0.17.1 is found via `HFLOW_ACPX_CLI` or `.probe/acpx`.
-   - Pick a first task whose acceptance rests on HFlow's own approved checks and that needs no
-     DSH shell call: #9682/#8497 (a host without a console - acpx starts DSH with
-     `CREATE_NO_WINDOW`) and #9687 (pwsh under the restricted token) are two unconfirmed causes of
-     failing shell calls that the npm route does not remove, and a failed shell call still ends
-     `end_turn`. Keep it away from reading large files (one ACP line over 1 MiB voids the turn).
-2. `python tools/m0_probe/real_client_checks.py all`. This is model-free.
-3. `python -m hflow doctor --profile <id>`. Every readiness line must be usable, and credentials
-   must not say "would be REFUSED".
-4. (Once per repo/machine: `hflow init project` and `hflow init profile <id>`; per task
-   `hflow init task <id> --goal ... --allow ...`, then answer the reuse fit test by hand.)
-   `python -m hflow prepare --task <t.json> --profile <id> --project-root <repo> --plan-out
-   <t.plan.json>` with a small task whose checks finish in seconds. Keep the turn well under DSH's
-   reported 300 s stream timeout (and #9515: a lost tool-call start can hang; HFlow's wall-clock
-   limit and the Job Object stop are the only bound).
-5. The user runs `python -m hflow approve --plan <t.plan.json>` (or `... --run`, which then runs it in
-   the same terminal, so Ctrl+C reaches the owner) in their own terminal: it shows
-   the plan and its approval code; the user types the code and their own approval text. An agent
-   never types this - a scripted approval is a hand-written artifact quoting the user verbatim.
-6. `python -m hflow run --plan <t.plan.json>`. Then follow the `next:` lines: for
-   `ACCEPTED/LOCAL_CANDIDATE`, `integrate prepare` -> `integrate apply` (or the hand-off plus
-   `reconcile`) -> `clean` preview -> `clean --apply`; `status`/`report` at any point.
-7. If anything is interrupted: press Ctrl+C in the owner's own terminal, not `cancel` from another
-   one. Then `resume` (exit 5 means the owner may still be alive; wait), then `ledger settle` with
-   an attestation in your own words (a pasted placeholder is refused). Never re-run the same
-   authorization.
-8. After the run, check the worktree root with `icacls`, because of the reported DSH Windows
-   sandbox ACE/Low-label leftovers (#8312, #9666 reproduced on 10.0.26300, this machine's build).
-   If `clean` refuses or reports `PARTIAL`, record it; never force it. Because ACP sessions do not
-   compose DSH's permission presets (#9693), also confirm nothing outside the worktree changed:
-   `status`/`report` show the user-checkout fingerprint comparison.
+0. **DSH route: the npm CLI** (`@deepseek-ai/dsh@0.2.0-rc.2`, installed `--ignore-scripts` at
+   `%LOCALAPPDATA%\HFlow\dsh\0.2.0-rc.2`, found by itself when PATH has no `dsh`; keep the Desktop
+   shim off PATH because of #9626). `doctor`'s `dsh launcher` line and `prepare`'s content note must
+   say `dsh=npm (data dir)`, with no `warning ... DSH #9626` line. A plan prepared for the npm route
+   before batch N must be prepared again (the node it runs is now part of the binding).
+1. Use a shell where (`hflow` needs `python -m pip install -e .` once):
+   - `DEEPSEEK_API_KEY` is set, or `DSH_HOME` is bound to a home that holds `.credentials.yaml` in
+     the version-1 layout and boots headless. A flat pre-release file is rewritten by DSH at boot
+     (#9845) - a write HFlow's stat-only check cannot see. Never create a home from nothing (#7978).
+   - no proxy variable is set in both casings (#9830), and acpx 0.17.1 is found via
+     `HFLOW_ACPX_CLI` or `.probe/acpx`.
+   - The task: acceptance rests on HFlow's own approved checks, needs no DSH shell call (#9682/#8497
+     no console, #9687 pwsh token, #9831 unelevated grant - all unconfirmed causes of failing shell
+     calls that still end `end_turn`), reads no large file (one ACP line over 1 MiB voids the turn),
+     and lives in a **small** repository (#9818: the first sandbox provisioning walks the whole tree
+     silently). Its checks run an interpreter from outside the worktree (`python -m pytest ...`),
+     because after a turn the tree may carry the Low label (#9666/#9819).
+2. `python tools/m0_probe/real_client_checks.py all` (model-free). If SDK 1.8.1 has been published
+   and resolved, add it to `CHECKED_SDK_VERSIONS` only after these checks pass.
+3. `hflow doctor --profile <id>`: every readiness line usable (including `writes`), credentials not
+   "would be REFUSED". In step 4's `prepare` preview, the `agent environment: ...` note must name
+   nothing DSH needs (secret-like names other than `DEEPSEEK_API_KEY` are withheld).
+4. (Once per repo/machine: `hflow init project`, `hflow init profile <id>`; per task
+   `hflow init task <id> --goal ... --allow ...`, then answer the reuse fit test by hand.) Optionally
+   `hflow prepare --task <t.json> --profile <id> --allow-writes` as a zero-model preview. Keep the
+   turn well under DSH's 300 s stream timeout (#9515: a lost tool-call start can hang; HFlow's
+   wall-clock limit and the Job Object stop are the only bound).
+5. The user, in their own terminal: `hflow approve --task <t.json> --profile <id> --allow-writes
+   --run`. It shows the plan and its approval code; the user types the code and their own approval
+   text, then it runs in that terminal (Ctrl+C reaches the owner). An agent never types this.
+6. Follow the `next:` lines (`hflow status` lists what needs you). For `ACCEPTED/LOCAL_CANDIDATE`:
+   `hflow integrate <run-id>` at a terminal, type its code; when the target is checked out run the
+   printed `git -C <repo> merge --ff-only <commit>` yourself, then `hflow integrate <run-id>` again.
+   It cleans the run worktree once integrated; a refusal or `PARTIAL` is printed - record it, never
+   force it.
+7. If anything is interrupted: Ctrl+C in the owner's terminal, not `cancel` from another one. Then
+   `resume` (exit 5 means the owner may still be alive; wait), then `ledger settle` with an
+   attestation in your own words. Never re-run the same authorization.
+8. After the run, check the worktree parent under the data dir with `icacls` (#8312/#9666 leftovers;
+   #9831 needs it caller-owned), and confirm nothing outside the worktree changed (#9693: ACP
+   sessions compose no permission presets) - `status`/`report` show the user-checkout fingerprint.
 
-Settled 2026-10-14: the ACP SDK is not pinned (user ruling) - after any acpx reinstall run
-`python tools/m0_probe/real_client_checks.py all --acpx-cli <entry>` and add a passing SDK version
-to `CHECKED_SDK_VERSIONS`; DSH's turn-time `git add` (#9382) is Web/Desktop-only by source, so the
-ACP path is unaffected unless a bound home's acp profile adds `dsh-web-app` (noted by
-`dsh_surfaces`). A bound `DSH_HOME` for the live task should keep the acp profile's bundles at
-`[dsh-base, dsh-acp-app]`.
+Settled: the ACP SDK is not pinned (2026-10-14); DSH's turn-time `git add` (#9382) is
+Web/Desktop-only by source - keep a bound home's acp bundles at `[dsh-base, dsh-acp-app]`.
+
+Open question (not yet asked): `Store.finalize_offline_reprocessing` and
+`tools/m2_live/replay_review.py` write a receipt outside the controller (AGENTS rule 2 says only the
+controller does). Either retire them (the M2 recovery was one-off; keep report.py's provenance
+rendering) or reword rule 2 and README to name that path. Ask the user.
 
 Only after that real evidence comes Team/DAG work. Before parallel tasks:
 
-- DSH #1485: concurrent instances sharing one `DSH_HOME` corrupt workspace session membership.
-  Use per-run homes seeded from a booting profile, or serialize.
-- Integrate does not re-compare the shared Git metadata against the source run's snapshot. Today
-  the worker is gone by then, but with parallel runs another worker could plant a filter or
-  merge driver before `integrate prepare`.
-- Prior art collected 2026-10-07 for that phase: mergetrain's train/bisect landing, codex's
-  spawn-slot reservations, per-task homes, and synchronous fan-out/join.
+- DSH #1485/#9612/#9615: concurrent instances sharing one `DSH_HOME` corrupt session membership;
+  use per-run homes seeded from a booting profile (HFlow keeps and prunes them), or serialize.
+- `integrate` compares the shared Git metadata around its own checks, but not against the source
+  run's snapshot before `integrate prepare`; with parallel runs another worker could plant a filter
+  or merge driver in between.
+- Prior art for that phase: mergetrain's train/bisect landing and named-Job-Object keeper (owner
+  liveness without attestation), codex's spawn-slot reservations, per-task homes, synchronous
+  fan-out/join.
 
 Do not rewrite historical evidence or reactivate the archived `workflow` installation.

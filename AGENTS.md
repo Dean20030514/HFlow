@@ -24,13 +24,16 @@ not restate the design; read the plan (`docs/history/Harness_Agnostic_Workflow_G
 | Scope containment and candidate fingerprints | `src/hflow/workspace.py` |
 | Git worktree isolation, candidate freezing, shared-metadata snapshot | `src/hflow/gitworkspace.py` |
 | Guarded worktree release (`hflow clean`) | `src/hflow/cleanup.py` |
-| Controlled integration of an accepted candidate (`hflow integrate`: prepare / apply / reconcile) | `src/hflow/integrate.py`; contract `docs/batch-i-integration-plan.md` |
-| `status` / `report` text from stored facts | `src/hflow/report.py` |
+| Controlled integration of an accepted candidate (`hflow integrate <run-id>`, which continues from any state; prepare / apply / reconcile / show) | `src/hflow/integrate.py` (the `<run-id>` flow and auto-clean in `cli.py`); contract `docs/batch-i-integration-plan.md` |
+| `status <run-id>` / `report` text from stored facts | `src/hflow/report.py` |
 | The operator's next command (`next:` lines) from stored facts; pasteable quoting and `--data-dir` | `src/hflow/hints.py` |
 | Commands and exit codes | `src/hflow/cli.py` |
+| `hflow doctor` (read-only readiness: Git, acpx, dsh, credential sources, ledger, profile) | `src/hflow/doctor.py` |
 | `hflow init project/profile/task` scaffolds (exclusive create, never answers the fit test) | `src/hflow/scaffold.py` |
-| `hflow runs` listing and its `--needs-you` facts; `hflow diff` | `src/hflow/listing.py` |
+| `hflow runs`, the `hflow status` inbox (no run id: Running / Ready / Attention), `hflow diff` | `src/hflow/listing.py` |
 | The one production driver (acpx → DSH ACP) | `src/hflow/drivers/acpx_dsh.py` |
+| Launch resolution, the agent child's environment (secret-like names withheld), spawn-gate checks | `src/hflow/drivers/launch.py`; entry files bound by content in `launch_content.py` |
+| Leaf helpers shared by the drivers (env and PATH lookup, containment, bounded reads; no driver imports) | `src/hflow/drivers/primitives.py` |
 | Windows Job Object process boundary | `src/hflow/drivers/winjob.py` |
 | Neutral event projection from the client stream | `src/hflow/drivers/acp_events.py` |
 | What DSH reads at launch beyond the packet (recorded, never enforced) | `src/hflow/drivers/dsh_surfaces.py` |

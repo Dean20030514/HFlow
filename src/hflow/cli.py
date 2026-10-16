@@ -1,8 +1,12 @@
 """HFlow command line.
 
 Subcommands: doctor / prepare / approve / run / status / report / cancel / resume / schema /
-clean / ledger settle / integrate (prepare, apply, reconcile, show) / init (project, profile,
-task) / runs / diff.
+clean / ledger settle / integrate (<run-id>, prepare, apply, reconcile, show) / init (project,
+profile, task) / runs / diff.
+
+The operator loop: ``init`` the starting files, ``approve --task T --allow-writes --run`` (or
+``prepare --plan-out``, ``approve --plan``, ``run --plan`` step by step), ``status`` for the
+inbox of runs that need you, ``integrate <run-id>`` for an accepted candidate.
 
 ``init`` writes one starting file that does not exist yet and never overwrites one: a project
 contract with ``kind=command`` checks, the two-role machine profile, or a task whose reuse
@@ -13,20 +17,24 @@ Git change from a run's recorded base to its frozen candidate commit; both read 
 ``prepare --plan-out`` saves a task's resolution as a plan; ``approve --plan`` writes the
 authorization artifact for it only for a person at an interactive terminal, who types back the
 plan's approval code and then the approval text (never an argument, never piped stdin);
-``run --plan`` resolves from the plan instead of repeating every flag. Neither ``approve`` nor
+``run --plan`` resolves from the plan instead of repeating every flag. ``approve --task`` does
+the first two in one process. A plan records the write opt-in (``--allow-writes``); ``approve
+--plan`` and ``run --plan`` never read ``HFLOW_ALLOW_WRITES``. Neither ``approve`` nor
 ``prepare`` calls a model or opens the database.
 
 ``ledger settle`` closes an ``unknown`` / ``launch_unknown`` ledger entry by operator attestation;
 it never calls a model, never re-dispatches and never changes a run's state.
 
 ``integrate`` takes an ``ACCEPTED`` run's candidate onto an existing local branch as a separate,
-operator-approved delivery: ``prepare`` builds and checks one commit without moving anything,
-``apply`` moves the branch by compare-and-set only (never a branch some worktree has checked out),
-``reconcile`` settles an interrupted record from what Git shows. It never calls a model.
+operator-approved delivery: ``integrate <run-id>`` continues it from whatever state it is in;
+step by step, ``prepare`` builds and checks one commit without moving anything, ``apply`` moves
+the branch by compare-and-set only (never a branch some worktree has checked out), ``reconcile``
+settles an interrupted record from what Git shows. It never calls a model.
 
-``status``, ``report`` and ``diff`` read one run: its id, or ``--last`` for the most recently
-created one (named first as ``run: <id>``); a command that acts on a run always takes its id. A
-command that looks a run, integration or invocation up never creates a ledger to look in.
+``status`` without a run id is the inbox; with one it reads that run. ``report`` and ``diff``
+read one run: its id, or ``--last`` for the most recently created one (named first as ``run:
+<id>``); a command that acts on a run always takes its id. A command that looks a run,
+integration or invocation up never creates a ledger to look in.
 
 ``doctor``, ``prepare``, ``approve``, ``status``, ``report``, ``schema``, ``clean``, ``init``,
 ``runs`` and ``diff`` never call a model; ``doctor`` never boots a DSH profile or runs ``dsh``: it
@@ -34,9 +42,8 @@ reports what is *known* locally, marks the rest ``unknown``. ``resume`` reconcil
 re-dispatches; on a live run it takes over only from an owner process proven gone, and that
 takeover blocks the run ``owner_lost``.
 
-``--controller-id`` is a human label. A run's exclusive owner is the controller *process*
-(``hflow.ownership``): a random token, its pid, creation time and host, and an OS file lock held
-for the process's lifetime.
+A run's exclusive owner is the controller *process* (``hflow.ownership``): a random token, its
+pid, creation time and host, and an OS file lock held for the process's lifetime.
 
 ``run`` is offline only with the ``fake`` driver (the default without a profile). With
 ``--driver acpx-dsh`` or a profile that binds it, ``run`` launches the real Harness and needs a
@@ -60,18 +67,16 @@ import argparse
 import json
 import os
 import sqlite3
-import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn
 
 from pydantic import ValidationError
 
 from .contracts import (
     CancellationReceipt,
-    CapabilityState,
     InvocationOutcome,
     ProjectConfig,
     ReconcileOutcome,
@@ -88,7 +93,7 @@ from .contracts import (
 )
 
 from .contracts import PlanArguments
-from .plan import DEFAULT_AUTHORIZATION_MODE, DEFAULT_PROJECT_ROOT, RESOLUTION_FLAGS
+from .plan import DEFAULT_PROJECT_ROOT, RESOLUTION_FLAGS
 
 if TYPE_CHECKING:  # imported for annotations only
     from .authorization import AuthorizationBinding, AuthorizationRecord
@@ -104,13 +109,14 @@ if TYPE_CHECKING:  # imported for annotations only
 from .controller import Controller, RunOutcome, inspect_run
 from .drivers.fake import FakeDriver, FakeScript
 from .drivers.acpx_dsh import DriverSetupError
-from .drivers.selected import FAKE_ALIASES, default_refusal_reason, local_probe
+from .drivers.selected import FAKE_ALIASES
 from .integrate import (
     IntegrationOutcome,
     apply_integration,
     prepare_integration,
     reconcile_integration,
 )
+from .contracts import INTEGRATION_ACTIVE_STATES, IntegrationRecord, IntegrationState
 from .hints import shell_word as _shell_word  # a printed path, quoted for the operator's shell
 from .paths import database_path, default_data_dir
 from . import profiles
@@ -319,724 +325,11 @@ def _outcome_exit_code(outcome: RunOutcome) -> int:
 # --------------------------------------------------------------------------
 
 
-def _doctor_profile_section(
-    data_dir: Path, requested: str, source: str
-) -> tuple[dict[str, object], int]:
-    """Resolve the named profile and report whether it is usable. No model, no launch.
-
-    Three states stay distinguishable, which is the whole point of this section: no profile
-    was named, a profile was named but cannot be used, or a profile was named and resolved.
-    The third reports each role's agent, driver and the dependencies that driver needs - so
-    "the config is selected" and "the config can actually start something" are separate,
-    visible answers rather than one optimistic one.
-    """
-    section: dict[str, object] = {
-        "requested": requested,
-        "requested_via": source,
-        "selected": bool(requested),
-        "usable": False,
-        "path": str(profiles.profile_path(data_dir, requested)) if requested else "",
-        "detail": "no machine profile selected",
-        "roles": {},
-    }
-    if not requested:
-        return section, EXIT_OK
-    try:
-        profile = profiles.load_profile(data_dir, requested)
-        bindings = profiles.resolve_role_bindings(profile)
-    except RefusedError as exc:
-        section["detail"] = exc.message
-        return section, EXIT_REFUSED
-
-    from .drivers.acpx_dsh import resolve_launch_config
-    from .drivers.selected import build_driver, resolve_driver_id
-
-    roles: dict[str, object] = {}
-    dependency_problems: list[str] = []
-    for role, (agent_id, binding) in bindings.items():
-        entry: dict[str, object] = {
-            "agent": agent_id,
-            "harness": binding.harness,
-            "driver": binding.driver,
-            "model_selection": binding.model_selection,
-            "capability_record": binding.capability_record,
-        }
-        try:
-            driver_id = resolve_driver_id(binding)
-            entry["driver_id"] = driver_id
-        except RefusedError as exc:
-            entry["driver_id"] = None
-            entry["usable"] = False
-            entry["detail"] = exc.message
-            dependency_problems.append(f"{role}: {exc.message}")
-            roles[role] = entry
-            continue
-        if driver_id == "fake":
-            # Building the offline driver would create its scratch directory; there is no
-            # external dependency to prove either, so nothing is constructed here.
-            entry["usable"] = True
-            entry["dependencies"] = ["none (offline fake driver: no model, no external client)"]
-            roles[role] = entry
-            continue
-        try:
-            # The resolution the driver itself performs when built without a launch (and the one
-            # ``prepare`` performs per role), done once here so its facts can be shown even when
-            # the launch is not resolvable; the driver is then built from this very launch.
-            launch = resolve_launch_config(data_dir=data_dir, binding=binding)
-            entry["launch"] = _doctor_launch_facts(launch)
-            instance = build_driver(binding, data_dir=data_dir, launch=launch)
-        except Exception as exc:  # noqa: BLE001 - an unusable binding is a report, not a crash
-            entry["usable"] = False
-            entry["detail"] = f"{type(exc).__name__}: {exc}"
-            dependency_problems.append(f"{role}: {exc}")
-        else:
-            probe = instance.probe(binding)  # type: ignore[attr-defined]
-            entry["usable"] = True
-            entry["dependencies"] = list(probe.notes)
-            entry["probe_only"] = probe.probe_only
-            entry["live_tested"] = probe.live_tested
-        roles[role] = entry
-
-    section["roles"] = roles
-    section["profile_id"] = profile.profile_id
-    section["profile_digest"] = profiles.profile_digest(profile)
-    section["security_mode"] = profile.security_mode
-    section["limits"] = profile.limits.model_dump(mode="json")
-    section["usable"] = not dependency_problems
-    section["detail"] = (
-        "every bound role resolved"
-        if not dependency_problems
-        else "; ".join(dependency_problems)
-    )
-    return section, (EXIT_OK if not dependency_problems else EXIT_REFUSED)
-
-
-def _capability_section(probe: object) -> dict[str, object]:
-    """Group the capability record so "verified" and "unknown" cannot be read as one list.
-
-    The states keep their existing meaning and none of them is upgraded here: ``probed`` and
-    ``enforced`` are the observed ones, ``documented`` is upstream documentation only,
-    ``unsupported`` is a known absence and ``unknown`` was never observed. The record is a
-    static table from the selected driver's ``probe``, so it is labelled as such - doctor
-    itself observes executables and file presence, not a live model round.
-    """
-    states: dict[str, list[str]] = {state.value: [] for state in CapabilityState}
-    for name, state in getattr(probe, "capabilities", {}).items():
-        states[state.value].append(name)
-    for names in states.values():
-        names.sort()
-    return {
-        "record": "static capability table from the selected driver's probe",
-        "source": "src/hflow/drivers/acpx_dsh.py::AcpxDshDriver.probe",
-        "evidence": "docs/m0-results.md, docs/adr/0001-transport.md",
-        "observed_here": ["probed", "enforced"],
-        "documented_only": ["documented"],
-        "known_absent": ["unsupported"],
-        "not_observed": ["unknown"],
-        "probe_only": getattr(probe, "probe_only", True),
-        "live_tested": getattr(probe, "live_tested", False),
-        "states": states,
-        "meaning": {
-            "probed": "behaviour observed locally on this machine; the observation is recorded "
-            "in the evidence above, not made by this doctor run",
-            "enforced": "observed and constrained by this code, not merely observed",
-            "documented": "claimed by upstream documentation only; not observed here",
-            "unsupported": "known not to work on this launch path",
-            "unknown": "never observed; no value is claimed",
-        },
-    }
-
-
-def _doctor_ledger_settlements(data_dir: Path) -> dict[str, object]:
-    """How many ledger entries an operator settled by attestation. Read-only, never migrates.
-
-    Opened with SQLite's read-only URI mode so doctor neither creates nor migrates a ledger; a
-    file it cannot read that way is reported as such rather than opened read-write.
-    """
-    path = database_path(data_dir)
-    result: dict[str, object] = {"consumed": None, "void": None}
-    if not path.exists():
-        result["detail"] = "no ledger file in this data dir"
-        return result
-    try:
-        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
-        try:
-            present = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = "
-                "'invocation_settlements'"
-            ).fetchone()
-            if present is None:
-                result["detail"] = (
-                    "not recorded: this ledger predates operator settlement (opening it with "
-                    "status/report migrates it)"
-                )
-                return result
-            rows = dict(
-                conn.execute(
-                    "SELECT settled_as, COUNT(*) FROM invocation_settlements GROUP BY settled_as"
-                ).fetchall()
-            )
-        finally:
-            conn.close()
-    except sqlite3.Error as exc:
-        result["detail"] = f"unreadable read-only ({exc}); not opened read-write by doctor"
-        return result
-    result["consumed"] = int(rows.get("consumed", 0))
-    result["void"] = int(rows.get("void", 0))
-    result["detail"] = (
-        f"{result['consumed']} consumed, {result['void']} void - settled by operator attestation "
-        "(not observed); billed usage for those entries stays unknown"
-    )
-    return result
-
-
-#: How long doctor's ledger integrity check may run before it stops and reports "incomplete",
-#: and every how many SQLite steps the clock is read.
-DOCTOR_LEDGER_CHECK_SECONDS = 10.0
-DOCTOR_LEDGER_CHECK_STEPS = 1000
-
-
-def _doctor_ledger_health(data_dir: Path) -> dict[str, object]:
-    """The ledger's storage version and a bounded integrity check, read-only. Never repairs.
-
-    Opened with SQLite's read-only URI mode, so doctor never creates, migrates or rebuilds a
-    ledger. ``PRAGMA quick_check(1)`` stops at its first finding, and a progress handler stops it
-    after :data:`DOCTOR_LEDGER_CHECK_SECONDS`; a check a lock or that bound cut short is
-    ``incomplete`` - never read as corruption. ``status`` is ``none`` (no ledger), ``ok``,
-    ``problem`` (the first finding is shown), ``incomplete`` or ``unreadable`` (not opened
-    read-only, or not a SQLite database). A fact line: it never changes doctor's exit code.
-    """
-    import time
-
-    from .migrate import SUPPORTED_STORAGE_VERSION
-
-    path = database_path(data_dir)
-    section: dict[str, object] = {
-        "path": str(path),
-        "status": "none",
-        "storage_version": None,
-        "build_storage_version": SUPPORTED_STORAGE_VERSION,
-        "quick_check": None,
-    }
-    if not path.exists():
-        section["detail"] = "no ledger file in this data dir"
-        return section
-    deadline = time.monotonic() + DOCTOR_LEDGER_CHECK_SECONDS
-    stopped = False
-
-    def past_deadline() -> int:
-        nonlocal stopped
-        stopped = stopped or time.monotonic() > deadline
-        return 1 if stopped else 0
-
-    try:
-        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0)
-    except sqlite3.Error as exc:
-        section.update(status="unreadable", detail=f"not opened read-only ({exc})")
-        return section
-    try:
-        conn.set_progress_handler(past_deadline, DOCTOR_LEDGER_CHECK_STEPS)
-        try:
-            row = conn.execute(
-                "SELECT value FROM schema_meta WHERE key = 'storage_version'"
-            ).fetchone()
-            section["storage_version"] = int(row[0]) if row is not None else None
-        except (sqlite3.Error, ValueError):
-            section["storage_version"] = None
-        findings = [str(item[0]) for item in conn.execute("PRAGMA quick_check(1)").fetchall()]
-    except sqlite3.Error as exc:
-        if stopped or _is_locked(exc) or "interrupt" in str(exc).lower():
-            why = "locked by another process" if _is_locked(exc) else (
-                f"stopped after {DOCTOR_LEDGER_CHECK_SECONDS:g}s"
-            )
-            section.update(
-                status="incomplete",
-                detail=f"{path}: integrity check incomplete ({why}); not a finding - run doctor "
-                "again later",
-            )
-        else:
-            section.update(status="unreadable", detail=f"{path}: unreadable read-only ({exc})")
-        return section
-    finally:
-        conn.close()
-    version = section["storage_version"]
-    version_text = (
-        f"storage version {version}" if version is not None else "storage version not recorded"
-    )
-    if isinstance(version, int) and version > SUPPORTED_STORAGE_VERSION:
-        version_text += (
-            f", newer than this build's {SUPPORTED_STORAGE_VERSION}: this build refuses to open it"
-        )
-    section["quick_check"] = findings[0] if findings else ""
-    if findings == ["ok"]:
-        section.update(status="ok", detail=f"{path}: quick_check ok, {version_text}")
-    else:
-        section.update(
-            status="problem",
-            detail=(
-                f"{path}: quick_check found a problem ({section['quick_check'] or 'no answer'}), "
-                f"{version_text}. Nothing was repaired; keep a copy before anything touches it"
-            ),
-        )
-    return section
-
-
-#: Executables doctor runs, with ``--version`` only and always from the absolute path PATH lookup
-#: found. ``dsh`` is deliberately not one of them: the ``dsh`` on PATH may be the DSH Desktop app's
-#: shim, and running it could start that app - doctor reports its path and nothing else.
-_DOCTOR_VERSION_PROBES = frozenset({"git", "node"})
-#: The DSH Desktop app's command-line shim, relative to ``%LOCALAPPDATA%`` (per-user install).
-#: Doctor only checks that this file exists; it never runs it and never edits PATH.
-DESKTOP_DSH_SHIM_RELATIVE = Path(
-    "Programs", "DeepSeek Harness", "resources", "runtime", "cli", "bin", "dsh.cmd"
-)
-
-
-def _doctor_version(program: str) -> str:
-    """The first line ``<program> --version`` prints, or why it could not be read."""
-    try:
-        completed = subprocess.run(  # noqa: S603 - an absolute path and a fixed metadata flag
-            [program, "--version"],
-            capture_output=True,
-            text=True,
-            errors="replace",
-            stdin=subprocess.DEVNULL,
-            timeout=20,
-            check=False,
-        )
-        return (completed.stdout or completed.stderr).strip().splitlines()[0]
-    except (OSError, subprocess.SubprocessError, IndexError) as exc:
-        return f"probe failed: {exc}"
-
-
-def _doctor_launch_facts(launch: object) -> dict[str, object]:
-    """Which acpx entry (and its version), dsh and node a launch resolved. Nothing is executed.
-
-    The version is the acpx package.json's ``version`` field (``observe_client_identity``), which
-    is what the package says, not a compatibility proof.
-    """
-    from .drivers.dsh_surfaces import observe_client_identity
-
-    client_entry = getattr(launch, "client_entry", "")
-    version = ""
-    if client_entry:
-        try:
-            version = observe_client_identity(launch).acpx_version  # type: ignore[arg-type]
-        except Exception:  # noqa: BLE001 - a record, never a reason doctor fails
-            version = ""
-    return {
-        "client_entry": client_entry or None,
-        "acpx_version": version or None,
-        "dsh_executable": getattr(launch, "dsh_executable", "") or None,
-        "node": getattr(launch, "node", "") or None,
-        "resolvable": bool(getattr(launch, "resolvable", False)),
-    }
-
-
-def _doctor_integrate_readiness(git: dict[str, object]) -> dict[str, object]:
-    """Whether ``hflow integrate`` can run with the Git on PATH, judged by its version only."""
-    from .gitworkspace import MIN_INTEGRATION_GIT, GitError, parse_git_version
-
-    needed = ".".join(str(part) for part in MIN_INTEGRATION_GIT)
-    section: dict[str, object] = {
-        "usable": None,
-        "minimum_git": needed,
-        "git": git.get("path"),
-        "git_version": None,
-    }
-    if not git.get("path"):
-        section["usable"] = False
-        section["detail"] = (
-            f"hflow integrate: NOT USABLE (needs Git {needed} or later; no git on PATH)"
-        )
-        return section
-    reported = str(git.get("version") or "")
-    try:
-        version = parse_git_version(reported)
-    except GitError:
-        section["detail"] = (
-            f"hflow integrate: unknown (needs Git {needed} or later; `git --version` gave "
-            f"{reported[:80]!r})"
-        )
-        return section
-    found = ".".join(str(part) for part in version)
-    section["git_version"] = found
-    section["usable"] = version[:2] >= MIN_INTEGRATION_GIT
-    section["detail"] = (
-        f"hflow integrate: usable (Git {found}; needs Git {needed} or later)"
-        if section["usable"]
-        else f"hflow integrate: NOT USABLE (needs Git {needed} or later; this Git is {found})"
-    )
-    return section
-
-
-def _doctor_acpx_readiness(
-    launch: object, on_path: dict[str, object], data_dir: Path
-) -> dict[str, object]:
-    """Where the acpx client entry resolves from - which is never PATH - and its version.
-
-    When none is found, the detail also prints the install that puts one where HFlow looks
-    (``<data-dir>/m0/acpx``) and the model-free check to run on it. Printed only: doctor never
-    runs npm or the client.
-    """
-    from .drivers.acpx_dsh import DEV_ACPX_RELATIVE, ENV_ACPX_CLI, PROBE_ACPX_RELATIVE
-    from .drivers.dsh_surfaces import RECORDED_ACPX_VERSION
-
-    facts = _doctor_launch_facts(launch)
-    order = (
-        f"${ENV_ACPX_CLI}, then <data-dir>/{DEV_ACPX_RELATIVE.as_posix()}, then this HFlow "
-        f"checkout's {PROBE_ACPX_RELATIVE.as_posix()}"
-    )
-    section: dict[str, object] = {
-        "client_entry": facts["client_entry"],
-        "acpx_version": facts["acpx_version"],
-        "on_path": on_path.get("path"),
-        "resolution_order": order,
-    }
-    if facts["client_entry"]:
-        section["detail"] = (
-            f"{facts['client_entry']} (acpx {facts['acpx_version'] or 'version unknown'}, read "
-            "from its package.json; nothing executed)"
-        )
-        return section
-    path_note = (
-        f"the acpx on PATH ({on_path['path']}) is not used"
-        if on_path.get("path")
-        else "acpx is not on PATH either, and PATH is not where HFlow looks"
-    )
-    # The npm prefix the data-dir step looks under: the part of the entry before node_modules.
-    # Absolute, so the printed commands work from any directory.
-    base = Path(os.path.abspath(data_dir))
-    parts = DEV_ACPX_RELATIVE.parts
-    prefix = base.joinpath(*parts[: parts.index("node_modules")])
-    entry = base / DEV_ACPX_RELATIVE
-    install = f"npm install --prefix {_shell_word(str(prefix))} acpx@{RECORDED_ACPX_VERSION}"
-    check = (
-        f"python tools/m0_probe/real_client_checks.py all --acpx-cli {_shell_word(str(entry))}"
-    )
-    section["install_command"] = install
-    section["check_command"] = check
-    section["detail"] = (
-        f"NOT FOUND - HFlow resolves the acpx entry from {order}; {path_note}. Set "
-        f"{ENV_ACPX_CLI} to the dist/cli.js of an acpx package installed outside any project, "
-        f"or install one where HFlow looks: `{install}`, then check it without a model "
-        f"(from this HFlow checkout): `{check}`. A machine profile does not name the acpx "
-        "entry in this build"
-    )
-    return section
-
-
-def _doctor_dsh_readiness(on_path: dict[str, object], data_dir: Path) -> dict[str, object]:
-    """Where a launch finds ``dsh``: PATH first, then the npm CLI under the data directory.
-
-    The same lookup a launch makes (``acpx_dsh.resolve_dsh``). With neither, the detail names both
-    places and prints the npm install (user ruling 2026-10-14). A DSH Desktop shim is reported
-    with DSH #9626 and never recommended. Path and stat only: doctor never runs dsh.
-    """
-    from .drivers.acpx_dsh import DSH_SOURCE_DATA_DIR, DSH_SOURCE_PATH, find_in_directory
-    from .drivers.dsh_surfaces import (
-        DSH_NPM_PACKAGE,
-        RECORDED_DSH_NPM_VERSION,
-        dsh_npm_bin_dir,
-        dsh_npm_install_command,
-    )
-
-    bin_dir = dsh_npm_bin_dir(data_dir)
-    installed = find_in_directory("dsh", bin_dir, os.environ)
-    section: dict[str, object] = {
-        "on_path": on_path.get("path"),
-        "data_dir_install": installed or None,
-        "source": None,
-        "desktop_shim": None,
-    }
-    never_run = "path only: doctor never runs dsh, which may start the DSH Desktop app"
-    if on_path.get("path"):
-        section["source"] = DSH_SOURCE_PATH
-        section["detail"] = f"{on_path['path']} (dsh={DSH_SOURCE_PATH}; {never_run})" + (
-            f"; the npm CLI under the data dir ({installed}) is not used while PATH has a dsh"
-            if installed
-            else ""
-        )
-        return section
-    if installed:
-        section["source"] = DSH_SOURCE_DATA_DIR
-        section["detail"] = (
-            f"{installed} (dsh={DSH_SOURCE_DATA_DIR}: PATH has no dsh, so a launch uses the "
-            f"{DSH_NPM_PACKAGE}@{RECORDED_DSH_NPM_VERSION} install under the data directory; "
-            f"{never_run})"
-        )
-        return section
-    install = dsh_npm_install_command(data_dir)
-    section["install_command"] = install
-    detail = (
-        "NOT FOUND on PATH (only absolute PATH entries are searched, never the current "
-        f"directory) or in {bin_dir}: a real launch is not resolvable without one. Install the "
-        f"npm CLI where HFlow looks: `{install}`"
-    )
-    local = os.environ.get("LOCALAPPDATA") if os.name == "nt" else None
-    if local:
-        shim = Path(local) / DESKTOP_DSH_SHIM_RELATIVE
-        if shim.is_file():  # stat only: the shim is never read or run here
-            section["desktop_shim"] = str(shim)
-            detail += (
-                f". The DSH Desktop shim at {shim} is not that route: DSH #9626 (community "
-                "reports, unconfirmed) makes its workspace-write sandbox - DSH's default - fail "
-                "every shell tool call, while the npm CLI's sandbox runner is node.exe"
-            )
-    section["detail"] = detail
-    return section
-
-
-def _doctor_credentials(child_kind: str, child_home: Path) -> dict[str, object]:
-    """Which credential sources an HFlow child could have, and whether a real launch is refused.
-
-    The facts are ``dsh_surfaces.credential_sources``' and the verdict is the launch rule's
-    (``acpx_dsh.credential_source_problem``, user ruling 2026-10-07), applied to the child
-    environment a launch would build from this one - so doctor cannot disagree with ``prepare``
-    or the spawn gate. ``DEEPSEEK_API_KEY`` is reported by name: its value is never read, printed
-    or hashed. A bound DSH home's stored-credentials file and ``.env`` are checked by stat only.
-    A fact line: it never changes doctor's exit code.
-    """
-    from .drivers.acpx_dsh import child_environment, credential_source_problem
-    from .drivers.dsh_surfaces import (
-        DEEPSEEK_API_KEY_NAME,
-        STORED_CREDENTIALS_NAME,
-        credential_sources,
-    )
-
-    kind: Literal["bound", "per_invocation"] = (
-        "bound" if child_kind == "bound" else "per_invocation"
-    )
-    child_env = child_environment(
-        os.environ, extra_env={}, dsh_home=str(child_home) if kind == "bound" else ""
-    )
-    sources = credential_sources(child_env, dsh_home_kind=kind, dsh_home=child_home)
-    key = "present" if sources.api_key_in_env else "absent"
-    refused = bool(
-        credential_source_problem(child_env, dsh_home_kind=kind, dsh_home=child_home)
-    )
-    section: dict[str, object] = {
-        DEEPSEEK_API_KEY_NAME: key,
-        "child_dsh_home_kind": child_kind,
-        "dsh_home_files": dict(sources.home_files),
-        "real_launch_refused": refused,
-    }
-    key_text = f"{DEEPSEEK_API_KEY_NAME} {key} in this environment (name only, value never read)"
-    if kind == "bound":
-        listed = ", ".join(f"{name} {state}" for name, state in sources.home_files)
-        detail = (
-            f"{key_text}; bound DSH home {child_home}: {listed} (stat only, never opened). DSH's "
-            "documented precedence (not observed): the launch environment, then the home's "
-            f"{STORED_CREDENTIALS_NAME}, then <cwd>/.env, then the home's .env"
-        )
-    else:
-        detail = (
-            f"{key_text}; DSH_HOME is not bound, so a child's DSH home is the per-invocation one, "
-            "created empty - no stored credentials - and the launch environment is its only "
-            "credential source (inferred from upstream source, not observed)"
-        )
-    section["detail"] = detail + (
-        ". A real launch from this environment would be REFUSED before dispatch "
-        "(no_credential_source): no credential source is visible"
-        if refused
-        else ". A real launch is not refused for credentials: a source is present (a presence "
-        "check only - it does not prove the credential is valid)"
-    )
-    return section
-
-
 def cmd_doctor(args: argparse.Namespace) -> int:
-    """Read-only environment probe. Never installs, never modifies global config.
+    """``hflow doctor``: the read-only environment probe (:mod:`hflow.doctor`)."""
+    from .doctor import cmd_doctor as doctor
 
-    It runs ``git --version`` and ``node --version`` (from the absolute paths PATH lookup found)
-    and nothing else: never ``dsh``, never the acpx client, never a model. The readiness lines it
-    adds (integrate's Git minimum, where the acpx entry and ``dsh`` resolve from, which
-    credential sources a child could have) are facts for the operator; the exit code stays
-    ``0``, or ``2`` when a named profile cannot be used.
-    """
-    data_dir = _data_dir(args)
-    profile_source = (
-        "--profile"
-        if args.profile
-        else (ENV_PROFILE if os.environ.get(ENV_PROFILE) else "none")
-    )
-    requested_profile = profiles.requested_profile_id(args.profile)
-    report: dict[str, object] = {
-        "python": sys.version.split()[0],
-        "executables": {},
-        "dsh_profiles": [],
-        "data_dir": str(data_dir),
-        "data_dir_writable": os.access(data_dir.parent if not data_dir.exists() else data_dir, os.W_OK),
-        "notes": [
-            "doctor performed no model calls, built no run and did not boot any DSH profile",
-        ],
-    }
-    from .drivers.acpx_dsh import (
-        INVOCATION_ID_PLACEHOLDER,
-        child_home_for,
-        effective_dsh_home,
-        find_on_path,
-        resolve_launch_config,
-    )
-
-    executables = report["executables"]
-    assert isinstance(executables, dict)
-    for name in ("python", "git", "dsh", "acpx", "node"):
-        # Absolute PATH entries only, as a launch resolves its programs: ``shutil.which`` looks in
-        # the current directory first on Windows and can return a relative path.
-        found = find_on_path(name, os.environ)
-        entry: dict[str, object] = {"path": found or None, "available": bool(found)}
-        if found and name in _DOCTOR_VERSION_PROBES:
-            entry["version"] = _doctor_version(found)
-        elif found and name == "dsh":
-            entry["note"] = "not run: doctor never starts dsh (it may be the DSH Desktop app)"
-        elif name == "dsh":
-            # A launch also looks in the data directory's npm install: see the launcher line.
-            entry["note"] = "not on PATH; the dsh launcher line says what a launch uses"
-        executables[name] = entry
-
-    dsh_home = Path(os.environ.get("DSH_HOME") or Path.home() / ".dsh")
-    profiles_dir = dsh_home / "profiles"
-    if profiles_dir.is_dir():
-        report["dsh_profiles"] = sorted(
-            p.name
-            for p in profiles_dir.iterdir()
-            if p.is_dir() and not p.name.startswith(".") and p.name != "node_modules"
-        )
-        report["dsh_home"] = str(dsh_home)
-    # ``dsh_home`` above is the home *your* shell's dsh uses. An HFlow child gets the launch's
-    # bound DSH_HOME or none at all, so its home is named separately (read-only resolution).
-    # The same resolution says where the acpx entry comes from, which is never PATH.
-    ambient_launch = resolve_launch_config(data_dir=data_dir)
-    child_kind, child_home = effective_dsh_home(
-        ambient_launch,
-        child_home=child_home_for(data_dir.resolve(), INVOCATION_ID_PLACEHOLDER),
-    )
-    report["child_dsh_home"] = {
-        "kind": child_kind,
-        "path": str(child_home),
-        "detail": (
-            "DSH_HOME is set here, so every HFlow child gets it (bound when the launch is "
-            "resolved)"
-            if child_kind == "bound"
-            else "DSH_HOME is not set here, so an HFlow child gets none: the driver removes it "
-            "and points USERPROFILE/HOME at the invocation's own home, and DSH's default home is "
-            "that home's .dsh, created empty for each invocation (no stored credentials, no "
-            "cordis.patch.yml, no AGENTS.md, no skills, a fresh anonymous id) - inferred from "
-            "upstream source, not observed"
-        ),
-    }
-
-    report["ledger_health"] = _doctor_ledger_health(data_dir)
-    report["ledger_settlements"] = _doctor_ledger_settlements(data_dir)
-    # Facts an operator needs before a first real run or an integration. None of them changes
-    # the exit code: they are reported, and `prepare` / the run gates still decide.
-    report["readiness"] = {
-        "integrate": _doctor_integrate_readiness(executables["git"]),
-        "acpx": _doctor_acpx_readiness(ambient_launch, executables["acpx"], data_dir),
-        "dsh": _doctor_dsh_readiness(executables["dsh"], data_dir),
-        "credentials": _doctor_credentials(child_kind, child_home),
-    }
-
-    probe = local_probe()
-    report["capability_record"] = probe.model_dump(mode="json")
-    report["capabilities"] = _capability_section(probe)
-
-    profile_section, profile_exit = _doctor_profile_section(
-        data_dir, requested_profile, profile_source
-    )
-    report["profile"] = profile_section
-    if requested_profile and profile_section.get("usable"):
-        implementer = (profile_section.get("roles") or {}).get("implementer", {})  # type: ignore[union-attr]
-        report["selected_driver"] = implementer.get("driver_id") or "unresolved"
-        report["driver_status"] = "RESOLVED_FROM_PROFILE"
-    elif requested_profile:
-        report["selected_driver"] = "unresolved"
-        report["driver_status"] = "PROFILE_NOT_USABLE"
-    else:
-        # Not "unselected" as a defect: no profile was named. A live run needs one, and saying
-        # so is different from saying a binding exists.
-        report["selected_driver"] = "none"
-        report["driver_status"] = "NO_PROFILE_SELECTED"
-        report["notes"].append(  # type: ignore[union-attr]
-            f"no machine profile selected: pass --profile <id> or set {ENV_PROFILE}. "
-            "`--driver fake` remains the offline default."
-        )
-        # Why nothing runs unattended by default, stated where a reader looks for it.
-        report["notes"].append(default_refusal_reason())  # type: ignore[union-attr]
-    report["notes"].append(  # type: ignore[union-attr]
-        "capability states are the recorded table, not a live compatibility proof; doctor "
-        "found executables on the absolute PATH entries and ran only `git --version` and "
-        "`node --version` (never dsh, never the acpx client), and observed file presence, the "
-        "dsh shim's text (to classify its carrier), the version fields of package and manifest "
-        "files, the SHA-256 of the launch entry files and, with --profile, of a bound DSH home's "
-        "patch files and AGENTS.md - nothing else was read and no .env or credential file was "
-        "opened (their presence is checked by stat only)"
-    )
-    report["notes"].append(  # type: ignore[union-attr]
-        "dsh_home/dsh_profiles describe the DSH home your own shell's dsh uses; an HFlow child "
-        "uses child_dsh_home"
-    )
-
-    if args.json:
-        print(canonical_json(report))
-    else:
-        print("\n".join(_doctor_text_lines(report)))
-    return profile_exit
-
-
-def _doctor_text_lines(report: dict[str, Any]) -> list[str]:
-    """``doctor``'s text form: the facts ``--json`` prints, one labelled line each."""
-    lines = [f"python        {report['python']}"]
-    for name, entry in report["executables"].items():
-        version = entry.get("version", "")
-        note = entry.get("note", "")
-        suffix = f"  {version}" if version else (f"  ({note})" if note else "")
-        lines.append(f"{name:<13} {entry['path'] or 'NOT FOUND'}{suffix}")
-    child = report["child_dsh_home"]
-    readiness = report["readiness"]
-    lines += [
-        f"your dsh home {report.get('dsh_home', 'not found')}",
-        f"child dsh home {child['kind']} {child['path']}",
-        f"dsh profiles  {', '.join(report['dsh_profiles']) or 'none'}",
-        f"data dir      {report['data_dir']} (writable={report['data_dir_writable']})",
-        f"ledger health {report['ledger_health']['detail']}",
-        f"ledger settle {report['ledger_settlements']['detail']}",
-        f"integrate     {readiness['integrate']['detail']}",
-        f"acpx client   {readiness['acpx']['detail']}",
-        f"dsh launcher  {readiness['dsh']['detail']}",
-        f"credentials   {readiness['credentials']['detail']}",
-    ]
-    profile = report["profile"]
-    lines.append(
-        f"profile       {profile['requested'] or '(none selected)'} "
-        f"[via {profile['requested_via']}] "
-        f"{'usable' if profile['usable'] else 'NOT USABLE'}"
-    )
-    if not profile["usable"]:
-        lines.append(f"  detail      {profile['detail']}")
-    for role, entry in (profile.get("roles") or {}).items():
-        state = "usable" if entry.get("usable") else "NOT USABLE"
-        lines.append(
-            f"  {role:<11} agent={entry.get('agent')} driver={entry.get('driver')} "
-            f"-> {entry.get('driver_id') or 'unresolved'} [{state}]"
-        )
-        if entry.get("detail"):
-            lines.append(f"               {entry['detail']}")
-        launch = entry.get("launch")
-        if launch:
-            lines.append(
-                f"               launch acpx={launch['client_entry'] or 'NOT FOUND'} "
-                f"(acpx {launch['acpx_version'] or 'version unknown'}) "
-                f"dsh={launch['dsh_executable'] or 'NOT FOUND'}"
-            )
-        lines += [f"               dep  {item}" for item in entry.get("dependencies") or []]
-    lines.append(f"driver        {report['selected_driver']} [{report['driver_status']}]")
-    capability_states = report["capabilities"]["states"]
-    for state in ("probed", "enforced", "documented", "unsupported", "unknown"):
-        lines.append(f"cap {state:<11} {', '.join(capability_states[state]) or '-'}")
-    lines += [f"note          {note}" for note in report["notes"]]
-    return lines
+    return doctor(args)
 
 
 def _resolution_arguments(args: argparse.Namespace) -> PlanArguments:
@@ -1047,10 +340,48 @@ def _resolution_arguments(args: argparse.Namespace) -> PlanArguments:
     The fields are :data:`RESOLUTION_FLAGS`' dests plus the data directory - one list, so a flag
     cannot be added to one and forgotten in the other.
     """
+    from .prepare import writes_opted_in
+
     values = {dest: getattr(args, dest, None) for dest, _flag in RESOLUTION_FLAGS}
     values["project_root"] = values["project_root"] or DEFAULT_PROJECT_ROOT
-    values["authorization_mode"] = values["authorization_mode"] or DEFAULT_AUTHORIZATION_MODE
+    # The write opt-in: --allow-writes, else HFLOW_ALLOW_WRITES - the fallback `run --task` has
+    # always honoured, and `prepare` shares it so its preview is that run. A plan records the
+    # result, and `approve --plan` / `run --plan` use that and never read the environment.
+    values["allow_writes"] = bool(values["allow_writes"]) or writes_opted_in()
     return PlanArguments.model_validate({**values, "data_dir": str(_data_dir(args))})
+
+
+def _plan_command(
+    verb: str, plan_path: str | Path, authorization_file: str | Path | None = None
+) -> str:
+    """``hflow <verb> --plan PLAN`` (with ``--authorization-file FILE``), ready to paste.
+
+    Never ``--data-dir``: a plan names its own data directory, and ``run --plan`` opens it.
+    """
+    from .hints import command
+
+    words = [verb, "--plan", _shell_word(str(plan_path))]
+    if authorization_file:
+        words += ["--authorization-file", _shell_word(str(authorization_file))]
+    return command(None, *words)
+
+
+def _resolve_and_report(arguments: PlanArguments) -> tuple[Resolution, PrepareReport]:
+    """Resolve ``arguments`` and build the preview of it: the one block ``prepare`` and
+    ``approve`` share, so what is approved is what was previewed.
+
+    The root budget file and the explicit repair opt-in are read and validated before anything
+    else is resolved; an invalid one refuses with no report printed and nothing dispatched.
+    """
+    from .prepare import build_prepare_report, resolve_arguments
+
+    resolution = resolve_arguments(arguments)
+    report = build_prepare_report(
+        resolution.resolved,
+        authorization_mode=arguments.authorization_mode,
+        root_budget_plan=resolution.root_plan,
+    )
+    return resolution, report
 
 
 def _usage_error(command: str, message: str) -> int:
@@ -1080,7 +411,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     every flag. A plan is not an approval, and it is written only for a task that would get past
     both gates.
     """
-    from .prepare import build_prepare_report, render_prepare_text, resolve_arguments
+    from .prepare import render_prepare_text
 
     arguments = _resolution_arguments(args)
     if args.plan_out:
@@ -1092,14 +423,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         # Resolved from the absolute form the plan records, so the report inside the plan is
         # exactly what `approve` and `run` compute from it.
         arguments = frozen_arguments(arguments)
-    # The root budget file and the explicit repair opt-in are read and validated before anything
-    # else is resolved; an invalid one refuses with no report printed and nothing dispatched.
-    resolution = resolve_arguments(arguments)
-    report = build_prepare_report(
-        resolution.resolved,
-        authorization_mode=arguments.authorization_mode,
-        root_budget_plan=resolution.root_plan,
-    )
+    resolution, report = _resolve_and_report(arguments)
     if args.json:
         print(canonical_json(report.model_dump(mode="json")))
     else:
@@ -1158,20 +482,20 @@ def _write_prepared_plan(
             "directly, charging the root to a CLI-minted record labelled as not a user approval",
             file=stream,
         )
-        print(f"next: hflow run --plan {_shell_word(str(path))}", file=stream)
+        print(f"next: {_plan_command('run', path)}", file=stream)
         print(
-            f"next: hflow approve --plan {_shell_word(str(path))}  # optional, instead: charge "
-            "the root to your own approval, then run --plan",
+            f"next: {_plan_command('approve', path)}  # optional, instead: charge the root to "
+            "your own approval, then run --plan",
             file=stream,
         )
     elif plan.prepare_report.authorization.required:
-        print(f"next: hflow approve --plan {_shell_word(str(path))}", file=stream)
+        print(f"next: {_plan_command('approve', path)}", file=stream)
     else:
         print(
             "plan          needs no authorization (offline fake driver, no root budget)",
             file=stream,
         )
-        print(f"next: hflow run --plan {_shell_word(str(path))}", file=stream)
+        print(f"next: {_plan_command('run', path)}", file=stream)
 
 
 def cmd_approve(args: argparse.Namespace) -> int:
@@ -1192,6 +516,10 @@ def cmd_approve(args: argparse.Namespace) -> int:
     exactly ``hflow run --plan PLAN`` with the file just written (:func:`_approve_then_run`); the
     exit code is the run's. Nothing about the approval itself changes, and nothing runs when it
     fails.
+
+    With ``--task`` (and the resolution flags ``prepare`` takes) instead of ``--plan``, the plan
+    is resolved and written first (:func:`_approve_task_plan`) and then approved exactly as
+    ``approve --plan`` approves it: one process for ``prepare --plan-out`` plus ``approve --plan``.
     """
     from .ids import new_id, utc_now
     from .plan import (
@@ -1204,19 +532,20 @@ def cmd_approve(args: argparse.Namespace) -> int:
         same_directory,
         write_authorization,
     )
-    from .prepare import build_prepare_report, render_prepare_text, resolve_arguments
+    from .prepare import render_prepare_text
 
-    opened = _open_plan(args, "approve")
+    if args.task:
+        opened = _approve_task_plan(args)
+    elif args.plan_out:
+        return _usage_error("approve", "--plan-out goes with --task: --plan names the plan")
+    else:
+        conflict = _plan_flag_conflict(args, "approve")
+        opened = conflict if conflict is not None else _open_plan(args, "approve")
     if isinstance(opened, int):
         return opened
     plan_path, plan = opened
     arguments = plan.arguments
-    resolution = resolve_arguments(arguments)
-    report = build_prepare_report(
-        resolution.resolved,
-        authorization_mode=arguments.authorization_mode,
-        root_budget_plan=resolution.root_plan,
-    )
+    resolution, report = _resolve_and_report(arguments)
     require_current(
         plan,
         plan_path,
@@ -1227,7 +556,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
     # What is being approved and the questions about it share one stream, the one the prompts
     # use: `approve --plan p > log.txt` must not hide the summary while still asking.
     summary_stream = sys.stderr
-    run_command = f"hflow run --plan {_shell_word(str(plan_path))}"
+    run_command = _plan_command("run", plan_path)
     if not report.authorization.required:
         result: dict[str, object] = {
             "authorization_required": False,
@@ -1261,9 +590,11 @@ def cmd_approve(args: argparse.Namespace) -> int:
         # itself is still an exclusive create. The existing file may be this plan's approval
         # already (the default name carries the binding digest), so the run that would use it
         # is printed; `run` verifies it like any other and refuses one that does not fit.
-        existing = run_command
-        if not same_directory(target, default_target):
-            existing += f" --authorization-file {_shell_word(str(target))}"
+        existing = (
+            run_command
+            if same_directory(target, default_target)
+            else _plan_command("run", plan_path, target)
+        )
         # Both lines on stderr: a refusal puts nothing on stdout (`approve --run` least of all).
         print(
             f"refused: {target} already exists and an authorization file is never overwritten. "
@@ -1294,7 +625,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
     # `run --plan` finds the file at the default path by itself; one written elsewhere (`--out`)
     # has to be named.
     if not same_directory(written, default_target):
-        run_command += f" --authorization-file {_shell_word(str(written))}"
+        run_command = _plan_command("run", plan_path, written)
     result = {
         "authorization_required": True,
         "written": True,
@@ -1308,6 +639,71 @@ def cmd_approve(args: argparse.Namespace) -> int:
         return _approve_then_run(args, plan_path, result, authorization_file=str(written))
     _print_approve_result(result, args.json)
     return EXIT_OK
+
+
+def _approve_task_plan(args: argparse.Namespace) -> tuple[Path, RunPlan]:
+    """``approve --task``: resolve the task as ``prepare --plan-out`` does and write its plan.
+
+    Returns ``(plan path, plan)`` for :func:`cmd_approve` to approve exactly as ``approve --plan``
+    does - which resolves the plan again and refuses it if it went stale in between. Refused, with
+    nothing written: a task ``run`` would refuse (the report is printed, as ``approve --plan``
+    prints it); standard input that is not a terminal when the plan needs an approval (before any
+    file is written); an existing different plan at the default path, ``<task stem>.plan.json``
+    next to the task, unless ``--plan-out`` names where it goes (an older plan there is then
+    replaced, as ``prepare --plan-out`` replaces it). A plan already there that is this one is
+    kept as it is. The ``plan`` line goes to stderr with the summary; stdout carries the result.
+    """
+    from .ids import utc_now
+    from .plan import (
+        build_plan,
+        check_plan_target,
+        default_plan_path,
+        frozen_arguments,
+        load_plan,
+        require_terminal,
+        write_plan,
+    )
+    from .prepare import render_prepare_text
+
+    arguments = frozen_arguments(_resolution_arguments(args))
+    explicit = args.plan_out is not None
+    target = check_plan_target(
+        Path(args.plan_out) if explicit else default_plan_path(Path(arguments.task))
+    )
+    resolution, report = _resolve_and_report(arguments)
+    if not resolution.resolved.ready_to_dispatch:
+        print(render_prepare_text(report), file=sys.stderr)
+        raise RefusedError(
+            RefusalCode.INVALID_SPEC,
+            "`hflow run` would refuse this task (admission or dispatch gate, listed above). "
+            "Nothing was written: no plan and no approval",
+        )
+    if report.authorization.required:
+        require_terminal(sys.stdin)  # before any file is written
+    plan = build_plan(
+        arguments, resolution, report, created_at=utc_now(), controller_build=controller_build()
+    )
+    if not explicit and target.exists():
+        try:
+            existing: RunPlan | None = load_plan(target)
+        except RefusedError:
+            existing = None
+        if existing is not None and (existing.binding_digest, existing.arguments) == (
+            plan.binding_digest,
+            plan.arguments,
+        ):
+            print(f"plan          {target} (already this plan; kept as it is)", file=sys.stderr)
+            return target, existing
+        raise RefusedError(
+            RefusalCode.INVALID_SPEC,
+            f"{target} already holds another plan (other inputs, or the same ones before they "
+            "changed), and approve --task never replaces a different plan by default. Nothing "
+            f"was written; pass --plan-out {_shell_word(str(target))} to replace it, or --plan-out "
+            "with another path",
+        )
+    path = write_plan(target, plan)
+    print(f"plan          {path}", file=sys.stderr)
+    return path, plan
 
 
 def _approve_result_lines(payload: dict[str, object]) -> list[str]:
@@ -1482,10 +878,7 @@ def _write_run_outcome(
         notes = payload["notes"]
         assert isinstance(notes, list)
         notes.append(offline_root_note)
-    if args.receipt_out:
-        receipt = outcome.receipt
-        _write_out(receipt.model_dump(mode="json") if receipt else payload, True, Path(args.receipt_out))
-    elif args.json:
+    if args.json:
         _write_out(payload, True)
     else:
         print(f"run        {outcome.run_id}")
@@ -1526,27 +919,11 @@ def _run_plan_inputs(
     """
     if not args.plan:  # the parser requires exactly one of --task and --plan
         return _resolution_arguments(args), None, None, args.authorization_file
-    from .plan import default_authorization_path, prepare_command
+    from .plan import default_authorization_path
 
-    given = [flag for dest, flag in RESOLUTION_FLAGS if getattr(args, dest, None) is not None]
-    if given:
-        # Named before the plan is opened, so even an unreadable plan gets this answer; the
-        # command to change an input is printed when the plan can be read.
-        try:
-            from .plan import load_plan
-
-            plan = load_plan(Path(os.path.abspath(args.plan)))
-            again = (
-                ". To change one, prepare the plan again with it changed: "
-                + prepare_command(plan.arguments, Path(os.path.abspath(args.plan)))
-            )
-        except RefusedError:
-            again = ". Re-run `hflow prepare ... --plan-out` to change one"
-        return _usage_error(
-            "run",
-            f"{', '.join(given)} cannot be combined with --plan: every resolution input comes "
-            f"from the plan{again}",
-        )
+    conflict = _plan_flag_conflict(args, "run")
+    if conflict is not None:
+        return conflict
     opened = _open_plan(args, "run")
     if isinstance(opened, int):
         return opened
@@ -1559,6 +936,33 @@ def _run_plan_inputs(
             authorization_file = str(candidate)
             print(f"note: using the approval of this plan at {candidate}", file=sys.stderr)
     return plan.arguments, plan, plan_path, authorization_file
+
+
+def _plan_flag_conflict(args: argparse.Namespace, command: str) -> int | None:
+    """A usage error when a resolution flag is given with ``--plan``, else ``None``.
+
+    Every resolution input comes from the plan, so a flag given as well would be a silent
+    override. Named before the plan is opened, so even an unreadable plan gets this answer; the
+    command to change an input is printed when the plan can be read.
+    """
+    from .plan import load_plan, prepare_command
+
+    given = [flag for dest, flag in RESOLUTION_FLAGS if getattr(args, dest, None) is not None]
+    if not given:
+        return None
+    try:
+        plan = load_plan(Path(os.path.abspath(args.plan)))
+        again = (
+            ". To change one, prepare the plan again with it changed: "
+            + prepare_command(plan.arguments, Path(os.path.abspath(args.plan)))
+        )
+    except RefusedError:
+        again = ". Re-run `hflow prepare ... --plan-out` to change one"
+    return _usage_error(
+        command,
+        f"{', '.join(given)} cannot be combined with --plan: every resolution input comes "
+        f"from the plan{again}",
+    )
 
 
 def _open_plan(args: argparse.Namespace, command: str) -> tuple[Path, RunPlan] | int:
@@ -1602,9 +1006,7 @@ def _approve_then_run(
     ``--json`` stdout carries two JSON lines, the approval's and then the run's.
     """
     result.pop("next", None)
-    command = f"hflow run --plan {_shell_word(str(plan_path))}"
-    if authorization_file:
-        command += f" --authorization-file {_shell_word(authorization_file)}"
+    command = _plan_command("run", plan_path, authorization_file)
     result["running"] = command
     if args.json:
         print(canonical_json(result))
@@ -1683,8 +1085,8 @@ def _run_authorization(
             raise RefusedError(
                 exc.code,
                 f"{exc.message} - this authorization was not issued for plan {plan_path} as "
-                "it resolves now. Nothing was dispatched; approve this plan with `hflow "
-                f"approve --plan {_shell_word(str(plan_path))}`",
+                "it resolves now. Nothing was dispatched; approve this plan with "
+                f"`{_plan_command('approve', plan_path)}`",
             ) from exc
     if root_plan is None:
         return _RunApproval(authorization=authorization)
@@ -1806,7 +1208,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
         if plan_path is not None:
             message += (
-                f" Approve the plan first: hflow approve --plan {_shell_word(str(plan_path))}"
+                f" Approve the plan first: {_plan_command('approve', plan_path)}"
             )
         _write_out({"refused": True, "reason": "live_authorization_missing", "detail": message}, args.json)
         print(f"refused: {message}", file=sys.stderr)
@@ -1866,7 +1268,6 @@ def cmd_run(args: argparse.Namespace) -> int:
             # check should leave evidence, not untracked files that later look like unfrozen
             # changes. This does not weaken any check.
             runners=CheckRunners.offline_default(extra_env=CHECK_ENV),
-            controller_id=args.controller_id,
             data_dir=data_dir,
             authorization=approval.authorization,
             # Batch E1: the root this run is spent against, and the ceilings the approval
@@ -1890,7 +1291,6 @@ def cmd_run(args: argparse.Namespace) -> int:
                 project=resolved.project,
                 project_root=resolved.project_root,
                 workspace_root=resolved.project_root,
-                controller_id=args.controller_id,
                 # The commit this command resolved the base to, once, and checked the approval
                 # against: the controller starts the worktree from it instead of resolving the
                 # task's ref again after the branch may have moved.
@@ -1898,7 +1298,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             )
         )
         steps: list[str] = []
-        if not (args.json or args.receipt_out):
+        if not args.json:
             from .hints import next_steps
 
             steps = next_steps(store, outcome.run_id, project_file=arguments.project)
@@ -2006,9 +1406,41 @@ def _inspect_command(args: argparse.Namespace, render: Callable[[RunInspection],
 
 
 def cmd_status(args: argparse.Namespace) -> int:
+    """One run's state (``status R-...``); without a run id, the inbox (:func:`_status_inbox`)."""
+    if args.run_id is None:
+        return _status_inbox(args)
     from .report import status_text
 
+    args.last = False  # status reads the run it names; ``--last`` is report's and diff's
     return _inspect_command(args, status_text)
+
+
+def _status_inbox(args: argparse.Namespace) -> int:
+    """Every run whose stored facts name something for you, grouped Running / Ready / Attention,
+    each with one line of facts and one ``next:`` command (``listing.inbox``).
+
+    Ledger reads and the clock only: no model, no driver, no process probe, no Git, no write, and
+    no ledger created when there is none. Exit 0 - whether or not anything needs you - or 6 when a
+    run could not be read (named on stderr, and in ``--json`` as an entry with an ``error``), as
+    ``runs`` answers.
+    """
+    from .listing import inbox, inbox_json, render_inbox
+
+    if args.project_root is not None:
+        return _usage_error("status", "--project-root reads one run's workspace: name the run id")
+    store = _existing_store(args)
+    if store is None:
+        entries, unreadable = [], []
+    else:
+        try:
+            entries, unreadable = inbox(store)
+        finally:
+            store.close()
+    if args.json:
+        print(canonical_json(inbox_json(entries, unreadable)))
+    else:
+        print(render_inbox(entries, unreadable=bool(unreadable)))
+    return _name_unreadable(unreadable)
 
 
 def cmd_report(args: argparse.Namespace) -> int:
@@ -2077,20 +1509,87 @@ def _run_integration(
     call: Callable[[], IntegrationOutcome],
     *,
     project_file: str | None = None,
+    integration_id: str | None = None,
 ) -> int:
     """Run one integrate operation on the open ``store``, then print it and what comes next.
 
     Its failures map through :func:`_integration_error`; anything that does not map there (a
     refusal other than :class:`~hflow.integrate.IntegrationBusy`, an unknown run) re-raises to
-    :func:`main`.
+    :func:`main`. ``integration_id`` names the record the operation acts on, read first so that
+    an integration this call brings to ``integrated`` is told from one that already was
+    (:func:`_finish_integration`).
     """
     try:
+        before = store.integration(integration_id) if integration_id else None
         outcome = call()
     except Exception as exc:  # noqa: BLE001 - mapped explicitly, anything else re-raised
         return _integration_error(exc)
+    return _finish_integration(
+        store, args, outcome, command, before=before, project_file=project_file
+    )
+
+
+def _finish_integration(
+    store: Store,
+    args: argparse.Namespace,
+    outcome: IntegrationOutcome,
+    command: str,
+    *,
+    before: IntegrationRecord | None,
+    project_file: str | None = None,
+    clean: bool | None = None,
+) -> int:
+    """Print ``outcome`` and what comes next; return ``command``'s exit code for it.
+
+    An integration that reached ``integrated`` in this process (``before`` was not) releases the
+    run's own worktree right here, through exactly the guarded cleanup ``hflow clean <run>
+    --apply`` runs (:func:`_auto_clean`) - unless ``--keep-worktree``. ``clean`` overrides that
+    decision (``integrate <run-id>`` also releases a worktree an earlier integration left). What
+    the cleanup did is printed, and the ``next:`` lines are worked out after it; a refused,
+    partial or failed cleanup never changes the exit code, which is the integration's.
+    """
+    integrated = outcome.record.state is IntegrationState.INTEGRATED
+    if clean is None:
+        clean = integrated and (before is None or before.state is not IntegrationState.INTEGRATED)
+    cleanup = _auto_clean(store, args, outcome.record.run_id) if integrated and clean else None
     steps = _integration_next(store, outcome, args, project_file=project_file)
-    _print_integration(outcome, args.json, steps)
+    _print_integration(outcome, args.json, steps, cleanup=cleanup)
     return _integration_exit(outcome, command)
+
+
+def _auto_clean(store: Store, args: argparse.Namespace, run_id: str) -> dict[str, object]:
+    """Release ``run_id``'s worktree once its change reached a branch: ``clean --apply`` in-process.
+
+    The same guards, the same refusals, no force, ``PARTIAL`` reported as such; the cleanup's
+    owner label is ``apply_cleanup``'s default. ``--keep-worktree`` skips it. A cleanup that
+    raises is reported, never raised: the integration it follows is recorded already.
+    """
+    if getattr(args, "keep_worktree", False):
+        return {
+            "applied": False,
+            "status": "KEPT",
+            "detail": "--keep-worktree: the run's worktree was left in place",
+        }
+    from .cleanup import apply_cleanup
+
+    try:
+        return apply_cleanup(store, run_id)
+    except Exception as exc:  # noqa: BLE001 - never changes the integration's outcome
+        return {
+            "applied": False,
+            "status": "ERROR",
+            "detail": f"the cleanup could not be completed ({type(exc).__name__}: {exc})",
+        }
+
+
+def _cleanup_lines(result: dict[str, object]) -> list[str]:
+    """What the cleanup after an integration did, as text lines (the refusals included)."""
+    lines = [f"cleanup       {result.get('status', '')}: {result.get('detail', '')}"]
+    plan = result.get("plan")
+    if isinstance(plan, dict):
+        for item in plan.get("refusals") or []:
+            lines.append(f"  refuse      {item['reason']}: {item['detail']}")
+    return lines
 
 
 def _integration_next(
@@ -2114,49 +1613,68 @@ def _integration_next(
 
 
 def _print_integration(
-    outcome: IntegrationOutcome, as_json: bool, steps: list[str] | None = None
+    outcome: IntegrationOutcome,
+    as_json: bool,
+    steps: list[str] | None = None,
+    *,
+    cleanup: dict[str, object] | None = None,
 ) -> None:
     from .hints import next_lines
     from .report import integration_record_lines
 
     if as_json:
-        print(canonical_json(outcome.as_dict()))
+        payload = outcome.as_dict()
+        if cleanup is not None:
+            payload["cleanup"] = cleanup
+        print(canonical_json(payload))
         return
     lines = integration_record_lines(outcome.record)
     for note in outcome.notes:
-        lines.append(f"note          {note}")
+        if note != outcome.record.detail:  # the record's own detail line already says it
+            lines.append(f"note          {note}")
     if outcome.receipt is not None:
         receipt = outcome.receipt
         lines.append(f"delivery      {receipt.delivery_state.value} ({receipt.basis})")
         for limitation in receipt.limitations:
             lines.append(f"limitation    {limitation}")
+    if cleanup is not None:
+        lines.extend(_cleanup_lines(cleanup))
     lines.extend(next_lines(list(outcome.handoff) if steps is None else steps))
     print("\n".join(lines))
 
 
-def cmd_integrate_prepare(args: argparse.Namespace) -> int:
-    """Build and check an integration commit for an accepted run. Never moves a branch."""
+def _integration_contract(
+    store: Store, args: argparse.Namespace, run_id: str
+) -> ProjectConfig | None:
+    """The project contract an integration of ``run_id`` is checked with: ``--project``, else the
+    run's recorded default (``integrate.recorded_project_file``). ``None``, after saying why on
+    stderr, when neither resolves: the caller exits ``EXIT_USAGE`` with nothing recorded."""
     from .integrate import recorded_project_file
     from .prepare import load_project_contract
 
+    project_file = Path(args.project) if args.project else recorded_project_file(store, run_id)
+    if project_file is None:
+        print(
+            f"refusing: pass --project for run {run_id}: it recorded no project "
+            "contract digest, its admission record cannot be read, or <project "
+            "root>/.hflow/project.json is missing, unreadable or no longer the contract the "
+            "run was admitted under",
+            file=sys.stderr,
+        )
+        return None
+    return load_project_contract(project_file)
+
+
+def cmd_integrate_prepare(args: argparse.Namespace) -> int:
+    """Build and check an integration commit for an accepted run. Never moves a branch."""
     data_dir = _data_dir(args)
     store = _lookup_store(args, "run", args.run_id)
     try:
         # An unknown run is named as one (by `main`), never as a missing --project.
         store.get_run(args.run_id)
-        project_file = (
-            Path(args.project) if args.project else recorded_project_file(store, args.run_id)
-        )
-        if project_file is None:
-            print(
-                f"refusing: pass --project for run {args.run_id}: it recorded no project "
-                "contract digest, its admission record cannot be read, or <project "
-                "root>/.hflow/project.json is missing, unreadable or no longer the contract the "
-                "run was admitted under",
-                file=sys.stderr,
-            )
+        project = _integration_contract(store, args, args.run_id)
+        if project is None:
             return EXIT_USAGE
-        project = load_project_contract(project_file)
         return _run_integration(
             store,
             args,
@@ -2192,6 +1710,7 @@ def cmd_integrate_apply(args: argparse.Namespace) -> int:
                 applied_by=applied_by,
                 controller_build=controller_build(),
             ),
+            integration_id=args.integration_id,
         )
     finally:
         store.close()
@@ -2203,8 +1722,9 @@ def cmd_integrate_apply(args: argparse.Namespace) -> int:
 INTEGRATION_ATTEST_MAX_CHARS = 500
 
 
-def cmd_integrate_reconcile(args: argparse.Namespace) -> int:
-    """Settle an integration record from what Git shows; never re-runs an update or a check."""
+def _integration_attestation(args: argparse.Namespace, command: str) -> str | None:
+    """``attested_by`` for a reconcile (the OS user, with ``--attest``'s words under
+    ``--owner-gone``), or ``None`` after saying on stderr why the attestation is refused."""
     from .controller import attestation_problem
 
     attestation = (args.attest or "").strip()
@@ -2213,7 +1733,7 @@ def cmd_integrate_reconcile(args: argparse.Namespace) -> int:
             problem: str | None = "--owner-gone needs --attest with what you know and why"
         elif len(attestation) > INTEGRATION_ATTEST_MAX_CHARS:
             problem = (
-                f"the attestation is {len(attestation)} characters; integrate reconcile records "
+                f"the attestation is {len(attestation)} characters; {command} records "
                 f"at most {INTEGRATION_ATTEST_MAX_CHARS} (in the run's audit note). Shorten it - "
                 "nothing is ever cut to fit"
             )
@@ -2221,10 +1741,18 @@ def cmd_integrate_reconcile(args: argparse.Namespace) -> int:
             problem = attestation_problem(args.attest)
         if problem is not None:
             print(f"refusing: {problem}", file=sys.stderr)
-            return EXIT_USAGE
+            return None
     attested_by = _os_user()
     if args.owner_gone:
         attested_by = f"{attested_by}: {attestation}"
+    return attested_by
+
+
+def cmd_integrate_reconcile(args: argparse.Namespace) -> int:
+    """Settle an integration record from what Git shows; never re-runs an update or a check."""
+    attested_by = _integration_attestation(args, "integrate reconcile")
+    if attested_by is None:
+        return EXIT_USAGE
     store = _lookup_store(args, "integration", args.integration_id)
     try:
         return _run_integration(
@@ -2238,6 +1766,7 @@ def cmd_integrate_reconcile(args: argparse.Namespace) -> int:
                 owner_gone_attested=args.owner_gone,
                 attested_by=attested_by,
             ),
+            integration_id=args.integration_id,
         )
     finally:
         store.close()
@@ -2267,6 +1796,277 @@ def cmd_integrate_show(args: argparse.Namespace) -> int:
         return EXIT_USAGE
     _print_integration(outcome, args.json, steps)
     return EXIT_OK
+
+
+# --------------------------------------------------------------------------
+# integrate <run-id>: one re-entrant command for a run's whole integration (ruling 2026-10-16)
+# --------------------------------------------------------------------------
+
+#: The parser key of ``hflow integrate <run-id>``. Never typed: a first word after ``integrate``
+#: that is a run id rather than a subcommand name selects it (:class:`_IntegrateCommands`).
+_INTEGRATE_RUN = "<run-id>"
+
+
+def _current_integration(
+    records: list[IntegrationRecord], target_ref: str | None
+) -> IntegrationRecord | None:
+    """The integration ``integrate <run-id>`` continues, from the run's records (oldest first).
+
+    The one that reached a branch, when one did; else the newest. With ``--target``, only the
+    records for that branch count. ``None``: nothing to continue, so the next step is a prepare.
+    """
+    if target_ref is not None:
+        records = [record for record in records if record.target_ref == target_ref]
+    integrated = [record for record in records if record.state is IntegrationState.INTEGRATED]
+    if integrated:
+        return integrated[-1]
+    return records[-1] if records else None
+
+
+def cmd_integrate_run(args: argparse.Namespace) -> int:
+    """``hflow integrate <run-id>``: continue the run's integration from whatever state it is in.
+
+    Every step is a subcommand's own operation, with its refusals and its exit code:
+
+    * no integration yet, or the newest ended ``stale`` / ``interrupted`` / ``failed`` /
+      ``superseded``: what ``integrate prepare`` does, the target being ``--target``, else the
+      branch of that newest integration, else the task's recorded base branch;
+    * ``ready`` - prepared just now or earlier: first what ``integrate reconcile`` does (a hand
+      merge after a hand-off is recorded ``integrated``, a moved target ``stale``); still
+      ``ready``, then at an interactive terminal the integration is shown with a confirmation
+      code to type back, and only the right code applies it - ``integrate apply`` with the tip
+      just shown as ``--expect-target`` (compare-and-set; a checked-out branch is handed off with
+      the merge to run yourself, and ``next: hflow integrate <run-id>``). Without a terminal it
+      stops at ``ready`` (exit 0, as ``prepare``) and says to run it at one;
+    * ``preparing`` / ``checking`` / ``applying``: what ``integrate reconcile`` does, with
+      ``--owner-gone --attest`` passed through;
+    * ``integrated``: reported. ``conflict`` / ``checks_failed``: reported (exit 3) and never
+      prepared again - that decision is the operator's (``integrate prepare``).
+
+    Whenever the integration ends ``integrated``, the run's worktree is released as ``clean
+    --apply`` would (:func:`_auto_clean`) unless ``--keep-worktree``; that never changes the exit
+    code.
+    """
+    attested_by = _integration_attestation(args, "integrate")
+    if attested_by is None:
+        return EXIT_USAGE
+    store = _lookup_store(args, "run", args.run_id)
+    try:
+        return _continue_integration(store, args, attested_by=attested_by)
+    finally:
+        store.close()
+
+
+def _continue_integration(store: Store, args: argparse.Namespace, *, attested_by: str) -> int:
+    from .hints import _PREPARE_AGAIN, hflow_command, word
+
+    run_id = args.run_id
+    store.get_run(run_id)  # an unknown run is named as one (by `main`)
+    rerun = hflow_command(store, "integrate", word(run_id))
+    before: IntegrationRecord | None = None
+    try:
+        record = _current_integration(
+            store.integrations_for(run_id),
+            f"refs/heads/{args.target}" if args.target else None,
+        )
+        if record is None or record.state in _PREPARE_AGAIN:
+            prepared = _prepare_for_run(store, args, run_id, record)
+            if isinstance(prepared, int):
+                return prepared
+            outcome, command = prepared, "prepare"
+        elif record.state is IntegrationState.READY or record.state in INTEGRATION_ACTIVE_STATES:
+            outcome = reconcile_integration(
+                store,
+                integration_id=record.integration_id,
+                controller_build=controller_build(),
+                owner_gone_attested=args.owner_gone,
+                attested_by=attested_by,
+            )
+            command, before = "reconcile", record
+        else:
+            outcome = IntegrationOutcome(
+                record=record,
+                receipt=store.integration_receipt(record.integration_id),
+                notes=[_settled_note(record)],
+            )
+            command, before = "reconcile", record
+    except Exception as exc:  # noqa: BLE001 - mapped explicitly, anything else re-raised
+        return _continue_error(store, exc, args)
+    if outcome.record.state is IntegrationState.READY:
+        return _confirm_and_apply(store, args, outcome, rerun)
+    outcome.handoff = _continuation(outcome, rerun)
+    return _finish_integration(
+        store,
+        args,
+        outcome,
+        command,
+        before=before,
+        clean=outcome.record.state is IntegrationState.INTEGRATED,
+    )
+
+
+def _settled_note(record: IntegrationRecord) -> str:
+    if record.state is IntegrationState.INTEGRATED:
+        return "already integrated; nothing was written"
+    return (
+        f"the newest integration of this run ended {record.state.value}; preparing it again "
+        "against the same tip cannot end otherwise, so `integrate <run-id>` does not - whether to "
+        "prepare again (`hflow integrate prepare`, for instance once the branch has moved) or to "
+        "start a new task revision is your decision. Nothing was written"
+    )
+
+
+def _prepare_for_run(
+    store: Store,
+    args: argparse.Namespace,
+    run_id: str,
+    latest: IntegrationRecord | None,
+) -> IntegrationOutcome | int:
+    """``integrate prepare`` for ``integrate <run-id>``; an exit code when it cannot start."""
+    from .hints import integrable, run_facts
+
+    target = args.target or (latest.target_ref.removeprefix("refs/heads/") if latest else "")
+    if not target:
+        facts = run_facts(store, run_id)
+        target = facts.base_branch
+        # A run that is not an accepted Git candidate gets prepare's own refusal, which names why.
+        if not target and integrable(facts.task_state, facts.delivery_state, facts.git_candidate):
+            print(
+                f"refusing: pass --target <branch> for run {run_id}: its task's base is not a "
+                "local branch of the repository the run recorded (a commit id, or a branch that "
+                "no longer exists), so there is no default target. Nothing was recorded",
+                file=sys.stderr,
+            )
+            return EXIT_USAGE
+    project = _integration_contract(store, args, run_id)
+    if project is None:
+        return EXIT_USAGE
+    return prepare_integration(
+        store,
+        run_id=run_id,
+        target_branch=target,
+        project=project,
+        runners=CheckRunners.offline_default(extra_env=CHECK_ENV),
+        data_dir=_data_dir(args),
+        controller_build=controller_build(),
+    )
+
+
+def _continuation(outcome: IntegrationOutcome, rerun: str) -> list[str]:
+    """The hand-off of an ``integrate <run-id>`` outcome: ``integrate <run-id>`` where the
+    subcommands would print ``integrate apply`` / ``reconcile`` / ``prepare``.
+
+    Commands the operator runs outside HFlow - the merge of a hand-off - are kept as printed.
+    ``[]`` where ``integrate <run-id>`` has nothing to continue (``integrated``, ``conflict``,
+    ``checks_failed``): the run's next steps then come from :mod:`hflow.hints`.
+    """
+    from .hints import _PREPARE_AGAIN, _with_comment
+
+    state = outcome.record.state
+    if outcome.handoff:
+        return [*(step for step in outcome.handoff if not step.startswith("hflow ")), rerun]
+    if state in _PREPARE_AGAIN:
+        return [_with_comment(rerun, "prepares again against the branch's current tip")]
+    if state in INTEGRATION_ACTIVE_STATES:
+        return [
+            _with_comment(rerun, "settles it once the process working on it has exited")
+        ]
+    return []
+
+
+def _confirm_and_apply(
+    store: Store, args: argparse.Namespace, outcome: IntegrationOutcome, rerun: str
+) -> int:
+    """A ``ready`` integration: at a terminal, the confirmation code and then the apply.
+
+    The facts, the code and the prompt go to stderr - the stream the prompt uses, as for
+    ``approve`` - so redirecting stdout never hides what is being confirmed; stdout carries the
+    result. The apply binds ``--expect-target`` to the tip shown, never to a fresh read, so a
+    branch that moved in between is ``stale``, not silently moved from somewhere else.
+    """
+    from .hints import _with_comment
+    from .integrate import confirmation_code
+    from .plan import is_terminal
+    from .report import integration_record_lines
+
+    record = outcome.record
+    if not is_terminal(sys.stdin):
+        outcome.handoff = [
+            _with_comment(
+                rerun,
+                "run it at an interactive terminal: it shows this integration and asks you to "
+                "type its confirmation code before anything moves",
+            )
+        ]
+        return _finish_integration(store, args, outcome, "prepare", before=None)
+    code = confirmation_code(record)
+    stream = sys.stderr
+    print("\n".join(integration_record_lines(record)), file=stream)
+    print(
+        f"integrating   {record.target_ref} {record.target_tip} -> {record.integration_commit} "
+        "by compare-and-set; a branch checked out in any worktree is not moved, you get the "
+        "merge to run yourself",
+        file=stream,
+    )
+    print(f"confirm code  {code}", file=stream)
+    stream.write(f"Type the confirmation code shown above ({len(code)} characters) to integrate: ")
+    stream.flush()
+    typed = sys.stdin.readline().strip()
+    if typed.lower() != code.lower():
+        print(
+            f"refused: the confirmation code did not match, so nothing was applied and nothing "
+            f"was written to {record.target_ref}. Run it again at a terminal and type the code it "
+            f"shows once you have read the integration\nnext: {rerun}",
+            file=sys.stderr,
+        )
+        return EXIT_REFUSED
+    try:
+        applied = apply_integration(
+            store,
+            integration_id=record.integration_id,
+            expect_target=record.target_tip,
+            applied_by=_os_user(),
+            controller_build=controller_build(),
+        )
+    except Exception as exc:  # noqa: BLE001 - mapped explicitly, anything else re-raised
+        return _continue_error(store, exc, args)
+    applied.handoff = _continuation(applied, rerun)
+    return _finish_integration(
+        store,
+        args,
+        applied,
+        "apply",
+        before=record,
+        clean=applied.record.state is IntegrationState.INTEGRATED,
+    )
+
+
+def _continue_error(store: Store, exc: Exception, args: argparse.Namespace) -> int:
+    """:func:`_integration_error`, plus the ``integrate <run-id>`` to run again when another
+    process may still be working on the integration (exit 5)."""
+    from .hints import ATTEST_PLACEHOLDER, _with_comment, hflow_command, word
+    from .integrate import IntegrationBusy
+
+    code = _integration_error(exc)
+    if isinstance(exc, IntegrationBusy):
+        if "--owner-gone" in str(exc) and not args.owner_gone:
+            # HFlow cannot tell whether that process runs (another host, no creation time): the
+            # attestation is the operator's, never fabricated.
+            step = _with_comment(
+                hflow_command(
+                    store, "integrate", word(args.run_id), "--owner-gone", "--attest",
+                    ATTEST_PLACEHOLDER,
+                ),
+                "only if you know that process has exited; recorded as your attestation, never "
+                "as an observation",
+            )
+        else:
+            step = _with_comment(
+                hflow_command(store, "integrate", word(args.run_id)),
+                "once the process working on it has exited",
+            )
+        print(f"next: {step}", file=sys.stderr)
+    return code
 
 
 class _NotOwnedDriver:
@@ -2366,7 +2166,6 @@ def _observer(store: Store, args: argparse.Namespace, run_id: str) -> tuple[Cont
         drivers["implementer"],  # type: ignore[arg-type]
         reviewer_driver=drivers["reviewer"],  # type: ignore[arg-type]
         controller_build=controller_build(),
-        controller_id=args.controller_id,
         effective_config=effective,
     )
     return controller, config_unreadable
@@ -2517,6 +2316,21 @@ def cmd_ledger_settle(args: argparse.Namespace) -> int:
     from .hints import next_lines, next_steps
     from .store import InvocationNotFound, SettlementRefused
 
+    # The text is checked before the ledger is opened: a placeholder, blank, oversized or
+    # NUL-bearing attestation is a usage error (4), as it is for `resume` and `integrate
+    # reconcile`, whatever the invocation. The placeholder rule reads the operator's own words,
+    # before the flag's suffix is added (a pasted placeholder plus that suffix is still not their
+    # words); the bounds read the text that is stored, suffix included, so a text within them is
+    # never refused later by the store for a length the operator did not type.
+    attestation = args.attest
+    if args.legacy_owner_gone:
+        attestation = f"{attestation}{LEGACY_OWNER_GONE_SUFFIX}"
+    problem = attestation_problem(args.attest) or _stored_attestation_problem(
+        attestation, suffix=LEGACY_OWNER_GONE_SUFFIX if args.legacy_owner_gone else ""
+    )
+    if problem is not None:
+        print(f"refusing: {problem}; nothing was done", file=sys.stderr)
+        return EXIT_USAGE
     attested_by = _os_user()
     store = _lookup_store(args, "invocation", args.invocation_id)
     try:
@@ -2525,18 +2339,6 @@ def cmd_ledger_settle(args: argparse.Namespace) -> int:
         )
         if alive is not None:
             raise SettlementRefused(alive)
-        # The placeholder rule reads the operator's own words, before the flag's suffix is added
-        # (a pasted placeholder plus that suffix is still not their words); the bounds read the
-        # text that is stored, suffix included, so a text within them is never refused later by
-        # the store for a length the operator did not type.
-        attestation = args.attest
-        if args.legacy_owner_gone:
-            attestation = f"{attestation}{LEGACY_OWNER_GONE_SUFFIX}"
-        problem = attestation_problem(args.attest) or _stored_attestation_problem(
-            attestation, suffix=LEGACY_OWNER_GONE_SUFFIX if args.legacy_owner_gone else ""
-        )
-        if problem is not None:
-            raise SettlementRefused(problem)
         settlement = store.settle_by_operator(
             args.invocation_id,
             settled_as=args.settled_as,
@@ -2596,10 +2398,10 @@ def cmd_ledger_settle(args: argparse.Namespace) -> int:
 
 
 def cmd_clean(args: argparse.Namespace) -> int:
-    """Release a run's workspace: preview by default, remove only with --apply."""
-    if args.apply and args.dry_run:
-        print("refusing: --apply and --dry-run are contradictory", file=sys.stderr)
-        return EXIT_USAGE
+    """Release a run's workspace: preview by default, remove only with --apply.
+
+    ``--apply``, ``--dry-run`` and ``--reconcile`` exclude each other (the parser refuses two).
+    """
     from .cleanup import apply_cleanup, plan_cleanup, reconcile_cleanup
 
     store = _lookup_store(args, "run", args.run_id)
@@ -2609,7 +2411,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
             _write_out(result if args.json else f"{result['status']}: {result['detail']}", args.json)
             return EXIT_OK
         if args.apply:
-            result = apply_cleanup(store, args.run_id, operator=args.controller_id)
+            result = apply_cleanup(store, args.run_id)
             if args.json:
                 print(canonical_json(result))
             else:
@@ -2739,21 +2541,67 @@ class _Parser(argparse.ArgumentParser):
         self.exit(EXIT_USAGE, f"{self.prog}: error: {message}\n")
 
 
+class _RunIdOrSubcommand:
+    """``integrate``'s choices: its subcommand names, and any run id (``R-...``, ``ids``)."""
+
+    def __init__(self, names: dict[str, argparse.ArgumentParser]) -> None:
+        self._names = names
+
+    def __contains__(self, value: object) -> bool:
+        return value in self._names or (isinstance(value, str) and value.startswith("R-"))
+
+    def __iter__(self):  # noqa: ANN204 - the names, for usage and "choose from" messages
+        return iter(self._names)
+
+
+class _IntegrateCommands(argparse._SubParsersAction):
+    """``integrate``'s subcommands, and ``integrate <run-id>``.
+
+    A first word that is a run id rather than a subcommand name selects the ``<run-id>`` parser
+    (:func:`cmd_integrate_run`) with that word as its run id. Any other word stays a usage error
+    that lists the choices.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.choices = _RunIdOrSubcommand(self._name_parser_map)
+
+    def __call__(self, parser, namespace, values, option_string=None):  # noqa: ANN001,ANN204
+        if values and values[0] not in self._name_parser_map:
+            values = [_INTEGRATE_RUN, *values]
+        super().__call__(parser, namespace, values, option_string)
+
+
+def _add_keep_worktree(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--keep-worktree",
+        action="store_true",
+        help=(
+            "when the integration ends integrated, keep the run's worktree instead of releasing it "
+            "as `hflow clean <run-id> --apply` would (same guards, never forced)"
+        ),
+    )
+
+
 def _add_resolution_args(
-    parser: argparse.ArgumentParser, *, plan_alternative: str | None = None
+    parser: argparse.ArgumentParser,
+    *,
+    plan_alternative: str | None = None,
+    task_help: str = "path to task.json",
 ) -> None:
     """The inputs `prepare` and `run` resolve a task from: one definition for both commands.
 
     Every one defaults to ``None`` so ``run --plan`` can tell a given flag from an absent one;
-    :func:`_resolution_arguments` applies the documented defaults (``--project-root .``,
-    ``--authorization-mode m2-live-change``). With ``plan_alternative`` (the help of ``--plan``)
+    :func:`_resolution_arguments` applies the documented default (``--project-root .``). The
+    task file carries its workspace mode and base commit itself (``init task`` writes both), so
+    no flag overrides them. With ``plan_alternative`` (the help of ``--plan``)
     exactly one of ``--task`` and ``--plan`` is required, and argparse enforces it.
     """
     if plan_alternative is None:
         parser.add_argument("--task", required=True, default=None, help="path to task.json")
     else:
         source = parser.add_mutually_exclusive_group(required=True)
-        source.add_argument("--task", default=None, help="path to task.json")
+        source.add_argument("--task", default=None, help=task_help)
         source.add_argument("--plan", default=None, help=plan_alternative)
     parser.add_argument(
         "--project",
@@ -2781,23 +2629,14 @@ def _add_resolution_args(
         ),
     )
     parser.add_argument(
-        "--base-commit",
-        default=None,
-        help="fix the base commit for a Git-worktree run (overrides the TaskSpec before admission)",
-    )
-    parser.add_argument(
-        "--workspace",
-        choices=["worktree", "in_place"],
-        default=None,
-        help="override workspace.mode before admission (worktree = isolated Git worktree)",
-    )
-    parser.add_argument(
-        "--authorization-mode",
-        choices=["stop-trial", "m2-live-change"],
+        "--allow-writes",
+        action="store_true",
         default=None,
         help=(
-            "which authorized activity the binding is for (default: m2-live-change); modes are "
-            "not interchangeable"
+            "let the implementer change the task's scope.write_allow paths (in its isolated "
+            "worktree); a task that declares write paths is refused without it. Without the flag "
+            "HFLOW_ALLOW_WRITES=1 in the environment counts. A plan records the opt-in, so "
+            "`approve --plan` and `run --plan` use the recorded value, not the environment"
         ),
     )
     parser.add_argument(
@@ -2874,6 +2713,13 @@ def cmd_init_task(args: argparse.Namespace) -> int:
     )
 
 
+def _name_unreadable(unreadable: list) -> int:
+    """``runs`` and the inbox: one stderr line per run that could not be read, and exit 6 if any."""
+    for item in unreadable:
+        print(f"stored record unreadable for run {item.run_id}: {item.reason}", file=sys.stderr)
+    return EXIT_RECORD_UNREADABLE if unreadable else EXIT_OK
+
+
 def cmd_runs(args: argparse.Namespace) -> int:
     """List runs with their first ``next:`` command, from SQLite only; no model, no probe."""
     from .listing import list_runs, render_runs
@@ -2883,7 +2729,7 @@ def cmd_runs(args: argparse.Namespace) -> int:
         lines, unreadable = [], []
     else:
         try:
-            lines, unreadable = list_runs(store, limit=args.limit, needs_you=args.needs_you)
+            lines, unreadable = list_runs(store, limit=args.limit)
         finally:
             store.close()
     if args.json:
@@ -2892,14 +2738,13 @@ def cmd_runs(args: argparse.Namespace) -> int:
         entries = [line.as_json() for line in lines] + [item.as_json() for item in unreadable]
         print(canonical_json(entries))
     else:
-        print(render_runs(lines, needs_you=args.needs_you, unreadable=bool(unreadable)))
-    for item in unreadable:
-        print(f"stored record unreadable for run {item.run_id}: {item.reason}", file=sys.stderr)
-    return EXIT_RECORD_UNREADABLE if unreadable else EXIT_OK
+        print(render_runs(lines, unreadable=bool(unreadable)))
+    return _name_unreadable(unreadable)
 
 
 def cmd_diff(args: argparse.Namespace) -> int:
     """Print the Git diff from a run's recorded base to its frozen candidate commit."""
+    from .gitworkspace import GitError
     from .listing import (
         UNREADABLE_ERRORS,
         NoCandidate,
@@ -2925,7 +2770,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
         store.close()
     try:
         returncode, output, error = run_diff(rng, stat=args.stat)
-    except (NoCandidate, OSError, subprocess.TimeoutExpired) as exc:
+    except (NoCandidate, GitError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return EXIT_REFUSED
     if returncode != 0:
@@ -2970,6 +2815,26 @@ def _add_read_target(parser: argparse.ArgumentParser) -> None:
     )
 
 
+class _RemovedSpelling(argparse.Action):
+    """A spelling that was removed: recognised only to name what replaced it, never an alias.
+
+    Given anywhere on the line, it ends parsing with one stderr line and :data:`EXIT_USAGE`
+    before anything opens; it is left out of ``--help``.
+    """
+
+    def __init__(self, option_strings: list[str], dest: str, *, replacement: str) -> None:
+        super().__init__(
+            option_strings, dest, nargs=0, default=argparse.SUPPRESS, help=argparse.SUPPRESS
+        )
+        self.replacement = replacement
+
+    def __call__(self, parser, namespace, values, option_string=None) -> NoReturn:  # noqa: ANN001
+        parser.exit(
+            EXIT_USAGE,
+            f"{parser.prog}: error: {self.option_strings[0]} was removed; {self.replacement}\n",
+        )
+
+
 def _verb(
     sub: argparse._SubParsersAction,
     name: str,
@@ -2978,22 +2843,53 @@ def _verb(
     *,
     json: bool = True,
     store: bool = True,
-    controller_id: bool = False,
 ) -> argparse.ArgumentParser:
-    """One subcommand with the flags most share: ``--json``, ``--data-dir``, ``--controller-id``."""
+    """One subcommand with the flags most share: ``--json`` and ``--data-dir``."""
     parser = sub.add_parser(name, help=help)
     if json:
         parser.add_argument("--json", action="store_true")
     if store:
         _add_store_args(parser)
-    if controller_id:
-        parser.add_argument("--controller-id", default="local-controller")
     parser.set_defaults(func=func)
     return parser
 
 
+#: ``hflow --help``: one line; the operator path and the exit codes follow the verb list.
+_DESCRIPTION = (
+    "Run one coding task through an agent harness under an explicit approval, a budget and the "
+    "project's approved checks, and keep the evidence."
+)
+_EPILOG = """\
+operator path:
+  hflow doctor                          what this machine can run (no model calls)
+  hflow init project | profile | task   write the starting files; never overwrites
+  hflow approve --task T --allow-writes --run
+                                        resolve the task, save it as a plan, approve it at a
+                                        terminal (type the code, then your own words), run it;
+                                        --allow-writes lets the task change its files
+                                        (step by step: prepare --plan-out P, approve --plan P,
+                                        run --plan P)
+  hflow status                          the inbox: every run that needs you, each with its
+                                        next: command (hflow status R for one run)
+  hflow integrate R                     take run R's accepted candidate onto its branch, at a
+                                        terminal; then the run's worktree is released
+
+A run reaches the real Harness (acpx-dsh) only under a machine profile and an approval; without
+one it runs offline with the fake driver.
+
+exit codes: 0 done, 2 refused (nothing created), 3 blocked, 4 usage, 5 in progress or another
+process holds the ledger, 6 a stored record or the ledger cannot be read, 130 interrupted.
+Each command's own --help says more; docs/operations.md is the operator guide.
+"""
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = _Parser(prog="hflow", description=__doc__)
+    parser = _Parser(
+        prog="hflow",
+        description=_DESCRIPTION,
+        epilog=_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--data-dir", default=None, help=_DATA_DIR_HELP)
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -3025,10 +2921,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     approve = _verb(
         sub, "approve", cmd_approve,
-        "turn a plan into an authorization file, at an interactive terminal only: type the "
-        "approval code it shows, then your own approval text (no model calls, no database)",
+        "turn a plan - or, with --task, a task resolved and saved as a plan first - into an "
+        "authorization file, at an interactive terminal only: type the approval code it shows, "
+        "then your own approval text (no model calls, no database)",
     )
-    approve.add_argument("--plan", required=True, help="plan file written by `prepare --plan-out`")
+    _add_resolution_args(
+        approve,
+        plan_alternative=(
+            "plan file written by `prepare --plan-out`, instead of --task: every resolution input "
+            "comes from it, so no other resolution flag may be given with it"
+        ),
+        task_help=(
+            "path to task.json, instead of --plan: resolve it with the flags below as `prepare` "
+            "does, write the plan (see --plan-out), then approve that plan"
+        ),
+    )
+    approve.add_argument(
+        "--plan-out",
+        default=None,
+        help=(
+            "with --task: the plan file to write (an older plan there is replaced). Default: "
+            "<task stem>.plan.json next to the task, where a different existing plan is refused"
+        ),
+    )
     approve.add_argument(
         "--out",
         default=None,
@@ -3047,7 +2962,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    run = _verb(sub, "run", cmd_run, "admit and run one task", controller_id=True)
+    run = _verb(sub, "run", cmd_run, "admit and run one task")
     _add_resolution_args(
         run,
         plan_alternative=(
@@ -3057,7 +2972,6 @@ def build_parser() -> argparse.ArgumentParser:
             "plan is used when it exists"
         ),
     )
-    run.add_argument("--receipt-out", default=None, help="write the result receipt to this path")
     run.add_argument(
         "--fake-write-plan",
         default=None,
@@ -3072,8 +2986,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    status = _verb(sub, "status", cmd_status, "show a run's state from SQLite (no model calls)")
-    _add_read_target(status)
+    status = _verb(
+        sub, "status", cmd_status,
+        "with a run id, that run's state; without one, every run that needs you, grouped "
+        "Running / Ready / Attention, each with its next command (SQLite only: no model calls, "
+        "no process probe)",
+    )
+    status.add_argument(
+        "run_id", nargs="?", default=None, help="the run to show; leave it out for the inbox"
+    )
+    status.add_argument(
+        "--last",
+        action=_RemovedSpelling,
+        replacement=(
+            "read the newest run with `hflow report --last`, or name it: `hflow status <run-id>`"
+        ),
+    )
     status.add_argument("--project-root", default=None, help=_DRIFT_ROOT_HELP)
 
     report = _verb(
@@ -3082,13 +3010,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_read_target(report)
     report.add_argument("--project-root", default=None, help=_DRIFT_ROOT_HELP)
 
-    cancel = _verb(sub, "cancel", cmd_cancel, "cancel a run's live attempt", controller_id=True)
+    cancel = _verb(sub, "cancel", cmd_cancel, "cancel a run's live attempt")
     cancel.add_argument("run_id")
 
     resume = _verb(
         sub, "resume", cmd_resume,
         "reconcile a run, or take a live one over from a dead owner (never re-dispatches)",
-        controller_id=True,
     )
     resume.add_argument("run_id")
     resume.add_argument(
@@ -3114,14 +3041,17 @@ def build_parser() -> argparse.ArgumentParser:
     clean = _verb(
         sub, "clean", cmd_clean,
         "release a run's workspace: preview by default, remove with --apply",
-        controller_id=True,
     )
     clean.add_argument("run_id")
-    clean.add_argument("--apply", action="store_true", help="actually remove the run's worktree")
-    clean.add_argument(
+    # One of three things, or the preview: argparse refuses any two together (exit 4).
+    clean_mode = clean.add_mutually_exclusive_group()
+    clean_mode.add_argument(
+        "--apply", action="store_true", help="actually remove the run's worktree"
+    )
+    clean_mode.add_argument(
         "--dry-run", action="store_true", help="explicit synonym for the default preview"
     )
-    clean.add_argument(
+    clean_mode.add_argument(
         "--reconcile",
         action="store_true",
         help="after an interruption, decide this run's workspace state from recorded facts",
@@ -3162,11 +3092,52 @@ def build_parser() -> argparse.ArgumentParser:
     integrate = sub.add_parser(
         "integrate",
         help=(
-            "integrate an accepted candidate into a local branch: prepare (build + check), apply "
+            "integrate an accepted candidate into a local branch: `integrate <run-id>` continues "
+            "it from whatever state it is in; or step by step, prepare (build + check), apply "
             "(compare-and-set), reconcile, show. No model calls"
         ),
     )
-    integrate_sub = integrate.add_subparsers(dest="integrate_command", required=True)
+    integrate_sub = integrate.add_subparsers(
+        dest="integrate_command", required=True, action=_IntegrateCommands
+    )
+    integrate_run = integrate_sub.add_parser(
+        _INTEGRATE_RUN,
+        prog="hflow integrate",
+        help=(
+            "continue run <run-id>'s integration from whatever state it is in: prepare it, show "
+            "it at an interactive terminal and apply it once you type its confirmation code (a "
+            "checked-out branch is handed to you to merge), record that merge when run again, "
+            "then release the run's worktree"
+        ),
+    )
+    integrate_run.add_argument("run_id", metavar="run-id")
+    integrate_run.add_argument("--json", action="store_true")
+    _add_store_args(integrate_run)
+    integrate_run.add_argument(
+        "--target",
+        default=None,
+        help=(
+            "an existing local branch name. Default: the branch of the run's newest integration, "
+            "else the task's base branch when that is a local branch"
+        ),
+    )
+    integrate_run.add_argument(
+        "--project",
+        default=None,
+        help="as for `integrate prepare` (used only when an integration is prepared)",
+    )
+    integrate_run.add_argument(
+        "--owner-gone",
+        action="store_true",
+        help="as for `integrate reconcile`: attest that an active integration's process has exited",
+    )
+    integrate_run.add_argument(
+        "--attest",
+        default="",
+        help="what you know and why (required with --owner-gone, at most 500 characters)",
+    )
+    _add_keep_worktree(integrate_run)
+    integrate_run.set_defaults(func=cmd_integrate_run)
     integrate_prepare = _verb(
         integrate_sub, "prepare", cmd_integrate_prepare,
         "build one integration commit on the target's current tip and run the run's approved "
@@ -3196,6 +3167,7 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="the full target tip the integration was checked against (printed by prepare)",
     )
+    _add_keep_worktree(integrate_apply)
     integrate_reconcile = _verb(
         integrate_sub, "reconcile", cmd_integrate_reconcile,
         "settle an integration from what Git shows (an interrupted apply, a hand merge, a "
@@ -3216,6 +3188,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="what you know and why (required with --owner-gone, at most 500 characters)",
     )
+    _add_keep_worktree(integrate_reconcile)
     integrate_show = _verb(
         integrate_sub, "show", cmd_integrate_show, "print one integration record"
     )
@@ -3301,13 +3274,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     runs.add_argument(
         "--needs-you",
-        action="store_true",
-        help=(
-            "only runs whose stored facts name something for you to do: live (its recorded "
-            "owner, and whether the clock is past its recorded deadline), blocked, open or "
-            "unresolved ledger entries, an accepted candidate not integrated, an interrupted "
-            "cleanup"
-        ),
+        action=_RemovedSpelling,
+        replacement="what needs you is `hflow status` (no run id)",
     )
 
     diff = _verb(

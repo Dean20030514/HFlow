@@ -192,7 +192,6 @@ def test_a_plan_round_trips_and_records_absolute_inputs(
     assert arguments.root_budget_file == os.path.abspath(project.root_file)
     assert arguments.data_dir == os.path.abspath(project.data_dir)
     assert arguments.driver == "fake"
-    assert arguments.base_commit is None, "not given, so not invented"
     assert arguments.authorization_mode == "m2-live-change"
     pending = plan.prepare_report.authorization
     assert pending.required is True
@@ -349,7 +348,6 @@ def test_an_explicit_absolute_data_dir_binds_what_the_default_resolution_binds(
 def test_frozen_arguments_name_the_selected_profile_and_absolute_paths(tmp_path: Path) -> None:
     given = PlanArguments(
         task="task.json", project_root=".", data_dir="data", root_budget_file="root.json",
-        base_commit="main",
     )
     frozen = frozen_arguments(given, env={"HFLOW_PROFILE": " dsh-local "})
     assert frozen.profile == "dsh-local", "the profile HFLOW_PROFILE selected is recorded"
@@ -358,7 +356,6 @@ def test_frozen_arguments_name_the_selected_profile_and_absolute_paths(tmp_path:
     assert frozen.data_dir == os.path.abspath("data")
     assert frozen.root_budget_file == os.path.abspath("root.json")
     assert frozen.project is None and frozen.repair_policy_file is None
-    assert frozen.base_commit == "main", "a ref is kept so it resolves again"
     assert frozen_arguments(given, env={}).profile is None
 
 
@@ -582,7 +579,10 @@ def test_approval_text_and_code_are_never_taken_from_the_command_line(
 ) -> None:
     subcommands = build_parser()._subparsers._group_actions[0].choices  # type: ignore[union-attr]
     dests = {action.dest for action in subcommands["approve"]._actions}
-    assert dests == {"help", "plan", "out", "run", "json", "data_dir"}
+    # The resolution inputs `prepare` takes (for --task) and file paths: none of them is a way
+    # to pass the approval text or the code.
+    resolution = {dest for dest, _flag in RESOLUTION_FLAGS}
+    assert dests == {"help", "plan", "plan_out", "out", "run", "json", "data_dir", *resolution}
     run_flag = next(a for a in subcommands["approve"]._actions if a.dest == "run")
     assert run_flag.nargs == 0, "--run takes no value: it is not a way to pass an approval"
 
@@ -628,11 +628,13 @@ def test_approve_refuses_a_plan_whose_task_changed(
 def test_approve_refuses_a_plan_whose_base_ref_moved(
     cli_project: CliProject, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """``--base-commit HEAD`` is recorded as the ref; HEAD moving after prepare makes it stale."""
+    """A task based on ``HEAD`` keeps the ref; HEAD moving after prepare makes the plan stale."""
     project = cli_project
-    assert _prepare(project, *project.admission_flags(), "--base-commit", "HEAD") == EXIT_OK
+    task = json.loads(project.task_file.read_text(encoding="utf-8"))
+    task["workspace"]["base_commit"] = "HEAD"
+    project.task_file.write_text(json.dumps(task), encoding="utf-8")
+    assert _prepare(project) == EXIT_OK
     capsys.readouterr()
-    assert load_plan(_plan_path(project)).arguments.base_commit == "HEAD"
     (project.repo / "later.txt").write_text("later\n", encoding="utf-8")
     git(project.repo, "add", "later.txt")
     git(project.repo, "commit", "-q", "-m", "HEAD moves after prepare")
@@ -702,9 +704,7 @@ def test_run_text_output_ends_with_the_next_command_and_never_a_rerun(
         ["--project-root", "."],
         ["--profile", "dsh-local"],
         ["--driver", "fake"],
-        ["--base-commit", "HEAD"],
-        ["--workspace", "worktree"],
-        ["--authorization-mode", "m2-live-change"],  # even the default value
+        ["--allow-writes"],
         ["--root-budget-file", "root.json"],
         ["--repair-policy-file", "policy.json"],
         ["--project", "project.json"],
@@ -795,8 +795,13 @@ def test_run_plan_refuses_an_approval_issued_for_another_plan(
 ) -> None:
     project = cli_project
     other_plan = project.tmp_path / "inputs" / "other.plan.json"
-    stop_trial = [*project.admission_flags(), "--authorization-mode", "stop-trial"]
-    assert _prepare(project, *stop_trial, plan=other_plan) == EXIT_OK
+    other_task = project.tmp_path / "inputs" / "other.task.json"
+    task = json.loads(project.task_file.read_text(encoding="utf-8"))
+    task["goal"] = "Another goal, approved for another plan"
+    other_task.write_text(json.dumps(task), encoding="utf-8")
+    flags = project.admission_flags()
+    flags[flags.index("--task") + 1] = str(other_task)
+    assert _prepare(project, *flags, plan=other_plan) == EXIT_OK
     other_approval = project.tmp_path / "other-approval.json"
     stdin = _typed(other_plan)
     assert _approve(monkeypatch, other_plan, stdin, "--out", str(other_approval)) == EXIT_OK
@@ -812,7 +817,7 @@ def test_run_plan_refuses_an_approval_issued_for_another_plan(
     )
     assert code == EXIT_REFUSED
     err = capsys.readouterr().err
-    assert "mode: authorized 'stop-trial'" in err
+    assert "the authorization does not cover this run" in err and "spec_digest" in err, err
     assert "was not issued for plan" in err
 
 
@@ -1002,7 +1007,141 @@ def test_the_resolution_flags_are_exactly_the_plan_arguments() -> None:
     plan records, the data directory aside (it is ``--data-dir``, before or after the verb)."""
     dests = [dest for dest, _flag in RESOLUTION_FLAGS]
     assert len(dests) == len(set(dests))
-    assert {*dests, "data_dir"} == set(PlanArguments.model_fields)
+    # ``authorization_mode`` has no flag (it has one value); it stays so an older plan that
+    # recorded ``stop-trial`` still loads.
+    assert {*dests, "data_dir", "authorization_mode"} == set(PlanArguments.model_fields)
+
+
+def test_prepare_records_the_write_opt_in_and_the_binding_covers_it(
+    cli_project: CliProject, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = cli_project
+    monkeypatch.delenv("HFLOW_ALLOW_WRITES", raising=False)
+    without = project.tmp_path / "inputs" / "without.plan.json"
+    assert _prepare(project, *project.admission_flags(), plan=without) == EXIT_OK
+    assert _prepare(project, *project.admission_flags(), "--allow-writes") == EXIT_OK
+    capsys.readouterr()
+    plain, writing = load_plan(without), load_plan(_plan_path(project))
+    assert (plain.arguments.allow_writes, writing.arguments.allow_writes) == (False, True)
+    assert plain.prepare_report.effective_config.implementer_writes is False
+    assert writing.prepare_report.effective_config.implementer_writes is True
+    assert plain.binding_digest != writing.binding_digest, "an approval covers the opt-in"
+    assert " --allow-writes " in prepare_command(writing.arguments, _plan_path(project))
+    assert "--allow-writes" not in prepare_command(plain.arguments, without)
+
+
+@pytest.mark.parametrize(
+    ("at_prepare", "at_run"), [("1", None), (None, "1")], ids=["set-then-unset", "unset-then-set"]
+)
+def test_run_plan_uses_the_recorded_write_opt_in_never_the_shell(
+    cli_project: CliProject, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    at_prepare: str | None, at_run: str | None,
+) -> None:
+    project = cli_project
+
+    def shell(value: str | None) -> None:
+        if value is None:
+            monkeypatch.delenv("HFLOW_ALLOW_WRITES", raising=False)
+        else:
+            monkeypatch.setenv("HFLOW_ALLOW_WRITES", value)
+
+    shell(at_prepare)
+    assert _prepare(project, *_offline_flags(project)) == EXIT_OK
+    capsys.readouterr()
+    recorded = load_plan(_plan_path(project))
+    assert recorded.arguments.allow_writes is (at_prepare == "1"), "prepare falls back to it"
+
+    shell(at_run)
+    assert _run_plan(project) == EXIT_OK, capsys.readouterr().err
+    run_id = json.loads(capsys.readouterr().out.strip().splitlines()[-1])["run_id"]
+    assert main(["status", run_id, "--json", "--data-dir", str(project.data_dir)]) == EXIT_OK
+    stored = json.loads(capsys.readouterr().out)["effective_config"]
+    assert stored["implementer_writes"] is (at_prepare == "1"), "the plan's value ran"
+
+
+@pytest.mark.parametrize(
+    ("extra", "env", "expected"),
+    [([], None, False), ([], "1", True), (["--allow-writes"], None, True),
+     (["--allow-writes"], "false", True)],
+    ids=["neither", "variable", "flag", "flag-beats-a-false-variable"],
+)
+def test_prepare_and_run_task_take_the_flag_or_fall_back_to_the_variable(
+    extra: list[str], env: str | None, expected: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if env is None:
+        monkeypatch.delenv("HFLOW_ALLOW_WRITES", raising=False)
+    else:
+        monkeypatch.setenv("HFLOW_ALLOW_WRITES", env)
+    for verb in ("prepare", "run"):
+        args = cli.build_parser().parse_args([verb, "--task", "task.json", *extra])
+        assert cli._resolution_arguments(args).allow_writes is expected, verb
+
+
+def test_run_task_honours_the_write_variable_as_a_fallback(
+    cli_project: CliProject, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = cli_project
+    monkeypatch.setenv("HFLOW_ALLOW_WRITES", "1")
+    argv = [
+        "run", *_offline_flags(project), "--fake-write-plan", str(project.plan_file),
+        "--json", "--data-dir", str(project.data_dir),
+    ]
+    assert main(argv) == EXIT_OK, capsys.readouterr().err
+    run_id = json.loads(capsys.readouterr().out.strip().splitlines()[-1])["run_id"]
+    assert main(["status", run_id, "--json", "--data-dir", str(project.data_dir)]) == EXIT_OK
+    assert json.loads(capsys.readouterr().out)["effective_config"]["implementer_writes"] is True
+
+
+def test_a_plan_from_before_allow_writes_keeps_the_permission_it_recorded(
+    cli_project: CliProject, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No ``allow_writes`` in the file: the plan's own recorded write permission - which its
+    binding, and any approval of it, already cover - never the environment."""
+    project = cli_project
+    monkeypatch.setenv("HFLOW_ALLOW_WRITES", "1")
+    assert _prepare(project, *_offline_flags(project)) == EXIT_OK
+    capsys.readouterr()
+    raw = json.loads(_plan_path(project).read_text(encoding="utf-8"))
+    del raw["arguments"]["allow_writes"]
+    _plan_path(project).write_text(json.dumps(raw), encoding="utf-8")
+    monkeypatch.delenv("HFLOW_ALLOW_WRITES")
+
+    assert load_plan(_plan_path(project)).arguments.allow_writes is True
+    assert _run_plan(project) == EXIT_OK, capsys.readouterr().err
+
+
+@pytest.mark.parametrize(("key", "value", "flag"), [
+    ("base_commit", "HEAD", "--base-commit"),
+    ("workspace", "in_place", "--workspace"),
+])
+def test_a_plan_that_set_a_retired_override_is_refused_with_the_re_prepare_command(
+    cli_project: CliProject, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    key: str, value: str, flag: str,
+) -> None:
+    """An older build recorded ``--base-commit`` / ``--workspace``; this one has neither, so such
+    a plan is refused, never run with the override silently gone - and never a traceback."""
+    project = cli_project
+    assert _prepare(project) == EXIT_OK
+    capsys.readouterr()
+    raw = json.loads(_plan_path(project).read_text(encoding="utf-8"))
+    raw["arguments"][key] = value
+    _plan_path(project).write_text(json.dumps(raw), encoding="utf-8")
+
+    assert _approve(monkeypatch, _plan_path(project), _UnreadableInput()) == EXIT_REFUSED
+    err = capsys.readouterr().err
+    assert f"was prepared with {flag}, which this build no longer has" in err, err
+    assert "re-prepare the plan: hflow prepare --task " in err and flag not in err.split(
+        "re-prepare the plan:"
+    )[1]
+    assert _run_plan(project) == EXIT_REFUSED
+    assert "which this build no longer has" in capsys.readouterr().err
+    assert not database_path(project.data_dir).exists()
+
+    # The same keys left null, as an older build wrote them when not given: the plan loads.
+    raw["arguments"][key] = None
+    raw["arguments"]["base_commit" if key == "workspace" else "workspace"] = None
+    _plan_path(project).write_text(json.dumps(raw), encoding="utf-8")
+    assert load_plan(_plan_path(project)).arguments.task == raw["arguments"]["task"]
 
 
 # --------------------------------------------------------------------------
@@ -1094,15 +1233,28 @@ def test_a_stale_plan_names_the_changed_configuration_fields_and_their_variables
         assert "is stale" in err and "Nothing was written or dispatched" in err
         assert "effective_config_digest: planned " in err
         assert plan.prepare_report.effective_config_digest in err
-        assert (
-            "effective_config.implementer_writes: planned True != now False "
-            "(read from the environment: HFLOW_ALLOW_WRITES)"
-        ) in err
+        # The write opt-in is the plan's own (it recorded it): the variable changes nothing.
+        assert "implementer_writes" not in err
         for role in ("implementer", "reviewer"):
             assert f"effective_config.roles[{role}].launch.dsh_home: planned " in err
         assert f"!= now {str(other_home)!r} (read from the environment: DSH_HOME)" in err
         assert "effective_config.profile_id" not in err, "the plan names its profile"
+        # The printed re-prepare carries the recorded opt-in as the flag.
+        assert " --allow-writes --plan-out " in err
     assert not database_path(Path(plan.arguments.data_dir)).exists()
+
+
+def test_approve_never_reads_the_write_variable_a_plan_recorded(
+    live_plan: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The trap a recorded opt-in closes: a plan prepared where HFLOW_ALLOW_WRITES was set is
+    approved in a shell without it - and is current, not stale."""
+    plan = load_plan(live_plan)
+    assert plan.arguments.allow_writes is True, "prepare recorded the variable's opt-in"
+    assert plan.prepare_report.effective_config.implementer_writes is True
+    monkeypatch.delenv("HFLOW_ALLOW_WRITES", raising=False)
+    assert _approve(monkeypatch, live_plan, _typed(live_plan)) == EXIT_OK, capsys.readouterr()
+    assert len(_authorizations(live_plan.parent)) == 1
 
 
 def test_approve_refuses_a_current_plan_the_run_would_refuse(
@@ -1253,3 +1405,166 @@ def test_run_plan_names_a_plan_the_environment_made_stale_before_asking_for_an_a
     assert "--profile" not in command, "HFLOW_PROFILE decides again when the plan named none"
     assert err.rstrip().endswith(command), err
     assert not database_path(project.data_dir).exists()
+
+
+# --------------------------------------------------------------------------
+# approve --task: prepare --plan-out and approve --plan in one process
+# --------------------------------------------------------------------------
+
+
+def _approve_task(
+    monkeypatch: pytest.MonkeyPatch, project: CliProject, stdin: io.StringIO | None, *extra: str
+) -> int:
+    monkeypatch.setattr(sys, "stdin", stdin)
+    return main(
+        ["approve", *project.admission_flags(), *extra, "--data-dir", str(project.data_dir)]
+    )
+
+
+def _code_for(project: CliProject, capsys: pytest.CaptureFixture[str]) -> str:
+    """The approval code of the task's plan, from a two-step plan written elsewhere."""
+    elsewhere = project.tmp_path / "two-step" / "task.plan.json"
+    assert _prepare(project, plan=elsewhere) == EXIT_OK
+    capsys.readouterr()
+    return approval_code(load_plan(elsewhere).binding_digest)
+
+
+def test_approve_task_writes_the_plan_and_the_same_artifact_as_the_two_step_path(
+    cli_project: CliProject, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = cli_project
+    two_step = project.tmp_path / "two-step" / "task.plan.json"
+    code = _code_for(project, capsys)
+    assert _approve(monkeypatch, two_step, _typed(two_step)) == EXIT_OK
+    capsys.readouterr()
+    [two_step_approval] = _authorizations(two_step.parent)
+
+    default_plan = project.task_file.with_name("task.plan.json")
+    assert not default_plan.exists()
+    stdin = _TerminalInput(f"{code}\n{APPROVAL_TEXT}\n")
+    assert _approve_task(monkeypatch, project, stdin) == EXIT_OK
+    captured = capsys.readouterr()
+    plan = load_plan(default_plan)
+    assert f"plan          {default_plan}" in captured.err
+    assert "approving     binding " + plan.binding_digest in captured.err
+    written = default_authorization_path(default_plan, plan.binding_digest)
+    assert _authorizations(default_plan.parent) == [written]
+    one_step, step_by_step = load_authorization(written), load_authorization(two_step_approval)
+    assert one_step.binding == step_by_step.binding, "the same binding as prepare + approve"
+    assert one_step.binding_digest() == plan.binding_digest == load_plan(two_step).binding_digest
+    assert one_step.root_limits == step_by_step.root_limits
+    assert one_step.user_text == APPROVAL_TEXT and one_step.origin == "user_artifact"
+    assert f"next: hflow run --plan {_shell_word(str(default_plan))}\n" in captured.out
+    assert not database_path(project.data_dir).exists(), "approve opened no ledger"
+
+    # The plan it wrote runs like any other, with the approval found at its default path.
+    assert main(
+        ["run", "--plan", str(default_plan), "--fake-write-plan", str(project.plan_file), "--json"]
+    ) == EXIT_OK, capsys.readouterr().err
+
+
+@pytest.mark.parametrize("stdin_kind", ["pipe", "none"])
+def test_approve_task_refuses_input_that_is_not_a_terminal_and_writes_nothing(
+    stdin_kind: str,
+    cli_project: CliProject,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project = cli_project
+    stdin = _UnreadableInput(terminal=False) if stdin_kind == "pipe" else None
+    assert _approve_task(monkeypatch, project, stdin) == EXIT_REFUSED
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "for a person at a terminal" in captured.err
+    assert "nothing was read and nothing was approved or written" in captured.err
+    assert "approving     binding" not in captured.err, "no summary and no code were shown"
+    assert not project.task_file.with_name("task.plan.json").exists(), "no plan either"
+    assert _authorizations(project.task_file.parent) == []
+
+
+def test_approve_task_refuses_a_wrong_code_and_writes_no_approval(
+    cli_project: CliProject, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = cli_project
+    code = _code_for(project, capsys)
+    stdin = _TerminalInput(f"{'0' if code[0] != '0' else '1'}{code[1:]}\n{APPROVAL_TEXT}\n")
+    assert _approve_task(monkeypatch, project, stdin) == EXIT_REFUSED
+    err = capsys.readouterr().err
+    assert "the approval code did not match" in err
+    assert stdin.readline() == f"{APPROVAL_TEXT}\n", "the approval line was never read"
+    assert _authorizations(project.task_file.parent) == []
+    # The plan is a preview, not an approval: it stays, as `prepare --plan-out` would leave it.
+    assert project.task_file.with_name("task.plan.json").exists()
+
+
+def test_approve_task_never_replaces_a_different_plan_unless_told_where(
+    cli_project: CliProject, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = cli_project
+    default_plan = project.task_file.with_name("task.plan.json")
+    assert _prepare(project, *_offline_flags(project), plan=default_plan) == EXIT_OK
+    capsys.readouterr()
+    before = default_plan.read_bytes()
+
+    assert _approve_task(monkeypatch, project, _UnreadableInput()) == EXIT_REFUSED
+    err = capsys.readouterr().err
+    assert "already holds another plan" in err
+    assert f"--plan-out {_shell_word(str(default_plan))}" in err
+    assert default_plan.read_bytes() == before
+    assert _authorizations(default_plan.parent) == []
+
+    code = _code_for(project, capsys)
+    stdin = _TerminalInput(f"{code}\n{APPROVAL_TEXT}\n")
+    assert _approve_task(monkeypatch, project, stdin, "--plan-out", str(default_plan)) == EXIT_OK
+    capsys.readouterr()
+    replaced = load_plan(default_plan)
+    assert replaced.arguments.root_budget_file is not None, "the plan was replaced as asked"
+    assert len(_authorizations(default_plan.parent)) == 1
+
+    # The same plan again: kept as it is, and its approval already exists.
+    assert _approve_task(monkeypatch, project, _UnreadableInput()) == EXIT_REFUSED
+    err = capsys.readouterr().err
+    assert "already this plan; kept as it is" in err and "never overwritten" in err
+
+
+def test_approve_task_run_approves_then_runs_in_the_same_process(
+    cli_project: CliProject, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = cli_project
+    code = _code_for(project, capsys)
+    _scripted_change(monkeypatch, project)
+    stdin = _TerminalInput(f"{code}\n{APPROVAL_TEXT}\n")
+    assert _approve_task(monkeypatch, project, stdin, "--run") == EXIT_OK
+    lines = capsys.readouterr().out.splitlines()
+    default_plan = project.task_file.with_name("task.plan.json")
+    assert lines[2].startswith(f"running       hflow run --plan {_shell_word(str(default_plan))}")
+    assert lines[4] == "state      ACCEPTED"
+
+
+def test_approve_task_refuses_a_task_the_run_would_refuse_and_writes_nothing(
+    cli_project: CliProject, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = cli_project
+    task = json.loads(project.task_file.read_text(encoding="utf-8"))
+    task["scope"]["write_allow"] = []
+    project.task_file.write_text(json.dumps(task), encoding="utf-8")
+    assert _approve_task(monkeypatch, project, _UnreadableInput()) == EXIT_REFUSED
+    err = capsys.readouterr().err
+    assert "`hflow run` would refuse this task" in err and "no plan and no approval" in err
+    assert not project.task_file.with_name("task.plan.json").exists()
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [["--driver", "fake"], ["--allow-writes"], ["--plan-out", "elsewhere.plan.json"]],
+    ids=["resolution-flag", "allow-writes", "plan-out"],
+)
+def test_approve_plan_takes_no_resolution_flag_and_no_plan_out(
+    extra: list[str], cli_project: CliProject, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = cli_project
+    assert _prepare(project) == EXIT_OK
+    capsys.readouterr()
+    assert main(["approve", "--plan", str(_plan_path(project)), *extra]) == EXIT_USAGE
+    assert "hflow approve: error:" in capsys.readouterr().err
+    assert _authorizations(_plan_path(project).parent) == []

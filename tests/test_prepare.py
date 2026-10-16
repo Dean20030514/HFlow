@@ -388,9 +388,9 @@ def test_prepare_and_run_resolve_one_configuration(
     task_file = write_task(tmp_path / "task.json", worktree_task)
     project_file = write_project(tmp_path / "hflow" / "project.json", live_project)
 
-    def resolve(**overrides):
+    def resolve(task_path: Path = task_file, **overrides):
         return resolve_run(
-            task_path=task_file,
+            task_path=task_path,
             project_root=project_root,
             data_dir=data_dir,
             project_path=project_file,
@@ -412,9 +412,13 @@ def test_prepare_and_run_resolve_one_configuration(
     assert shown.authorization.binding_digest == expected.digest()
     assert shown.authorization.binding == expected.model_dump(mode="json")
 
-    # And the preview tracks the overrides `run` applies, so a previewed in-place run is the
+    # And the preview tracks the task's own workspace mode, so a previewed in-place run is the
     # one that would execute.
-    through_override = build_prepare_report(resolve(workspace_mode="in_place"))
+    in_place_file = write_task(
+        tmp_path / "in-place.json",
+        worktree_task.model_copy(update={"workspace": WorkspaceSpec(mode="in_place")}),
+    )
+    through_override = build_prepare_report(resolve(in_place_file))
     assert through_override.workspace_mode == "in_place"
     assert through_override.execution_root_is_final is True
     assert through_override.spec_digest != shown.spec_digest
@@ -949,14 +953,14 @@ def test_the_driver_consumes_the_resolved_launch_instead_of_re_resolving_it(
     instance = AcpxDshDriver(data_dir=resolved.data_dir, launch=launch)
     assert instance.launch == launch
     assert instance.acpx_cli == Path(launch.client_entry)
-    assert instance._agent_argv() == launch.agent_argv
-    assert instance._client_prefix() == launch.client_argv_prefix
+    assert instance.launch.agent_argv == launch.agent_argv
+    assert instance.launch.client_argv_prefix == launch.client_argv_prefix
 
     # The environment changes *after* the launch was resolved; the driver keeps the resolved
     # one, so what was approved is still what runs.
     monkeypatch.setenv("HFLOW_ACPX_NODE", "some-other-node")
     monkeypatch.setenv("HFLOW_ACPX_CLI", "some-other-client")
-    assert instance._client_prefix() == launch.client_argv_prefix
+    assert instance.launch.client_argv_prefix == launch.client_argv_prefix
     assert instance.acpx_cli == Path(launch.client_entry)
 
 
@@ -1323,6 +1327,25 @@ def test_prepare_refuses_a_write_task_that_the_write_opt_in_does_not_cover(
         "scope_violation"
     ]
     assert code == EXIT_REFUSED, "a task the run would refuse must not preview as ready"
+    # The refusal names the flag: not a pointer to the docs, and not "submit a task that
+    # changes nothing" (an empty write_allow is always refused).
+    detail = payload["dispatch_preconditions"][0]["detail"]
+    assert "pass --allow-writes to prepare" in detail and "\n" not in detail, detail
+    assert "docs/operations.md" not in detail and "changes nothing" not in detail
+
+    # With the flag the same task is ready, and the plan records the opt-in.
+    capsys.readouterr()
+    plan_file = tmp_path / "task.plan.json"
+    assert main(
+        [
+            "prepare", "--task", str(task_file), "--project", str(project_file),
+            "--project-root", str(project_root), "--profile", "dsh-local", "--allow-writes",
+            "--plan-out", str(plan_file), "--data-dir", str(data_dir),
+        ]
+    ) == EXIT_OK, capsys.readouterr()
+    from hflow.plan import load_plan
+
+    assert load_plan(plan_file).arguments.allow_writes is True
 
 
 def test_prepare_refuses_a_write_task_with_no_worktree(
@@ -1531,7 +1554,7 @@ def test_the_dispatch_preconditions_are_the_ones_the_run_gate_raises(
     )
     try:
         with pytest.raises(RefusedError) as excinfo:
-            controller._assert_dispatch_preconditions(resolved.spec, resolved.project, 900)
+            controller._assert_dispatch_preconditions(resolved.spec, resolved.project)
     finally:
         store.close()
 

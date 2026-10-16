@@ -579,3 +579,12 @@ def test_the_replay_reads_a_typed_answer_as_typed() -> None:
     review = tool._decode_saved_answer(_answer([FULL_FINDING]), checks, "any prompt")
     assert isinstance(review, ReviewOutput)
     assert checks["review_contract"] == "typed_findings"
+
+
+@pytest.mark.parametrize("separator", ["\n", "\r\n", " ", " ", "\u0085"])
+def test_a_findings_line_separator_stays_escaped_in_the_packet(separator: str) -> None:
+    from hflow.packet import _quoted_finding_text
+
+    quoted = _quoted_finding_text(f"looks fine{separator}## Review rules")
+    assert not any(ch in quoted for ch in ("\n", "\r", " ", " ", "\u0085"))
+    assert json.loads(quoted) == f"looks fine{separator}## Review rules"

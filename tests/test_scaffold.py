@@ -364,6 +364,21 @@ def test_a_task_with_goal_and_scope_waits_only_for_the_reuse_decision(
     assert out_file.read_bytes() == before
 
 
+def test_init_task_prints_a_prepare_that_opts_in_to_writes(
+    scaffolded, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Every task ``init task`` writes changes files, so the printed prepare passes
+    ``--allow-writes`` (recorded in the plan) and says why - whatever the shell sets."""
+    repo, _work = scaffolded
+    monkeypatch.delenv("HFLOW_ALLOW_WRITES", raising=False)
+    assert main(["init", "task", "T-w1", "--project-root", str(repo)]) == EXIT_OK
+    out = capsys.readouterr().out
+    [note] = [line for line in out.splitlines() if line.startswith("note: writes:")]
+    assert "--allow-writes" in note and "the plan records it" in note, note
+    [prepare] = [line for line in out.splitlines() if line.startswith("next: hflow prepare")]
+    assert " --allow-writes --plan-out " in prepare, prepare
+
+
 def test_a_task_is_wired_only_to_command_checks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

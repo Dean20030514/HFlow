@@ -311,6 +311,9 @@ def test_an_npm_carrier_binds_its_entry_and_package_json(tmp_path: Path) -> None
     script.parent.mkdir(parents=True)
     script.write_text("// carrier entry stand-in", encoding="utf-8")
     (package / "package.json").write_text('{"version": "0.2.0-rc.2"}', encoding="utf-8")
+    # The shim runs the node.exe beside it when there is one, whatever PATH says.
+    node = shim.parent / "node.exe"
+    node.write_bytes(b"MZ-node-stand-in")
 
     launch = resolve_launch_config(
         data_dir=tmp_path / "data",
@@ -328,11 +331,15 @@ def test_an_npm_carrier_binds_its_entry_and_package_json(tmp_path: Path) -> None
         str(package / "package.json")
     )
     assert "carrier_archive" not in paths
+    assert paths["carrier_interpreter"] == str(node)
     assert any("bound by path only" in note for note in launch.content_notes)
 
     script.write_text("// replaced carrier entry", encoding="utf-8")
     changes = launch_content_changes(launch)
     assert len(changes) == 1 and changes[0].startswith("carrier_entry"), changes
+    node.write_bytes(b"MZ-another-node")
+    changes = launch_content_changes(launch)
+    assert {change.split(" ")[0] for change in changes} == {"carrier_entry", "carrier_interpreter"}
 
     # A classified shim whose script is gone cannot be bound, so it is not resolvable.
     script.unlink()
@@ -490,7 +497,7 @@ def test_a_linked_entry_is_hashed_and_spawned_at_its_final_path(tmp_path: Path) 
     # One path for both: the one the content binding hashed is the one the client argv starts.
     assert launch.client_entry == entry.path == os.path.realpath(link)
     driver = AcpxDshDriver(data_dir=tmp_path / "data", launch=launch)
-    assert driver._client_argv(tmp_path, tmp_path, 60)[2] == entry.path
+    assert driver._client_argv(tmp_path, 60)[2] == entry.path
 
 
 def test_the_probe_and_so_doctor_print_the_digests_with_the_honest_label(

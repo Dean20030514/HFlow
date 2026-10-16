@@ -7,40 +7,65 @@ architecture — read the plan for that (`docs/batch-e-plan.md` for the root bud
 bounded repair).
 
 It was first written at M1 and has been corrected since; where a section describes a
-capability that arrived later (the production Driver, Git worktrees, the review wire, the batch
-E1 root ledger, the batch E2 bounded repair), the module and its evidence are named so the claim
-can be checked. A statement is only as strong as the artifact beside it: implemented code, an
-offline test, or a recorded live execution on one binding — never a neighbour's success.
+capability that arrived later (the production driver, Git worktrees, the review wire, the root
+ledger, the bounded repair, integration), the module and its evidence are named so the claim can
+be checked. A statement is only as strong as the artifact beside it: implemented code, an offline
+test, or a recorded live execution on one binding — never a neighbour's success. The operator's
+view of the same behaviour is `docs/operations.md`.
+
+## How to read a claim
+
+| Kind | Means | Where the backing is |
+|---|---|---|
+| implemented | the code path exists in this tree | the module named next to the claim |
+| offline-tested | a test or an offline tool covers it, with no model call | `tests/`, `tools/m0_probe/real_client_checks.py` |
+| live evidence, one binding | a recorded real execution on a specific machine, client and build | `docs/m2-live-acceptance-result.md`, `docs/m0-results.md` |
+| unsupported / unverified | not implemented, or never exercised - never inferred from a neighbouring row | the README's "Not implemented", a driver capability record, a run's own notes |
+
+A recorded live result is scoped to the artifacts named beside it. It does not become a property
+of "the controller", and upgrading a dependency invalidates it until re-checked.
 
 ## Layer map
 
 ```text
-CLI (cli.py: doctor/prepare/run/status/report/cancel/resume/clean/ledger/integrate/schema)
+CLI (cli.py: prepare/approve/run/status/report/runs/diff/cancel/resume/clean/ledger/integrate/
+  |          init/schema; doctor.py: the read-only environment probe)
+  |-- plan.py         saved plans, staleness, approve's terminal-only approval and its code
+  |-- hints.py        the `next:` commands from stored facts; pasteable quoting and --data-dir
+  |-- listing.py      `runs`, the `status` inbox, `diff`
+  |-- scaffold.py     `init project/profile/task` (exclusive create)
+  |-- integrate.py    controlled integration of an accepted candidate (prepare/apply/reconcile)
+  |-- cleanup.py      guarded release of one run's managed worktree
+  |-- report.py       status/report rendering from stored facts only
   |
-prepare.py  the one resolution `prepare` and `run` share: task overrides, project contract,
-  |         per-role bindings (profiles.py), resolved launch, write permission, base commit
+prepare.py  the one resolution `prepare`, `approve` and `run` share: project contract, per-role
+  |         bindings (profiles.py), resolved launch, write permission, base commit
   |
 Controller (controller.py)  — finite state machine, no LLM calls
   |-- admission.py    TaskSpec + project contract -> admit or refuse (nothing is created first);
   |                   the dispatch preconditions, repair-policy rules included
   |-- authorization.py  one-shot, bound, user-attested approval artifact for a real run
+  |-- ownership.py    the owner identity of a run: token, pid, creation time, host, OS file lock
   |-- packet.py       the role input packets, rendered from stored facts, 32 KiB bound
   |-- store.py        SQLite transactions, reserve_dispatch, compare-and-set, stop-conditional writes
-  |-- migrate.py      table DDL and numbered storage versions (v5); the tables are runs / attempts /
+  |-- migrate.py      table DDL and numbered storage versions (v8); the tables are runs / attempts /
   |                   evidence / run_notes / authorizations / root_budgets / invocations /
-  |                   run_repair_records
+  |                   run_repair_records / invocation_settlements / integrations (+ schema_meta)
   |-- verify.py       approved checks over a frozen candidate -> evidence (with exit_reason)
   |-- artifacts.py    bounded output capture and the allowlisted check environment
   |-- workspace.py    scope containment, deny rules, manifests, candidate fingerprints
-  |-- gitworkspace.py Git worktrees, base-commit resolution, candidate freezing, candidate refs
+  |-- gitworkspace.py Git worktrees, base-commit resolution, candidate freezing, candidate refs,
+  |                   the shared-Git-metadata snapshot
   |-- review.py       the one reviewer-answer parser, shared by the driver and replay
-  |-- cleanup.py      guarded release of one run's managed worktree
-  |-- report.py       status/report rendering from stored facts only
   |-- runtime.py      the controller build id recorded into every run
   |
 HarnessDriver (contracts.HarnessDriver; a driver's optional cancel_handle is looked up, not declared)
   |-- drivers/selected.py   the single place a binding becomes a driver object
-  |-- drivers/acpx_dsh.py   the production transport: acpx -> official DSH ACP
+  |-- drivers/acpx_dsh.py   the production transport: acpx -> official DSH ACP (spawn, stream
+  |                         reader, stop, reconcile)
+  |-- drivers/launch.py     launch resolution, the agent child environment, the spawn-gate refusals
+  |-- drivers/launch_content.py  launch entry files bound by content
+  |-- drivers/primitives.py leaf helpers: PATH lookup without the cwd, env keys, bounded reads
   |-- drivers/acp_events.py neutral projection of the client's event stream
   |-- drivers/dsh_surfaces.py what DSH reads at launch beyond the packet, observed per role
   |                         (files read, a .env never opened; never executed, enforced or bound)
@@ -75,16 +100,19 @@ notes or receipt paths, and neither
 authenticates the database against another process running as the same user.
 
 `cleanup.py` checks that provenance against the observed workspace and Git registration before
-repository operations. Its cleanup claim checks terminal run state and absence of active
-attempts inside the claim transaction. Each removal attempt rechecks the guards and claimed
-workspace identity, including index flags that can hide modified files. Removal succeeds only when both the directory and its
+repository operations. A run that carries a `git_metadata: changed` or `unreadable` note is refused
+`git_metadata_changed` - before any status read, which would run a filter that metadata names -
+until the shared Git metadata digests to the run's recorded `snapshot before dispatch` again. Its
+cleanup claim checks terminal run state and absence of active attempts inside the claim
+transaction. Each removal attempt rechecks the guards and claimed workspace identity, including
+index flags that can hide modified files. Removal succeeds only when both the directory and its
 registration are gone; reconciliation uses the same repository source. An already recorded
 success is an idempotent historical result, not a new removal or observation; a later directory
-at that path is not deleted. A
-historical root ledger may identify the repository when provenance is absent; missing paths
-without a reliable source stay unknown. Invalid stored context or repair records raise
-`StoredRecordUnreadable`: `status`/`report` exit `6`, naming the record instead of replacing it or
-exposing a traceback. Continuation and cleanup retain their conservative refusal paths.
+at that path is not deleted. A historical root ledger may identify the repository when
+provenance is absent; missing paths without a reliable source stay unknown. Invalid stored context
+or repair records raise `StoredRecordUnreadable`: `status`/`report` exit `6`, naming the record
+instead of replacing it or exposing a traceback. Continuation and cleanup retain their
+conservative refusal paths.
 
 ## State
 
@@ -96,12 +124,18 @@ Task state: `DRAFT → READY → RUNNING → CHECKING → ACCEPTED`, plus `BLOCK
 
 A run itself never reaches `INTEGRATED` or `PUBLISHED`: a TaskSpec asking for one of those delivery
 levels is still refused at admission, before any run row exists. Integration is a separate,
-operator-approved step after acceptance (`hflow integrate`, `src/hflow/integrate.py`, batch I2):
-its own `integrations` record (storage v8) and its own `IntegrationReceipt` with
+operator-approved step after acceptance (`hflow integrate`, `src/hflow/integrate.py`): its own
+`integrations` record (storage v8) and its own `IntegrationReceipt` with
 `delivery_state = INTEGRATED`, while the run's receipt stays `LOCAL_CANDIDATE` and is never
 rewritten. Integration states: `preparing → checking → ready → applying → integrated`, terminal
 `conflict` / `checks_failed` / `stale` / `interrupted` / `superseded` / `failed`. Its checks are
-evidence of kind `integration-check` over the integration commit, run in a worktree of their own.
+evidence of kind `integration-check` over the integration commit, run in a worktree of their own
+and bracketed by a shared-Git-metadata snapshot (a change ends `checks_failed`, leaves that
+worktree in place and notes the run). The ref update is Git's own compare-and-set: a locked ref
+fails it with Git's message and the record returns to `ready`. `hflow integrate <run-id>` drives
+the same operations from whatever state the run's integration is in, and an integration that
+reaches `integrated` in the process releases the run's worktree through `cleanup.apply_cleanup`
+(unless `--keep-worktree`), never changing the exit code.
 `PUBLISHED` is not reachable in this build.
 
 Each top-level invocation also has a ledger state (`invocations.state`, `InvocationStartState`),
@@ -141,7 +175,67 @@ arrives after an entry was closed as `launch_unknown` never reopens it
 (`store.record_invocation_spawn`): a reported launch records its process facts and makes the entry
 `unknown` - not `started`, which is open and could be settled into releasing the root - and a
 reported non-launch records `not_started`, the same results the closure would have reached had
-the report come first.
+the report come first. `hflow ledger settle` moves an `unknown` or `launch_unknown` entry of an
+ended run to `operator_settled` by attestation (an `invocation_settlements` row); it is not a
+result, a process or a provider request.
+
+## Reading the counters honestly
+
+`hflow status <run-id>` prints several numbers that are easy to confuse. An excerpt of its real
+output for an offline fake run with a root budget file (one implementer, one reviewer, one
+`command` check, no model), paths and digests shortened:
+
+```text
+state         ACCEPTED
+delivery      LOCAL_CANDIDATE
+claimed_by    local-controller
+owner         pid=1776 host=<host> created=2026-10-16T13:33:24.951149Z generation=1 token=862c07f9...
+  liveness    not_probed (lock not_probed; not probed: the run is terminal): the run is terminal; its owner is not probed
+turns         reserved 2/4, implementer self-reported 1 (a self-report, not a dispatched count and not a bill)
+invocations   implementer=1 reviewer=1 (attempt rows; a deterministic dispatch count, not a model-request count)
+root budget   root-0f383c4e...
+  submissions used 2/3 (remaining 1)
+  repairs     used 0/0 (the root's own counter: a repair dispatch is charged here; whether repair was armed for a run is in that run's repair decisions)
+  deadline    2026-10-17T13:33:31Z (root limit 86400s, measured from the first reservation at 2026-10-16T13:33:31Z)
+  approvals   AUTH-offline-60lwgk9kpy
+dispatch ledger
+  reserved=0 requested=0 started=0 not_started=0 settled=2 unknown=0 launch_unknown=0
+  processes   0 operating-system child(ren) reported by a driver (ever started 0); 2 launch(es) ran without one, which is what the offline driver does
+  provider model requests: unknown - no invocation row records one, and neither a reservation nor a process is counted as one
+candidate     workspace still matches the accepted fingerprint
+model_calls   0 (this command; provider-side requests are reported by the receipt and stay unknown when not observed)
+```
+
+- `claimed_by` is a human label. `owner` is the recorded controller process (storage v6; "not
+  recorded" before). `liveness` (`matching`, `gone`, `unknown`, `not_recorded`, `not_probed`)
+  says what its word rests on - observed by this command, or decided by rule with nothing probed -
+  and none of it is stored.
+- `reserved 2/4` is turns *paid for* out of the ceiling; a run that cannot afford the review blocks
+  before the reviewer starts. `implementer self-reported` is the implementer's own count summed
+  over rounds (the receipt's `controller_turns_observed`); it is not a dispatch count and returns no
+  budget. The dispatch count is `invocations`.
+- `root budget` reads the ledger row: `submissions` span every run and revision of the root,
+  `repairs` is the root's own counter, `deadline` is fixed at the first reservation, `approvals`
+  names every authorization charged (an offline run's CLI-minted `AUTH-offline-...` included).
+- The **dispatch ledger** keeps the four facts of "State" apart. `processes` (and its alias `ever
+  started`) counts invocations whose driver reported a pid and is never derived from a result
+  state, so this offline run shows two settled launches and zero processes.
+  `operator_settled=N (by attestation, not observed)` appears once `ledger settle` closed an entry.
+- **Billing is unknown.** No invocation row records a provider request, so billed tokens, cost and
+  quota stay `null` - never read as `0`. ACP `usage_update` is context-window usage and an
+  agent-reported `usage`/`cost` is not a bill; neither fills those fields.
+- A run with no root row prints `legacy / not recorded` for the root and the ledger: absent, not
+  "0 used".
+- Per invocation, `model`, `stream` and `launch` lines show the model observation, where the
+  prompt response fell in the stream, and the launch-surface record; they read `not recorded` /
+  `unknown` (never `0`) for the offline driver, older rows and streams not read to their end.
+- `dsh context` lists, per frozen candidate, the files a DSH agent would load from the candidate
+  worktree (`none on the list` or `CHANGED n:`), marked `declaration checked` when each was matched
+  against `write_allow`. `repair` lists every repair decision, refusals included.
+- `candidate` compares the workspace with the accepted fingerprint; `DRIFTED` means the stored
+  `ACCEPTED` describes the candidate as it was, not the files on disk now.
+- When they apply, `open entries`, `git metadata` lines (the shared-Git-metadata warnings),
+  integration records and `next:` lines follow.
 
 ## Six properties the code enforces
 
@@ -152,10 +246,11 @@ the report come first.
    from a run that dispatches and then blocks (`exit 3`), from an argument-parsing error
    (`exit 4`), from a run that exists but is not finished or cannot continue under its recorded
    admission binding (`exit 5`), and from an unreadable stored record (`exit 6`).
-2. **Budget before dispatch.** `store.reserve_dispatch` is the one dispatch transaction of
-   batch E1, for both roles: in one `BEGIN IMMEDIATE` it checks ownership, phase, the absence of
-   a stop, the root (unresolved invocations, deadline, room for the rest of the loop, repair
-   count) and the authorization, then creates or attaches the attempt row, inserts the
+2. **Budget before dispatch.** `store.reserve_dispatch` is the one dispatch transaction, for
+   both roles (`implementer` and `reviewer` are the only roles it accepts): in one
+   `BEGIN IMMEDIATE` it checks ownership, phase, the absence of a stop, the root (unresolved
+   invocations, deadline, room for the rest of the loop, repair count) and the authorization,
+   then creates or attaches the attempt row, inserts the
    invocation row and increments the run, root and authorization counters - or rolls all of it
    back. Replaying the same invocation id returns the recorded intent and charges nothing.
    Database `CHECK` constraints (`turns_reserved <= turn_limit`,
@@ -183,7 +278,13 @@ the report come first.
    after the write keeps the applied result; for the implementer, a stop that lands after the
    result was applied but before the freeze still prevents the freeze and the ref. When a stop
    commits while the acceptance is being written, `finalize_acceptance` refuses the late success
-   in its own transaction, and the run is left in the stop's recorded state with no receipt.
+   in its own transaction, and the run is left in the stop's recorded state with no receipt. It
+   also requires the receipt to name this run, its current attempt and its task revision, and
+   writes receipt and state in one guarded UPDATE. After a takeover (`store.take_over_run`,
+   `owner_lost`) the superseded owner's launch registration
+   (`register_attempt_invocation_unless_stopped`) and review attachment
+   (`attach_review_result_unless_stopped`) require a live run without a receipt, so they write
+   nothing.
 6. **Unknown means stop.** An interrupted invocation becomes `OUTCOME_UNKNOWN` with its
    reservation intact, the run blocks, and `resume` only reconciles. It never
    re-dispatches (A04). The same block follows a completion that answers no observed prompt
@@ -192,7 +293,55 @@ the report come first.
    a client whose boundary could not be confirmed empty (`boundary_not_empty`), and a controller
    interrupted (Ctrl+C, `SystemExit`) while a driver was starting or running an invocation.
 
-## Bounded repair (batch E2)
+Every store transaction (`Store.transaction`, and the migration's) runs its `COMMIT` inside the
+guarded block: a commit that fails (`database is locked`, for one) is rolled back while it is still
+open, so the connection releases the write lock and its own uncommitted rows. Opening a ledger
+already at this build's storage version writes nothing; a new file is created and an older one
+migrated ("Storage version and migrations").
+
+## Storage version and migrations
+
+The ledger records its own storage version, separate from the contract schema version. A file is
+migrated to `migrate.STORAGE_VERSION` (8) the first time a build that understands it opens it; all
+DDL lives in `migrate.py`, and `store.py` only decides when to migrate.
+
+| Version | Adds (and what an older row gets) |
+|---|---|
+| v1 | `runs`, `attempts`, `evidence`, `run_notes`, `authorizations` |
+| v2 | the root ledger `root_budgets` and the per-dispatch `invocations` |
+| v3 | `invocations.launch_requested_at` (a request apart from a launch) and `authorizations.origin`; a v2 row past `reserved` becomes a launch request |
+| v4 | the process facts a driver reports (`process_started_at`, `process_pid`, `spawn_kind`); older rows keep `spawn_kind = unknown`. Also repairs rows the first v3 step left with the request time in `started_at` |
+| v5 | `evidence.exit_reason`, `run_repair_records`, `attempts.is_repair`; older rows keep an empty reason and `is_repair = 0` |
+| v6 | the owner identity (`owner_token`, `owner_pid`, `owner_created`, `owner_host`, `claim_generation`); an older row keeps a NULL owner, read as "owner unknown" |
+| v7 | `invocation_settlements`, the append-only record of `ledger settle` |
+| v8 | `integrations`, with partial unique indexes (one `preparing`/`checking`/`applying` record per run, one `applying` per repository and target branch); a run accepted before v8 has none |
+
+A file whose bootstrap never stamped a version is read by its shape, newest first. The v5 step
+rebuilds `attempts` (v1's `UNIQUE (run_id, task_revision, role)` becomes `UNIQUE (run_id,
+task_revision, role, is_repair)`, so a third implementer attempt cannot be inserted) by SQLite's
+own procedure, with foreign keys suspended before the transaction and `PRAGMA foreign_key_check`
+verified before it commits; an `attempts` table with unexpected columns is refused.
+
+On the first open by a newer build:
+
+1. The version is read before anything is written; a version newer than this build is refused
+   with nothing touched.
+2. A file at version > 0 is first copied with SQLite's backup API to `<db>.pre-v<version>.bak`,
+   through a `.partial` copy that is checked (`integrity_check` and its version) before the rename.
+   An existing `.bak` that is empty, damaged or of another version refuses the open, ledger
+   unchanged: move it aside and open again. A `.partial` another process is still writing (its open
+   handle blocks the cleanup) refuses with "open it again once that process has finished".
+3. The migration runs in one `BEGIN IMMEDIATE` transaction; any failure, a failed `COMMIT`
+   included, rolls it back whole. Re-opening a migrated file does nothing, and the snapshot is
+   never overwritten.
+
+Nothing is back-filled: an old evidence row keeps an empty `exit_reason`, which is exactly what
+keeps it ineligible to trigger a repair. There is no downgrade: do not open a migrated ledger with
+an older build. The only rollback is to stop everything, keep the migrated file, and copy the
+snapshot over `hflow.sqlite` (for example `Copy-Item hflow.sqlite.pre-v7.bak hflow.sqlite`) -
+losing everything written after the snapshot.
+
+## Bounded repair
 
 One failed round may be followed by **one** second implementer attempt in the same run, on the
 same revision, starting from the frozen candidate, followed by fresh checks and a fresh
@@ -466,7 +615,7 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
   invocation were asked as a run note, and reports the driver's facts. Coordination lives in
   the store and in the driver, never in a controller read: `register_attempt_invocation_unless_stopped`
   and `block_unless_stopped` write with `WHERE cancel_intent_at IS NULL`, and the driver's gate
-  (`_gate`, a `Condition`) is held while it publishes an invocation's handle **and** creates the
+  (`_gate`, a lock) is held while it publishes an invocation's handle **and** creates the
   child, which *both* stop entry points - `cancel_handle` and `cancel(invocation_id)` - take to
   record their request. A missing handle is not an answer while a spawn is in flight: a stop that
   takes the gate waits for that critical section to end - normally by waiting to *acquire* the
@@ -520,12 +669,17 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
   `<data-dir>/m0/acpx`, the entry falls back to the HFlow checkout's own `.probe/acpx`, so a run
   whose project root is the HFlow repository itself reports the launch not resolvable until
   `HFLOW_ACPX_CLI` names an acpx installed outside it. The DSH batch shim is wrapped in the
-  absolute `%SystemRoot%\System32\cmd.exe`. The child environment (also used by the zero-model
-  preflight) always carries `NoDefaultCurrentDirectoryInExePath=1`, with every other spelling
-  removed, drops relative and empty `PATH` entries (absolute entries are passed on as they are),
-  and has `DSH_PERMISSION_MODE` / `DSH_TOOLS_MODE` removed, so neither cmd.exe (which runs the
-  npm shim's bare `node`; the Desktop shim runs an absolute `DeepSeek Harness.exe`) nor Node's
-  spawn looks in the workspace first.
+  absolute `%SystemRoot%\System32\cmd.exe`. The child environment (`launch.child_environment`,
+  also used by the zero-model preflight) always carries `NoDefaultCurrentDirectoryInExePath=1`,
+  with every other spelling removed, drops relative and empty `PATH` entries (absolute entries are
+  passed on as they are), and has `DSH_PERMISSION_MODE` / `DSH_TOOLS_MODE` removed, so neither
+  cmd.exe (which runs the npm shim's bare `node`; the Desktop shim runs an absolute `DeepSeek
+  Harness.exe`) nor Node's spawn looks in the workspace first. The `node` the npm shim runs (the
+  `node.exe` beside the shim, else the first on the child's `PATH`) is bound by content as
+  `carrier_interpreter` and looked up again in the child's environment at the spawn gate. Every
+  variable `artifacts.is_secret_like` matches is withheld from the agent child except
+  `DEEPSEEK_API_KEY` (user ruling 2026-10-16), and the launch record notes the withheld names -
+  a denylist, not a credential sandbox.
 - **Billing is unknown.** `provider_billed_tokens`, `provider_cost` and
   `subscription_quota_remaining` are `null` because nothing observes them. Do not read `null`
   as `0`. An agent-reported `usage` on the prompt response (UNSTABLE in ACP) or the `cost` of a
@@ -547,7 +701,7 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
 | later offline reprocessing | `ACCEPTED` / `LOCAL_CANDIDATE` recorded for that same candidate from its own evidence | that the repaired parser carries the recorded verdict through the acceptance predicates. No model was called, no check re-executed, no allowance consumed |
 
 None of these rows certify cooperative cancellation, a filesystem sandbox, descendant control,
-model selection, or remote billing termination. Batch E1/E2 and the 2026-10-02 refinement
-(root ledger, bounded repair, launch hardening, `--model`) are offline-tested only. Details and
+model selection, or remote billing termination. The root ledger, the bounded repair, the launch
+hardening, `--model`, the plan flow and integration are offline-tested only. Details and
 provenance: `docs/m2-live-acceptance-result.md`, `docs/m2-review-wire-repair.md`,
 `docs/m0-results.md`, `docs/adr/0001-transport.md`.

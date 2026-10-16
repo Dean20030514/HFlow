@@ -350,9 +350,12 @@ def test_python_dash_m_hflow_is_the_cli(tmp_path: Path) -> None:
             errors="replace", timeout=SUBPROCESS_TIMEOUT, env=hflow_env(), check=False,
         )
 
-    usage = hflow("status")
+    usage = hflow("report")
     assert usage.returncode == 4, usage.stderr  # EXIT_USAGE, not argparse's own 2
-    assert "usage: hflow status" in usage.stderr
+    assert "usage: hflow report" in usage.stderr
+    inbox = hflow("status")  # no run id: the inbox, which never creates a ledger to read
+    assert (inbox.returncode, inbox.stdout.strip()) == (0, "nothing needs you"), inbox.stderr
+    assert not (tmp_path / "data").exists()
     missing = hflow("status", "R-missing")
     assert missing.returncode == 4, missing.stderr
     assert "unknown run R-missing" in missing.stderr

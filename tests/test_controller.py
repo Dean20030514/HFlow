@@ -346,7 +346,6 @@ def test_candidate_change_after_verification_invalidates_evidence(
         verification=verification,
         review=ReviewResult(status="accepted", isolation=IsolationLevel.PROMPT_ONLY),
         observed_turns=1,
-        base_ref="base",
         limitations=[],
     )
     # The stale evidence is refused, never reused: no new receipt is written. The run already
@@ -596,6 +595,32 @@ def test_reservation_and_attempt_are_written_atomically(
     assert row["turns_remaining"] == 4
     assert row["task_state"] == TaskState.READY.value
     assert store.attempts_for(run_id) == []
+
+
+def test_a_replayed_reservation_never_launches_the_driver(
+    controller: Controller,
+    driver,
+    store: Store,
+    run_request: RunRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``is_new=False`` means the invocation id is already recorded: coordinate, never start it."""
+    from hflow.contracts import DispatchReservation
+
+    def replay(**kwargs: object) -> DispatchReservation:
+        return DispatchReservation(
+            is_new=False, attempt_id="A-recorded", role=str(kwargs["role"]),
+            detail="this invocation id is already recorded",
+        )
+
+    monkeypatch.setattr(store, "reserve_dispatch", replay)
+
+    outcome = controller.run_task(run_request)
+
+    assert outcome.task_state is TaskState.BLOCKED
+    assert outcome.block_code is RefusalCode.INTERNAL_ERROR
+    assert "already recorded in the ledger" in (outcome.block_reason or "")
+    assert driver.started == [], "a replayed reservation must not launch a second process"
 
 
 def test_claim_is_exclusive_across_two_connections(

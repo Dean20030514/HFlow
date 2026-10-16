@@ -289,7 +289,7 @@ def main() -> int:
         "\nPreview the run and the binding an approval must cover (no model call; approving\n"
         "and running are user actions, see docs/operations.md):\n"
         "  hflow prepare --task {task} --project {project} --project-root {repo} \\\n"
-        "      --profile <id> --data-dir {data}".format(
+        "      --profile <id> --allow-writes --data-dir {data}".format(
             task=files["task"], project=files["project"], repo=repo, data=root / "data"
         )
     )
