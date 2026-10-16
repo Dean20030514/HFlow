@@ -404,9 +404,8 @@ candidate, `allow_reviewer_changes` is set, and it carries at least one finding.
 `id`; nothing else, nothing coerced. `changes_requested` with `[]` records `no_findings` and stops.
 A finding that breaks the schema makes the whole answer a `review_protocol_error`, never a
 rejection. The schema checks shape only: a `location` is not checked against the candidate and
-`severity` is the reviewer's own label. The offline replay (`tools/m2_live/replay_review.py`)
-reads a saved answer under the untyped contract only when the recorded reviewer prompt did not
-show typed findings, and records which contract it used (`review_contract`).
+`severity` is the reviewer's own label. Review evidence stored before typed findings existed is
+displayed as stored and never re-validated.
 
 **The repair round** is its own `attempts` row (`is_repair = 1`; the schema allows one). Its
 packet carries the original goal, scope and base, the previous candidate, the failed checks and
@@ -1107,10 +1106,8 @@ and say so.
 
 Git: 2.31+ for worktree runs, 2.40+ for `hflow integrate`. The global attributes file is located
 with `git var GIT_ATTR_GLOBAL` on Git 2.42+, else from `core.attributesFile`, else
-`$XDG_CONFIG_HOME/git/attributes`, else `~/.config/git/attributes`. Two tools write:
-`tools/m0_probe/write_results_doc.py` regenerates `docs/m0-results.md`, and
-`tools/m2_live/replay_review.py <run> --finalize` records a delivery decision through the Store,
-which needs its own explicit approval.
+`$XDG_CONFIG_HOME/git/attributes`, else `~/.config/git/attributes`. One tool writes a tracked
+file: `tools/m0_probe/write_results_doc.py` regenerates `docs/m0-results.md`.
 
 ## Appendix: writing the artifact by hand
 

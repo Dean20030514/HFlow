@@ -81,10 +81,10 @@ task (AGENTS rule 10).
 Settled: the ACP SDK is not pinned (2026-10-14); DSH's turn-time `git add` (#9382) is
 Web/Desktop-only by source - keep a bound home's acp bundles at `[dsh-base, dsh-acp-app]`.
 
-Open question (not yet asked): `Store.finalize_offline_reprocessing` and
-`tools/m2_live/replay_review.py` write a receipt outside the controller (AGENTS rule 2 says only the
-controller does). Either retire them (the M2 recovery was one-off; keep report.py's provenance
-rendering) or reword rule 2 and README to name that path. Ask the user.
+Settled 2026-10-16: the one-off M2 offline replay (`tools/m2_live/replay_review.py`,
+`Store.finalize_offline_reprocessing`) wrote a receipt outside the controller; it was retired
+rather than relaxing AGENTS rule 2 (the user left the choice to the recommendation). Its last
+version is in `2ea0020`; `report` still prints the provenance of the receipt it wrote.
 
 Only after that real evidence comes Team/DAG work. Before parallel tasks:
 

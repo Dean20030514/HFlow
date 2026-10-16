@@ -1,5 +1,11 @@
 # Reviewer result wire — repair and offline replay of the recorded B attempt
 
+> **Retired tool (2026-10-16).** `tools/m2_live/replay_review.py` and
+> `Store.finalize_offline_reprocessing` were removed after this one-off recovery, because they
+> wrote a receipt outside the controller (AGENTS rule 2). Their last version is in commit
+> `2ea0020`. The receipt they wrote stays in its ledger, and `hflow report` still prints its
+> provenance next to the delivery. The record below is unchanged.
+
 **Outcome: M2 candidate delivered after evidence-based offline recovery.** The live
 implementation and review both completed; delivery was originally blocked by **adapter result
 loss**, not by the candidate and not by the reviewer's judgment. The verdict was then recovered

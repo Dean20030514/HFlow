@@ -518,8 +518,8 @@ exists (`drivers/acpx_dsh.py`) and is bound through `drivers/selected.py`.
   the driver observed for the session the first `session/prompt` request named - a chunk for any
   other session, or with no `sessionId` (counted in a limitation,
   `agent_message_chunk_other_session=N`), a chunk observed before that request, or a request that
-  names no session, leaves no verdict; the offline replay tool binds the same way and refuses
-  any of these streams - and decoded into one canonical `ReviewOutput` (`src/hflow/review.py`).
+  names no session, leaves no verdict - and decoded into one canonical `ReviewOutput`
+  (`src/hflow/review.py`).
   Chunks group into messages by ACP `messageId`, and only a different id starts a new message, so a
   same-id thought (DSH sends reasoning under the message's own id), a usage update or a tool call
   does not split one. The answer is the last message's message-chunk text in stream order, and

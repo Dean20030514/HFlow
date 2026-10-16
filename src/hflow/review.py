@@ -63,7 +63,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from .contracts import RecordedUntypedReview, ReviewOutput
+from .contracts import ReviewOutput
 from .profiles import summarize_validation_error
 
 #: Bound on retained assistant text for one invocation. A looping agent must not be able
@@ -419,21 +419,6 @@ def decode_review(answer: str) -> ReviewOutput:
     and no field is ever filled in on the model's behalf.
     """
     return validate_review(_answer_payload(answer))
-
-
-def decode_untyped_recorded_review(answer: str) -> RecordedUntypedReview:
-    """Decode a *historical* answer against the contract its reviewer was shown: untyped findings.
-
-    Same grammar as :func:`decode_review`; only the finding objects are not typed. This exists so
-    an offline replay of bytes recorded before typed findings can still read their verdict. It is
-    never a fallback for a new answer: the drivers call :func:`decode_review` only, and a caller
-    that uses this must say which contract the verdict was read under.
-    """
-    payload = _answer_payload(answer)
-    try:
-        return RecordedUntypedReview.model_validate(payload)
-    except ValidationError as exc:
-        raise ReviewDecodeError(REVIEW_INVALID, _describe(payload, exc)) from exc
 
 
 def _answer_payload(answer: str) -> dict[str, Any]:

@@ -227,6 +227,7 @@ not safe yet".
 - `docs/batch-i-integration-plan.md`: the integration contract.
 - `docs/ai/agents/next-session.md`: the next milestone and the full live checklist.
 
-Two tools write: `tools/m0_probe/write_results_doc.py` regenerates `docs/m0-results.md` (hand edits
-are overwritten), and `tools/m2_live/replay_review.py <run> --finalize` records a delivery decision,
-which needs its own explicit approval.
+One tool writes a tracked file: `tools/m0_probe/write_results_doc.py` regenerates
+`docs/m0-results.md` (hand edits are overwritten). Only the controller writes a receipt or a task
+state (AGENTS rule 2); the one-off M2 offline replay that also did was retired after its use
+(`docs/m2-review-wire-repair.md`).

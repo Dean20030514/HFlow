@@ -4,15 +4,14 @@ A finding is ``{body, title?, location?{path, line_start?, line_end?}, severity?
 strictly: an unknown key, a blank body, an unknown severity or a bad line range makes the whole
 reviewer answer ``REVIEW_INVALID`` - a protocol problem, never a rejection with zero findings.
 Severity is recorded and rendered, and gates nothing. History recorded before this change
-(untyped finding objects) stays readable by ``status``/``report`` and by the offline replay, and
-is never re-validated against the new model.
+(untyped finding objects) stays readable by ``status``/``report`` and is never re-validated
+against the new model.
 
 No model is called anywhere in this file.
 """
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import re
 import sqlite3
@@ -43,7 +42,6 @@ from hflow.review import (
     REVIEW_INVALID,
     ReviewDecodeError,
     decode_review,
-    decode_untyped_recorded_review,
 )
 from hflow.store import Store
 from hflow.verify import CheckRunners
@@ -59,8 +57,6 @@ from tests.test_batch_e_repair import (
     _spec,
 )
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-REPLAY_TOOL = REPO_ROOT / "tools" / "m2_live" / "replay_review.py"
 
 FULL_FINDING = {
     "id": "F-1",
@@ -194,11 +190,10 @@ def test_an_integer_past_the_digit_limit_in_a_fenced_block_is_review_invalid() -
         '{"verdict":"changes_requested","findings":[{"body":"x","location":'
         '{"path":"a","line_start":' + huge + "}}]}\n```"
     )
-    for decode in (decode_review, decode_untyped_recorded_review):
-        with pytest.raises(ReviewDecodeError) as excinfo:
-            decode(answer)
-        assert excinfo.value.kind == REVIEW_INVALID
-        assert "fenced result block" in excinfo.value.detail, excinfo.value.detail
+    with pytest.raises(ReviewDecodeError) as excinfo:
+        decode_review(answer)
+    assert excinfo.value.kind == REVIEW_INVALID
+    assert "fenced result block" in excinfo.value.detail, excinfo.value.detail
 
 
 def test_nesting_past_the_decoder_stack_in_a_fenced_block_is_review_invalid() -> None:
@@ -208,10 +203,9 @@ def test_nesting_past_the_decoder_stack_in_a_fenced_block_is_review_invalid() ->
         "```json\n"
         '{"verdict":"accepted","findings":[],"x":' + "[" * depth + "]" * depth + "}\n```"
     )
-    for decode in (decode_review, decode_untyped_recorded_review):
-        with pytest.raises(ReviewDecodeError) as excinfo:
-            decode(answer)
-        assert excinfo.value.kind == REVIEW_INVALID
+    with pytest.raises(ReviewDecodeError) as excinfo:
+        decode_review(answer)
+    assert excinfo.value.kind == REVIEW_INVALID
 
 
 # --------------------------------------------------------------------------
@@ -524,61 +518,11 @@ def test_a_legacy_untyped_finding_never_buys_a_repair(
         store.close()
 
 
-def test_a_legacy_answer_decodes_only_under_the_untyped_contract() -> None:
+def test_a_new_legacy_shaped_answer_is_review_invalid() -> None:
     answer = _answer(LEGACY_REVIEW["findings"], verdict="accepted")
     with pytest.raises(ReviewDecodeError) as excinfo:
         decode_review(answer)
     assert excinfo.value.kind == REVIEW_INVALID
-
-    recorded = decode_untyped_recorded_review(answer)
-    assert recorded.verdict == "accepted"
-    assert recorded.findings == LEGACY_REVIEW["findings"]
-    # The same digest as before typed findings existed: the dump is the stored object unchanged.
-    assert recorded.model_dump(mode="json") == {"verdict": "accepted", "findings": LEGACY_REVIEW["findings"]}
-
-
-def _replay_tool():
-    spec = importlib.util.spec_from_file_location("hflow_replay_review_h3", REPLAY_TOOL)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_the_replay_reads_an_old_answer_under_the_contract_its_reviewer_was_shown() -> None:
-    tool = _replay_tool()
-    answer = _answer(LEGACY_REVIEW["findings"], verdict="accepted")
-    old_prompt = "Review the frozen candidate. Report findings against the candidate fingerprint."
-
-    checks: dict[str, object] = {}
-    review = tool._decode_saved_answer(answer, checks, old_prompt)
-    assert review.verdict == "accepted"
-    assert checks["review_contract"] == "untyped_findings (recorded before typed findings)"
-    assert "review_invalid" in str(checks["typed_contract_error"])
-
-
-@pytest.mark.parametrize(
-    "prompt",
-    [None, "[HFlow reviewer task]\n" + OUTPUT_CONTRACT_NOTE],
-    ids=["prompt-missing", "prompt-showed-typed-findings"],
-)
-def test_the_replay_never_reads_an_untyped_answer_its_reviewer_was_told_to_type(
-    prompt: str | None,
-) -> None:
-    """A reviewer shown typed findings that answered untyped gave an invalid verdict; so does a
-    recording whose prompt cannot show which contract applied."""
-    tool = _replay_tool()
-    with pytest.raises(ReviewDecodeError) as excinfo:
-        tool._decode_saved_answer(_answer(LEGACY_REVIEW["findings"], verdict="accepted"), {}, prompt)
-    assert excinfo.value.kind == REVIEW_INVALID
-
-
-def test_the_replay_reads_a_typed_answer_as_typed() -> None:
-    tool = _replay_tool()
-    checks: dict[str, object] = {}
-    review = tool._decode_saved_answer(_answer([FULL_FINDING]), checks, "any prompt")
-    assert isinstance(review, ReviewOutput)
-    assert checks["review_contract"] == "typed_findings"
 
 
 @pytest.mark.parametrize("separator", ["\n", "\r\n", " ", " ", "\u0085"])

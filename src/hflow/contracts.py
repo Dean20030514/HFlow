@@ -1181,21 +1181,6 @@ class ReviewOutput(BaseModel):
     findings: list[Finding]
 
 
-class RecordedUntypedReview(BaseModel):
-    """A reviewer verdict produced under the contract in force before typed findings.
-
-    Only for re-reading historical bytes offline (``tools/m2_live/replay_review.py``): that
-    reviewer was told "findings is a list of objects" and nothing more, so its answer is judged
-    against that contract, not one it was never shown. Never used for a new reviewer answer -
-    the drivers decode with :class:`ReviewOutput` only.
-    """
-
-    model_config = Strict
-
-    verdict: Literal["accepted", "changes_requested"]
-    findings: list[dict[str, Any]]
-
-
 class InvocationRequest(BaseModel):
     model_config = Strict
 
