@@ -1,5 +1,7 @@
 # AGENTS.md — HFlow working notes
 
+> Archived 2026-10-18: do not start new work here. See README.md and `docs/distilled-lessons.md`.
+
 Short navigation for an agent (or human) editing this repository. It intentionally does
 not restate the design; read the plan (`docs/history/Harness_Agnostic_Workflow_Greenfield_Plan_2026-09-19.md`;
 "plan N.M" in source comments cites its sections) and `docs/architecture.md` when the task needs them.

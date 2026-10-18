@@ -1,5 +1,8 @@
 # Next-session handoff — 2026-10-16 (after batch N)
 
+> Archived 2026-10-18: the project stopped before the first live small task below was run. Kept
+> as a record; see `docs/distilled-lessons.md`.
+
 ## User decision (unchanged)
 
 > 先完成“小任务从授权到集成、异常后可恢复”的真实闭环，再扩展 Team，最接近实际可用。

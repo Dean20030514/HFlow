@@ -1,5 +1,11 @@
 # HFlow
 
+> **Archived (2026-10-18).** Development has stopped. HFlow never delivered a real project change
+> through its own loop. What is worth keeping is distilled in
+> [docs/distilled-lessons.md](docs/distilled-lessons.md) (Chinese), compared against what Claude
+> Code already provides. The code and tests stay as they are at tag `final`; nothing here is
+> maintained.
+
 HFlow runs one coding task through an agent harness under an explicit approval, a budget and the
 project's own approved checks, and keeps the evidence. A small deterministic controller owns
 admission, budget, attempts, evidence and the receipt; the harness (DSH over acpx today) owns
